@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}대시보드 - 재고 관리 시스템{% endblock %}
+{% block content %}
+<div class="mb-8">
+    <h2 class="text-2xl font-bold mb-4">재고 현황 대시보드</h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+        <div class="bg-white p-6 rounded-lg shadow">
+            <h3 class="text-lg font-semibold text-gray-700 mb-2">전체 품목 수</h3>
+            <p class="text-3xl font-bold text-blue-600">{{ total_items }}</p>
+        </div>
+        <div class="bg-white p-6 rounded-lg shadow">
+            <h3 class="text-lg font-semibold text-gray-700 mb-2">불일치 품목 수</h3>
+            <p class="text-3xl font-bold text-red-600">{{ discrepancy_count }}</p>
+        </div>
+        <div class="bg-white p-6 rounded-lg shadow">
+            <h3 class="text-lg font-semibold text-gray-700 mb-2">마지막 비교 시각</h3>
+            <p class="text-xl text-gray-600">{{ last_check_time }}</p>
+        </div>
+    </div>
+
+    <div class="bg-white p-6 rounded-lg shadow mb-6">
+        <h3 class="text-lg font-semibold mb-4">재고 현황 테이블</h3>
+        {% if inventory_data %}
+        <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">지점코드</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">품목코드</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ENTRY번호</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">QR재고</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">RAW재고</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">차이</th>
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">상태</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-200">
+                {% for item in inventory_data %}
+                <tr class="hover:bg-gray-50">
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ item.branch_code }}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ item.item_code }}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ item.entry_no }}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ item.qr_quantity }}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ item.raw_quantity }}</td>
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ item.difference }}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">
+                        {% if item.difference == 0 %}
+                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
+                            일치
+                        </span>
+                        {% else %}
+                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800">
+                            불일치
+                        </span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="text-center py-8 text-gray-500">데이터가 없습니다.</p>
+        {% endif %}
+    </div>
+
+    <div class="bg-white p-6 rounded-lg shadow">
+        <h3 class="text-lg font-semibold mb-4">수동 비교 실행</h3>
+        <form id="compareForm" class="flex items-center space-x-4">
+            <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 px-4 rounded">
+                지금 비교 실행
+            </button>
+            <div id="compareResult" class="ml-4 min-w-0 flex-1"></div>
+        </form>
+    </div>
+</div>
+
+<script>
+    document.getElementById('compareForm').addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const resultDiv = document.getElementById('compareResult');
+        resultDiv.innerHTML = '<p class="text-yellow-600">비교 중...</p>';
+        try {
+            const response = await fetch('/compare/now', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            });
+            const data = await response.json();
+            if (data.discrepancies && data.discrepancies.length > 0) {
+                resultDiv.innerHTML = `
+                    <p class="text-red-600">불일치 발견: ${data.discrepancies.length}건</p>
+                    <ul class="mt-2 space-y-1 text-sm">
+                        ${data.discrepancies.map(d => `<li>${d.branch_code} ${d.item_code} ${d.entry_no}: QR=${d.qr_quantity}, RAW=${d.raw_quantity}, diff=${d.difference}</li>`).join('')}
+                    </ul>
+                `;
+            } else {
+                resultDiv.innerHTML = '<p class="text-green-600">불일치 없음</p>';
+            }
+        } catch (error) {
+            resultDiv.innerHTML = `<p class="text-red-600">오류 발생: ${error.message}</p>`;
+        }
+    });
+</script>
+{% endblock %}
