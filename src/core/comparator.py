@@ -26,3 +26,19 @@ def compare_inventories(qr_inventory: List[Dict[str, Any]], raw_inventory: List[
 
     # TODO: 실제 비교 로직 구현 (추후)
     return result
+
+
+class InventoryComparator:
+    """
+    `main.py`에서 사용되는 래퍼 클래스.
+    `qr_db`와 `raw_db` 인스턴스를 받아 `compare_inventories`를 호출한다.
+    """
+    def __init__(self, qr_db, raw_db):
+        self.qr_db = qr_db
+        self.raw_db = raw_db
+
+    def compare(self) -> Dict[str, Any]:
+        """QR DB와 RAW DB의 재고를 조회하고 비교한다."""
+        qr_inventory = self.qr_db.fetch_inventory()
+        raw_inventory = self.raw_db.fetch_inventory()
+        return compare_inventories(qr_inventory, raw_inventory)

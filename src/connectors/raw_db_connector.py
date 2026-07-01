@@ -22,3 +22,23 @@ class RawDBConnector(abc.ABC):
     def close(self) -> None:
         """RAW DB 연결을 종료한다."""
         pass
+
+class MockRawDBConnector(RawDBConnector):
+    """테스트용 Mock 구현체, 고정된 재고 데이터를 반환한다."""
+
+    def __init__(self):
+        self._data = [
+            {"item_id": "A001", "name": "Item A", "quantity": 10, "location": "Warehouse"},
+            {"item_id": "B002", "name": "Item B", "quantity": 5, "location": "Store"},
+        ]
+
+    def connect(self) -> None:
+        # Mock 연결, 실제 동작 없음
+        pass
+
+    def fetch_inventory(self) -> List[Dict[str, Any]]:
+        return self._data
+
+    def close(self) -> None:
+        # Mock 종료, 실제 동작 없음
+        pass
