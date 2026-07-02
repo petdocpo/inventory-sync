@@ -44,17 +44,8 @@ async def health_check() -> dict:
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    """대시보드 페이지."""
-    inventory = qr_db.get_inventory()
-    comparison = comparator.compare()
-    return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
-            "inventory": inventory,
-            "comparison": comparison,
-        },
-    )
+    """대시보드 페이지 - 단순 테스트용."""
+    return HTMLResponse("<html><body><h1>Dashboard Test</h1></body></html>")
 
 @app.get("/scan", response_class=HTMLResponse)
 async def scan_get(request: Request):
@@ -88,12 +79,8 @@ async def get_inventory():
 
 @app.get("/adjust", response_class=HTMLResponse)
 async def adjust_get(request: Request):
-    """재고 조정 폼 (GET)."""
-    logs = adjuster.get_adjustment_logs()
-    return templates.TemplateResponse(
-        "adjust.html",
-        {"request": request, "logs": logs},
-    )
+    """재고 조정 폼 (GET) - 단순 테스트용."""
+    return HTMLResponse("<html><body><h1>Adjust Test</h1></body></html>")
 
 @app.post("/adjust")
 async def adjust_post(
@@ -108,11 +95,8 @@ async def adjust_post(
 
 @app.get("/qr", response_class=HTMLResponse)
 async def qr_get(request: Request):
-    """QR 코드 생성 폼 (GET)."""
-    return templates.TemplateResponse(
-        "qr_generate.html",
-        {"request": request},
-    )
+    """QR 코드 생성 폼 (GET) - 단순 테스트용."""
+    return HTMLResponse("<html><body><h1>QR Test</h1></body></html>")
 
 @app.post("/qr/download")
 async def qr_download_post(
@@ -149,8 +133,8 @@ async def compare_now():
 
 def main() -> None:
     """메인 진입점."""
-    # Use environment variable for port, default to 8000 if not set
-    port = int(os.getenv("SERVER_PORT", "8000"))
+    # 포트는 환경변수 SERVER_PORT로 설정 (기본값 28000)
+    port = int(os.getenv("SERVER_PORT", "28000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
