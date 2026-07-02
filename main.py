@@ -27,6 +27,7 @@ app.mount("/qr_codes", StaticFiles(directory="qr_codes"), name="qr_codes")
 
 # 컴포넌트 초기화
 qr_db = SQLiteQRDBConnector()
+qr_db.connect()  # Add database connection initialization
 raw_db = MockRawDBConnector()
 comparator = InventoryComparator(qr_db, raw_db)
 notifier = TeamsNotifier()
@@ -148,7 +149,9 @@ async def compare_now():
 
 def main() -> None:
     """메인 진입점."""
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Use environment variable for port, default to 8000 if not set
+    port = int(os.getenv("SERVER_PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()

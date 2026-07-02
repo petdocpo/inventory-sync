@@ -43,6 +43,10 @@ class SQLiteQRDBConnector(QRDBConnector):
         cursor = self.conn.execute("SELECT * FROM inventory")
         return [dict(row) for row in cursor.fetchall()]
 
+    def get_inventory(self) -> List[Dict[str, Any]]:
+        """호환성을 위해 fetch_inventory를 래핑한다."""
+        return self.fetch_inventory()
+
     def upsert_item(self, item_data: Dict[str, Any]) -> None:
         """아이템을 삽입하거나 업데이트한다."""
         assert self.conn is not None
@@ -67,3 +71,30 @@ class SQLiteQRDBConnector(QRDBConnector):
         if self.conn:
             self.conn.close()
             self.conn = None
+
+    def adjust_quantity(self, branch_code: str, item_code: str, entry_no: str, delta: int) -> int:
+        """
+        현재 수량에 delta를 더한다 (IN: +1, OUT: -1).
+        해당 레코드가 없으면 quantity=delta로 신규 생성.
+        변경 후 수량을 반환한다.
+        """
+        assert self.conn is not None
+        cursor = self.conn.execute(
+            "SELECT quantity FROM inventory WHERE branch_code=? AND item_code=? AND entry_no=?",
+            (branch_code, item_code, entry_no)
+        )
+        row = cursor.fetchone()
+        current_qty = row["quantity"] if row else 0
+        new_qty = current_qty + delta
+        self.conn.execute(
+            """
+            INSERT INTO inventory (branch_code, item_code, entry_no, quantity, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(branch_code, item_code, entry_no) DO UPDATE SET
+                quantity=excluded.quantity,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (branch_code, item_code, entry_no, new_qty)
+        )
+        self.conn.commit()
+        return new_qty
