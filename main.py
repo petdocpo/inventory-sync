@@ -23,8 +23,6 @@ SERVER_PORT = int(os.getenv("SERVER_PORT", "28000"))
 QR_DIR = "./qr_codes"
 
 app = FastAPI(title="재고 관리 시스템", version="1.2.0")
-Path(QR_DIR).mkdir(parents=True, exist_ok=True)
-app.mount("/qr/download", StaticFiles(directory=QR_DIR), name="qr_codes")
 
 from auth.login import (  # noqa: E402
     init_auth_db, authenticate, create_session, get_session,
