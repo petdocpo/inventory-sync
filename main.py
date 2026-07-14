@@ -721,13 +721,13 @@ async def qr_page(
             <div class="card" style="border:1px solid #1E2761;">
               <h3 style="margin-bottom:8px;">📦 일괄 생성</h3>
               <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                <form method="post" action="/master/qr/generate-bulk" style="flex:1;">
+                <form method="post" action="/master/qr/generate-bulk" style="flex:1;" onsubmit="showZipLoading();">
                   <input type="hidden" name="branch_code" value="{filter_branch}">
                   <button class="btn" type="submit" style="width:100%;">
                     📦 {filter_branch} ZIP 다운로드
                   </button>
                 </form>
-                <form method="post" action="/master/qr/generate-bulk" style="flex:1;">
+                <form method="post" action="/master/qr/generate-bulk" style="flex:1;" onsubmit="showZipLoading();">
                   <input type="hidden" name="branch_code" value="ALL">
                   <button class="btn" type="submit"
                           style="width:100%;background:#64748B;">
@@ -741,7 +741,7 @@ async def qr_page(
             <div class="card" style="border:1px solid #1E2761;">
               <h3 style="margin-bottom:8px;">📦 일괄 생성</h3>
               <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                <form method="post" action="/master/qr/generate-bulk" style="flex:1;">
+                <form method="post" action="/master/qr/generate-bulk" style="flex:1;" onsubmit="showZipLoading();">
                   <input type="hidden" name="branch_code" value="ALL">
                   <button class="btn" type="submit" style="width:100%;">
                     🌐 전체 지점 ZIP 다운로드
@@ -760,7 +760,7 @@ async def qr_page(
           <p style="color:#666;font-size:12px;margin-bottom:12px;">
             우리 지점({user['branch_code']})의 전체 품목 QR을 ZIP으로 한 번에 받을 수 있어요.
           </p>
-          <form method="post" action="/master/qr/generate-bulk">
+          <form method="post" action="/master/qr/generate-bulk" onsubmit="showZipLoading();">
             <input type="hidden" name="branch_code" value="{user['branch_code']}">
             <button class="btn" type="submit" style="width:100%;">
               📦 우리 지점 전체 QR ZIP 다운로드
@@ -774,7 +774,7 @@ async def qr_page(
     <div class="card">
       <h3 style="margin-bottom:12px;">개별 생성</h3>
       <form method="post" action="/qr/generate" id="qrGenForm"
-            onsubmit="document.getElementById('qrGenBtn').innerHTML='⏳ 생성 중...'; document.getElementById('qrGenBtn').disabled=true;">
+            onsubmit="startQrGenTimer();">
         <label style="font-size:13px;color:#555;">품목 선택 ({len(items)}개)</label>
         <select name="item_key" required style="margin-bottom:14px;">
           {options_html}
@@ -783,6 +783,41 @@ async def qr_page(
       </form>
     </div>
     {bulk_html}
+
+    <div id="zipLoadingOverlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+         background:rgba(0,0,0,0.5);z-index:999;justify-content:center;align-items:center;">
+      <div style="background:white;padding:24px 32px;border-radius:12px;text-align:center;">
+        <div style="font-size:32px;margin-bottom:8px;">📦</div>
+        <div style="font-weight:bold;color:#1E2761;">ZIP 생성 중입니다...</div>
+        <div id="zipTimerText" style="color:#888;font-size:13px;margin-top:6px;">잠시만 기다려주세요</div>
+      </div>
+    </div>
+    <script>
+    function startQrGenTimer() {{
+      const btn = document.getElementById('qrGenBtn');
+      let secondsLeft = 5;
+      btn.disabled = true;
+      const tick = () => {{
+        btn.innerHTML = secondsLeft > 0 ? `⏳ 생성 중... (약 ${{secondsLeft}}초)` : '⏳ 거의 완료...';
+        secondsLeft--;
+      }};
+      tick();
+      const interval = setInterval(() => {{
+        if (secondsLeft < 0) {{ clearInterval(interval); return; }}
+        tick();
+      }}, 1000);
+    }}
+    function showZipLoading() {{
+      document.getElementById('zipLoadingOverlay').style.display = 'flex';
+      let secondsLeft = 10;
+      const label = document.getElementById('zipTimerText');
+      const interval = setInterval(() => {{
+        secondsLeft--;
+        label.textContent = secondsLeft > 0 ? `약 ${{secondsLeft}}초 남음` : '거의 완료...';
+        if (secondsLeft <= 0) clearInterval(interval);
+      }}, 1000);
+    }}
+    </script>
     """
     return HTMLResponse(content=render_page(content, user, "qr"))
 
