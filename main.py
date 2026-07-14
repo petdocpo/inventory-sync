@@ -193,6 +193,37 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       </div>
       <div class="content">{content}</div>
       <nav class="bottomnav">{menu_html}</nav>
+      <script>
+      (function() {{
+        function saveColumnWidths() {{
+          document.querySelectorAll('table').forEach(function(table, tIdx) {{
+            var widths = [];
+            table.querySelectorAll('th').forEach(function(th) {{
+              widths.push(th.offsetWidth);
+            }});
+            localStorage.setItem('colWidths_' + window.location.pathname + '_' + tIdx, JSON.stringify(widths));
+          }});
+        }}
+        function restoreColumnWidths() {{
+          document.querySelectorAll('table').forEach(function(table, tIdx) {{
+            var saved = localStorage.getItem('colWidths_' + window.location.pathname + '_' + tIdx);
+            if (!saved) return;
+            try {{
+              var widths = JSON.parse(saved);
+              var ths = table.querySelectorAll('th');
+              ths.forEach(function(th, i) {{
+                if (widths[i]) th.style.width = widths[i] + 'px';
+              }});
+            }} catch (e) {{}}
+          }});
+        }}
+        restoreColumnWidths();
+        document.querySelectorAll('th').forEach(function(th) {{
+          var observer = new ResizeObserver(function() {{ saveColumnWidths(); }});
+          observer.observe(th);
+        }});
+      }})();
+      </script>
     </body></html>
     """
 
