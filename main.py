@@ -314,7 +314,10 @@ def fetch_raw_inventory() -> List[Dict[str, Any]]:
 # ── 대시보드 ────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(session_token: str = Cookie(default=None)):
+async def dashboard(
+    session_token: str = Cookie(default=None),
+    filter_branch: str = ""
+):
     """대시보드 — 불일치 품목만 표시"""
     user = get_session(session_token)
     if not user:
@@ -322,9 +325,15 @@ async def dashboard(session_token: str = Cookie(default=None)):
 
     conn = get_conn()
     if user["role"] == "master":
-        rows = conn.execute(
-            "SELECT * FROM inventory ORDER BY branch_code, item_code"
-        ).fetchall()
+        if filter_branch:
+            rows = conn.execute(
+                "SELECT * FROM inventory WHERE branch_code=? ORDER BY item_code",
+                (filter_branch,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM inventory ORDER BY branch_code, item_code"
+            ).fetchall()
     else:
         rows = conn.execute(
             "SELECT * FROM inventory WHERE branch_code=? ORDER BY item_code",
@@ -364,9 +373,29 @@ async def dashboard(session_token: str = Cookie(default=None)):
     if not disc_rows:
         disc_rows = '<tr><td colspan="7" style="text-align:center;padding:24px;color:#22C55E;">✅ 모든 재고가 일치합니다</td></tr>'
 
+    branch_filter_html = ""
+    if user["role"] == "master":
+        branch_options = '<option value="">전체 지점</option>'
+        for b in BRANCHES:
+            sel = "selected" if filter_branch == b["branch_code"] else ""
+            branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
+        branch_filter_html = f"""
+        <form method="get" action="/" style="margin-bottom:16px;">
+          <div style="display:flex;gap:8px;align-items:flex-end;">
+            <div style="flex:1;max-width:220px;">
+              <label style="font-size:12px;color:#888;">지점 필터</label>
+              <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
+            </div>
+            <button class="btn" type="submit">선택</button>
+            <a href="/" style="padding:10px 14px;background:#eee;
+               border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+          </div>
+        </form>"""
+
     content = f"""
     <h2 style="margin-bottom:8px;">⚠️ 대시보드</h2>
     <p style="color:#888;font-size:13px;margin-bottom:16px;">불일치 품목만 표시됩니다</p>
+    {branch_filter_html}
     <div style="display:flex;gap:12px;margin-bottom:16px;">
       <div class="card" style="flex:1;text-align:center;padding:16px;">
         <div style="color:#888;font-size:12px;">불일치 품목</div>
