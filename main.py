@@ -1055,20 +1055,33 @@ async def scan_post(data: Dict[str, str]):
 async def adjust_get(
     session_token: str = Cookie(default=None),
     preset_branch: str = "",
-    preset_code: str = ""
+    preset_code: str = "",
+    filter_branch: str = ""
 ):
     user = get_session(session_token)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
 
+    effective_branch = preset_branch or filter_branch
+
     conn = get_conn()
     if user["role"] == "master":
-        items = conn.execute(
-            "SELECT * FROM items ORDER BY branch_code, item_name"
-        ).fetchall()
-        logs = conn.execute(
-            "SELECT * FROM adjustment_log ORDER BY id DESC LIMIT 20"
-        ).fetchall()
+        if effective_branch:
+            items = conn.execute(
+                "SELECT * FROM items WHERE branch_code=? ORDER BY item_name",
+                (effective_branch,)
+            ).fetchall()
+            logs = conn.execute(
+                "SELECT * FROM adjustment_log WHERE branch_code=? ORDER BY id DESC LIMIT 20",
+                (effective_branch,)
+            ).fetchall()
+        else:
+            items = conn.execute(
+                "SELECT * FROM items ORDER BY branch_code, item_name"
+            ).fetchall()
+            logs = conn.execute(
+                "SELECT * FROM adjustment_log ORDER BY id DESC LIMIT 20"
+            ).fetchall()
     else:
         items = conn.execute(
             "SELECT * FROM items WHERE branch_code=? ORDER BY item_name",
@@ -1080,12 +1093,30 @@ async def adjust_get(
         ).fetchall()
     conn.close()
 
+    branch_filter_html = ""
+    if user["role"] == "master":
+        branch_options = '<option value="">전체 지점</option>'
+        for b in BRANCHES:
+            sel = "selected" if filter_branch == b["branch_code"] else ""
+            branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
+        branch_filter_html = f"""
+        <div class="card">
+          <form method="get" action="/adjust" style="display:flex;gap:8px;align-items:flex-end;">
+            <div style="flex:1;max-width:220px;">
+              <label style="font-size:12px;color:#888;">지점 필터</label>
+              <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
+            </div>
+            <button class="btn" type="submit">선택</button>
+            <a href="/adjust" style="padding:10px 14px;background:#eee;
+               border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+          </form>
+        </div>"""
+
     options_html = ""
     for it in items:
         sel = "selected" if preset_code == it["item_code"] and preset_branch == it["branch_code"] else ""
         options_html += f'<option value="{it["branch_code"]}|{it["item_code"]}" {sel}>{it["branch_name"]} / {it["item_name"]} ({it["item_code"]})</option>'
 
-    # 이력 테이블 행 (항상 체크박스 포함 - 계정 무관하게 삭제 가능)
     log_rows = ""
     if not logs:
         log_rows = '<tr><td colspan="7" style="text-align:center;padding:16px;color:#888;">이력 없음</td></tr>'
@@ -1105,7 +1136,6 @@ async def adjust_get(
               <td>{lg['result_quantity']}</td>
             </tr>"""
 
-    # 전체선택/삭제 컨트롤 — 로그 있고 없고 상관없이 항상 정의됨 (계정 무관하게 표시)
     log_controls = """
         <div style="display:flex;gap:8px;">
           <button type="button" class="btn" id="logSelectAllBtn"
@@ -1172,6 +1202,7 @@ async def adjust_get(
 
     content = f"""
     <h2 style="margin-bottom:16px;">✏️ 수기 조정</h2>
+    {branch_filter_html}
     <div class="card">
       <div style="margin-bottom:12px;">
         <label style="font-size:13px;color:#555;">품목 검색</label>
