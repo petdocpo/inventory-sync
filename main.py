@@ -102,6 +102,19 @@ def init_db():
         )
     """)
 
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS scan_log (
+            {pk},
+            branch_code TEXT NOT NULL,
+            branch_name TEXT,
+            item_name TEXT,
+            item_code TEXT NOT NULL,
+            scan_type TEXT,
+            result_quantity INTEGER,
+            scanned_at TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -123,6 +136,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("qr", "/qr", "📷", "QR생성"),
         ("adjust", "/adjust", "✏️", "수기조정"),
         ("raw", "/raw-upload", "📤", "유비플러스 재고"),
+        ("scanlog", "/scan-log", "📜", "스캔이력"),
     ]
     if is_master:
         menus.append(("master", "/master", "⚙️", "마스터"))
@@ -823,9 +837,15 @@ async def scan_get(branch_code: str, item_code: str, scan_type: str):
         "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
         (branch_code, item_code)
     ).fetchone()
-    conn.close()
     item_name = item["item_name"] if item else item_code
     branch_name = item["branch_name"] if item else branch_code
+    now = datetime.now().isoformat()
+    conn.execute(
+        "INSERT INTO scan_log (branch_code, branch_name, item_name, item_code, scan_type, result_quantity, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (branch_code, branch_name, item_name, item_code, scan_type, new_qty, now)
+    )
+    conn.commit()
+    conn.close()
 
     action_label = "입고 ✅" if scan_type == "IN" else "출고 📤"
     bg_color = "#D1FAE5" if scan_type == "IN" else "#FEE2E2"
@@ -1178,6 +1198,66 @@ async def api_qty(branch_code: str, item_code: str,
     raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in raw_data}
     raw_qty = raw_map.get(f"{branch_code}|{item_code}", None)
     return {"qr_qty": qr_qty, "raw_qty": raw_qty}
+
+# ── 스캔 이력 조회 ──────────────────────────────────────
+
+@app.get("/scan-log", response_class=HTMLResponse)
+async def scan_log_page(
+    session_token: str = Cookie(default=None),
+    search: str = ""
+):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    query = "SELECT * FROM scan_log WHERE 1=1"
+    params: list = []
+    if user["role"] == "branch":
+        query += " AND branch_code=?"
+        params.append(user["branch_code"])
+    if search:
+        query += " AND (item_name LIKE ? OR item_code LIKE ?)"
+        params += [f"%{search}%", f"%{search}%"]
+    query += " ORDER BY id DESC LIMIT 100"
+    logs = conn.execute(query, params).fetchall()
+    conn.close()
+
+    rows_html = ""
+    if not logs:
+        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">스캔 이력 없음</td></tr>'
+    else:
+        for lg in logs:
+            type_label = "입고" if lg["scan_type"] == "IN" else "출고"
+            type_color = "#22C55E" if lg["scan_type"] == "IN" else "#EF4444"
+            rows_html += f"""
+            <tr>
+              <td>{lg['scanned_at'][:16] if lg['scanned_at'] else '-'}</td>
+              <td>{lg['branch_name'] or lg['branch_code']}</td>
+              <td>{lg['item_name'] or '-'}</td>
+              <td>{lg['item_code']}</td>
+              <td style="color:{type_color};font-weight:bold;">{type_label}</td>
+              <td>{lg['result_quantity']}</td>
+            </tr>"""
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📜 스캔 이력</h2>
+    <div class="card">
+      <form method="get" action="/scan-log" style="display:flex;gap:8px;">
+        <input name="search" value="{search}" placeholder="상품명/품번 검색" style="flex:1;">
+        <button class="btn" type="submit">검색</button>
+      </form>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>시각</th><th>지점</th><th>상품명</th><th>품번</th><th>구분</th><th>처리후 재고</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "scan-log"))
 
 
 # ── 헬스체크 ────────────────────────────────────────────
