@@ -795,27 +795,26 @@ async def qr_page(
     <script>
     function startQrGenTimer() {{
       const btn = document.getElementById('qrGenBtn');
-      let secondsLeft = 5;
+      let seconds = 0;
       btn.disabled = true;
-      const tick = () => {{
-        btn.innerHTML = secondsLeft > 0 ? `⏳ 생성 중... (약 ${{secondsLeft}}초)` : '⏳ 거의 완료...';
-        secondsLeft--;
-      }};
-      tick();
       const interval = setInterval(() => {{
-        if (secondsLeft < 0) {{ clearInterval(interval); return; }}
-        tick();
+        seconds++;
+        btn.innerHTML = `⏳ 생성 중... (${{seconds}}초째)`;
       }}, 1000);
+      btn.innerHTML = '⏳ 생성 중... (0초째)';
     }}
     function showZipLoading() {{
       document.getElementById('zipLoadingOverlay').style.display = 'flex';
-      let secondsLeft = 10;
+      let seconds = 0;
       const label = document.getElementById('zipTimerText');
       const interval = setInterval(() => {{
-        secondsLeft--;
-        label.textContent = secondsLeft > 0 ? `약 ${{secondsLeft}}초 남음` : '거의 완료...';
-        if (secondsLeft <= 0) clearInterval(interval);
+        seconds++;
+        label.textContent = `${{seconds}}초째 생성 중...`;
       }}, 1000);
+      setTimeout(() => {{
+        document.getElementById('zipLoadingOverlay').style.display = 'none';
+        clearInterval(interval);
+      }}, 60000);
     }}
     </script>
     """
