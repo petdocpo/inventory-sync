@@ -561,10 +561,12 @@ async def data_page_redirect():
 
 # ── QR 생성 ─────────────────────────────────────────────
 
-def generate_qr_bytes(server_url, branch_code, item_code, scan_type) -> bytes:
-    """QR 코드를 메모리에서 생성해 PNG 바이트로 반환 (Vercel 서버리스 호환)"""
+def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="") -> bytes:
+    """QR 코드를 메모리에서 생성 + 하단에 상품명/입출고 라벨 삽입"""
     import qrcode
     import io
+    from PIL import Image, ImageDraw, ImageFont
+
     url = (f"{server_url}/scan"
            f"?branch_code={branch_code}"
            f"&item_code={item_code}"
@@ -572,9 +574,31 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type) -> bytes:
     qr = qrcode.QRCode(version=1, box_size=8, border=4)
     qr.add_data(url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+    label_height = 60
+    canvas = Image.new("RGB", (qr_img.width, qr_img.height + label_height), "white")
+    canvas.paste(qr_img, (0, 0))
+
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
+    type_label = "입고 IN" if scan_type == "IN" else "출고 OUT"
+    text1 = item_name[:20] if item_name else item_code
+    text2 = type_label
+
+    for i, text in enumerate([text1, text2]):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w = bbox[2] - bbox[0]
+        x = (canvas.width - w) / 2
+        y = qr_img.height + 6 + i * 24
+        draw.text((x, y), text, fill="black", font=font)
+
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    canvas.save(buf, format="PNG")
     buf.seek(0)
     return buf.getvalue()
 
@@ -598,16 +622,27 @@ async def qr_download(filename: str):
     if hostname_env:
         server_url = hostname_env
     else:
+        hostname_env = os.getenv("PUBLIC_SERVER_URL")
+    if hostname_env:
+        server_url = hostname_env
+    else:
         hostname = socket.gethostbyname(socket.gethostname())
         server_url = f"http://{hostname}:{SERVER_PORT}"
 
-    img_bytes = generate_qr_bytes(server_url, branch_code, item_code, scan_type)
+    img_bytes = generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name)
     return Response(content=img_bytes, media_type="image/png")
 
 def generate_qr_image(server_url, branch_code, item_name, item_code, scan_type, output_dir=QR_DIR):
     """QR 코드 생성 — 로컬 환경에서는 파일로도 저장 (호환용), Vercel에서는 파일 저장 실패해도 무시"""
     filename = f"{branch_code}_{item_code}_{scan_type}.png"
-    img_bytes = generate_qr_bytes(server_url, branch_code, item_code, scan_type)
+    conn = get_conn()
+    item = conn.execute(
+        "SELECT item_name FROM items WHERE branch_code=? AND item_code=?",
+        (branch_code, item_code)
+    ).fetchone()
+    conn.close()
+    item_name = item["item_name"] if item else ""
+    img_bytes = generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name)
     try:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         file_path = Path(output_dir) / filename
@@ -754,8 +789,12 @@ async def qr_generate(
         return HTMLResponse(content=render_page('<div class="card"><p>❌ 품목 선택 오류</p></div>', user, "qr"))
 
     branch_code, item_name, item_code = parts
-    hostname = socket.gethostbyname(socket.gethostname())
-    server_url = f"http://{hostname}:{SERVER_PORT}"
+    hostname_env = os.getenv("PUBLIC_SERVER_URL")
+    if hostname_env:
+        server_url = hostname_env
+    else:
+        hostname = socket.gethostbyname(socket.gethostname())
+        server_url = f"http://{hostname}:{SERVER_PORT}"
 
     _, in_file = generate_qr_image(server_url, branch_code, item_name, item_code, "IN")
     _, out_file = generate_qr_image(server_url, branch_code, item_name, item_code, "OUT")
@@ -1979,8 +2018,12 @@ async def master_qr_generate_bulk(
             '<div class="card"><p>❌ 등록된 품목이 없습니다.</p>'
             '<a href="/qr">← 돌아가기</a></div>', user, "qr"))
 
-    hostname = socket.gethostbyname(socket.gethostname())
-    server_url = f"http://{hostname}:{SERVER_PORT}"
+    hostname_env = os.getenv("PUBLIC_SERVER_URL")
+    if hostname_env:
+        server_url = hostname_env
+    else:
+        hostname = socket.gethostbyname(socket.gethostname())
+        server_url = f"http://{hostname}:{SERVER_PORT}"
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1988,7 +2031,7 @@ async def master_qr_generate_bulk(
             for scan_type in ["IN", "OUT"]:
                 img_bytes = generate_qr_bytes(
                     server_url, it["branch_code"],
-                    it["item_code"], scan_type
+                    it["item_code"], scan_type, it["item_name"]
                 )
                 filename = f"{it['branch_code']}_{it['item_code']}_{scan_type}.png"
                 zf.writestr(f"{it['branch_code']}/{filename}", img_bytes)
