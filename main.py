@@ -1906,13 +1906,12 @@ async def master_qr_generate_bulk(
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for it in items:
             for scan_type in ["IN", "OUT"]:
-                _, filename = generate_qr_image(
+                img_bytes = generate_qr_bytes(
                     server_url, it["branch_code"],
-                    it["item_name"], it["item_code"], scan_type
+                    it["item_code"], scan_type
                 )
-                file_path = Path(QR_DIR) / filename
-                if file_path.exists():
-                    zf.write(file_path, f"{it['branch_code']}/{filename}")
+                filename = f"{it['branch_code']}_{it['item_code']}_{scan_type}.png"
+                zf.writestr(f"{it['branch_code']}/{filename}", img_bytes)
 
     zip_buffer.seek(0)
     encoded_name = quote(f"{zip_name}.zip")
