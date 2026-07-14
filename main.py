@@ -582,7 +582,6 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
 
     draw = ImageDraw.Draw(canvas)
     try:
-        try:
         font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic-Bold.ttf")
         font = ImageFont.truetype(font_path, 16)
     except Exception:
