@@ -19,7 +19,7 @@ class SQLiteQRDBConnector(QRDBConnector):
     def connect(self) -> None:
         """SQLite DB 연결을 초기화하고 테이블을 생성한다."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._create_table()
 
@@ -28,11 +28,14 @@ class SQLiteQRDBConnector(QRDBConnector):
         assert self.conn is not None
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
-                item_id TEXT PRIMARY KEY,
+                branch_code TEXT NOT NULL,
+                item_code TEXT NOT NULL,
+                entry_no TEXT NOT NULL,
                 name TEXT NOT NULL,
                 quantity INTEGER NOT NULL DEFAULT 0,
                 location TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (branch_code, item_code, entry_no)
             )
         """)
         self.conn.commit()
@@ -51,15 +54,17 @@ class SQLiteQRDBConnector(QRDBConnector):
         """아이템을 삽입하거나 업데이트한다."""
         assert self.conn is not None
         self.conn.execute("""
-            INSERT INTO inventory (item_id, name, quantity, location, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(item_id) DO UPDATE SET
+            INSERT INTO inventory (branch_code, item_code, entry_no, name, quantity, location, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(branch_code, item_code, entry_no) DO UPDATE SET
                 name=excluded.name,
                 quantity=excluded.quantity,
                 location=excluded.location,
                 updated_at=CURRENT_TIMESTAMP
         """, (
-            item_data["item_id"],
+            item_data["branch_code"],
+            item_data["item_code"],
+            item_data["entry_no"],
             item_data["name"],
             item_data["quantity"],
             item_data.get("location", "")
