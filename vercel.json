@@ -5,6 +5,9 @@
             "runtime": "@vercel/python@4.3.0"
         }
     },
+    "regions": [
+        "hnd1"
+    ],
     "routes": [
         {
             "src": "/(.*)",
