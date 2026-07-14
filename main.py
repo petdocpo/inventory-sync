@@ -608,29 +608,40 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
 async def qr_download(filename: str):
     """QR 이미지를 즉석에서 생성해 반환 (파일 저장 없이 동작, Vercel 호환)"""
     from fastapi.responses import Response
-    # 파일명 형식: {branch_code}_{item_code}_{scan_type}.png
     name = filename.replace(".png", "")
     parts = name.rsplit("_", 1)
     if len(parts) != 2:
-        return Response(status_code=404)
+        return Response(content=b"Invalid filename format", status_code=404)
     prefix, scan_type = parts
     branch_part = prefix.split("_", 1)
     if len(branch_part) != 2:
-        return Response(status_code=404)
+        return Response(content=b"Invalid filename format", status_code=404)
     branch_code, item_code = branch_part
 
     hostname_env = os.getenv("PUBLIC_SERVER_URL")
     if hostname_env:
         server_url = hostname_env
     else:
-        hostname_env = os.getenv("PUBLIC_SERVER_URL")
-    if hostname_env:
-        server_url = hostname_env
-    else:
         hostname = socket.gethostbyname(socket.gethostname())
         server_url = f"http://{hostname}:{SERVER_PORT}"
 
-    img_bytes = generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name)
+    item_name = ""
+    try:
+        conn = get_conn()
+        item = conn.execute(
+            "SELECT item_name FROM items WHERE branch_code=? AND item_code=?",
+            (branch_code, item_code)
+        ).fetchone()
+        conn.close()
+        item_name = item["item_name"] if item else ""
+    except Exception:
+        item_name = ""
+
+    try:
+        img_bytes = generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name)
+    except Exception as e:
+        return Response(content=f"QR generation failed: {str(e)}".encode(), status_code=500)
+
     return Response(content=img_bytes, media_type="image/png")
 
 def generate_qr_image(server_url, branch_code, item_name, item_code, scan_type, output_dir=QR_DIR):
