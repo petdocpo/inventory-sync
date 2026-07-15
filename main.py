@@ -114,7 +114,9 @@ def init_db():
             item_code TEXT NOT NULL,
             scan_type TEXT,
             result_quantity INTEGER,
-            scanned_at TEXT
+            scanned_at TEXT,
+            device_info TEXT,
+            client_ip TEXT
         )
     """)
 
@@ -161,7 +163,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         is_active = "background:#1E2761;color:white;" if active == key else "color:#555;"
         menu_html += f"""
         <a href="{href}" style="flex:1;text-align:center;padding:8px 0;
-           text-decoration:none;font-size:12px;{is_active}border-radius:8px;
+           text-decoration:none;font-size:12px;{is_active}border-radius:8px;">
           <div style="font-size:20px;">{icon}</div>
           <div>{label}</div>
         </a>
@@ -172,23 +174,35 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>재고 관리 시스템</title>
+      <link rel="manifest" href="/manifest.json">
+      <meta name="theme-color" content="#1E2761">
+      <link rel="apple-touch-icon" href="/icon-192.png">
+      <meta name="apple-mobile-web-app-capable" content="yes">
+      <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+      <script>
+        if ('serviceWorker' in navigator) {{
+          window.addEventListener('load', function() {{
+            navigator.serviceWorker.register('/sw.js').catch(function() {{}});
+          }});
+        }}
+      </script>
       <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                background: #f5f7fa; padding-bottom: 80px; }}
-        .topbar {{ background: #1E2761; color: white; padding: 14px 20px;
+        .topbar {{ background: #1E2761; color: white; padding: 10px 14px;
                   display: flex; justify-content: space-between; align-items: center; }}
-        .content {{ max-width: 960px; margin: 0 auto; padding: 20px 16px; }}
-        .card {{ background: white; border-radius: 12px; padding: 20px;
+        .content {{ max-width: 960px; margin: 0 auto; padding: 10px 14px; }}
+        .card {{ background: white; border-radius: 12px; padding: 16px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }}
-        .btn {{ background: #1E2761; color: white; padding: 8px 20px;
+        .btn {{ background: #1E2761; color: white; padding: 8px 14px;
                border: none; border-radius: 8px; cursor: pointer; font-size: 14px; }}
         .btn:hover {{ background: #2a3580; }}
         .btn-red {{ background: #EF4444; }}
         input, select {{ width: 100%; padding: 8px; border: 1px solid #ddd;
                         border-radius: 8px; font-size: 14px; margin-top: 4px; }}
         table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-        th {{ background: #1E2761; color: white; padding: 8px; text-align: left;
+        th {{ background: #1E2761; color: white; padding: 8px 6px; text-align: left;
              resize: horizontal; overflow: auto; position: relative;
              min-width: 40px; border-right: 1px solid rgba(255,255,255,0.2); }}
         td {{ padding: 8px; border-bottom: 1px solid #eee;
@@ -657,14 +671,14 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-    label_height = 60
+    label_height = 80
     canvas = Image.new("RGB", (qr_img.width, qr_img.height + label_height), "white")
     canvas.paste(qr_img, (0, 0))
 
     draw = ImageDraw.Draw(canvas)
     try:
         font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic-Bold.ttf")
-        font = ImageFont.truetype(font_path, 16)
+        font = ImageFont.truetype(font_path, 22)
     except Exception:
         font = ImageFont.load_default()
 
@@ -676,7 +690,7 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
         bbox = draw.textbbox((0, 0), text, font=font)
         w = bbox[2] - bbox[0]
         x = (canvas.width - w) / 2
-        y = qr_img.height + 6 + i * 24
+        y = qr_img.height + 8 + i * 32
         draw.text((x, y), text, fill="black", font=font)
 
     buf = io.BytesIO()
@@ -994,9 +1008,12 @@ def adjust_quantity(branch_code: str, item_code: str, delta: int, absolute: bool
 
 
 @app.get("/scan", response_class=HTMLResponse)
-async def scan_get(branch_code: str, item_code: str, scan_type: str):
+async def scan_get(request: Request, branch_code: str, item_code: str, scan_type: str):
     delta = 1 if scan_type == "IN" else -1
     new_qty = adjust_quantity(branch_code, item_code, delta)
+
+    device_info = request.headers.get("user-agent", "")[:255]
+    client_ip = request.client.host if request.client else ""
 
     conn = get_conn()
     item = conn.execute(
@@ -1007,8 +1024,8 @@ async def scan_get(branch_code: str, item_code: str, scan_type: str):
     branch_name = item["branch_name"] if item else branch_code
     now = datetime.now().isoformat()
     conn.execute(
-        "INSERT INTO scan_log (branch_code, branch_name, item_name, item_code, scan_type, result_quantity, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (branch_code, branch_name, item_name, item_code, scan_type, new_qty, now)
+        "INSERT INTO scan_log (branch_code, branch_name, item_name, item_code, scan_type, result_quantity, scanned_at, device_info, client_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (branch_code, branch_name, item_name, item_code, scan_type, new_qty, now, device_info, client_ip)
     )
     conn.commit()
     conn.close()
@@ -1447,8 +1464,13 @@ async def scan_log_page(
             type_label = "입고" if lg["scan_type"] == "IN" else "출고"
             type_color = "#22C55E" if lg["scan_type"] == "IN" else "#EF4444"
             check_cell = ""
+            device_cell = ""
             if user["role"] == "master":
                 check_cell = f'<td style="text-align:center;"><input type="checkbox" name="log_ids" value="{lg["id"]}" class="scanlog-check" style="width:16px;height:16px;"></td>'
+                device_raw = (lg["device_info"] if "device_info" in lg.keys() else "") or "-"
+                ip_raw = (lg["client_ip"] if "client_ip" in lg.keys() else "") or "-"
+                device_short = device_raw[:30] + ("..." if len(device_raw) > 30 else "")
+                device_cell = f'<td style="font-size:9px;color:#888;" title="{device_raw}">{device_short}<br>{ip_raw}</td>'
             rows_html += f"""
             <tr>
               {check_cell}
@@ -1458,6 +1480,7 @@ async def scan_log_page(
               <td>{lg['item_code']}</td>
               <td style="color:{type_color};font-weight:bold;">{type_label}</td>
               <td>{lg['result_quantity']}</td>
+              {device_cell}
             </tr>"""
 
     delete_controls = ""
@@ -1495,7 +1518,7 @@ async def scan_log_page(
         <table>
           <thead><tr>
             {header_check}
-            <th>시각</th><th>지점</th><th>상품명</th><th>품번</th><th>구분</th><th>처리후 재고</th>
+            <th>시각</th><th>지점</th><th>상품명</th><th>품번</th><th>구분</th><th>처리후 재고</th>{'<th>기기/IP</th>' if user["role"] == "master" else ''}
           </tr></thead>
           <tbody>{rows_html}</tbody>
         </table>
@@ -1578,6 +1601,83 @@ async def scan_log_delete_all(session_token: str = Cookie(default=None)):
     return RedirectResponse(url="/scan-log", status_code=303)
 
 # ── 헬스체크 ────────────────────────────────────────────
+
+# ── PWA ──────────────────────────────────────────────
+
+@app.get("/manifest.json")
+async def pwa_manifest():
+    from fastapi.responses import JSONResponse
+    return JSONResponse({
+        "name": "재고 관리 시스템",
+        "short_name": "재고관리",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#f5f7fa",
+        "theme_color": "#1E2761",
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}
+        ]
+    })
+
+
+@app.get("/sw.js")
+async def pwa_service_worker():
+    from fastapi.responses import Response
+    js = """
+const CACHE_NAME = 'inventory-sync-v1';
+self.addEventListener('install', function(event) {
+  self.skipWaiting();
+});
+self.addEventListener('activate', function(event) {
+  self.clients.claim();
+});
+self.addEventListener('fetch', function(event) {
+  // 네트워크 우선, 실패 시 아무 것도 안 함 (재고 데이터는 항상 최신이어야 하므로 캐시 저장 안 함)
+  event.respondWith(
+    fetch(event.request).catch(function() {
+      return new Response('오프라인 상태입니다. 네트워크 연결을 확인해주세요.', {
+        status: 503,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+      });
+    })
+  );
+});
+"""
+    return Response(content=js, media_type="application/javascript")
+
+
+@app.get("/icon-192.png")
+async def pwa_icon_192():
+    return _generate_app_icon(192)
+
+
+@app.get("/icon-512.png")
+async def pwa_icon_512():
+    return _generate_app_icon(512)
+
+
+def _generate_app_icon(size: int):
+    from fastapi.responses import Response
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+    img = Image.new("RGB", (size, size), "#1E2761")
+    draw = ImageDraw.Draw(img)
+    text = "📦"
+    try:
+        font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic-Bold.ttf")
+        font = ImageFont.truetype(font_path, int(size * 0.3))
+        label = "재고"
+        bbox = draw.textbbox((0, 0), label, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((size - w) / 2, (size - h) / 2 - bbox[1]), label, fill="white", font=font)
+    except Exception:
+        pass
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return Response(content=buf.getvalue(), media_type="image/png")
+
 
 @app.get("/health")
 async def health_check():
@@ -2068,7 +2168,7 @@ async def _process_raw_upload_master(file: UploadFile):
 
     conn = get_conn()
     data_start_row = header_row_idx + 1
-    conn.execute("DELETE FROM raw_inventory")
+    conn.execute("DELETE FROM raw_inventory WHERE source='master'")
     old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
     old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
     conn.execute("DELETE FROM hq_bonus_log")
@@ -2209,9 +2309,9 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
     data_start_row = header_row_idx + 1
     # ── 이전 업로드 데이터 삭제 (지점 제한 있으면 해당 지점만, 없으면 전체 - 마스터) ──
     if restrict_branch:
-        conn.execute("DELETE FROM raw_inventory WHERE branch_code=?", (restrict_branch,))
+        conn.execute("DELETE FROM raw_inventory WHERE branch_code=? AND source='branch'", (restrict_branch,))
     else:
-        conn.execute("DELETE FROM raw_inventory")
+        conn.execute("DELETE FROM raw_inventory WHERE source='branch'")
     # 이전 H/Q 반영 이력도 초기화 (재계산 기준점 리셋)
     old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
     old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
@@ -2250,9 +2350,9 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
 
             conn.execute("""
                 INSERT INTO raw_inventory
-                  (branch_code, branch_name, item_name, item_code, quantity, uploaded_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(branch_code, item_code) DO UPDATE SET
+                  (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
+                VALUES (?, ?, ?, ?, ?, 'branch', ?)
+                ON CONFLICT(branch_code, item_code, source) DO UPDATE SET
                   quantity=excluded.quantity,
                   item_name=excluded.item_name,
                   branch_name=excluded.branch_name,
@@ -2454,15 +2554,113 @@ async def qr_init_page(session_token: str = Cookie(default=None)):
       <p style="color:#666;font-size:12px;margin-bottom:12px;">
         컬럼: <b>A=지점명 / B=상품명 / C=품번 / D=초기수량</b> (1행 헤더)
       </p>
-      <form method="post" action="/master/qr-init/upload"
-            enctype="multipart/form-data"
-            style="display:flex;gap:8px;align-items:center;">
-        <input type="file" name="file" accept=".xlsx,.xls" style="width:auto;flex:1;">
-        <button class="btn" type="submit">업로드</button>
-      </form>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="file" id="qrInitFile" accept=".xlsx,.xls" style="width:auto;flex:1;">
+        <button class="btn" type="button" onclick="uploadQrInit()" id="qrInitBtn">업로드</button>
+      </div>
+      <div id="qrInitResult" style="display:none;margin-top:12px;padding:12px;
+           border-radius:8px;font-size:13px;"></div>
+      <script>
+      async function uploadQrInit() {
+        const file = document.getElementById('qrInitFile').files[0];
+        if (!file) { alert('파일을 선택해주세요.'); return; }
+        const fd = new FormData();
+        fd.append('file', file);
+        const btn = document.getElementById('qrInitBtn');
+        let seconds = 0;
+        btn.disabled = true;
+        const timerInterval = setInterval(() => {
+          seconds++;
+          btn.textContent = `업로드 중... (${seconds}초째)`;
+        }, 1000);
+        btn.textContent = '업로드 중... (0초째)';
+        try {
+          const res = await fetch('/master/qr-init/upload-ajax', { method: 'POST', body: fd });
+          const data = await res.json();
+          const box = document.getElementById('qrInitResult');
+          box.style.display = 'block';
+          box.style.background = data.errors && data.errors.length ? '#FEF9C3' : '#D1FAE5';
+          box.innerHTML = `<b>${data.errors && data.errors.length ? '⚠️' : '✅'} 업로드 완료</b><br>
+          성공: <b style="color:#22C55E">${data.success}건</b> &nbsp;
+          실패: <b style="color:#EF4444">${data.skipped}건</b>
+          ${data.errors && data.errors.length ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${e}</li>`).join('') + '</ul>' : ''}`;
+        } catch(e) {
+          alert('업로드 중 오류가 발생했습니다.');
+        } finally {
+          clearInterval(timerInterval);
+          btn.textContent = '업로드';
+          btn.disabled = false;
+        }
+      }
+      </script>
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/qr-init/upload-ajax")
+async def qr_init_upload_ajax(
+    session_token: str = Cookie(default=None),
+    file: UploadFile = File(...)
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
+
+    contents = await file.read()
+    import io
+    wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
+    ws = wb.active
+    if ws is None:
+        return {"success": 0, "skipped": 0, "errors": ["시트를 찾을 수 없습니다."]}
+
+    branch_map = {}
+    for b in BRANCHES:
+        branch_map[b["branch_name"]] = b["branch_code"]
+        branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
+        branch_map[b["branch_code"]] = b["branch_code"]
+
+    conn = get_conn()
+    now = datetime.now().isoformat()
+    success, skipped, errors = 0, 0, []
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        if not row[0]:
+            continue
+        try:
+            branch_name = str(row[0]).strip()
+            item_name = str(row[1]).strip() if row[1] else ""
+            item_code = str(row[2]).strip() if row[2] else ""
+            if not item_code:
+                item_code = f"미지정_{branch_name}_{item_name}"[:50]
+            init_qty = int(float(str(row[3]))) if row[3] is not None else 0
+            branch_code = (branch_map.get(branch_name)
+                           or branch_map.get(branch_name.replace(" ", ""))
+                           or branch_name)
+
+            conn.execute(
+                """INSERT INTO inventory
+                   (branch_code, item_name, item_code, quantity, last_updated)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(branch_code, item_code) DO UPDATE SET
+                     quantity=excluded.quantity,
+                     item_name=excluded.item_name,
+                     last_updated=excluded.last_updated""",
+                (branch_code, item_name, item_code, init_qty, now)
+            )
+            conn.execute(
+                "INSERT INTO qr_init_log (branch_code, item_code, init_quantity, initialized_at) VALUES (?, ?, ?, ?)",
+                (branch_code, item_code, init_qty, now)
+            )
+            success += 1
+        except Exception as e:
+            errors.append(f"행 {row_idx}: {str(e)[:50]}")
+            skipped += 1
+            continue
+
+    conn.commit()
+    conn.close()
+    return {"success": success, "skipped": skipped, "errors": errors[:10]}
 
 
 @app.post("/master/qr-init/upload")
@@ -2470,6 +2668,7 @@ async def qr_init_upload(
     session_token: str = Cookie(default=None),
     file: UploadFile = File(...)
 ):
+    """구버전 호환용 - 폼 제출 방식 (리다이렉트만)"""
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
@@ -2497,6 +2696,8 @@ async def qr_init_upload(
             branch_name = str(row[0]).strip()
             item_name = str(row[1]).strip() if row[1] else ""
             item_code = str(row[2]).strip() if row[2] else ""
+            if not item_code:
+                item_code = f"미지정_{branch_name}_{item_name}"[:50]
             init_qty = int(float(str(row[3]))) if row[3] is not None else 0
             branch_code = (branch_map.get(branch_name)
                            or branch_map.get(branch_name.replace(" ", ""))
