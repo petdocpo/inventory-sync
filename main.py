@@ -127,7 +127,7 @@ init_db()
 def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> str:
     """공통 레이아웃 — 상단 타이틀 + 하단 메뉴 포함"""
     branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")
-    role_badge = f'<span style="background:#4FC3F7;color:white;padding:2px 10px;border-radius:12px;font-size:12px;margin-left:8px;">{branch_name}</span>' if user else ""
+    role_badge = f'<span style="background:#4FC3F7;color:white;padding:2px 10px;border-radius:12px;font-size:8px;margin-left:8px;">{branch_name}</span>' if user else ""
 
     is_master = user and user.get("role") == "master"
     menus = [
@@ -135,18 +135,21 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("inventory", "/inventory", "📦", "재고현황"),
         ("qr", "/qr", "📷", "QR생성"),
         ("adjust", "/adjust", "✏️", "수기조정"),
-        ("raw", "/raw-upload", "📤", "유비플러스 재고"),
+        ("raw-branch", "/raw-branch", "📤", "유비플러스 재고"),
         ("scanlog", "/scan-log", "📜", "스캔이력"),
     ]
     if is_master:
         menus.append(("master", "/master", "⚙️", "마스터"))
+    # 지점 계정에는 지점용 raw 메뉴만, 마스터는 지점용 메뉴 숨기고 마스터 메뉴 안에서 접근
+    if is_master:
+        menus = [m for m in menus if m[0] != "raw-branch"]
     menu_html = ""
     for key, href, icon, label in menus:
         is_active = "background:#1E2761;color:white;" if active == key else "color:#555;"
         menu_html += f"""
         <a href="{href}" style="flex:1;text-align:center;padding:8px 0;
-           text-decoration:none;font-size:12px;{is_active}border-radius:8px;">
-          <div style="font-size:20px;">{icon}</div>
+           text-decoration:none;font-size:10px;{is_active}border-radius:8px;padding:6px 2px;
+          <div style="font-size:16px;">{icon}</div>
           <div>{label}</div>
         </a>
         """
@@ -178,9 +181,9 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         td {{ padding: 10px; border-bottom: 1px solid #eee;
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
         .badge-green {{ background:#D1FAE5;color:#065F46;padding:2px 8px;
-                       border-radius:10px;font-size:12px; }}
+                       border-radius:10px;font-size:8px; }}
         .badge-red {{ background:#FEE2E2;color:#991B1B;padding:2px 8px;
-                     border-radius:10px;font-size:12px; }}
+                     border-radius:10px;font-size:8px; }}
         .bottomnav {{ position:fixed;bottom:0;left:0;right:0;
                      background:white;border-top:1px solid #eee;
                      display:flex;padding:6px 8px;z-index:100; }}
@@ -364,7 +367,7 @@ async def dashboard(
               <td>
                 <a href="/adjust?preset_branch={r['branch_code']}&preset_code={r['item_code']}"
                    style="background:#1E2761;color:white;padding:4px 10px;
-                          border-radius:6px;font-size:12px;text-decoration:none;">
+                          border-radius:6px;font-size:8px;text-decoration:none;">
                   수정
                 </a>
               </td>
@@ -383,7 +386,7 @@ async def dashboard(
         <form method="get" action="/" style="margin-bottom:16px;">
           <div style="display:flex;gap:8px;align-items:flex-end;">
             <div style="flex:1;max-width:220px;">
-              <label style="font-size:12px;color:#888;">지점 필터</label>
+              <label style="font-size:8px;color:#888;">지점 필터</label>
               <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
             </div>
             <button class="btn" type="submit">선택</button>
@@ -398,11 +401,11 @@ async def dashboard(
     {branch_filter_html}
     <div style="display:flex;gap:12px;margin-bottom:16px;">
       <div class="card" style="flex:1;text-align:center;padding:16px;">
-        <div style="color:#888;font-size:12px;">불일치 품목</div>
+        <div style="color:#888;font-size:8px;">불일치 품목</div>
         <div style="font-size:28px;font-weight:bold;color:#EF4444;">{disc_count}</div>
       </div>
       <div class="card" style="flex:1;text-align:center;padding:16px;">
-        <div style="color:#888;font-size:12px;">마지막 확인</div>
+        <div style="color:#888;font-size:8px;">마지막 확인</div>
         <div style="font-size:13px;font-weight:bold;color:#1E2761;">
           {datetime.now().strftime('%m/%d %H:%M')}
         </div>
@@ -512,7 +515,7 @@ async def inventory_page(
     if user["role"] == "master":
         branch_filter_html = f"""
         <div style="flex:1;min-width:120px;">
-          <label style="font-size:12px;color:#888;">지점 필터</label>
+          <label style="font-size:8px;color:#888;">지점 필터</label>
           <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
         </div>"""
 
@@ -524,11 +527,11 @@ async def inventory_page(
             style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
         {branch_filter_html}
         <div style="flex:1;min-width:120px;">
-          <label style="font-size:12px;color:#888;">품목 필터</label>
+          <label style="font-size:8px;color:#888;">품목 필터</label>
           <select name="filter_item" style="margin-top:4px;">{item_options}</select>
         </div>
         <div style="flex:2;min-width:160px;">
-          <label style="font-size:12px;color:#888;">검색 (상품명/품번)</label>
+          <label style="font-size:8px;color:#888;">검색 (상품명/품번)</label>
           <input name="search" value="{search}" placeholder="검색어 입력"
                  style="margin-top:4px;">
         </div>
@@ -544,9 +547,9 @@ async def inventory_page(
           <span style="font-size:13px;color:#888;">{len(rows)}개 항목</span>
           <div style="display:flex;gap:8px;">
             <button type="button" class="btn" id="invSelectAllBtn"
-                    style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+                    style="background:#64748B;font-size:8px;padding:6px 12px;">전체선택</button>
             <button type="submit" class="btn btn-red"
-                    style="font-size:12px;padding:6px 12px;"
+                    style="font-size:8px;padding:6px 12px;"
                     onclick="return confirm('선택한 재고를 삭제할까요?')">선택삭제</button>
           </div>
         </div>
@@ -767,7 +770,7 @@ async def qr_page(
         <form method="get" action="/qr" style="margin-bottom:12px;">
           <div style="display:flex;gap:8px;align-items:flex-end;">
             <div style="flex:1;">
-              <label style="font-size:12px;color:#888;">지점 선택</label>
+              <label style="font-size:8px;color:#888;">지점 선택</label>
               <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
             </div>
             <button class="btn" type="submit">선택</button>
@@ -808,7 +811,7 @@ async def qr_page(
                   </button>
                 </form>
               </div>
-              <p style="color:#aaa;font-size:12px;margin-top:8px;">
+              <p style="color:#aaa;font-size:8px;margin-top:8px;">
                 특정 지점만 생성하려면 위에서 지점을 선택하세요.
               </p>
             </div>"""
@@ -817,7 +820,7 @@ async def qr_page(
         bulk_html = f"""
         <div class="card" style="border:1px solid #1E2761;">
           <h3 style="margin-bottom:8px;">📦 일괄 생성</h3>
-          <p style="color:#666;font-size:12px;margin-bottom:12px;">
+          <p style="color:#666;font-size:8px;margin-bottom:12px;">
             우리 지점({user['branch_code']})의 전체 품목 QR을 ZIP으로 한 번에 받을 수 있어요.
           </p>
           <form method="post" action="/master/qr/generate-bulk" onsubmit="showZipLoading();">
@@ -1034,7 +1037,7 @@ async def scan_get(branch_code: str, item_code: str, scan_type: str):
             <div style="font-size:28px;font-weight:bold;color:#1E2761;">{new_qty}개</div>
           </div>
         </div>
-        <div style="font-size:12px;color:#aaa;">
+        <div style="font-size:8px;color:#aaa;">
           {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         </div>
       </div>
@@ -1103,7 +1106,7 @@ async def adjust_get(
         <div class="card">
           <form method="get" action="/adjust" style="display:flex;gap:8px;align-items:flex-end;">
             <div style="flex:1;max-width:220px;">
-              <label style="font-size:12px;color:#888;">지점 필터</label>
+              <label style="font-size:8px;color:#888;">지점 필터</label>
               <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
             </div>
             <button class="btn" type="submit">선택</button>
@@ -1139,12 +1142,12 @@ async def adjust_get(
     log_controls = """
         <div style="display:flex;gap:8px;">
           <button type="button" class="btn" id="logSelectAllBtn"
-                  style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+                  style="background:#64748B;font-size:8px;padding:6px 12px;">전체선택</button>
           <button type="submit" class="btn btn-red"
-                  style="font-size:12px;padding:6px 12px;"
+                  style="font-size:8px;padding:6px 12px;"
                   onclick="return confirm('선택한 이력을 삭제할까요?')">선택삭제</button>
           <button type="button" class="btn btn-red" id="logDeleteAllBtn"
-                  style="font-size:12px;padding:6px 12px;">전체삭제</button>
+                  style="font-size:8px;padding:6px 12px;">전체삭제</button>
         </div>"""
 
     log_header_check = """<th style="width:40px;text-align:center;">
@@ -1446,12 +1449,12 @@ async def scan_log_page(
         delete_controls = """
         <div style="display:flex;gap:8px;margin-bottom:12px;">
           <button type="button" class="btn" id="scanlogSelectAllBtn"
-                  style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+                  style="background:#64748B;font-size:8px;padding:6px 12px;">전체선택</button>
           <button type="submit" class="btn btn-red"
-                  style="font-size:12px;padding:6px 12px;"
+                  style="font-size:8px;padding:6px 12px;"
                   onclick="return confirm('선택한 스캔 이력을 삭제할까요?')">선택삭제</button>
           <button type="button" class="btn btn-red" id="scanlogDeleteAllBtn"
-                  style="font-size:12px;padding:6px 12px;">전체삭제</button>
+                  style="font-size:8px;padding:6px 12px;">전체삭제</button>
         </div>"""
 
     table_open = '<form method="post" action="/scan-log/delete">' if user["role"] == "master" else '<div>'
@@ -1569,14 +1572,14 @@ async def master_page(session_token: str = Cookie(default=None)):
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📋</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">데이터 관리</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">품목 {item_count}개 등록됨</div>
+          <div style="color:#888;font-size:8px;margin-top:4px;">품목 {item_count}개 등록됨</div>
         </div>
       </a>
       <a href="/master/qr-init" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🔄</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">QR 재고 업로드</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">엑셀로 초기 수량 업로드</div>
+          <div style="color:#888;font-size:8px;margin-top:4px;">엑셀로 초기 수량 업로드</div>
         </div>
       </a>
     </div>
@@ -1645,22 +1648,22 @@ async def master_data_page(
       <form method="post" action="/master/data/add">
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           <div style="flex:1;min-width:130px;">
-            <label style="font-size:12px;color:#888;">지점</label>
+            <label style="font-size:8px;color:#888;">지점</label>
             <select name="branch_code" required style="margin-top:4px;">
               <option value="">선택</option>
               {''.join(f'<option value="{b["branch_code"]}">{b["branch_name"]}</option>' for b in BRANCHES)}
             </select>
           </div>
           <div style="flex:1;min-width:130px;">
-            <label style="font-size:12px;color:#888;">상품명</label>
+            <label style="font-size:8px;color:#888;">상품명</label>
             <input name="item_name" required placeholder="상품명" style="margin-top:4px;">
           </div>
           <div style="flex:1;min-width:130px;">
-            <label style="font-size:12px;color:#888;">품번</label>
+            <label style="font-size:8px;color:#888;">품번</label>
             <input name="item_code" required placeholder="품번" style="margin-top:4px;">
           </div>
           <div style="flex:1;min-width:100px;">
-            <label style="font-size:12px;color:#888;">초기 수량</label>
+            <label style="font-size:8px;color:#888;">초기 수량</label>
             <input name="init_quantity" type="number" value="0" style="margin-top:4px;">
           </div>
         </div>
@@ -1670,7 +1673,7 @@ async def master_data_page(
 
     <div class="card">
       <h3 style="margin-bottom:12px;">📂 엑셀 업로드</h3>
-      <p style="color:#666;font-size:12px;margin-bottom:8px;">컬럼: A=지점명 | B=상품명 | C=품번 (1행 헤더)</p>
+      <p style="color:#666;font-size:8px;margin-bottom:8px;">컬럼: A=지점명 | B=상품명 | C=품번 (1행 헤더)</p>
       <form method="post" action="/master/data/upload" enctype="multipart/form-data"
             style="display:flex;gap:8px;align-items:center;">
         <input type="file" name="file" accept=".xlsx,.xls" style="width:auto;flex:1;">
@@ -1682,11 +1685,11 @@ async def master_data_page(
       <form method="get" action="/master/data"
             style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
         <div style="flex:1;min-width:120px;">
-          <label style="font-size:12px;color:#888;">지점 필터</label>
+          <label style="font-size:8px;color:#888;">지점 필터</label>
           <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
         </div>
         <div style="flex:2;min-width:160px;">
-          <label style="font-size:12px;color:#888;">검색</label>
+          <label style="font-size:8px;color:#888;">검색</label>
           <input name="search" value="{search}" placeholder="상품명/품번 검색"
                  style="margin-top:4px;">
         </div>
@@ -1702,12 +1705,12 @@ async def master_data_page(
           <h3>품목 목록 ({len(items)}개)</h3>
           <div style="display:flex;gap:8px;">
             <button type="button" class="btn" id="masterDataSelectAllBtn"
-                    style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+                    style="background:#64748B;font-size:8px;padding:6px 12px;">전체선택</button>
             <button type="submit" class="btn btn-red"
-                    style="font-size:12px;padding:6px 12px;"
+                    style="font-size:8px;padding:6px 12px;"
                     onclick="return confirm('선택 항목을 삭제할까요?')">선택삭제</button>
             <button type="button" class="btn btn-red" id="masterDataDeleteAllBtn"
-                    style="font-size:12px;padding:6px 12px;">전체삭제</button>
+                    style="font-size:8px;padding:6px 12px;">전체삭제</button>
           </div>
         </div>
         <table>
@@ -1905,7 +1908,7 @@ async def raw_upload_page(session_token: str = Cookie(default=None)):
     </div>
     <div class="card">
       <h3 style="margin-bottom:8px;">엑셀 업로드</h3>
-      <p style="color:#666;font-size:12px;margin-bottom:12px;">
+      <p style="color:#666;font-size:8px;margin-bottom:12px;">
         컬럼 위치: <b>A=지점명 / B=상품명 / D=품번 / N=현재수량 / H,Q=QR재고 가산분</b> (1행 헤더)
       </p>
       <div style="display:flex;gap:8px;align-items:center;">
@@ -1936,8 +1939,8 @@ async def raw_upload_page(session_token: str = Cookie(default=None)):
           컬럼 매핑: <b>${{JSON.stringify(data.col_map_debug)}}</b><br>
           성공: <b style="color:#22C55E">${{data.success}}건</b> &nbsp;
           실패: <b style="color:#EF4444">${{data.skipped}}건</b>
-          ${{data.errors.length ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${{e}}</li>`).join('') + '</ul>' : ''}}
-          ${{data.hq_debug && data.hq_debug.length ? '<br><b>H/Q 반영 내역:</b><ul>' + data.hq_debug.map(e=>`<li style="font-size:12px;">${{e}}</li>`).join('') + '</ul>' : '<br><span style="color:#F59E0B;">⚠️ H/Q 반영된 품목 없음</span>'}}`;
+          ${{data.errors.length ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:8px;">${{e}}</li>`).join('') + '</ul>' : ''}}
+          ${{data.hq_debug && data.hq_debug.length ? '<br><b>H/Q 반영 내역:</b><ul>' + data.hq_debug.map(e=>`<li style="font-size:8px;">${{e}}</li>`).join('') + '</ul>' : '<br><span style="color:#F59E0B;">⚠️ H/Q 반영된 품목 없음</span>'}}`;
           setTimeout(() => location.reload(), 2000);
         }} catch(e) {{
           alert('업로드 중 오류가 발생했습니다.');
@@ -1953,7 +1956,7 @@ async def raw_upload_page(session_token: str = Cookie(default=None)):
         <h3>현재 유비플러스 데이터 ({len(raws)}개)</h3>
         <form method="post" action="/master/raw-upload/clear">
           <button type="submit" class="btn btn-red"
-                  style="font-size:12px;padding:6px 12px;"
+                  style="font-size:8px;padding:6px 12px;"
                   onclick="return confirm('전체 데이터를 삭제합니다.')">전체 초기화</button>
         </form>
       </div>
@@ -2138,11 +2141,55 @@ async def raw_upload_clear(session_token: str = Cookie(default=None)):
 
 @app.get("/raw-upload", response_class=HTMLResponse)
 async def raw_upload_redirect(session_token: str = Cookie(default=None)):
-    """일반 메뉴에서 유비플러스 재고 페이지로 바로 접근"""
+    """구 경로 호환용 - 역할별 분기"""
     user = get_session(session_token)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
-    return RedirectResponse(url="/master/raw-upload", status_code=303)
+    if user["role"] == "master":
+        return RedirectResponse(url="/master/raw-upload", status_code=303)
+    return RedirectResponse(url="/raw-branch", status_code=303)
+
+@app.get("/raw-branch", response_class=HTMLResponse)
+async def raw_branch_page(session_token: str = Cookie(default=None)):
+    """지점 계정 전용 — 본인 지점 RAW 재고만 조회 (읽기 전용, 업로드 불가)"""
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if user["role"] == "master":
+        return RedirectResponse(url="/master/raw-upload", status_code=303)
+
+    conn = get_conn()
+    raws = conn.execute(
+        "SELECT * FROM raw_inventory WHERE branch_code=? ORDER BY item_code",
+        (user["branch_code"],)
+    ).fetchall()
+    conn.close()
+
+    rows_html = ""
+    if not raws:
+        rows_html = '<tr><td colspan="4" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
+    else:
+        for r in raws:
+            rows_html += f"""
+            <tr>
+              <td>{r['item_name']}</td>
+              <td>{r['item_code']}</td>
+              <td style="font-weight:bold;">{r['quantity']}</td>
+              <td>{r['uploaded_at'][:10] if r['uploaded_at'] else '-'}</td>
+            </tr>"""
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📤 유비플러스 재고 ({user['branch_code']})</h2>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>상품명</th><th>품번</th><th>수량</th><th>업로드일</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "raw-branch"))
 
 
 # ── 마스터 > QR 재고 업로드(초기화) ────────────────────
@@ -2165,7 +2212,7 @@ async def qr_init_page(session_token: str = Cookie(default=None)):
     </div>
     <div class="card">
       <h3 style="margin-bottom:8px;">엑셀 업로드</h3>
-      <p style="color:#666;font-size:12px;margin-bottom:12px;">
+      <p style="color:#666;font-size:8px;margin-bottom:12px;">
         컬럼: <b>A=지점명 / B=상품명 / C=품번 / D=초기수량</b> (1행 헤더)
       </p>
       <form method="post" action="/master/qr-init/upload"
