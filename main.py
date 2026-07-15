@@ -178,17 +178,17 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         .content {{ max-width: 960px; margin: 0 auto; padding: 20px 16px; }}
         .card {{ background: white; border-radius: 12px; padding: 20px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }}
-        .btn {{ background: #1E2761; color: white; padding: 10px 20px;
+        .btn {{ background: #1E2761; color: white; padding: 8px 20px;
                border: none; border-radius: 8px; cursor: pointer; font-size: 14px; }}
         .btn:hover {{ background: #2a3580; }}
         .btn-red {{ background: #EF4444; }}
-        input, select {{ width: 100%; padding: 10px; border: 1px solid #ddd;
+        input, select {{ width: 100%; padding: 8px; border: 1px solid #ddd;
                         border-radius: 8px; font-size: 14px; margin-top: 4px; }}
         table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-        th {{ background: #1E2761; color: white; padding: 10px; text-align: left;
+        th {{ background: #1E2761; color: white; padding: 8px; text-align: left;
              resize: horizontal; overflow: auto; position: relative;
              min-width: 40px; border-right: 1px solid rgba(255,255,255,0.2); }}
-        td {{ padding: 10px; border-bottom: 1px solid #eee;
+        td {{ padding: 8px; border-bottom: 1px solid #eee;
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
         .badge-green {{ background:#D1FAE5;color:#065F46;padding:2px 8px;
                        border-radius:10px;font-size:12px; }}
@@ -1535,6 +1535,13 @@ async def scan_log_delete(
     ids = form.getlist("log_ids")
     if ids:
         conn = get_conn()
+        logs_to_delete = conn.execute(
+            f"SELECT * FROM scan_log WHERE id IN ({','.join('?' for _ in ids)})",
+            [int(i) for i in ids]
+        ).fetchall()
+        for lg in logs_to_delete:
+            revert_delta = -1 if lg["scan_type"] == "IN" else 1
+            adjust_quantity(lg["branch_code"], lg["item_code"], revert_delta)
         conn.execute(
             f"DELETE FROM scan_log WHERE id IN ({','.join('?' for _ in ids)})",
             [int(i) for i in ids]
@@ -1550,6 +1557,13 @@ async def scan_log_delete_all(session_token: str = Cookie(default=None)):
     if not user or user["role"] != "master":
         return RedirectResponse(url="/scan-log", status_code=303)
     conn = get_conn()
+    if user["role"] == "master":
+        query = "SELECT * FROM scan_log"
+        params = []
+    logs_to_delete = conn.execute(query, params).fetchall()
+    for lg in logs_to_delete:
+        revert_delta = -1 if lg["scan_type"] == "IN" else 1
+        adjust_quantity(lg["branch_code"], lg["item_code"], revert_delta)
     conn.execute("DELETE FROM scan_log")
     conn.commit()
     conn.close()
@@ -1989,7 +2003,140 @@ async def raw_upload_ajax(
     user = get_session(session_token)
     if not user:
         return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
-    return await _process_raw_upload(file, restrict_branch=None)
+    return await _process_raw_upload_master(file)
+
+async def _process_raw_upload_master(file: UploadFile):
+    """마스터 전용 — 헤더가 2행에 있고 컬럼명이 다른 '재고수불부' 형식 처리"""
+    contents = await file.read()
+    import io
+    wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
+    ws = wb.active
+    if ws is None:
+        return {"success": 0, "skipped": 0, "errors": ["시트를 찾을 수 없습니다."]}
+
+    header_row_idx = None
+    col_map = {}
+    KEYWORDS = {
+        "branch": ["지점"],
+        "item_name": ["상품명"],
+        "item_code": ["품번"],
+        "qty": ["기말수량"],
+        "h": ["증가수량"],
+        "q": ["재고조정"],
+    }
+    for row_idx in range(1, 6):
+        row_vals = next(ws.iter_rows(min_row=row_idx, max_row=row_idx, values_only=True), None)
+        if not row_vals:
+            continue
+        found = {}
+        for col_idx, cell_val in enumerate(row_vals):
+            if not cell_val:
+                continue
+            text = str(cell_val).strip()
+            for key, keywords in KEYWORDS.items():
+                if key in found:
+                    continue
+                if any(kw in text for kw in keywords):
+                    found[key] = col_idx
+        if all(k in found for k in ("branch", "item_name", "item_code")):
+            header_row_idx = row_idx
+            col_map = found
+            break
+
+    if header_row_idx is None:
+        return {"success": 0, "skipped": 0,
+                "errors": ["헤더를 찾을 수 없습니다. '지점/상품명/품번' 컬럼명이 포함된 행이 있는지 확인해주세요."]}
+
+    branch_map = {}
+    for b in BRANCHES:
+        branch_map[b["branch_name"]] = b["branch_code"]
+        branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
+        branch_map[b["branch_code"]] = b["branch_code"]
+
+    now = datetime.now().isoformat()
+    success, skipped, errors = 0, 0, []
+    hq_adjustments = []
+    debug_hq_log = []
+
+    conn = get_conn()
+    data_start_row = header_row_idx + 1
+    conn.execute("DELETE FROM raw_inventory")
+    old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
+    old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
+    conn.execute("DELETE FROM hq_bonus_log")
+    conn.commit()
+
+    for idx, row in enumerate(ws.iter_rows(min_row=data_start_row, values_only=True), start=data_start_row):
+        branch_col = col_map.get("branch")
+        if branch_col is None or branch_col >= len(row) or not row[branch_col]:
+            continue
+        try:
+            branch_name = str(row[col_map["branch"]]).strip()
+            item_name = str(row[col_map["item_name"]]).strip() if row[col_map["item_name"]] else ""
+            item_code = str(row[col_map["item_code"]]).strip() if row[col_map["item_code"]] else ""
+
+            if not item_code:
+                item_code = f"미지정_{branch_name}_{item_name}"[:50]
+
+            qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
+            qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
+            qty_q = row[col_map["q"]] if "q" in col_map and col_map["q"] < len(row) else None
+
+            raw_quantity = int(float(str(qty_n))) if qty_n not in (None, "") else 0
+            add_h = int(float(str(qty_h))) if qty_h not in (None, "") else 0
+            add_q = int(float(str(qty_q))) if qty_q not in (None, "") else 0
+            hq_total = add_h + add_q
+
+            branch_code = (branch_map.get(branch_name)
+                           or branch_map.get(branch_name.replace(" ", ""))
+                           or branch_name)
+
+            conn.execute("""
+                INSERT INTO raw_inventory
+                  (branch_code, branch_name, item_name, item_code, quantity, uploaded_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(branch_code, item_code) DO UPDATE SET
+                  quantity=excluded.quantity,
+                  item_name=excluded.item_name,
+                  branch_name=excluded.branch_name,
+                  uploaded_at=excluded.uploaded_at
+            """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
+
+            if hq_total != 0:
+                hq_adjustments.append((branch_code, item_name, item_code, hq_total))
+                debug_hq_log.append(f"{item_name}({item_code}): 증가={add_h}, 조정={add_q}, 합계={hq_total}")
+
+            success += 1
+        except Exception as e:
+            errors.append(f"행 {idx}: {str(e)[:50]}")
+            skipped += 1
+
+    conn.commit()
+    conn.close()
+
+    for branch_code, item_name, item_code, new_hq_total in hq_adjustments:
+        conn2 = get_conn()
+        prev_hq_total = old_hq_map.get(f"{branch_code}|{item_code}", 0)
+        net_delta = new_hq_total - prev_hq_total
+        if net_delta != 0:
+            new_qty = adjust_quantity(branch_code, item_code, net_delta, absolute=False)
+            conn2.execute(
+                "INSERT INTO adjustment_log (branch_code, item_name, item_code, delta, result_quantity, adjusted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (branch_code, item_name, item_code, net_delta, new_qty, now)
+            )
+        conn2.execute("""
+            INSERT INTO hq_bonus_log (branch_code, item_code, last_hq_total, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(branch_code, item_code) DO UPDATE SET
+              last_hq_total=excluded.last_hq_total, updated_at=excluded.updated_at
+        """, (branch_code, item_code, new_hq_total, now))
+        conn2.commit()
+        conn2.close()
+
+    return {"success": success, "skipped": skipped, "errors": errors[:10],
+            "header_row_used": header_row_idx,
+            "hq_debug": debug_hq_log[:20],
+            "col_map_debug": {k: v for k, v in col_map.items()}}
 
 
 async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] = None):
