@@ -1380,7 +1380,8 @@ async def api_qty(branch_code: str, item_code: str,
 @app.get("/scan-log", response_class=HTMLResponse)
 async def scan_log_page(
     session_token: str = Cookie(default=None),
-    search: str = ""
+    search: str = "",
+    date_filter: str = ""
 ):
     user = get_session(session_token)
     if not user:
@@ -1395,20 +1396,42 @@ async def scan_log_page(
     if search:
         query += " AND (item_name LIKE ? OR item_code LIKE ?)"
         params += [f"%{search}%", f"%{search}%"]
-    query += " ORDER BY id DESC LIMIT 100"
+    if date_filter:
+        query += " AND scanned_at LIKE ?"
+        params.append(f"{date_filter}%")
+    query += " ORDER BY id DESC LIMIT 200"
     logs = conn.execute(query, params).fetchall()
     conn.close()
 
+    from datetime import timedelta, timezone
+    KST = timezone(timedelta(hours=9))
+
+    def to_kst_str(iso_str):
+        if not iso_str:
+            return "-"
+        try:
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt_kst = dt.astimezone(KST)
+            return dt_kst.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return iso_str[:16] if len(iso_str) >= 16 else iso_str
+
     rows_html = ""
     if not logs:
-        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">스캔 이력 없음</td></tr>'
+        rows_html = '<tr><td colspan="7" style="text-align:center;padding:20px;color:#888;">스캔 이력 없음</td></tr>'
     else:
         for lg in logs:
             type_label = "입고" if lg["scan_type"] == "IN" else "출고"
             type_color = "#22C55E" if lg["scan_type"] == "IN" else "#EF4444"
+            check_cell = ""
+            if user["role"] == "master":
+                check_cell = f'<td style="text-align:center;"><input type="checkbox" name="log_ids" value="{lg["id"]}" class="scanlog-check" style="width:16px;height:16px;"></td>'
             rows_html += f"""
             <tr>
-              <td>{lg['scanned_at'][:16] if lg['scanned_at'] else '-'}</td>
+              {check_cell}
+              <td>{to_kst_str(lg['scanned_at'])}</td>
               <td>{lg['branch_name'] or lg['branch_code']}</td>
               <td>{lg['item_name'] or '-'}</td>
               <td>{lg['item_code']}</td>
@@ -1416,25 +1439,108 @@ async def scan_log_page(
               <td>{lg['result_quantity']}</td>
             </tr>"""
 
+    delete_controls = ""
+    header_check = ""
+    if user["role"] == "master":
+        header_check = '<th style="width:40px;text-align:center;"><input type="checkbox" id="scanlogAllCheck" style="width:16px;height:16px;"></th>'
+        delete_controls = """
+        <div style="display:flex;gap:8px;margin-bottom:12px;">
+          <button type="button" class="btn" id="scanlogSelectAllBtn"
+                  style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+          <button type="submit" class="btn btn-red"
+                  style="font-size:12px;padding:6px 12px;"
+                  onclick="return confirm('선택한 스캔 이력을 삭제할까요?')">선택삭제</button>
+          <button type="button" class="btn btn-red" id="scanlogDeleteAllBtn"
+                  style="font-size:12px;padding:6px 12px;">전체삭제</button>
+        </div>"""
+
+    table_open = '<form method="post" action="/scan-log/delete">' if user["role"] == "master" else '<div>'
+    table_close = '</form>' if user["role"] == "master" else '</div>'
+
     content = f"""
     <h2 style="margin-bottom:16px;">📜 스캔 이력</h2>
     <div class="card">
-      <form method="get" action="/scan-log" style="display:flex;gap:8px;">
-        <input name="search" value="{search}" placeholder="상품명/품번 검색" style="flex:1;">
+      <form method="get" action="/scan-log" style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input name="search" value="{search}" placeholder="상품명/품번 검색" style="flex:1;min-width:140px;">
+        <input name="date_filter" type="date" value="{date_filter}" style="flex:1;min-width:140px;">
         <button class="btn" type="submit">검색</button>
+        <a href="/scan-log" style="padding:10px 14px;background:#eee;
+           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
       </form>
     </div>
     <div class="card">
-      <table>
-        <thead><tr>
-          <th>시각</th><th>지점</th><th>상품명</th><th>품번</th><th>구분</th><th>처리후 재고</th>
-        </tr></thead>
-        <tbody>{rows_html}</tbody>
-      </table>
+      {table_open}
+        {delete_controls}
+        <table>
+          <thead><tr>
+            {header_check}
+            <th>시각 (KST)</th><th>지점</th><th>상품명</th><th>품번</th><th>구분</th><th>처리후 재고</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      {table_close}
     </div>
+    <form method="post" action="/scan-log/delete-all" id="scanlogDeleteAllForm"></form>
+    <script>
+      (function() {{
+        var allCheck = document.getElementById('scanlogAllCheck');
+        var selectBtn = document.getElementById('scanlogSelectAllBtn');
+        var deleteAllBtn = document.getElementById('scanlogDeleteAllBtn');
+        function applyAll(checked) {{
+          document.querySelectorAll('.scanlog-check').forEach(function(c) {{ c.checked = checked; }});
+          if (allCheck) allCheck.checked = checked;
+        }}
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ applyAll(allCheck.checked); }}); }}
+        if (selectBtn) {{
+          selectBtn.addEventListener('click', function() {{
+            var next = !(allCheck && allCheck.checked);
+            applyAll(next);
+          }});
+        }}
+        if (deleteAllBtn) {{
+          deleteAllBtn.addEventListener('click', function() {{
+            if (confirm('전체 스캔 이력을 삭제합니다. 되돌릴 수 없습니다.')) {{
+              document.getElementById('scanlogDeleteAllForm').submit();
+            }}
+          }});
+        }}
+      }})();
+    </script>
     """
-    return HTMLResponse(content=render_page(content, user, "scan-log"))
+    return HTMLResponse(content=render_page(content, user, "scanlog"))
 
+
+@app.post("/scan-log/delete")
+async def scan_log_delete(
+    request: Request,
+    session_token: str = Cookie(default=None)
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    form = await request.form()
+    ids = form.getlist("log_ids")
+    if ids:
+        conn = get_conn()
+        conn.execute(
+            f"DELETE FROM scan_log WHERE id IN ({','.join('?' for _ in ids)})",
+            [int(i) for i in ids]
+        )
+        conn.commit()
+        conn.close()
+    return RedirectResponse(url="/scan-log", status_code=303)
+
+
+@app.post("/scan-log/delete-all")
+async def scan_log_delete_all(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/scan-log", status_code=303)
+    conn = get_conn()
+    conn.execute("DELETE FROM scan_log")
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/scan-log", status_code=303)
 
 # ── 헬스체크 ────────────────────────────────────────────
 
@@ -1553,6 +1659,10 @@ async def master_data_page(
             <label style="font-size:12px;color:#888;">품번</label>
             <input name="item_code" required placeholder="품번" style="margin-top:4px;">
           </div>
+          <div style="flex:1;min-width:100px;">
+            <label style="font-size:12px;color:#888;">초기 수량</label>
+            <input name="init_quantity" type="number" value="0" style="margin-top:4px;">
+          </div>
         </div>
         <button class="btn" type="submit" style="margin-top:12px;">등록</button>
       </form>
@@ -1648,7 +1758,8 @@ async def master_data_add(
     session_token: str = Cookie(default=None),
     branch_code: str = Form(...),
     item_name: str = Form(...),
-    item_code: str = Form(...)
+    item_code: str = Form(...),
+    init_quantity: int = Form(0)
 ):
     user = get_session(session_token)
     if not user or user["role"] != "master":
@@ -1662,6 +1773,13 @@ async def master_data_add(
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name""",
             (branch_code, branch_name, item_name, item_code, datetime.now().isoformat())
+        )
+        conn.execute(
+            """INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(branch_code, item_code) DO UPDATE SET
+                 quantity=excluded.quantity, item_name=excluded.item_name, last_updated=excluded.last_updated""",
+            (branch_code, item_name, item_code, init_quantity, datetime.now().isoformat())
         )
         conn.commit()
     except Exception:
@@ -1937,8 +2055,7 @@ async def raw_upload_ajax(
             item_code = str(row[col_map["item_code"]]).strip() if row[col_map["item_code"]] else ""
 
             if not item_code:
-                skipped += 1
-                continue
+                item_code = f"미지정_{branch_name}_{item_name}"[:50]
 
             qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
             qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
