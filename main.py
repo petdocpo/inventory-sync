@@ -69,6 +69,7 @@ def init_db():
             UNIQUE(branch_code, item_code)
         )
     """)
+    
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS raw_inventory (
             {pk},
@@ -77,10 +78,12 @@ def init_db():
             item_name TEXT NOT NULL,
             item_code TEXT NOT NULL,
             quantity INTEGER DEFAULT 0,
+            source TEXT DEFAULT 'branch',
             uploaded_at TEXT,
-            UNIQUE(branch_code, item_code)
+            UNIQUE(branch_code, item_code, source)
         )
     """)
+
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS qr_init_log (
             {pk},
@@ -317,11 +320,16 @@ async def auto_login(token: str):
 # ── RAW 목 데이터 (추후 MSSQL 교체) ─────────────────────
 
 def fetch_raw_inventory() -> List[Dict[str, Any]]:
-    """RAW 재고 — raw_inventory 테이블에서 조회 (MSSQL 연동 전 임시)"""
+    """RAW 재고 — master 소스 우선, 없으면 branch 소스 사용"""
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM raw_inventory").fetchall()
+    rows = conn.execute("SELECT * FROM raw_inventory ORDER BY source DESC").fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    merged = {}
+    for r in rows:
+        key = f"{r['branch_code']}|{r['item_code']}"
+        if key not in merged:
+            merged[key] = dict(r)
+    return list(merged.values())
 
 
 # ── 대시보드 ────────────────────────────────────────────
@@ -1487,7 +1495,7 @@ async def scan_log_page(
         <table>
           <thead><tr>
             {header_check}
-            <th>시각 (KST)</th><th>지점</th><th>상품명</th><th>품번</th><th>구분</th><th>처리후 재고</th>
+            <th>시각</th><th>지점</th><th>상품명</th><th>품번</th><th>구분</th><th>처리후 재고</th>
           </tr></thead>
           <tbody>{rows_html}</tbody>
         </table>
@@ -2093,9 +2101,9 @@ async def _process_raw_upload_master(file: UploadFile):
 
             conn.execute("""
                 INSERT INTO raw_inventory
-                  (branch_code, branch_name, item_name, item_code, quantity, uploaded_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(branch_code, item_code) DO UPDATE SET
+                  (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
+                VALUES (?, ?, ?, ?, ?, 'master', ?)
+                ON CONFLICT(branch_code, item_code, source) DO UPDATE SET
                   quantity=excluded.quantity,
                   item_name=excluded.item_name,
                   branch_name=excluded.branch_name,
