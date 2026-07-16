@@ -148,12 +148,13 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     role_badge = f'<span style="background:#4FC3F7;color:white;padding:2px 10px;border-radius:12px;font-size:12px;margin-left:8px;">{branch_name}</span>' if user else ""
 
     is_master = user and user.get("role") == "master"
+    raw_menu_href = "/master/raw-upload" if is_master else "/raw-branch"
     menus = [
         ("dashboard", "/", "⚠️", "대시보드"),
         ("inventory", "/inventory", "📦", "재고현황"),
         ("qr", "/qr", "📷", "QR생성"),
         ("adjust", "/adjust", "✏️", "수기조정"),
-        ("raw-branch", "/raw-branch", "📤", "유비플러스 재고"),
+        ("raw-branch", raw_menu_href, "📤", "유비플러스 재고"),
         ("scanlog", "/scan-log", "📜", "스캔이력"),
     ]
     if is_master:
