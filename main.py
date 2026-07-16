@@ -202,10 +202,10 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         input, select {{ width: 100%; padding: 8px; border: 1px solid #ddd;
                         border-radius: 8px; font-size: 14px; margin-top: 4px; }}
         table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-        th {{ background: #1E2761; color: white; padding: 8px 6px; text-align: left;
+        th {{ background: #1E2761; color: white; padding: 6px 5px; text-align: left; font-size: 12px;
              resize: horizontal; overflow: auto; position: relative;
-             min-width: 40px; border-right: 1px solid rgba(255,255,255,0.2); }}
-        td {{ padding: 8px; border-bottom: 1px solid #eee;
+             min-width: 60px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); }}
+        td {{ padding: 6px 5px; border-bottom: 1px solid #eee; font-size: 12px;
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
         .badge-green {{ background:#D1FAE5;color:#065F46;padding:2px 8px;
                        border-radius:10px;font-size:12px; }}
@@ -671,14 +671,15 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-    label_height = 80
+    label_height = int(qr_img.height * 0.35)
     canvas = Image.new("RGB", (qr_img.width, qr_img.height + label_height), "white")
     canvas.paste(qr_img, (0, 0))
 
     draw = ImageDraw.Draw(canvas)
     try:
         font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic-Bold.ttf")
-        font = ImageFont.truetype(font_path, 22)
+        font_size = int(qr_img.height * 0.09)
+        font = ImageFont.truetype(font_path, font_size)
     except Exception:
         font = ImageFont.load_default()
 
@@ -690,7 +691,7 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
         bbox = draw.textbbox((0, 0), text, font=font)
         w = bbox[2] - bbox[0]
         x = (canvas.width - w) / 2
-        y = qr_img.height + 8 + i * 32
+        y = qr_img.height + int(label_height * 0.15) + i * int(font_size * 1.3)
         draw.text((x, y), text, fill="black", font=font)
 
     buf = io.BytesIO()
@@ -2114,7 +2115,10 @@ async def raw_upload_ajax(
     return await _process_raw_upload_master(file)
 
 async def _process_raw_upload_master(file: UploadFile):
-    """마스터 전용 — 헤더가 2행에 있고 컬럼명이 다른 '재고수불부' 형식 처리"""
+    """마스터 전용 — 헤더가 2행에 있고 컬럼명이 다른 '재고수불부' 형식 처리
+    ⚠️ 2026-07 수정: 업로드된 엑셀에 실제로 존재하는 지점만 삭제/갱신하도록 변경
+       (기존 버그: source='master' 전체를 지워서 다른 지점 데이터가 0으로 변함)
+    """
     contents = await file.read()
     import io
     wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
@@ -2165,21 +2169,42 @@ async def _process_raw_upload_master(file: UploadFile):
     success, skipped, errors = 0, 0, []
     hq_adjustments = []
     debug_hq_log = []
-
-    conn = get_conn()
     data_start_row = header_row_idx + 1
-    conn.execute("DELETE FROM raw_inventory WHERE source='master'")
-    old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
-    old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
-    conn.execute("DELETE FROM hq_bonus_log")
-    conn.commit()
 
+    # ── ⚠️ 1단계: 삭제 전에 먼저 "이번 엑셀에 실제로 어떤 지점이 있는지" 수집 ──
+    branches_in_file = set()
+    parsed_rows = []
     for idx, row in enumerate(ws.iter_rows(min_row=data_start_row, values_only=True), start=data_start_row):
         branch_col = col_map.get("branch")
         if branch_col is None or branch_col >= len(row) or not row[branch_col]:
             continue
+        branch_name = str(row[branch_col]).strip()
+        branch_code = (branch_map.get(branch_name)
+                       or branch_map.get(branch_name.replace(" ", ""))
+                       or branch_name)
+        branches_in_file.add(branch_code)
+        parsed_rows.append((idx, row, branch_code, branch_name))
+
+    # ── ⚠️ 빈 데이터 방어: 엑셀에서 유효한 지점 행을 하나도 못 찾으면 삭제 자체를 하지 않고 즉시 중단 ──
+    if not branches_in_file:
+        return {"success": 0, "skipped": 0,
+                "errors": ["엑셀에서 유효한 지점 데이터를 찾지 못했습니다. 기존 데이터는 보존되었으며 아무 것도 변경되지 않았습니다."],
+                "header_row_used": header_row_idx,
+                "col_map_debug": {k: v for k, v in col_map.items()}}
+
+    conn = get_conn()
+    # ── ⚠️ 핵심 수정: source='master' 전체가 아니라, 이번 엑셀에 있는 지점만 삭제 ──
+    for bc in branches_in_file:
+        conn.execute("DELETE FROM raw_inventory WHERE source='master' AND branch_code=?", (bc,))
+    old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
+    old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
+    # ── ⚠️ hq_bonus_log도 전체 삭제 대신 해당 지점만 삭제 ──
+    for bc in branches_in_file:
+        conn.execute("DELETE FROM hq_bonus_log WHERE branch_code=?", (bc,))
+    conn.commit()
+
+    for idx, row, branch_code, branch_name in parsed_rows:
         try:
-            branch_name = str(row[col_map["branch"]]).strip()
             item_name = str(row[col_map["item_name"]]).strip() if row[col_map["item_name"]] else ""
             item_code = str(row[col_map["item_code"]]).strip() if row[col_map["item_code"]] else ""
 
@@ -2194,10 +2219,6 @@ async def _process_raw_upload_master(file: UploadFile):
             add_h = int(float(str(qty_h))) if qty_h not in (None, "") else 0
             add_q = int(float(str(qty_q))) if qty_q not in (None, "") else 0
             hq_total = add_h + add_q
-
-            branch_code = (branch_map.get(branch_name)
-                           or branch_map.get(branch_name.replace(" ", ""))
-                           or branch_name)
 
             conn.execute("""
                 INSERT INTO raw_inventory
