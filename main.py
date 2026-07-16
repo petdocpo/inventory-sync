@@ -2213,7 +2213,7 @@ async def _process_raw_upload_master(file: UploadFile):
                 # 품번 없는 상품: 지점+상품명 조합으로 안전한 고유 코드 생성 (50자 자르기로 인한 충돌 방지)
                 import hashlib
                 name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
-                item_code = f"미지정_{branch_code}_{name_hash}"
+                item_code = f"미지정_{name_hash}"
 
             qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
             qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
@@ -2372,8 +2372,9 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
 
             if not item_code:
                 import hashlib
+                import hashlib
                 name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
-                item_code = f"미지정_{branch_code}_{name_hash}"
+                item_code = f"미지정_{name_hash}"
 
             qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
             qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
