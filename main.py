@@ -482,7 +482,7 @@ async def inventory_page(
         params.append(filter_branch)
 
     if filter_item:
-        query += " AND item_code=?"
+        query += " AND item_name=?"
         params.append(filter_item)
 
     if search:
@@ -496,7 +496,7 @@ async def inventory_page(
         "SELECT DISTINCT branch_code FROM inventory ORDER BY branch_code"
     ).fetchall() if user["role"] == "master" else []
     all_items = conn.execute(
-        "SELECT DISTINCT item_code, item_name FROM inventory ORDER BY item_name"
+        "SELECT DISTINCT item_name FROM inventory ORDER BY item_name"
     ).fetchall()
     conn.close()
 
@@ -512,8 +512,8 @@ async def inventory_page(
     default_sel = "selected" if not filter_item else ""
     item_options = f'<option value="" {default_sel}>전체 품목</option>'
     for it in all_items:
-      sel = "selected" if filter_item == it["item_code"] else ""
-      item_options += f'<option value="{it["item_code"]}" {sel}>{it["item_name"]}</option>'
+      sel = "selected" if filter_item == it["item_name"] else ""
+      item_options += f'<option value="{it["item_name"]}" {sel}>{it["item_name"]}</option>'
 
     rows_html = ""
     if not rows:
