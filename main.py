@@ -2210,7 +2210,10 @@ async def _process_raw_upload_master(file: UploadFile):
             item_code = str(row[col_map["item_code"]]).strip() if row[col_map["item_code"]] else ""
 
             if not item_code:
-                item_code = f"미지정_{branch_name}_{item_name}"[:50]
+                # 품번 없는 상품: 지점+상품명 조합으로 안전한 고유 코드 생성 (50자 자르기로 인한 충돌 방지)
+                import hashlib
+                name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
+                item_code = f"미지정_{branch_code}_{name_hash}"
 
             qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
             qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
@@ -2231,6 +2234,23 @@ async def _process_raw_upload_master(file: UploadFile):
                   branch_name=excluded.branch_name,
                   uploaded_at=excluded.uploaded_at
             """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
+
+            # ⚠️ 신규 상품 자동 등록: items에 없으면 items + inventory(초기수량 0)에 추가
+            existing_item = conn.execute(
+                "SELECT id FROM items WHERE branch_code=? AND item_code=?",
+                (branch_code, item_code)
+            ).fetchone()
+            if not existing_item:
+                conn.execute("""
+                    INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
+                """, (branch_code, branch_name, item_name, item_code, now))
+                conn.execute("""
+                    INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
+                    VALUES (?, ?, ?, 0, ?)
+                    ON CONFLICT(branch_code, item_code) DO NOTHING
+                """, (branch_code, item_name, item_code, now))
 
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
@@ -2351,7 +2371,9 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
             item_code = str(row[col_map["item_code"]]).strip() if row[col_map["item_code"]] else ""
 
             if not item_code:
-                item_code = f"미지정_{branch_name}_{item_name}"[:50]
+                import hashlib
+                name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
+                item_code = f"미지정_{branch_code}_{name_hash}"
 
             qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
             qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
@@ -2365,7 +2387,7 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
             branch_code = (branch_map.get(branch_name)
                            or branch_map.get(branch_name.replace(" ", ""))
                            or branch_name)
-            
+
             if restrict_branch and branch_code != restrict_branch:
                 skipped += 1
                 continue
@@ -2380,6 +2402,23 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                   branch_name=excluded.branch_name,
                   uploaded_at=excluded.uploaded_at
             """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
+
+            # ⚠️ 신규 상품 자동 등록: items에 없으면 items + inventory(초기수량 0)에 추가
+            existing_item = conn.execute(
+                "SELECT id FROM items WHERE branch_code=? AND item_code=?",
+                (branch_code, item_code)
+            ).fetchone()
+            if not existing_item:
+                conn.execute("""
+                    INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
+                """, (branch_code, branch_name, item_name, item_code, now))
+                conn.execute("""
+                    INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
+                    VALUES (?, ?, ?, 0, ?)
+                    ON CONFLICT(branch_code, item_code) DO NOTHING
+                """, (branch_code, item_name, item_code, now))
 
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
