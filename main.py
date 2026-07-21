@@ -203,11 +203,15 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         input, select {{ width: 100%; padding: 8px; border: 1px solid #ddd;
                         border-radius: 8px; font-size: 14px; margin-top: 4px; }}
         table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-        th {{ background: #1E2761; color: white; padding: 6px 5px; text-align: left; font-size: 12px;
+        th { background: #1E2761; color: white; padding: 6px 5px; text-align: left; font-size: 12px;
              resize: horizontal; overflow: auto; position: relative;
-             min-width: 60px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); }}
-        td {{ padding: 6px 5px; border-bottom: 1px solid #eee; font-size: 12px;
-             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+             min-width: 60px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); }
+        td { padding: 6px 5px; border-bottom: 1px solid #eee; font-size: 12px;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        @media (max-width: 480px) {{
+          th {{ font-size: 10px; padding: 4px 3px; min-width: 44px; }}
+          td {{ font-size: 10px; padding: 4px 3px; }}
+        }}
         .badge-green {{ background:#D1FAE5;color:#065F46;padding:2px 8px;
                        border-radius:10px;font-size:12px; }}
         .badge-red {{ background:#FEE2E2;color:#991B1B;padding:2px 8px;
