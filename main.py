@@ -254,40 +254,6 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           observer.observe(th);
         }});
       }})();
-      (function() {
-        var GLOBAL_BRANCH_KEY = 'global_filter_branch';
-        var selects = document.querySelectorAll('select[name="filter_branch"]');
-        if (selects.length === 0) return;
-
-        var saved = localStorage.getItem(GLOBAL_BRANCH_KEY);
-        var urlParams = new URLSearchParams(window.location.search);
-        var urlHasFilter = urlParams.has('filter_branch');
-
-        selects.forEach(function(sel) {
-          // URL에 filter_branch가 없고, 저장된 값이 있으면 자동 적용 후 폼 제출
-          if (!urlHasFilter && saved) {
-            var optionExists = Array.from(sel.options).some(function(o) { return o.value === saved; });
-            if (optionExists && sel.value !== saved) {
-              sel.value = saved;
-              var form = sel.closest('form');
-              if (form) {
-                form.submit();
-                return;
-              }
-            }
-          }
-          // 사용자가 직접 필터를 바꾸면 저장
-          sel.addEventListener('change', function() {
-            localStorage.setItem(GLOBAL_BRANCH_KEY, sel.value);
-          });
-        });
-
-        // URL에 filter_branch가 명시적으로 있으면 그 값으로 저장 갱신 (초기화 버튼 등 반영)
-        if (urlHasFilter) {
-          var urlVal = urlParams.get('filter_branch') || '';
-          localStorage.setItem(GLOBAL_BRANCH_KEY, urlVal);
-        }
-      })();
       </script>
     </body></html>
     """
@@ -1506,8 +1472,7 @@ async def api_qty(branch_code: str, item_code: str,
 async def scan_log_page(
     session_token: str = Cookie(default=None),
     search: str = "",
-    date_filter: str = "",
-    filter_branch: str = ""
+    date_filter: str = ""
 ):
     user = get_session(session_token)
     if not user:
@@ -1519,9 +1484,6 @@ async def scan_log_page(
     if user["role"] == "branch":
         query += " AND branch_code=?"
         params.append(user["branch_code"])
-    elif filter_branch:
-        query += " AND branch_code=?"
-        params.append(filter_branch)
     if search:
         query += " AND (item_name LIKE ? OR item_code LIKE ?)"
         params += [f"%{search}%", f"%{search}%"]
@@ -1574,18 +1536,6 @@ async def scan_log_page(
               {device_cell}
             </tr>"""
 
-    branch_filter_html = ""
-    if user["role"] == "master":
-        branch_options = '<option value="">전체 지점</option>'
-        for b in BRANCHES:
-            sel = "selected" if filter_branch == b["branch_code"] else ""
-            branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
-        branch_filter_html = f"""
-        <div style="flex:1;min-width:140px;">
-          <label style="font-size:12px;color:#888;">지점 필터</label>
-          <select name="filter_branch" class="global-branch-filter" style="margin-top:4px;">{branch_options}</select>
-        </div>"""
-
     delete_controls = ""
     header_check = ""
     if user["role"] == "master":
@@ -1608,20 +1558,11 @@ async def scan_log_page(
     <h2 style="margin-bottom:16px;">📜 스캔 이력</h2>
     <div class="card">
       <form method="get" action="/scan-log" style="display:flex;gap:8px;flex-wrap:wrap;">
-        {branch_filter_html}
-        <div style="flex:1;min-width:140px;">
-          <label style="font-size:12px;color:#888;">검색</label>
-          <input name="search" value="{search}" placeholder="상품명/품번 검색" style="margin-top:4px;">
-        </div>
-        <div style="flex:1;min-width:140px;">
-          <label style="font-size:12px;color:#888;">날짜</label>
-          <input name="date_filter" type="date" value="{date_filter}" style="margin-top:4px;">
-        </div>
-        <div style="display:flex;align-items:flex-end;gap:8px;">
-          <button class="btn" type="submit">검색</button>
-          <a href="/scan-log" style="padding:10px 14px;background:#eee;
-             border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
-        </div>
+        <input name="search" value="{search}" placeholder="상품명/품번 검색" style="flex:1;min-width:140px;">
+        <input name="date_filter" type="date" value="{date_filter}" style="flex:1;min-width:140px;">
+        <button class="btn" type="submit">검색</button>
+        <a href="/scan-log" style="padding:10px 14px;background:#eee;
+           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
       </form>
     </div>
     <div class="card">
