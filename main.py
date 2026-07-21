@@ -254,6 +254,37 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           observer.observe(th);
         }});
       }})();
+      (function() {{
+        var GLOBAL_BRANCH_KEY = 'global_filter_branch';
+        var selects = document.querySelectorAll('select[name="filter_branch"]');
+        if (selects.length === 0) return;
+
+        var saved = localStorage.getItem(GLOBAL_BRANCH_KEY);
+        var urlParams = new URLSearchParams(window.location.search);
+        var urlHasFilter = urlParams.has('filter_branch');
+
+        selects.forEach(function(sel) {{
+          if (!urlHasFilter && saved) {{
+            var optionExists = Array.from(sel.options).some(function(o) {{ return o.value === saved; }});
+            if (optionExists && sel.value !== saved) {{
+              sel.value = saved;
+              var form = sel.closest('form');
+              if (form) {{
+                form.submit();
+                return;
+              }}
+            }}
+          }}
+          sel.addEventListener('change', function() {{
+            localStorage.setItem(GLOBAL_BRANCH_KEY, sel.value);
+          }});
+        }});
+
+        if (urlHasFilter) {{
+          var urlVal = urlParams.get('filter_branch') || '';
+          localStorage.setItem(GLOBAL_BRANCH_KEY, urlVal);
+        }}
+      }})();
       </script>
     </body></html>
     """
