@@ -658,7 +658,7 @@ async def data_page_redirect():
 # ── QR 생성 ─────────────────────────────────────────────
 
 def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="") -> bytes:
-    """QR 코드를 메모리에서 생성 + 하단에 상품명(최대 3줄 자동 줄바꿈)/입출고 라벨 삽입"""
+    """QR 코드를 메모리에서 생성 + 하단에 상품명/입출고 라벨 삽입"""
     import qrcode
     import io
     from PIL import Image, ImageDraw, ImageFont
@@ -672,82 +672,28 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-    # ── 상품명 줄바꿈 처리 (최대 3줄) ──
-    def wrap_text(draw_obj, text, font_obj, max_width, max_lines=3):
-        if not text:
-            return [""]
-        lines = []
-        current = ""
-        for ch in text:
-            test = current + ch
-            bbox = draw_obj.textbbox((0, 0), test, font=font_obj)
-            w = bbox[2] - bbox[0]
-            if w > max_width and current:
-                lines.append(current)
-                current = ch
-                if len(lines) >= max_lines - 1:
-                    break
-            else:
-                current = test
-        if current:
-            lines.append(current)
-        # max_lines 초과 시 마지막 줄에 ... 처리
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-        if len(lines) == max_lines:
-            last = lines[-1]
-            while True:
-                bbox = draw_obj.textbbox((0, 0), last + "…", font=font_obj)
-                if bbox[2] - bbox[0] <= max_width or len(last) <= 1:
-                    break
-                last = last[:-1]
-            # 원본 텍스트가 더 남아있는지 체크해서만 … 붙임
-            consumed = sum(len(l) for l in lines[:-1]) + len(last)
-            if consumed < len(text):
-                lines[-1] = last + "…"
-        return lines
-
-    draw_probe = ImageDraw.Draw(qr_img)  # 폭 측정용 임시 draw
-    try:
-        font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic-Bold.ttf")
-        # ⚠️ 글씨 크기 축소: 기존 0.09 → 0.065 (상품명 2~3줄 배치 공간 확보)
-        font_size = int(qr_img.height * 0.065)
-        font = ImageFont.truetype(font_path, font_size)
-        type_font_size = int(qr_img.height * 0.075)
-        type_font = ImageFont.truetype(font_path, type_font_size)
-    except Exception:
-        font = ImageFont.load_default()
-        type_font = font
-        font_size = 14
-
-    max_text_width = int(qr_img.width * 0.92)
-    name_lines = wrap_text(draw_probe, item_name if item_name else item_code, font, max_text_width, max_lines=3)
-
-    type_label = "입고 IN" if scan_type == "IN" else "출고 OUT"
-
-    line_height = int(font_size * 1.25)
-    name_block_height = line_height * len(name_lines)
-    type_block_height = int(type_font_size * 1.3) if 'type_font_size' in dir() or True else int(font_size * 1.3)
-    label_height = int(name_block_height + type_block_height + qr_img.height * 0.08)
-
+    label_height = int(qr_img.height * 0.35)
     canvas = Image.new("RGB", (qr_img.width, qr_img.height + label_height), "white")
     canvas.paste(qr_img, (0, 0))
 
     draw = ImageDraw.Draw(canvas)
+    try:
+        font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic-Bold.ttf")
+        font_size = int(qr_img.height * 0.09)
+        font = ImageFont.truetype(font_path, font_size)
+    except Exception:
+        font = ImageFont.load_default()
 
-    y = qr_img.height + int(qr_img.height * 0.04)
-    for line in name_lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
+    type_label = "입고 IN" if scan_type == "IN" else "출고 OUT"
+    text1 = item_name[:20] if item_name else item_code
+    text2 = type_label
+
+    for i, text in enumerate([text1, text2]):
+        bbox = draw.textbbox((0, 0), text, font=font)
         w = bbox[2] - bbox[0]
         x = (canvas.width - w) / 2
-        draw.text((x, y), line, fill="black", font=font)
-        y += line_height
-
-    y += int(qr_img.height * 0.02)
-    bbox = draw.textbbox((0, 0), type_label, font=type_font)
-    w = bbox[2] - bbox[0]
-    x = (canvas.width - w) / 2
-    draw.text((x, y), type_label, fill="black", font=type_font)
+        y = qr_img.height + int(label_height * 0.15) + i * int(font_size * 1.3)
+        draw.text((x, y), text, fill="black", font=font)
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
@@ -2128,9 +2074,6 @@ async def raw_upload_page(session_token: str = Cookie(default=None)):
           성공: <b style="color:#22C55E">${{data.success}}건</b> &nbsp;
           실패: <b style="color:#EF4444">${{data.skipped}}건</b>
           ${{data.errors.length ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${{e}}</li>`).join('') + '</ul>' : ''}}
-          <br><b>신규 상품 등록:</b> 성공 ${data.new_items_created ?? '?'}건, 실패 ${data.new_items_failed ?? '?'}건
-          <br><b>신규 상품 등록:</b> 성공 ${data.new_items_created ?? '?'}건, 실패 ${data.new_items_failed ?? '?'}건
-          ${data.new_item_errors_debug && data.new_item_errors_debug.length ? '<ul>' + data.new_item_errors_debug.map(e=>`<li style="color:#EF4444;font-size:12px;">${e}</li>`).join('') + '</ul>' : ''}
           ${{data.hq_debug && data.hq_debug.length ? '<br><b>H/Q 반영 내역:</b><ul>' + data.hq_debug.map(e=>`<li style="font-size:12px;">${{e}}</li>`).join('') + '</ul>' : '<br><span style="color:#F59E0B;">⚠️ H/Q 반영된 품목 없음</span>'}}`;
           setTimeout(() => location.reload(), 2000);
         }} catch(e) {{
@@ -2176,7 +2119,6 @@ async def _process_raw_upload_master(file: UploadFile):
     """마스터 전용 — 헤더가 2행에 있고 컬럼명이 다른 '재고수불부' 형식 처리
     ⚠️ 2026-07 수정: 업로드된 엑셀에 실제로 존재하는 지점만 삭제/갱신하도록 변경
        (기존 버그: source='master' 전체를 지워서 다른 지점 데이터가 0으로 변함)
-    ⚠️ 2026-07 추가 수정: 신규 상품 자동 등록 디버그 카운터 추가 (원인 파악용)
     """
     contents = await file.read()
     import io
@@ -2230,10 +2172,7 @@ async def _process_raw_upload_master(file: UploadFile):
     debug_hq_log = []
     data_start_row = header_row_idx + 1
 
-    new_items_created = 0
-    new_items_failed = 0
-    debug_new_item_errors = []
-
+    # ── ⚠️ 1단계: 삭제 전에 먼저 "이번 엑셀에 실제로 어떤 지점이 있는지" 수집 ──
     branches_in_file = set()
     parsed_rows = []
     for idx, row in enumerate(ws.iter_rows(min_row=data_start_row, values_only=True), start=data_start_row):
@@ -2247,6 +2186,7 @@ async def _process_raw_upload_master(file: UploadFile):
         branches_in_file.add(branch_code)
         parsed_rows.append((idx, row, branch_code, branch_name))
 
+    # ── ⚠️ 빈 데이터 방어: 엑셀에서 유효한 지점 행을 하나도 못 찾으면 삭제 자체를 하지 않고 즉시 중단 ──
     if not branches_in_file:
         return {"success": 0, "skipped": 0,
                 "errors": ["엑셀에서 유효한 지점 데이터를 찾지 못했습니다. 기존 데이터는 보존되었으며 아무 것도 변경되지 않았습니다."],
@@ -2254,10 +2194,12 @@ async def _process_raw_upload_master(file: UploadFile):
                 "col_map_debug": {k: v for k, v in col_map.items()}}
 
     conn = get_conn()
+    # ── ⚠️ 핵심 수정: source='master' 전체가 아니라, 이번 엑셀에 있는 지점만 삭제 ──
     for bc in branches_in_file:
         conn.execute("DELETE FROM raw_inventory WHERE source='master' AND branch_code=?", (bc,))
     old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
     old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
+    # ── ⚠️ hq_bonus_log도 전체 삭제 대신 해당 지점만 삭제 ──
     for bc in branches_in_file:
         conn.execute("DELETE FROM hq_bonus_log WHERE branch_code=?", (bc,))
     conn.commit()
@@ -2268,6 +2210,7 @@ async def _process_raw_upload_master(file: UploadFile):
             item_code = str(row[col_map["item_code"]]).strip() if row[col_map["item_code"]] else ""
 
             if not item_code:
+                # 품번 없는 상품: 지점+상품명 조합으로 안전한 고유 코드 생성 (50자 자르기로 인한 충돌 방지)
                 import hashlib
                 name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
                 item_code = f"미지정_{name_hash}"
@@ -2292,27 +2235,22 @@ async def _process_raw_upload_master(file: UploadFile):
                   uploaded_at=excluded.uploaded_at
             """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
 
-            try:
-                existing_item = conn.execute(
-                    "SELECT id FROM items WHERE branch_code=? AND item_code=?",
-                    (branch_code, item_code)
-                ).fetchone()
-                if not existing_item:
-                    conn.execute("""
-                        INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
-                    """, (branch_code, branch_name, item_name, item_code, now))
-                    conn.execute("""
-                        INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
-                        VALUES (?, ?, ?, 0, ?)
-                        ON CONFLICT(branch_code, item_code) DO NOTHING
-                    """, (branch_code, item_name, item_code, now))
-                    new_items_created += 1
-            except Exception as item_err:
-                new_items_failed += 1
-                if len(debug_new_item_errors) < 10:
-                    debug_new_item_errors.append(f"{branch_code}/{item_code}: {str(item_err)[:80]}")
+            # ⚠️ 신규 상품 자동 등록: items에 없으면 items + inventory(초기수량 0)에 추가
+            existing_item = conn.execute(
+                "SELECT id FROM items WHERE branch_code=? AND item_code=?",
+                (branch_code, item_code)
+            ).fetchone()
+            if not existing_item:
+                conn.execute("""
+                    INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
+                """, (branch_code, branch_name, item_name, item_code, now))
+                conn.execute("""
+                    INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
+                    VALUES (?, ?, ?, 0, ?)
+                    ON CONFLICT(branch_code, item_code) DO NOTHING
+                """, (branch_code, item_name, item_code, now))
 
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
@@ -2348,10 +2286,7 @@ async def _process_raw_upload_master(file: UploadFile):
     return {"success": success, "skipped": skipped, "errors": errors[:10],
             "header_row_used": header_row_idx,
             "hq_debug": debug_hq_log[:20],
-            "col_map_debug": {k: v for k, v in col_map.items()},
-            "new_items_created": new_items_created,
-            "new_items_failed": new_items_failed,
-            "new_item_errors_debug": debug_new_item_errors}
+            "col_map_debug": {k: v for k, v in col_map.items()}}
 
 
 async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] = None):
@@ -2362,8 +2297,10 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
     if ws is None:
         return {"success": 0, "skipped": 0, "errors": ["시트를 찾을 수 없습니다."]}
 
+    # ── 헤더 행 자동 탐색 (1행 또는 2행, 병합 셀 대응) ──
+    # 최대 5행까지 훑어서 "품번" 또는 "현재수량" 텍스트가 있는 행을 헤더로 인식
     header_row_idx = None
-    col_map = {}
+    col_map = {}  # {"branch":0, "item_name":1, "item_code":3, "qty":13, "h":7, "q":16}
 
     KEYWORDS = {
         "branch": ["지점", "지점명"],
@@ -2388,6 +2325,7 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                     continue
                 if any(kw in text for kw in keywords):
                     found[key] = col_idx
+        # 최소한 지점/상품명/품번 세 개는 찾아야 이 행을 헤더로 인정
         if all(k in found for k in ("branch", "item_name", "item_code")):
             header_row_idx = row_idx
             col_map = found
@@ -2408,20 +2346,20 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
     hq_adjustments = []
     debug_hq_log = []
 
-    new_items_created = 0
-    new_items_failed = 0
-    debug_new_item_errors = []
 
     conn = get_conn()
     data_start_row = header_row_idx + 1
+    # ── 이전 업로드 데이터 삭제 (지점 제한 있으면 해당 지점만, 없으면 전체 - 마스터) ──
     if restrict_branch:
         conn.execute("DELETE FROM raw_inventory WHERE branch_code=? AND source='branch'", (restrict_branch,))
     else:
         conn.execute("DELETE FROM raw_inventory WHERE source='branch'")
+    # 이전 H/Q 반영 이력도 초기화 (재계산 기준점 리셋)
     old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
     old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
     conn.execute("DELETE FROM hq_bonus_log")
     conn.commit()
+    
 
     for idx, row in enumerate(ws.iter_rows(min_row=data_start_row, values_only=True), start=data_start_row):
         branch_col = col_map.get("branch")
@@ -2433,6 +2371,7 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
             item_code = str(row[col_map["item_code"]]).strip() if row[col_map["item_code"]] else ""
 
             if not item_code:
+                import hashlib
                 import hashlib
                 name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
                 item_code = f"미지정_{name_hash}"
@@ -2465,34 +2404,29 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                   uploaded_at=excluded.uploaded_at
             """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
 
-            try:
-                existing_item = conn.execute(
-                    "SELECT id FROM items WHERE branch_code=? AND item_code=?",
-                    (branch_code, item_code)
-                ).fetchone()
-                if not existing_item:
-                    conn.execute("""
-                        INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
-                    """, (branch_code, branch_name, item_name, item_code, now))
-                    conn.execute("""
-                        INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
-                        VALUES (?, ?, ?, 0, ?)
-                        ON CONFLICT(branch_code, item_code) DO NOTHING
-                    """, (branch_code, item_name, item_code, now))
-                    new_items_created += 1
-            except Exception as item_err:
-                new_items_failed += 1
-                if len(debug_new_item_errors) < 10:
-                    debug_new_item_errors.append(f"{branch_code}/{item_code}: {str(item_err)[:80]}")
+            # ⚠️ 신규 상품 자동 등록: items에 없으면 items + inventory(초기수량 0)에 추가
+            existing_item = conn.execute(
+                "SELECT id FROM items WHERE branch_code=? AND item_code=?",
+                (branch_code, item_code)
+            ).fetchone()
+            if not existing_item:
+                conn.execute("""
+                    INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
+                """, (branch_code, branch_name, item_name, item_code, now))
+                conn.execute("""
+                    INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
+                    VALUES (?, ?, ?, 0, ?)
+                    ON CONFLICT(branch_code, item_code) DO NOTHING
+                """, (branch_code, item_name, item_code, now))
 
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
                 debug_hq_log.append(f"{item_name}({item_code}): H={add_h}, Q={add_q}, 합계={hq_total}")
 
             success += 1
-
+            
         except Exception as e:
             errors.append(f"행 {idx}: {str(e)[:50]}")
             skipped += 1
@@ -2503,6 +2437,8 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
     for branch_code, item_name, item_code, new_hq_total in hq_adjustments:
         conn2 = get_conn()
         prev_hq_total = old_hq_map.get(f"{branch_code}|{item_code}", 0)
+
+        # 이전에 반영했던 만큼 빼고, 새 값을 더함 → 결과적으로 "덮어쓰기" 효과
         net_delta = new_hq_total - prev_hq_total
 
         if net_delta != 0:
@@ -2526,10 +2462,7 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
     return {"success": success, "skipped": skipped, "errors": errors[:10],
             "header_row_used": header_row_idx,
             "hq_debug": debug_hq_log[:20],
-            "col_map_debug": {k: v for k, v in col_map.items()},
-            "new_items_created": new_items_created,
-            "new_items_failed": new_items_failed,
-            "new_item_errors_debug": debug_new_item_errors}
+            "col_map_debug": {k: v for k, v in col_map.items()}}
 
 @app.post("/master/raw-upload/clear")
 async def raw_upload_clear(session_token: str = Cookie(default=None)):
