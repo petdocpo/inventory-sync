@@ -147,8 +147,9 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     # ⚠️ 모바일 전용 테이블 글씨 축소 — f-string 중괄호 충돌 방지를 위해 별도 문자열로 조립
     mobile_table_css = (
         "@media (max-width: 480px) {"
-        "th { font-size: 10px; padding: 4px 3px; min-width: 44px; }"
-        "td { font-size: 10px; padding: 4px 3px; }"
+        "table { table-layout: auto; min-width: 700px; }"
+        "th { font-size: 11px; padding: 5px 4px; resize: none; min-width: 70px; }"
+        "td { font-size: 11px; padding: 5px 4px; }"
         "}"
     )
     branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")    
@@ -210,6 +211,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         input, select {{ width: 100%; padding: 8px; border: 1px solid #ddd;
                         border-radius: 8px; font-size: 14px; margin-top: 4px; }}
         table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+        .table-scroll-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
         th {{ background: #1E2761; color: white; padding: 6px 5px; text-align: left; font-size: 12px;
              resize: horizontal; overflow: auto; position: relative;
              min-width: 60px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); }}
@@ -233,6 +235,16 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       <div class="content">{content}</div>
       <nav class="bottomnav">{menu_html}</nav>
       <script>
+      (function() {{
+        // 모바일 가로스크롤을 위해 모든 table을 스크롤 컨테이너로 자동 래핑
+        document.querySelectorAll('table').forEach(function(table) {{
+          if (table.parentElement && table.parentElement.classList.contains('table-scroll-wrap')) return;
+          var wrap = document.createElement('div');
+          wrap.className = 'table-scroll-wrap';
+          table.parentNode.insertBefore(wrap, table);
+          wrap.appendChild(table);
+        }});
+      }})();
       (function() {{
         function saveColumnWidths() {{
           document.querySelectorAll('table').forEach(function(table, tIdx) {{
