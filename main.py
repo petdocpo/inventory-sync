@@ -144,7 +144,14 @@ init_db()
 
 def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> str:
     """공통 레이아웃 — 상단 타이틀 + 하단 메뉴 포함"""
-    branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")
+    # ⚠️ 모바일 전용 테이블 글씨 축소 — f-string 중괄호 충돌 방지를 위해 별도 문자열로 조립
+    mobile_table_css = (
+        "@media (max-width: 480px) {"
+        "th { font-size: 10px; padding: 4px 3px; min-width: 44px; }"
+        "td { font-size: 10px; padding: 4px 3px; }"
+        "}"
+    )
+    branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")    
     role_badge = f'<span style="background:#4FC3F7;color:white;padding:2px 10px;border-radius:12px;font-size:12px;margin-left:8px;">{branch_name}</span>' if user else ""
 
     is_master = user and user.get("role") == "master"
@@ -208,6 +215,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
              min-width: 60px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); }}
         td {{ padding: 6px 5px; border-bottom: 1px solid #eee; font-size: 12px;
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        {mobile_table_css}
         .badge-green {{ background:#D1FAE5;color:#065F46;padding:2px 8px;
                        border-radius:10px;font-size:12px; }}
         .badge-red {{ background:#FEE2E2;color:#991B1B;padding:2px 8px;
