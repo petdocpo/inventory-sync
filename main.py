@@ -658,7 +658,7 @@ async def data_page_redirect():
 # ── QR 생성 ─────────────────────────────────────────────
 
 def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="") -> bytes:
-    """QR 코드를 메모리에서 생성 + 하단에 상품명/입출고 라벨 삽입"""
+    """QR 코드를 메모리에서 생성 + 하단에 상품명(최대 3줄 자동 줄바꿈)/입출고 라벨 삽입"""
     import qrcode
     import io
     from PIL import Image, ImageDraw, ImageFont
@@ -672,28 +672,79 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
-    label_height = int(qr_img.height * 0.35)
+    def wrap_text(draw_obj, text, font_obj, max_width, max_lines=3):
+        if not text:
+            return [""]
+        lines = []
+        current = ""
+        for ch in text:
+            test = current + ch
+            bbox = draw_obj.textbbox((0, 0), test, font=font_obj)
+            w = bbox[2] - bbox[0]
+            if w > max_width and current:
+                lines.append(current)
+                current = ch
+                if len(lines) >= max_lines - 1:
+                    break
+            else:
+                current = test
+        if current:
+            lines.append(current)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+        if len(lines) == max_lines:
+            last = lines[-1]
+            while True:
+                bbox = draw_obj.textbbox((0, 0), last + "…", font=font_obj)
+                if bbox[2] - bbox[0] <= max_width or len(last) <= 1:
+                    break
+                last = last[:-1]
+            consumed = sum(len(l) for l in lines[:-1]) + len(last)
+            if consumed < len(text):
+                lines[-1] = last + "…"
+        return lines
+
+    draw_probe = ImageDraw.Draw(qr_img)
+    try:
+        font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic-Bold.ttf")
+        font_size = int(qr_img.height * 0.065)
+        font = ImageFont.truetype(font_path, font_size)
+        type_font_size = int(qr_img.height * 0.075)
+        type_font = ImageFont.truetype(font_path, type_font_size)
+    except Exception:
+        font = ImageFont.load_default()
+        type_font = font
+        font_size = 14
+        type_font_size = 16
+
+    max_text_width = int(qr_img.width * 0.92)
+    name_lines = wrap_text(draw_probe, item_name if item_name else item_code, font, max_text_width, max_lines=3)
+
+    type_label = "입고 IN" if scan_type == "IN" else "출고 OUT"
+
+    line_height = int(font_size * 1.25)
+    name_block_height = line_height * len(name_lines)
+    type_block_height = int(type_font_size * 1.3)
+    label_height = int(name_block_height + type_block_height + qr_img.height * 0.08)
+
     canvas = Image.new("RGB", (qr_img.width, qr_img.height + label_height), "white")
     canvas.paste(qr_img, (0, 0))
 
     draw = ImageDraw.Draw(canvas)
-    try:
-        font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic-Bold.ttf")
-        font_size = int(qr_img.height * 0.09)
-        font = ImageFont.truetype(font_path, font_size)
-    except Exception:
-        font = ImageFont.load_default()
 
-    type_label = "입고 IN" if scan_type == "IN" else "출고 OUT"
-    text1 = item_name[:20] if item_name else item_code
-    text2 = type_label
-
-    for i, text in enumerate([text1, text2]):
-        bbox = draw.textbbox((0, 0), text, font=font)
+    y = qr_img.height + int(qr_img.height * 0.04)
+    for line in name_lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
         w = bbox[2] - bbox[0]
         x = (canvas.width - w) / 2
-        y = qr_img.height + int(label_height * 0.15) + i * int(font_size * 1.3)
-        draw.text((x, y), text, fill="black", font=font)
+        draw.text((x, y), line, fill="black", font=font)
+        y += line_height
+
+    y += int(qr_img.height * 0.02)
+    bbox = draw.textbbox((0, 0), type_label, font=type_font)
+    w = bbox[2] - bbox[0]
+    x = (canvas.width - w) / 2
+    draw.text((x, y), type_label, fill="black", font=type_font)
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
