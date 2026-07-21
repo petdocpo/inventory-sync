@@ -2008,20 +2008,33 @@ async def master_data_add(
     branch_name = next(
         (b["branch_name"] for b in BRANCHES if b["branch_code"] == branch_code), branch_code)
     conn = get_conn()
+    now = datetime.now().isoformat()
     try:
         conn.execute(
             """INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name""",
-            (branch_code, branch_name, item_name, item_code, datetime.now().isoformat())
+            (branch_code, branch_name, item_name, item_code, now)
         )
         conn.execute(
             """INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(branch_code, item_code) DO UPDATE SET
                  quantity=excluded.quantity, item_name=excluded.item_name, last_updated=excluded.last_updated""",
-            (branch_code, item_name, item_code, init_quantity, datetime.now().isoformat())
+            (branch_code, item_name, item_code, init_quantity, now)
         )
+        # ⚠️ RAW 재고에 0으로 자동 생성 (이미 있으면 건드리지 않음, source='master')
+        existing_raw = conn.execute(
+            "SELECT id FROM raw_inventory WHERE branch_code=? AND item_code=? AND source='master'",
+            (branch_code, item_code)
+        ).fetchone()
+        if not existing_raw:
+            conn.execute(
+                """INSERT INTO raw_inventory
+                   (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
+                   VALUES (?, ?, ?, ?, 0, 'master', ?)""",
+                (branch_code, branch_name, item_name, item_code, now)
+            )
         conn.commit()
     except Exception:
         pass
@@ -2049,6 +2062,7 @@ async def master_data_upload(
         branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
         branch_map[b["branch_code"]] = b["branch_code"]
     conn = get_conn()
+    now = datetime.now().isoformat()
     for row in ws.iter_rows(min_row=2, values_only=True):
         if not row[0]:
             continue
@@ -2063,8 +2077,27 @@ async def master_data_upload(
                 """INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
                    VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name""",
-                (branch_code, branch_name, item_name, item_code, datetime.now().isoformat())
+                (branch_code, branch_name, item_name, item_code, now)
             )
+            # ⚠️ inventory에도 없으면 0으로 생성 (기존 코드에 누락돼 있던 부분 보강)
+            conn.execute(
+                """INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
+                   VALUES (?, ?, ?, 0, ?)
+                   ON CONFLICT(branch_code, item_code) DO NOTHING""",
+                (branch_code, item_name, item_code, now)
+            )
+            # ⚠️ RAW 재고에 0으로 자동 생성 (이미 있으면 건드리지 않음, source='master')
+            existing_raw = conn.execute(
+                "SELECT id FROM raw_inventory WHERE branch_code=? AND item_code=? AND source='master'",
+                (branch_code, item_code)
+            ).fetchone()
+            if not existing_raw:
+                conn.execute(
+                    """INSERT INTO raw_inventory
+                       (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
+                       VALUES (?, ?, ?, ?, 0, 'master', ?)""",
+                    (branch_code, branch_name, item_name, item_code, now)
+                )
         except Exception:
             continue
     conn.commit()
