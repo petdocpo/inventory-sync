@@ -3244,8 +3244,11 @@ async def qr_init_upload_ajax(
             branch_name = str(row[0]).strip()
             item_name = str(row[1]).strip() if row[1] else ""
             item_code = str(row[2]).strip() if row[2] else ""
+            item_code = str(row[2]).strip() if row[2] else ""
             if not item_code:
-                item_code = f"미지정_{branch_name}_{item_name}"[:50]
+                import hashlib
+                name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
+                item_code = f"미지정_{name_hash}"
             init_qty = int(float(str(row[3]))) if row[3] is not None else 0
             branch_code = (branch_map.get(branch_name)
                            or branch_map.get(branch_name.replace(" ", ""))
@@ -3309,8 +3312,11 @@ async def qr_init_upload(
             branch_name = str(row[0]).strip()
             item_name = str(row[1]).strip() if row[1] else ""
             item_code = str(row[2]).strip() if row[2] else ""
+            item_code = str(row[2]).strip() if row[2] else ""
             if not item_code:
-                item_code = f"미지정_{branch_name}_{item_name}"[:50]
+                import hashlib
+                name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
+                item_code = f"미지정_{name_hash}"
             init_qty = int(float(str(row[3]))) if row[3] is not None else 0
             branch_code = (branch_map.get(branch_name)
                            or branch_map.get(branch_name.replace(" ", ""))
