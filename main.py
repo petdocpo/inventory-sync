@@ -1941,20 +1941,18 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
 
     branch_options_html = '<option value="">전체 지점</option>'
     for b in branches:
-        sel = 'selected' if branch == b[0] else ''
-        branch_options_html += f'<option value="{b[0]}" {sel}>{b[1]}</option>'
+        sel = 'selected' if branch == b["branch_code"] else ''
+        branch_options_html += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
 
     rows_html = ""
-    if not rows:
-        rows_html = '<tr><td colspan="11" style="text-align:center;padding:20px;color:#888;">평가 데이터 없음</td></tr>'
     for r in rows:
         rows_html += f"""
         <tr>
-            <td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td>
-            <td>{r[3]}점</td><td>{r[4]}</td>
-            <td>{r[5]}점</td><td>{r[6]}</td>
-            <td>{r[7]}점</td><td><b>{r[8]}</b></td>
-            <td>{r[9]}</td><td>{r[10]}</td>
+            <td>{r['branch_name']}</td><td>{r['vendor_name']}</td><td>{r['eval_date']}</td>
+            <td>{r['quality_score']}점</td><td>{r['quality_comment']}</td>
+            <td>{r['attitude_score']}점</td><td>{r['attitude_comment']}</td>
+            <td>{r['speed_score']}점</td><td><b>{r['total_score']}</b></td>
+            <td>{r['evaluated_by']}</td><td>{r['created_at']}</td>
         </tr>
         """
 
@@ -2024,9 +2022,9 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None)):
     for i, r in enumerate(vendor_rows, start=1):
         vendor_rows_html += f"""
         <tr>
-            <td>{i}</td><td>{r[0]}</td><td>{r[1]}건</td>
-            <td>{r[2]}</td><td>{r[3]}</td><td>{r[4]}</td>
-            <td><b>{r[5]}</b></td>
+            <td>{i}</td><td>{r['vendor_name']}</td><td>{r['cnt']}건</td>
+            <td>{r['avg_quality']}</td><td>{r['avg_attitude']}</td><td>{r['avg_speed']}</td>
+            <td><b>{r['avg_total']}</b></td>
         </tr>
         """
 
@@ -2036,9 +2034,9 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None)):
     for r in branch_rows:
         branch_rows_html += f"""
         <tr>
-            <td>{r[0]}</td><td>{r[1]}건</td>
-            <td>{r[2]}</td><td>{r[3]}</td><td>{r[4]}</td>
-            <td><b>{r[5]}</b></td>
+            <td>{r['branch_name']}</td><td>{r['cnt']}건</td>
+            <td>{r['avg_quality']}</td><td>{r['avg_attitude']}</td><td>{r['avg_speed']}</td>
+            <td><b>{r['avg_total']}</b></td>
         </tr>
         """
 
