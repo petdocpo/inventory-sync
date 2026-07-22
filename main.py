@@ -2734,13 +2734,6 @@ async def _process_raw_upload_master(file: UploadFile):
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
 
-            # ⚠️ 품번 없는 상품(미지정_): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
-            if item_code.startswith("미지정_"):
-                conn.execute("""
-                    UPDATE inventory SET quantity=?, last_updated=?
-                    WHERE branch_code=? AND item_code=?
-                """, (raw_quantity, now, branch_code, item_code))
-
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
                 debug_hq_log.append(f"{item_name}({item_code}): 증가={add_h}, 조정={add_q}, 합계={hq_total}")
@@ -2909,13 +2902,6 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                     VALUES (?, ?, ?, 0, ?)
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
-
-            # ⚠️ 품번 없는 상품(미지정_): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
-            if item_code.startswith("미지정_"):
-                conn.execute("""
-                    UPDATE inventory SET quantity=?, last_updated=?
-                    WHERE branch_code=? AND item_code=?
-                """, (raw_quantity, now, branch_code, item_code))
 
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
