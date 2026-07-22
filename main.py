@@ -147,9 +147,9 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     # ⚠️ 모바일 전용 테이블 글씨 축소 — f-string 중괄호 충돌 방지를 위해 별도 문자열로 조립
     mobile_table_css = (
         "@media (max-width: 480px) {"
-        "table { table-layout: auto; min-width: 700px; }"
-        "th { font-size: 11px; padding: 5px 4px; resize: none; min-width: 70px; }"
-        "td { font-size: 11px; padding: 5px 4px; }"
+        "table { table-layout: auto; min-width: 560px; }"
+        "th { font-size: 8px; padding: 3px 2px; resize: none; min-width: 48px; }"
+        "td { font-size: 8px; padding: 3px 2px; }"
         "}"
     )
     branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")    
@@ -1679,6 +1679,331 @@ async def scan_log_page(
     """
     return HTMLResponse(content=render_page(content, user, "scanlog"))
 
+@app.get("/vendor-eval", response_class=HTMLResponse)
+async def vendor_eval_page(request: Request):
+    role = request.session.get("role")
+    branch_code = request.session.get("branch_code")
+    branch_name = request.session.get("branch_name")
+
+    if not role:
+        return RedirectResponse(url="/login", status_code=302)
+    if role == "master":
+        return RedirectResponse(url="/master/vendor-eval", status_code=302)
+
+    quality_options = [
+        {"score": 1, "label": "불량", "desc": "사용 불가"},
+        {"score": 2, "label": "미흡", "desc": "포장 가능 등 기존 제품 품질 사전 이슈"},
+        {"score": 3, "label": "보통", "desc": "불편/마감 관련 사용성 저해 원인"},
+        {"score": 4, "label": "일반", "desc": "일반적인 품질"},
+        {"score": 5, "label": "우수", "desc": "제공 대비 품질 우수"},
+    ]
+    attitude_options = [
+        {"score": 1, "label": "불가", "desc": "소통 불가"},
+        {"score": 2, "label": "소극", "desc": "요청 이행 강요/합리적 요청 수행 거부"},
+        {"score": 3, "label": "보통", "desc": "일반적인 대응"},
+        {"score": 4, "label": "원활", "desc": "요청 사항 경청 및 빠른 대처"},
+        {"score": 5, "label": "우수", "desc": "대응 상시 선제/즉시 대처"},
+    ]
+    speed_options = [
+        {"score": 1, "label": "+6일 이상", "desc": ""},
+        {"score": 2, "label": "+4~5일 내", "desc": ""},
+        {"score": 3, "label": "+3~4일 내", "desc": ""},
+        {"score": 4, "label": "+2일 내", "desc": ""},
+        {"score": 5, "label": "+1일 내", "desc": ""},
+    ]
+
+    quality_js = json.dumps(quality_options, ensure_ascii=False)
+    attitude_js = json.dumps(attitude_options, ensure_ascii=False)
+    speed_js = json.dumps(speed_options, ensure_ascii=False)
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>거래처 평가</title>
+        <style>
+            body {{ font-family: 'Malgun Gothic', sans-serif; background:#f5f5f5; margin:0; padding:16px; }}
+            .card {{ background:#fff; border-radius:12px; padding:20px; max-width:520px; margin:0 auto; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
+            h2 {{ font-size:18px; margin-bottom:4px; }}
+            .step-indicator {{ color:#888; font-size:13px; margin-bottom:16px; }}
+            .field {{ margin-bottom:14px; }}
+            label {{ display:block; font-weight:bold; margin-bottom:6px; font-size:14px; }}
+            input[type=text], input[type=date] {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; }}
+            .option {{ border:1px solid #ddd; border-radius:8px; padding:10px; margin-bottom:8px; cursor:pointer; }}
+            .option.selected {{ border-color:#2563eb; background:#eff6ff; }}
+            .option .label {{ font-weight:bold; font-size:14px; }}
+            .option .desc {{ font-size:12px; color:#888; margin-top:2px; }}
+            textarea {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; min-height:70px; margin-top:8px; display:none; }}
+            .btn-row {{ display:flex; justify-content:space-between; margin-top:16px; }}
+            button {{ padding:10px 20px; border:none; border-radius:6px; font-size:14px; cursor:pointer; }}
+            .btn-next {{ background:#2563eb; color:#fff; margin-left:auto; }}
+            .btn-prev {{ background:#eee; color:#333; }}
+            .btn-next:disabled {{ background:#ccc; cursor:not-allowed; }}
+            .step {{ display:none; }}
+            .step.active {{ display:block; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h2>거래처 평가</h2>
+            <div class="step-indicator" id="stepIndicator">기본 정보</div>
+
+            <div class="step active" id="step0">
+                <div class="field">
+                    <label>거래처명</label>
+                    <input type="text" id="vendorName" placeholder="거래처명 입력">
+                </div>
+                <div class="field">
+                    <label>평가일</label>
+                    <input type="date" id="evalDate">
+                </div>
+                <div class="btn-row">
+                    <button class="btn-next" onclick="goStep(1)">다음</button>
+                </div>
+            </div>
+
+            <div class="step" id="step1">
+                <div class="field">
+                    <label>1. 제품 품질(마감 등)</label>
+                    <div id="qualityOptions"></div>
+                    <textarea id="qualityComment" placeholder="사유를 입력하세요 (필수)"></textarea>
+                </div>
+                <div class="btn-row">
+                    <button class="btn-prev" onclick="goStep(0)">이전</button>
+                    <button class="btn-next" id="nextBtn1" onclick="goStep(2)" disabled>다음</button>
+                </div>
+            </div>
+
+            <div class="step" id="step2">
+                <div class="field">
+                    <label>2. 이슈/클레임 대응 태도</label>
+                    <div id="attitudeOptions"></div>
+                    <textarea id="attitudeComment" placeholder="사유를 입력하세요 (필수)"></textarea>
+                </div>
+                <div class="btn-row">
+                    <button class="btn-prev" onclick="goStep(1)">이전</button>
+                    <button class="btn-next" id="nextBtn2" onclick="goStep(3)" disabled>다음</button>
+                </div>
+            </div>
+
+            <div class="step" id="step3">
+                <div class="field">
+                    <label>3. 이슈/클레임 대응 속도</label>
+                    <div id="speedOptions"></div>
+                </div>
+                <div class="btn-row">
+                    <button class="btn-prev" onclick="goStep(2)">이전</button>
+                    <button class="btn-next" id="submitBtn" onclick="submitEval()" disabled>제출</button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const qualityOptions = {quality_js};
+            const attitudeOptions = {attitude_js};
+            const speedOptions = {speed_js};
+
+            let selected = {{ quality: null, attitude: null, speed: null }};
+
+            function renderOptions(containerId, options, key, hasComment) {{
+                const container = document.getElementById(containerId);
+                container.innerHTML = '';
+                options.forEach(opt => {{
+                    const div = document.createElement('div');
+                    div.className = 'option';
+                    div.innerHTML = '<div class="label">' + opt.label + '</div>' +
+                        (opt.desc ? '<div class="desc">' + opt.desc + '</div>' : '');
+                    div.onclick = () => {{
+                        selected[key] = opt.score;
+                        document.querySelectorAll('#' + containerId + ' .option').forEach(o => o.classList.remove('selected'));
+                        div.classList.add('selected');
+                        if (hasComment) {{
+                            const commentEl = document.getElementById(key + 'Comment');
+                            commentEl.style.display = 'block';
+                        }}
+                        checkStepValid(key);
+                    }};
+                    container.appendChild(div);
+                }});
+            }}
+
+            function checkStepValid(key) {{
+                if (key === 'quality') {{
+                    const comment = document.getElementById('qualityComment').value.trim();
+                    document.getElementById('nextBtn1').disabled = !(selected.quality && comment);
+                }} else if (key === 'attitude') {{
+                    const comment = document.getElementById('attitudeComment').value.trim();
+                    document.getElementById('nextBtn2').disabled = !(selected.attitude && comment);
+                }} else if (key === 'speed') {{
+                    document.getElementById('submitBtn').disabled = !selected.speed;
+                }}
+            }}
+
+            document.getElementById('qualityComment').addEventListener('input', () => checkStepValid('quality'));
+            document.getElementById('attitudeComment').addEventListener('input', () => checkStepValid('attitude'));
+
+            renderOptions('qualityOptions', qualityOptions, 'quality', true);
+            renderOptions('attitudeOptions', attitudeOptions, 'attitude', true);
+            renderOptions('speedOptions', speedOptions, 'speed', false);
+
+            const stepNames = ['기본 정보', '1/3 제품 품질', '2/3 대응 태도', '3/3 대응 속도'];
+            function goStep(n) {{
+                if (n === 1 && !document.getElementById('vendorName').value.trim()) {{
+                    alert('거래처명을 입력하세요.');
+                    return;
+                }}
+                document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+                document.getElementById('step' + n).classList.add('active');
+                document.getElementById('stepIndicator').innerText = stepNames[n];
+            }}
+
+            async function submitEval() {{
+                const payload = {{
+                    vendor_name: document.getElementById('vendorName').value.trim(),
+                    eval_date: document.getElementById('evalDate').value,
+                    quality_score: selected.quality,
+                    quality_comment: document.getElementById('qualityComment').value.trim(),
+                    attitude_score: selected.attitude,
+                    attitude_comment: document.getElementById('attitudeComment').value.trim(),
+                    speed_score: selected.speed
+                }};
+                const res = await fetch('/vendor-eval/submit', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify(payload)
+                }});
+                if (res.ok) {{
+                    alert('평가가 등록되었습니다.');
+                    window.location.href = '/vendor-eval';
+                }} else {{
+                    const err = await res.json();
+                    alert('오류: ' + (err.detail || '등록 실패'));
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@app.post("/vendor-eval/submit")
+async def vendor_eval_submit(request: Request):
+    role = request.session.get("role")
+    branch_code = request.session.get("branch_code")
+    branch_name = request.session.get("branch_name")
+
+    if not role or role == "master":
+        return JSONResponse(status_code=403, content={"detail": "지점 계정만 등록 가능합니다."})
+
+    data = await request.json()
+    vendor_name = data.get("vendor_name", "").strip()
+    eval_date = data.get("eval_date") or None
+    quality_score = data.get("quality_score")
+    quality_comment = data.get("quality_comment", "").strip()
+    attitude_score = data.get("attitude_score")
+    attitude_comment = data.get("attitude_comment", "").strip()
+    speed_score = data.get("speed_score")
+
+    if not vendor_name or not quality_score or not quality_comment or not attitude_score or not attitude_comment or not speed_score:
+        return JSONResponse(status_code=400, content={"detail": "필수 항목이 누락되었습니다."})
+
+    total_score = round((quality_score + attitude_score + speed_score) / 3, 1)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO vendor_evaluation
+        (branch_code, branch_name, vendor_name, eval_date, quality_score, quality_comment,
+         attitude_score, attitude_comment, speed_score, total_score, evaluated_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (branch_code, branch_name, vendor_name, eval_date, quality_score, quality_comment,
+          attitude_score, attitude_comment, speed_score, total_score, request.session.get("username", branch_code)))
+    conn.commit()
+    conn.close()
+
+    return JSONResponse(content={"status": "ok"})
+
+@app.get("/master/vendor-eval", response_class=HTMLResponse)
+async def master_vendor_eval_page(request: Request, branch: str = None):
+    role = request.session.get("role")
+    if role != "master":
+        return RedirectResponse(url="/login", status_code=302)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if branch:
+        cur.execute("SELECT DISTINCT branch_code, branch_name FROM vendor_evaluation ORDER BY branch_name")
+        branches = cur.fetchall()
+        cur.execute("""
+            SELECT branch_name, vendor_name, eval_date, quality_score, quality_comment,
+                   attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
+            FROM vendor_evaluation WHERE branch_code = ? ORDER BY created_at DESC
+        """, (branch,))
+    else:
+        cur.execute("SELECT DISTINCT branch_code, branch_name FROM vendor_evaluation ORDER BY branch_name")
+        branches = cur.fetchall()
+        cur.execute("""
+            SELECT branch_name, vendor_name, eval_date, quality_score, quality_comment,
+                   attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
+            FROM vendor_evaluation ORDER BY created_at DESC
+        """)
+    rows = cur.fetchall()
+    conn.close()
+
+    branch_options_html = '<option value="">전체 지점</option>'
+    for b in branches:
+        sel = 'selected' if branch == b[0] else ''
+        branch_options_html += f'<option value="{b[0]}" {sel}>{b[1]}</option>'
+
+    rows_html = ""
+    for r in rows:
+        rows_html += f"""
+        <tr>
+            <td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td>
+            <td>{r[3]}점</td><td>{r[4]}</td>
+            <td>{r[5]}점</td><td>{r[6]}</td>
+            <td>{r[7]}점</td><td><b>{r[8]}</b></td>
+            <td>{r[9]}</td><td>{r[10]}</td>
+        </tr>
+        """
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <title>거래처 평가 - 마스터</title>
+        <style>
+            body {{ font-family: 'Malgun Gothic', sans-serif; padding:20px; }}
+            table {{ border-collapse:collapse; width:100%; font-size:13px; }}
+            th, td {{ border:1px solid #ddd; padding:8px; text-align:left; }}
+            th {{ background:#f5f5f5; }}
+            select {{ padding:6px; margin-bottom:16px; }}
+        </style>
+    </head>
+    <body>
+        <h2>거래처 평가 (마스터 조회)</h2>
+        <select onchange="location.href='/master/vendor-eval?branch='+this.value">
+            {branch_options_html}
+        </select>
+        <table>
+            <tr>
+                <th>지점</th><th>거래처</th><th>평가일</th>
+                <th>품질점수</th><th>품질사유</th>
+                <th>태도점수</th><th>태도사유</th>
+                <th>속도점수</th><th>총점</th>
+                <th>등록자</th><th>등록일시</th>
+            </tr>
+            {rows_html}
+        </table>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 @app.post("/scan-log/delete")
 async def scan_log_delete(
@@ -2409,6 +2734,13 @@ async def _process_raw_upload_master(file: UploadFile):
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
 
+            # ⚠️ 품번 없는 상품(미지정_): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
+            if item_code.startswith("미지정_"):
+                conn.execute("""
+                    UPDATE inventory SET quantity=?, last_updated=?
+                    WHERE branch_code=? AND item_code=?
+                """, (raw_quantity, now, branch_code, item_code))
+
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
                 debug_hq_log.append(f"{item_name}({item_code}): 증가={add_h}, 조정={add_q}, 합계={hq_total}")
@@ -2577,6 +2909,13 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                     VALUES (?, ?, ?, 0, ?)
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
+
+            # ⚠️ 품번 없는 상품(미지정_): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
+            if item_code.startswith("미지정_"):
+                conn.execute("""
+                    UPDATE inventory SET quantity=?, last_updated=?
+                    WHERE branch_code=? AND item_code=?
+                """, (raw_quantity, now, branch_code, item_code))
 
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
