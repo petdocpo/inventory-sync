@@ -4,6 +4,7 @@ FastAPI 기반 / SQLite ↔ Supabase(PostgreSQL) 겸용 / 지점별 로그인
 """
 import os
 import socket
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -1901,8 +1902,7 @@ async def vendor_eval_submit(request: Request, session_token: str = Cookie(defau
     total_score = round((quality_score + attitude_score + speed_score) / 3, 1)
 
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
+    conn.execute("""
         INSERT INTO vendor_evaluation
         (branch_code, branch_name, vendor_name, eval_date, quality_score, quality_comment,
          attitude_score, attitude_comment, speed_score, total_score, evaluated_by)
@@ -1922,24 +1922,21 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
         return RedirectResponse(url="/login", status_code=303)
 
     conn = get_conn()
-    cur = conn.cursor()
 
-    cur.execute("SELECT DISTINCT branch_code, branch_name FROM vendor_evaluation ORDER BY branch_name")
-    branches = cur.fetchall()
+    branches = conn.execute("SELECT DISTINCT branch_code, branch_name FROM vendor_evaluation ORDER BY branch_name").fetchall()
 
     if branch:
-        cur.execute("""
+        rows = conn.execute("""
             SELECT branch_name, vendor_name, eval_date, quality_score, quality_comment,
                    attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
             FROM vendor_evaluation WHERE branch_code = ? ORDER BY created_at DESC
-        """, (branch,))
+        """, (branch,)).fetchall()
     else:
-        cur.execute("""
+        rows = conn.execute("""
             SELECT branch_name, vendor_name, eval_date, quality_score, quality_comment,
                    attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
             FROM vendor_evaluation ORDER BY created_at DESC
-        """)
-    rows = cur.fetchall()
+        """).fetchall()
     conn.close()
 
     branch_options_html = '<option value="">전체 지점</option>'
@@ -2748,9 +2745,9 @@ async def _process_raw_upload_master(file: UploadFile):
                 "col_map_debug": {k: v for k, v in col_map.items()}}
 
     conn = get_conn()
-    # ── ⚠️ 핵심 수정: source='master' 전체가 아니라, 이번 엑셀에 있는 지점만 삭제 ──
+    # ── source 무관, 이번 엑셀에 있는 지점의 RAW 전체를 삭제 후 재삽입 (최신 업로드가 항상 기준) ──
     for bc in branches_in_file:
-        conn.execute("DELETE FROM raw_inventory WHERE source='master' AND branch_code=?", (bc,))
+        conn.execute("DELETE FROM raw_inventory WHERE branch_code=?", (bc,))
     old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
     old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
     # ── ⚠️ hq_bonus_log도 전체 삭제 대신 해당 지점만 삭제 ──
@@ -2782,10 +2779,11 @@ async def _process_raw_upload_master(file: UploadFile):
                 INSERT INTO raw_inventory
                   (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
                 VALUES (?, ?, ?, ?, ?, 'master', ?)
-                ON CONFLICT(branch_code, item_code, source) DO UPDATE SET
+                ON CONFLICT(branch_code, item_code) DO UPDATE SET
                   quantity=excluded.quantity,
                   item_name=excluded.item_name,
                   branch_name=excluded.branch_name,
+                  source=excluded.source,
                   uploaded_at=excluded.uploaded_at
             """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
 
@@ -2905,9 +2903,9 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
     data_start_row = header_row_idx + 1
     # ── 이전 업로드 데이터 삭제 (지점 제한 있으면 해당 지점만, 없으면 전체 - 마스터) ──
     if restrict_branch:
-        conn.execute("DELETE FROM raw_inventory WHERE branch_code=? AND source='branch'", (restrict_branch,))
+        conn.execute("DELETE FROM raw_inventory WHERE branch_code=?", (restrict_branch,))
     else:
-        conn.execute("DELETE FROM raw_inventory WHERE source='branch'")
+        conn.execute("DELETE FROM raw_inventory")
     # 이전 H/Q 반영 이력도 초기화 (재계산 기준점 리셋)
     old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
     old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
@@ -2951,10 +2949,11 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                 INSERT INTO raw_inventory
                   (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
                 VALUES (?, ?, ?, ?, ?, 'branch', ?)
-                ON CONFLICT(branch_code, item_code, source) DO UPDATE SET
+                ON CONFLICT(branch_code, item_code) DO UPDATE SET
                   quantity=excluded.quantity,
                   item_name=excluded.item_name,
                   branch_name=excluded.branch_name,
+                  source=excluded.source,
                   uploaded_at=excluded.uploaded_at
             """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
 
