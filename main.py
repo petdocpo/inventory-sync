@@ -2505,6 +2505,225 @@ async def vendor_master_delete(request: Request, session_token: str = Cookie(def
         conn.close()
     return RedirectResponse(url="/master/vendor-master", status_code=303)
 
+@app.get("/master/eval-criteria", response_class=HTMLResponse)
+async def eval_criteria_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    criteria_list = conn.execute("SELECT * FROM eval_criteria ORDER BY display_order").fetchall()
+    criteria_html = ""
+    for c in criteria_list:
+        options = conn.execute(
+            "SELECT * FROM eval_criteria_option WHERE criteria_id=? ORDER BY score", (c["id"],)
+        ).fetchall()
+        opt_rows = ""
+        for o in options:
+            comment_badge = '<span class="badge-red">사유필수</span>' if o["requires_comment"] else '<span class="badge-green">사유없음</span>'
+            safe_label = o['label'].replace("'", "")
+            safe_desc = (o['description'] or '').replace("'", "")
+            opt_rows += f"""
+            <tr>
+              <td>{o['score']}</td><td>{o['label']}</td><td style="font-size:12px;color:#888;">{o['description'] or '-'}</td>
+              <td>{comment_badge}</td>
+              <td><button class="btn" style="font-size:11px;padding:4px 8px;" onclick="editOption({o['id']}, '{safe_label}', '{safe_desc}', {str(o['requires_comment']).lower()})">수정</button></td>
+            </tr>
+            """
+        active_badge = '<span class="badge-green">사용중</span>' if c["active"] else '<span class="badge-red">비활성</span>'
+        criteria_html += f"""
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <div>
+              <b>{c['display_order']}. {c['label']}</b> {active_badge}
+              <span style="color:#888;font-size:12px;">(최대 {c['max_score']}단계)</span>
+            </div>
+            <div style="display:flex;gap:6px;">
+              <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="toggleActive({c['id']}, {str(not c['active']).lower()})">{'비활성화' if c['active'] else '활성화'}</button>
+              <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="addOption({c['id']})">단계 추가</button>
+              <button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteCriteria({c['id']})">문항 삭제</button>
+            </div>
+          </div>
+          <table>
+            <thead><tr><th>점수</th><th>라벨</th><th>설명</th><th>사유</th><th></th></tr></thead>
+            <tbody>{opt_rows}</tbody>
+          </table>
+        </div>
+        """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📝 거래처평가 문항 관리</h2>
+    <div class="card" style="background:#FFF7ED;border:1px solid #FCD34D;">
+      <p style="font-size:13px;color:#92400E;">⚠️ 여기서 만든 문항은 새로 작성되는 평가부터 적용됩니다. 기존 평가 기록(레거시)은 영향받지 않습니다.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-bottom:8px;">새 문항 추가</h3>
+      <div style="display:flex;gap:8px;">
+        <input type="text" id="newCriteriaLabel" placeholder="문항명 (예: 배송 포장 상태)" style="flex:1;">
+        <button class="btn" type="button" onclick="addCriteria()">추가</button>
+      </div>
+      <div id="addCriteriaResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+    {criteria_html}
+
+    <script>
+      async function addCriteria() {{
+        const input = document.getElementById('newCriteriaLabel');
+        const label = input.value.trim();
+        if (!label) {{ alert('문항명을 입력하세요.'); return; }}
+        const res = await fetch('/master/eval-criteria/add', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ label: label }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('addCriteriaResult').innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+
+      async function deleteCriteria(id) {{
+        if (!confirm('이 문항과 모든 단계 옵션을 삭제합니다. 계속할까요?')) return;
+        const res = await fetch('/master/eval-criteria/' + id + '/delete', {{ method: 'POST' }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('삭제 실패'); }}
+      }}
+
+      async function toggleActive(id, newActive) {{
+        const res = await fetch('/master/eval-criteria/' + id + '/toggle', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ active: newActive }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('변경 실패'); }}
+      }}
+
+      async function addOption(criteriaId) {{
+        const label = prompt('새 단계의 라벨을 입력하세요 (예: 매우 우수)');
+        if (!label) return;
+        const requiresComment = confirm('이 단계 선택 시 사유 입력을 필수로 할까요? (확인=필수, 취소=선택)');
+        const res = await fetch('/master/eval-criteria/' + criteriaId + '/option/add', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ label: label, description: '', requires_comment: requiresComment }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '추가 실패'));
+        }}
+      }}
+
+      async function editOption(optionId, currentLabel, currentDesc, currentRequires) {{
+        const label = prompt('라벨 수정:', currentLabel);
+        if (label === null) return;
+        const description = prompt('설명 수정 (선택):', currentDesc);
+        const requiresComment = confirm('이 단계 선택 시 사유 입력을 필수로 할까요? (확인=필수, 취소=선택)');
+        const res = await fetch('/master/eval-criteria/option/' + optionId + '/edit', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ label: label, description: description || '', requires_comment: requiresComment }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('수정 실패'); }}
+      }}
+    </script>
+    """
+    conn.close()
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/eval-criteria/add")
+async def eval_criteria_add(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    label = data.get("label", "").strip()
+    if not label:
+        return JSONResponse(status_code=400, content={"detail": "문항명을 입력하세요."})
+
+    import re
+    criteria_key = re.sub(r'[^a-z0-9_]', '', label.lower().replace(' ', '_'))[:40] or f"criteria_{int(datetime.now().timestamp())}"
+
+    conn = get_conn()
+    max_order = conn.execute("SELECT COALESCE(MAX(display_order), 0) as m FROM eval_criteria").fetchone()["m"]
+    conn.execute(
+        "INSERT INTO eval_criteria (criteria_key, label, display_order, active, max_score) VALUES (?, ?, ?, TRUE, 5)",
+        (f"{criteria_key}_{int(datetime.now().timestamp())}", label, max_order + 1)
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/eval-criteria/{criteria_id}/delete")
+async def eval_criteria_delete(criteria_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    conn = get_conn()
+    conn.execute("DELETE FROM eval_criteria WHERE id=?", (criteria_id,))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/eval-criteria/{criteria_id}/toggle")
+async def eval_criteria_toggle(criteria_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    active = data.get("active", True)
+    conn = get_conn()
+    conn.execute("UPDATE eval_criteria SET active=? WHERE id=?", (active, criteria_id))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/eval-criteria/{criteria_id}/option/add")
+async def eval_criteria_option_add(criteria_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    label = data.get("label", "").strip()
+    description = data.get("description", "").strip()
+    requires_comment = data.get("requires_comment", False)
+    if not label:
+        return JSONResponse(status_code=400, content={"detail": "라벨을 입력하세요."})
+
+    conn = get_conn()
+    max_score = conn.execute(
+        "SELECT COALESCE(MAX(score), 0) as m FROM eval_criteria_option WHERE criteria_id=?", (criteria_id,)
+    ).fetchone()["m"]
+    new_score = max_score + 1
+    conn.execute(
+        "INSERT INTO eval_criteria_option (criteria_id, score, label, description, requires_comment) VALUES (?, ?, ?, ?, ?)",
+        (criteria_id, new_score, label, description, requires_comment)
+    )
+    conn.execute("UPDATE eval_criteria SET max_score=? WHERE id=?", (new_score, criteria_id))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/eval-criteria/option/{option_id}/edit")
+async def eval_criteria_option_edit(option_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    label = data.get("label", "").strip()
+    description = data.get("description", "").strip()
+    requires_comment = data.get("requires_comment", False)
+    if not label:
+        return JSONResponse(status_code=400, content={"detail": "라벨을 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "UPDATE eval_criteria_option SET label=?, description=?, requires_comment=? WHERE id=?",
+        (label, description, requires_comment, option_id)
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
 @app.post("/scan-log/delete")
 async def scan_log_delete(
     request: Request,
@@ -2671,6 +2890,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">🏢</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 관리</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">거래처 {vendor_count}개 등록됨</div>
+        </div>
+      </a>
+      <a href="/master/eval-criteria" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📝</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">평가 문항 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">문항 추가/삭제/수정</div>
         </div>
       </a>
     </div>
