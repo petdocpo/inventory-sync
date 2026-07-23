@@ -2013,6 +2013,273 @@ async def vendor_eval_submit(request: Request, session_token: str = Cookie(defau
 
     return JSONResponse(content={"status": "ok"})
 
+@app.get("/vendor-eval/history", response_class=HTMLResponse)
+async def vendor_eval_history(session_token: str = Cookie(default=None), eval_month: str = "", edit: str = ""):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    branch_code = user["branch_code"]
+    if not eval_month:
+        return RedirectResponse(url="/vendor-eval", status_code=303)
+
+    conn = get_conn()
+    evaluations = conn.execute("""
+        SELECT * FROM vendor_evaluation_v2
+        WHERE branch_code = ? AND eval_month = ?
+        ORDER BY vendor_name
+    """, (branch_code, eval_month)).fetchall()
+
+    rows_html = ""
+    for ev in evaluations:
+        answers = conn.execute("""
+            SELECT a.score, a.comment, c.label
+            FROM vendor_evaluation_answer a
+            JOIN eval_criteria c ON c.id = a.criteria_id
+            WHERE a.evaluation_id = ?
+            ORDER BY c.display_order
+        """, (ev["id"],)).fetchall()
+        answers_html = "<br>".join(
+            f"<b>{a['label']}</b>: {a['score']}점" + (f" ({a['comment']})" if a['comment'] else "")
+            for a in answers
+        )
+        edit_btn = f'<a href="/vendor-eval/edit/{ev["id"]}" class="btn" style="text-decoration:none;font-size:12px;padding:6px 10px;">수정</a>' if edit else ""
+        rows_html += f"""
+        <tr>
+            <td>{ev['vendor_name']}</td>
+            <td style="font-size:12px;">{answers_html}</td>
+            <td><b>{ev['total_score']}</b></td>
+            <td>{edit_btn}</td>
+        </tr>
+        """
+    conn.close()
+
+    if not evaluations:
+        rows_html = '<tr><td colspan="4" style="text-align:center;padding:20px;color:#888;">제출된 평가 없음</td></tr>'
+
+    content = f"""
+    <h2 style="margin-bottom:8px;">📋 {eval_month} 제출 내역</h2>
+    <div class="card">
+      <table>
+        <thead><tr><th>거래처</th><th>답변 내역</th><th>총점</th><th></th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    <a href="/vendor-eval" style="display:inline-block;margin-top:8px;color:#2563eb;font-size:13px;text-decoration:none;">← 돌아가기</a>
+    """
+    return HTMLResponse(content=render_page(content, user, "vendor-eval"))
+
+
+@app.get("/vendor-eval/edit/{evaluation_id}", response_class=HTMLResponse)
+async def vendor_eval_edit_page(evaluation_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    ev = conn.execute("SELECT * FROM vendor_evaluation_v2 WHERE id=?", (evaluation_id,)).fetchone()
+    if not ev or ev["branch_code"] != user["branch_code"]:
+        conn.close()
+        return RedirectResponse(url="/vendor-eval", status_code=303)
+
+    criteria_list = conn.execute("SELECT * FROM eval_criteria WHERE active = TRUE ORDER BY display_order").fetchall()
+    criteria_data = []
+    for c in criteria_list:
+        options = conn.execute(
+            "SELECT * FROM eval_criteria_option WHERE criteria_id=? ORDER BY score", (c["id"],)
+        ).fetchall()
+        existing_answer = conn.execute(
+            "SELECT score, comment FROM vendor_evaluation_answer WHERE evaluation_id=? AND criteria_id=?",
+            (evaluation_id, c["id"])
+        ).fetchone()
+        criteria_data.append({
+            "id": c["id"], "key": c["criteria_key"], "label": c["label"], "max_score": c["max_score"],
+            "options": [{"score": o["score"], "label": o["label"], "desc": o["description"] or "",
+                         "requires_comment": bool(o["requires_comment"])} for o in options],
+            "existing_score": existing_answer["score"] if existing_answer else None,
+            "existing_comment": existing_answer["comment"] if existing_answer else ""
+        })
+    conn.close()
+
+    criteria_js = json.dumps(criteria_data, ensure_ascii=False)
+    vendor_name_js = json.dumps(ev["vendor_name"], ensure_ascii=False)
+    eval_month_js = json.dumps(ev["eval_month"], ensure_ascii=False)
+
+    step_divs = ""
+    n_criteria = len(criteria_data)
+    for idx, c in enumerate(criteria_data):
+        step_num = idx + 1
+        is_first = (step_num == 1)
+        is_last = (step_num == n_criteria)
+        active_cls = "active" if is_first else ""
+        prev_btn = '' if is_first else f'<button class="ve-btn-prev" onclick="goStep({step_num - 1})">이전</button>'
+        next_action = "submitEdit()" if is_last else f"goStep({step_num + 1})"
+        next_label = "저장" if is_last else "다음"
+        next_id = "submitBtn" if is_last else f"nextBtn{step_num}"
+        step_divs += f"""
+        <div class="ve-step {active_cls}" id="step{step_num}">
+            <div class="ve-field">
+                <label>{step_num}. {c['label']}</label>
+                <div id="options_{c['key']}"></div>
+                <textarea id="comment_{c['key']}" placeholder="사유를 입력하세요 (필수)"></textarea>
+            </div>
+            <div class="ve-btn-row">
+                {prev_btn}
+                <button class="ve-btn-next" id="{next_id}" onclick="{next_action}">{next_label}</button>
+            </div>
+        </div>
+        """
+
+    step_names_js = json.dumps([f"{i+1}/{n_criteria} {c['label']}" for i, c in enumerate(criteria_data)], ensure_ascii=False)
+
+    content = f"""
+    <style>
+        .ve-card {{ background:#fff; border-radius:12px; padding:20px; max-width:520px; margin:0 auto; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
+        .ve-card h2 {{ font-size:18px; margin-bottom:4px; }}
+        .ve-step-indicator {{ color:#888; font-size:13px; margin-bottom:16px; }}
+        .ve-field {{ margin-bottom:14px; }}
+        .ve-field label {{ display:block; font-weight:bold; margin-bottom:6px; font-size:14px; }}
+        .ve-option {{ border:1px solid #ddd; border-radius:8px; padding:10px; margin-bottom:8px; cursor:pointer; }}
+        .ve-option.selected {{ border-color:#2563eb; background:#eff6ff; }}
+        .ve-option .ve-label {{ font-weight:bold; font-size:14px; }}
+        .ve-option .ve-desc {{ font-size:12px; color:#888; margin-top:2px; }}
+        .ve-card textarea {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; min-height:70px; margin-top:8px; display:none; }}
+        .ve-btn-row {{ display:flex; justify-content:space-between; margin-top:16px; }}
+        .ve-card button {{ padding:10px 20px; border:none; border-radius:6px; font-size:14px; cursor:pointer; }}
+        .ve-btn-next {{ background:#2563eb; color:#fff; margin-left:auto; }}
+        .ve-btn-prev {{ background:#eee; color:#333; }}
+        .ve-step {{ display:none; }}
+        .ve-step.active {{ display:block; }}
+    </style>
+    <div class="ve-card">
+        <h2>거래처 평가 수정 — {ev['vendor_name']}</h2>
+        <div class="ve-step-indicator" id="stepIndicator">{'1/' + str(n_criteria) + ' ' + criteria_data[0]['label'] if criteria_data else ''}</div>
+        {step_divs}
+    </div>
+
+    <script>
+        const criteriaData = {criteria_js};
+        const vendorName = {vendor_name_js};
+        const evalMonth = {eval_month_js};
+        const evaluationId = {evaluation_id};
+        const stepNames = {step_names_js};
+
+        let selected = {{}};
+        criteriaData.forEach(c => selected[c.key] = c.existing_score);
+
+        function renderOptions(criteria) {{
+            const container = document.getElementById('options_' + criteria.key);
+            container.innerHTML = '';
+            criteria.options.forEach(opt => {{
+                const div = document.createElement('div');
+                div.className = 've-option' + (opt.score === criteria.existing_score ? ' selected' : '');
+                div.innerHTML = '<div class="ve-label">' + opt.label + '</div>' +
+                    (opt.desc ? '<div class="ve-desc">' + opt.desc + '</div>' : '');
+                div.onclick = () => {{
+                    selected[criteria.key] = opt.score;
+                    document.querySelectorAll('#options_' + criteria.key + ' .ve-option').forEach(o => o.classList.remove('selected'));
+                    div.classList.add('selected');
+                    const commentEl = document.getElementById('comment_' + criteria.key);
+                    if (opt.requires_comment) {{
+                        commentEl.style.display = 'block';
+                    }} else {{
+                        commentEl.style.display = 'none';
+                    }}
+                }};
+                container.appendChild(div);
+            }});
+        }}
+
+        criteriaData.forEach(c => {{
+            renderOptions(c);
+            const commentEl = document.getElementById('comment_' + c.key);
+            commentEl.value = c.existing_comment || '';
+            const curOpt = c.options.find(o => o.score === c.existing_score);
+            if (curOpt && curOpt.requires_comment) {{ commentEl.style.display = 'block'; }}
+        }});
+
+        function goStep(n) {{
+            document.querySelectorAll('.ve-step').forEach(s => s.classList.remove('active'));
+            document.getElementById('step' + n).classList.add('active');
+            document.getElementById('stepIndicator').innerText = stepNames[n - 1];
+        }}
+
+        async function submitEdit() {{
+            const answers = criteriaData.map(c => ({{
+                criteria_id: c.id,
+                score: selected[c.key],
+                comment: document.getElementById('comment_' + c.key).value.trim(),
+                max_score: c.max_score
+            }}));
+            const payload = {{ vendor_name: vendorName, eval_month: evalMonth, answers: answers }};
+            const res = await fetch('/vendor-eval/edit/' + evaluationId + '/submit', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify(payload)
+            }});
+            if (res.ok) {{
+                alert('수정되었습니다.');
+                window.location.href = '/vendor-eval/history?eval_month=' + encodeURIComponent(evalMonth) + '&edit=1';
+            }} else {{
+                const err = await res.json();
+                alert('오류: ' + (err.detail || '수정 실패'));
+            }}
+        }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "vendor-eval"))
+
+
+@app.post("/vendor-eval/edit/{evaluation_id}/submit")
+async def vendor_eval_edit_submit(evaluation_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    ev = conn.execute("SELECT * FROM vendor_evaluation_v2 WHERE id=?", (evaluation_id,)).fetchone()
+    if not ev or ev["branch_code"] != user["branch_code"]:
+        conn.close()
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    answers = data.get("answers", [])
+
+    normalized_scores = []
+    for a in answers:
+        score = a.get("score")
+        max_score = a.get("max_score", 5)
+        criteria_id = a.get("criteria_id")
+        comment = a.get("comment", "").strip()
+
+        if not score or not criteria_id:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "일부 문항이 답변되지 않았습니다."})
+
+        opt = conn.execute(
+            "SELECT requires_comment FROM eval_criteria_option WHERE criteria_id=? AND score=?",
+            (criteria_id, score)
+        ).fetchone()
+        if opt and opt["requires_comment"] and not comment:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "사유가 필요한 문항에 사유가 누락되었습니다."})
+
+        normalized_scores.append((score / max_score) * 5)
+
+    total_score = round(sum(normalized_scores) / len(normalized_scores), 1) if normalized_scores else 0
+
+    conn.execute("DELETE FROM vendor_evaluation_answer WHERE evaluation_id=?", (evaluation_id,))
+    for a in answers:
+        conn.execute(
+            "INSERT INTO vendor_evaluation_answer (evaluation_id, criteria_id, score, comment) VALUES (?, ?, ?, ?)",
+            (evaluation_id, a.get("criteria_id"), a.get("score"), a.get("comment", "").strip())
+        )
+    conn.execute("UPDATE vendor_evaluation_v2 SET total_score=? WHERE id=?", (total_score, evaluation_id))
+    conn.commit()
+    conn.close()
+
+    return JSONResponse(content={"status": "ok"})
+
 
 @app.get("/master/vendor-eval", response_class=HTMLResponse)
 async def master_vendor_eval_page(session_token: str = Cookie(default=None), branch: str = "", month: str = ""):
