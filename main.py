@@ -2281,6 +2281,141 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
     """
     return HTMLResponse(content=render_page(content, user, "vendor-eval"))
 
+@app.get("/master/vendor-master", response_class=HTMLResponse)
+async def vendor_master_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    vendors = conn.execute("SELECT * FROM vendor_master ORDER BY vendor_name").fetchall()
+    conn.close()
+
+    rows_html = ""
+    if not vendors:
+        rows_html = '<tr><td colspan="3" style="text-align:center;padding:20px;color:#888;">등록된 거래처 없음</td></tr>'
+    for v in vendors:
+        rows_html += f"""
+        <tr>
+          <td style="text-align:center;">
+            <input type="checkbox" name="selected_ids" value="{v['id']}" class="vm-check" style="width:16px;height:16px;">
+          </td>
+          <td>{v['vendor_name']}</td>
+          <td>{str(v['created_at'])[:10] if v['created_at'] else '-'}</td>
+        </tr>
+        """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">🏢 거래처 관리</h2>
+    <div class="card">
+      <h3 style="margin-bottom:8px;">거래처 추가</h3>
+      <div style="display:flex;gap:8px;">
+        <input type="text" id="newVendorName" placeholder="거래처명 입력" style="flex:1;">
+        <button class="btn" type="button" onclick="addVendor()">추가</button>
+      </div>
+      <div id="addResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+    <div class="card">
+      <form method="post" action="/master/vendor-master/delete">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <span style="font-size:13px;color:#888;">{len(vendors)}개 거래처</span>
+          <div style="display:flex;gap:8px;">
+            <button type="button" class="btn" id="vmSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+            <button type="submit" class="btn btn-red" style="font-size:12px;padding:6px 12px;"
+                    onclick="return confirm('선택한 거래처를 삭제할까요? 기존 평가 기록은 유지됩니다.')">선택삭제</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr>
+            <th style="width:40px;text-align:center;"><input type="checkbox" id="vmAllCheck" style="width:16px;height:16px;"></th>
+            <th>거래처명</th><th>등록일</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      </form>
+    </div>
+    <script>
+      async function addVendor() {{
+        const input = document.getElementById('newVendorName');
+        const name = input.value.trim();
+        if (!name) {{ alert('거래처명을 입력하세요.'); return; }}
+        const res = await fetch('/master/vendor-master/add', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ vendor_name: name }})
+        }});
+        const box = document.getElementById('addResult');
+        if (res.ok) {{
+          box.style.color = '#22C55E';
+          box.innerText = '추가되었습니다.';
+          setTimeout(() => location.reload(), 800);
+        }} else {{
+          const err = await res.json();
+          box.style.color = '#EF4444';
+          box.innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+      (function() {{
+        var allCheck = document.getElementById('vmAllCheck');
+        var selectBtn = document.getElementById('vmSelectAllBtn');
+        function applyAll(checked) {{
+          document.querySelectorAll('.vm-check').forEach(function(c) {{ c.checked = checked; }});
+          if (allCheck) allCheck.checked = checked;
+        }}
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ applyAll(allCheck.checked); }}); }}
+        if (selectBtn) {{
+          selectBtn.addEventListener('click', function() {{
+            var next = !(allCheck && allCheck.checked);
+            applyAll(next);
+          }});
+        }}
+      }})();
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/vendor-master/add")
+async def vendor_master_add(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    vendor_name = data.get("vendor_name", "").strip()
+    if not vendor_name:
+        return JSONResponse(status_code=400, content={"detail": "거래처명을 입력하세요."})
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO vendor_master (vendor_name) VALUES (?) ON CONFLICT (vendor_name) DO NOTHING",
+            (vendor_name,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/vendor-master/delete")
+async def vendor_master_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    form = await request.form()
+    ids = form.getlist("selected_ids")
+    if ids:
+        conn = get_conn()
+        conn.execute(
+            f"DELETE FROM vendor_master WHERE id IN ({','.join('?' for _ in ids)})",
+            [int(i) for i in ids]
+        )
+        conn.commit()
+        conn.close()
+    return RedirectResponse(url="/master/vendor-master", status_code=303)
+
 @app.post("/scan-log/delete")
 async def scan_log_delete(
     request: Request,
@@ -2422,7 +2557,10 @@ async def master_page(session_token: str = Cookie(default=None)):
     conn = get_conn()
     raw_count = conn.execute("SELECT COUNT(*) AS cnt FROM raw_inventory").fetchone()["cnt"]
     item_count = conn.execute("SELECT COUNT(*) AS cnt FROM items").fetchone()["cnt"]
+    vendor_count = conn.execute("SELECT COUNT(*) AS cnt FROM vendor_master").fetchone()["cnt"]
     conn.close()
+
+    vendor_count = conn.execute("SELECT COUNT(*) AS cnt FROM vendor_master").fetchone()["cnt"] if conn else 0
 
     content = f"""
     <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
@@ -2439,6 +2577,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">🔄</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">QR 재고 업로드</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">엑셀로 초기 수량 업로드</div>
+        </div>
+      </a>
+      <a href="/master/vendor-master" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🏢</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">거래처 {vendor_count}개 등록됨</div>
         </div>
       </a>
     </div>
