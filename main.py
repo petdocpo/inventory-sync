@@ -2560,8 +2560,6 @@ async def master_page(session_token: str = Cookie(default=None)):
     vendor_count = conn.execute("SELECT COUNT(*) AS cnt FROM vendor_master").fetchone()["cnt"]
     conn.close()
 
-    vendor_count = conn.execute("SELECT COUNT(*) AS cnt FROM vendor_master").fetchone()["cnt"] if conn else 0
-
     content = f"""
     <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
