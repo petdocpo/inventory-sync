@@ -1991,7 +1991,7 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
         <button class="btn" type="submit">검색</button>
         <a href="/master/vendor-eval" style="padding:10px 14px;background:#eee;
            border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
-        <a href="/master/vendor-eval/summary" class="btn" style="text-decoration:none;background:#64748B;">📊 종합분석</a>
+        <a href="/master/vendor-eval/summary?{query_string}" class="btn" style="text-decoration:none;background:#64748B;">📊 종합분석</a>
         <a href="/master/vendor-eval/export?{query_string}" class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
       </form>
     </div>
