@@ -1916,7 +1916,7 @@ async def vendor_eval_submit(request: Request, session_token: str = Cookie(defau
 
 
 @app.get("/master/vendor-eval", response_class=HTMLResponse)
-async def master_vendor_eval_page(session_token: str = Cookie(default=None), branch: str = ""):
+async def master_vendor_eval_page(session_token: str = Cookie(default=None), branch: str = "", month: str = ""):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
@@ -1924,19 +1924,26 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
     conn = get_conn()
 
     branches = conn.execute("SELECT DISTINCT branch_code, branch_name FROM vendor_evaluation ORDER BY branch_name").fetchall()
+    months = conn.execute("""
+        SELECT DISTINCT TO_CHAR(eval_date, 'YYYY-MM') as ym FROM vendor_evaluation
+        WHERE eval_date IS NOT NULL ORDER BY ym DESC
+    """).fetchall()
 
+    query = """
+        SELECT id, branch_name, vendor_name, eval_date, quality_score, quality_comment,
+               attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
+        FROM vendor_evaluation WHERE 1=1
+    """
+    params = []
     if branch:
-        rows = conn.execute("""
-            SELECT branch_name, vendor_name, eval_date, quality_score, quality_comment,
-                   attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
-            FROM vendor_evaluation WHERE branch_code = ? ORDER BY created_at DESC
-        """, (branch,)).fetchall()
-    else:
-        rows = conn.execute("""
-            SELECT branch_name, vendor_name, eval_date, quality_score, quality_comment,
-                   attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
-            FROM vendor_evaluation ORDER BY created_at DESC
-        """).fetchall()
+        query += " AND branch_code = ?"
+        params.append(branch)
+    if month:
+        query += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+        params.append(month)
+    query += " ORDER BY created_at DESC"
+
+    rows = conn.execute(query, params).fetchall()
     conn.close()
 
     branch_options_html = '<option value="">전체 지점</option>'
@@ -1944,10 +1951,21 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
         sel = 'selected' if branch == b["branch_code"] else ''
         branch_options_html += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
 
+    month_options_html = '<option value="">전체 기간</option>'
+    for m in months:
+        ym = m["ym"]
+        sel = 'selected' if month == ym else ''
+        month_options_html += f'<option value="{ym}" {sel}>{ym}</option>'
+
     rows_html = ""
+    if not rows:
+        rows_html = '<tr><td colspan="12" style="text-align:center;padding:20px;color:#888;">평가 데이터 없음</td></tr>'
     for r in rows:
         rows_html += f"""
         <tr>
+            <td style="text-align:center;">
+              <input type="checkbox" name="selected_ids" value="{r['id']}" class="ve-check" style="width:16px;height:16px;">
+            </td>
             <td>{r['branch_name']}</td><td>{r['vendor_name']}</td><td>{r['eval_date']}</td>
             <td>{r['quality_score']}점</td><td>{r['quality_comment']}</td>
             <td>{r['attitude_score']}점</td><td>{r['attitude_comment']}</td>
@@ -1956,32 +1974,184 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
         </tr>
         """
 
+    query_string = f"branch={branch}&month={month}"
+
     content = f"""
     <h2 style="margin-bottom:16px;">🤝 거래처 평가 (마스터 조회)</h2>
     <div class="card">
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px;">
+      <form method="get" action="/master/vendor-eval" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
         <div>
           <label style="font-size:12px;color:#888;">지점 필터</label>
-          <select name="filter_branch" onchange="location.href='/master/vendor-eval?branch='+this.value">
-              {branch_options_html}
-          </select>
+          <select name="branch">{branch_options_html}</select>
         </div>
-        <a href="/master/vendor-eval/summary" class="btn" style="text-decoration:none;">📊 종합분석 보기</a>
-      </div>
-      <table>
-          <thead><tr>
-              <th>지점</th><th>거래처</th><th>평가일</th>
-              <th>품질점수</th><th>품질사유</th>
-              <th>태도점수</th><th>태도사유</th>
-              <th>속도점수</th><th>총점</th>
-              <th>등록자</th><th>등록일시</th>
-          </tr></thead>
-          <tbody>{rows_html}</tbody>
-      </table>
+        <div>
+          <label style="font-size:12px;color:#888;">월 필터</label>
+          <select name="month">{month_options_html}</select>
+        </div>
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/vendor-eval" style="padding:10px 14px;background:#eee;
+           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+        <a href="/master/vendor-eval/summary" class="btn" style="text-decoration:none;background:#64748B;">📊 종합분석</a>
+        <a href="/master/vendor-eval/export?{query_string}" class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
+      </form>
     </div>
+    <div class="card">
+      <form method="post" action="/master/vendor-eval/delete">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <span style="font-size:13px;color:#888;">{len(rows)}개 항목</span>
+          <div style="display:flex;gap:8px;">
+            <button type="button" class="btn" id="veSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+            <button type="submit" class="btn btn-red" style="font-size:12px;padding:6px 12px;"
+                    onclick="return confirm('선택한 평가를 삭제할까요?')">선택삭제</button>
+            <button type="button" class="btn btn-red" id="veDeleteAllBtn" style="font-size:12px;padding:6px 12px;">전체삭제</button>
+          </div>
+        </div>
+        <table>
+            <thead><tr>
+                <th style="width:40px;text-align:center;"><input type="checkbox" id="veAllCheck" style="width:16px;height:16px;"></th>
+                <th>지점</th><th>거래처</th><th>평가일</th>
+                <th>품질점수</th><th>품질사유</th>
+                <th>태도점수</th><th>태도사유</th>
+                <th>속도점수</th><th>총점</th>
+                <th>등록자</th><th>등록일시</th>
+            </tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+      </form>
+    </div>
+    <form method="post" action="/master/vendor-eval/delete-all" id="veDeleteAllForm">
+      <input type="hidden" name="branch" value="{branch}">
+      <input type="hidden" name="month" value="{month}">
+    </form>
+    <script>
+      (function() {{
+        var allCheck = document.getElementById('veAllCheck');
+        var selectBtn = document.getElementById('veSelectAllBtn');
+        var deleteAllBtn = document.getElementById('veDeleteAllBtn');
+        function applyAll(checked) {{
+          document.querySelectorAll('.ve-check').forEach(function(c) {{ c.checked = checked; }});
+          if (allCheck) allCheck.checked = checked;
+        }}
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ applyAll(allCheck.checked); }}); }}
+        if (selectBtn) {{
+          selectBtn.addEventListener('click', function() {{
+            var next = !(allCheck && allCheck.checked);
+            applyAll(next);
+          }});
+        }}
+        if (deleteAllBtn) {{
+          deleteAllBtn.addEventListener('click', function() {{
+            if (confirm('현재 필터 기준 평가 데이터를 전체 삭제합니다. 되돌릴 수 없습니다.')) {{
+              document.getElementById('veDeleteAllForm').submit();
+            }}
+          }});
+        }}
+      }})();
+    </script>
     """
     return HTMLResponse(content=render_page(content, user, "vendor-eval"))
 
+
+@app.post("/master/vendor-eval/delete")
+async def master_vendor_eval_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    form = await request.form()
+    ids = form.getlist("selected_ids")
+    if ids:
+        conn = get_conn()
+        conn.execute(
+            f"DELETE FROM vendor_evaluation WHERE id IN ({','.join('?' for _ in ids)})",
+            [int(i) for i in ids]
+        )
+        conn.commit()
+        conn.close()
+    return RedirectResponse(url="/master/vendor-eval", status_code=303)
+
+
+@app.post("/master/vendor-eval/delete-all")
+async def master_vendor_eval_delete_all(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    form = await request.form()
+    branch = form.get("branch", "")
+    month = form.get("month", "")
+
+    query = "DELETE FROM vendor_evaluation WHERE 1=1"
+    params = []
+    if branch:
+        query += " AND branch_code = ?"
+        params.append(branch)
+    if month:
+        query += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+        params.append(month)
+
+    conn = get_conn()
+    conn.execute(query, params)
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/master/vendor-eval", status_code=303)
+
+
+@app.get("/master/vendor-eval/export")
+async def master_vendor_eval_export(session_token: str = Cookie(default=None), branch: str = "", month: str = ""):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    query = """
+        SELECT branch_name, vendor_name, eval_date, quality_score, quality_comment,
+               attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
+        FROM vendor_evaluation WHERE 1=1
+    """
+    params = []
+    if branch:
+        query += " AND branch_code = ?"
+        params.append(branch)
+    if month:
+        query += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+        params.append(month)
+    query += " ORDER BY created_at DESC"
+
+    conn = get_conn()
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    import io
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "거래처평가"
+    headers = ["지점", "거래처", "평가일", "품질점수", "품질사유", "태도점수", "태도사유", "속도점수", "총점", "등록자", "등록일시"]
+    ws.append(headers)
+    for r in rows:
+        ws.append([
+            r["branch_name"], r["vendor_name"], str(r["eval_date"]) if r["eval_date"] else "",
+            r["quality_score"], r["quality_comment"],
+            r["attitude_score"], r["attitude_comment"],
+            r["speed_score"], float(r["total_score"]) if r["total_score"] is not None else None,
+            r["evaluated_by"], str(r["created_at"]) if r["created_at"] else ""
+        ])
+
+    for col_idx in range(1, len(headers) + 1):
+        ws.column_dimensions[chr(64 + col_idx)].width = 18
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"거래처평가_{branch or '전체'}_{month or '전체'}.xlsx"
+    from urllib.parse import quote
+    encoded_filename = quote(filename)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
+    )
 
 @app.get("/master/vendor-eval/summary", response_class=HTMLResponse)
 async def master_vendor_eval_summary(session_token: str = Cookie(default=None)):
