@@ -1683,7 +1683,7 @@ async def scan_log_page(
     return HTMLResponse(content=render_page(content, user, "scanlog"))
 
 @app.get("/vendor-eval", response_class=HTMLResponse)
-async def vendor_eval_page(session_token: str = Cookie(default=None)):
+async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month: str = ""):
     user = get_session(session_token)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
@@ -1692,12 +1692,29 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
 
     branch_code = user["branch_code"]
 
+    from datetime import date
+    today = date.today()
+    prev_month_num = today.month - 1 if today.month > 1 else 12
+    prev_month_year = today.year if today.month > 1 else today.year - 1
+    default_month = f"{prev_month_year}-{prev_month_num:02d}"
+
     conn = get_conn()
     all_vendors = conn.execute("SELECT vendor_name FROM vendor_master ORDER BY vendor_name").fetchall()
+
+    # 이 지점이 이미 진행 중인 라운드가 있는지 확인 (가장 최근 등록된 eval_month)
+    existing_round = conn.execute("""
+        SELECT eval_month FROM vendor_evaluation
+        WHERE branch_code = ? AND TO_CHAR(created_at, 'YYYY-MM') = TO_CHAR(CURRENT_DATE, 'YYYY-MM')
+        ORDER BY created_at DESC LIMIT 1
+    """, (branch_code,)).fetchone()
+
+    if not eval_month:
+        eval_month = existing_round["eval_month"] if existing_round else default_month
+
     done_vendors = conn.execute("""
         SELECT DISTINCT vendor_name FROM vendor_evaluation
-        WHERE branch_code = ? AND TO_CHAR(eval_date, 'YYYY-MM') = TO_CHAR(CURRENT_DATE, 'YYYY-MM')
-    """, (branch_code,)).fetchall()
+        WHERE branch_code = ? AND eval_month = ?
+    """, (branch_code, eval_month)).fetchall()
     conn.close()
 
     done_set = {v["vendor_name"] for v in done_vendors}
@@ -1719,13 +1736,14 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
         content = f"""
         <div class="card" style="text-align:center;padding:40px;">
           <div style="font-size:32px;">✅</div>
-          <p style="font-weight:bold;margin-top:12px;">이번 달 거래처 평가가 완료되었습니다.</p>
+          <p style="font-weight:bold;margin-top:12px;">{eval_month} 거래처 평가가 완료되었습니다.</p>
           <p style="color:#888;font-size:13px;margin-top:4px;">{total_count}개 거래처 평가 완료</p>
         </div>
         """
         return HTMLResponse(content=render_page(content, user, "vendor-eval"))
 
     current_vendor = remaining[0]
+    is_first_of_round = (done_count == 0)
 
     quality_options = [
         {"score": 1, "label": "불량", "desc": "사용 불가"},
@@ -1753,6 +1771,28 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
     attitude_js = json.dumps(attitude_options, ensure_ascii=False)
     speed_js = json.dumps(speed_options, ensure_ascii=False)
     current_vendor_js = json.dumps(current_vendor, ensure_ascii=False)
+    eval_month_js = json.dumps(eval_month, ensure_ascii=False)
+
+    month_selector_html = ""
+    if is_first_of_round:
+        month_options = ""
+        for i in range(6):
+            m = today.month - i
+            y = today.year
+            while m <= 0:
+                m += 12
+                y -= 1
+            val = f"{y}-{m:02d}"
+            sel = "selected" if val == eval_month else ""
+            month_options += f'<option value="{val}" {sel}>{val}</option>'
+        month_selector_html = f"""
+        <div class="ve-field">
+            <label>평가월 (이번 라운드 전체에 적용됩니다)</label>
+            <select id="evalMonthSelect" onchange="changeMonth()">{month_options}</select>
+        </div>
+        """
+    else:
+        month_selector_html = f'<p style="color:#888;font-size:12px;margin-bottom:12px;">평가월: {eval_month}</p>'
 
     content = f"""
     <style>
@@ -1762,7 +1802,7 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
         .ve-step-indicator {{ color:#888; font-size:13px; margin-bottom:16px; }}
         .ve-field {{ margin-bottom:14px; }}
         .ve-field label {{ display:block; font-weight:bold; margin-bottom:6px; font-size:14px; }}
-        .ve-card input[type=date] {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; }}
+        .ve-card select {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; }}
         .ve-option {{ border:1px solid #ddd; border-radius:8px; padding:10px; margin-bottom:8px; cursor:pointer; }}
         .ve-option.selected {{ border-color:#2563eb; background:#eff6ff; }}
         .ve-option .ve-label {{ font-weight:bold; font-size:14px; }}
@@ -1782,10 +1822,7 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
         <div class="ve-step-indicator" id="stepIndicator">기본 정보</div>
 
         <div class="ve-step active" id="step0">
-            <div class="ve-field">
-                <label>평가일</label>
-                <input type="date" id="evalDate">
-            </div>
+            {month_selector_html}
             <div class="ve-btn-row">
                 <button class="ve-btn-next" onclick="goStep(1)">다음</button>
             </div>
@@ -1832,8 +1869,15 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
         const attitudeOptions = {attitude_js};
         const speedOptions = {speed_js};
         const currentVendor = {current_vendor_js};
+        let currentEvalMonth = {eval_month_js};
 
         let selected = {{ quality: null, attitude: null, speed: null }};
+
+        function changeMonth() {{
+            const sel = document.getElementById('evalMonthSelect');
+            currentEvalMonth = sel.value;
+            window.location.href = '/vendor-eval?eval_month=' + encodeURIComponent(currentEvalMonth);
+        }}
 
         function renderOptions(containerId, options, key, hasComment) {{
             const container = document.getElementById(containerId);
@@ -1847,9 +1891,12 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
                     selected[key] = opt.score;
                     document.querySelectorAll('#' + containerId + ' .ve-option').forEach(o => o.classList.remove('selected'));
                     div.classList.add('selected');
-                    if (hasComment) {{
-                        const commentEl = document.getElementById(key + 'Comment');
+                    const commentEl = document.getElementById(key + 'Comment');
+                    if (hasComment && opt.score <= 3) {{
                         commentEl.style.display = 'block';
+                    }} else {{
+                        commentEl.style.display = 'none';
+                        commentEl.value = '';
                     }}
                     checkStepValid(key);
                 }};
@@ -1859,11 +1906,13 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
 
         function checkStepValid(key) {{
             if (key === 'quality') {{
+                const needsComment = selected.quality !== null && selected.quality <= 3;
                 const comment = document.getElementById('qualityComment').value.trim();
-                document.getElementById('nextBtn1').disabled = !(selected.quality && comment);
+                document.getElementById('nextBtn1').disabled = !(selected.quality && (!needsComment || comment));
             }} else if (key === 'attitude') {{
+                const needsComment = selected.attitude !== null && selected.attitude <= 3;
                 const comment = document.getElementById('attitudeComment').value.trim();
-                document.getElementById('nextBtn2').disabled = !(selected.attitude && comment);
+                document.getElementById('nextBtn2').disabled = !(selected.attitude && (!needsComment || comment));
             }} else if (key === 'speed') {{
                 document.getElementById('submitBtn').disabled = !selected.speed;
             }}
@@ -1886,7 +1935,7 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
         async function submitEval() {{
             const payload = {{
                 vendor_name: currentVendor,
-                eval_date: document.getElementById('evalDate').value,
+                eval_month: currentEvalMonth,
                 quality_score: selected.quality,
                 quality_comment: document.getElementById('qualityComment').value.trim(),
                 attitude_score: selected.attitude,
@@ -1920,26 +1969,32 @@ async def vendor_eval_submit(request: Request, session_token: str = Cookie(defau
     branch_name = next((b["branch_name"] for b in BRANCHES if b["branch_code"] == branch_code), branch_code)
 
     data = await request.json()
-    vendor_name = data.get("vendor_name", "").strip()  # 순차진행 화면에서 자동으로 넘어온 값 (서버가 지정한 대상)
-    eval_date = data.get("eval_date") or None
+    vendor_name = data.get("vendor_name", "").strip()
+    eval_month = data.get("eval_month", "").strip()
     quality_score = data.get("quality_score")
     quality_comment = data.get("quality_comment", "").strip()
     attitude_score = data.get("attitude_score")
     attitude_comment = data.get("attitude_comment", "").strip()
     speed_score = data.get("speed_score")
 
-    if not vendor_name or not quality_score or not quality_comment or not attitude_score or not attitude_comment or not speed_score:
+    if not vendor_name or not eval_month or not quality_score or not attitude_score or not speed_score:
         return JSONResponse(status_code=400, content={"detail": "필수 항목이 누락되었습니다."})
 
+    if quality_score <= 3 and not quality_comment:
+        return JSONResponse(status_code=400, content={"detail": "품질 사유를 입력하세요."})
+    if attitude_score <= 3 and not attitude_comment:
+        return JSONResponse(status_code=400, content={"detail": "태도 사유를 입력하세요."})
+
     total_score = round((quality_score + attitude_score + speed_score) / 3, 1)
+    eval_date = f"{eval_month}-01"
 
     conn = get_conn()
     conn.execute("""
         INSERT INTO vendor_evaluation
-        (branch_code, branch_name, vendor_name, eval_date, quality_score, quality_comment,
+        (branch_code, branch_name, vendor_name, eval_date, eval_month, quality_score, quality_comment,
          attitude_score, attitude_comment, speed_score, total_score, evaluated_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (branch_code, branch_name, vendor_name, eval_date, quality_score, quality_comment,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (branch_code, branch_name, vendor_name, eval_date, eval_month, quality_score, quality_comment,
           attitude_score, attitude_comment, speed_score, total_score, user["login_id"]))
     conn.commit()
     conn.close()
