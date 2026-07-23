@@ -2154,14 +2154,23 @@ async def master_vendor_eval_export(session_token: str = Cookie(default=None), b
     )
 
 @app.get("/master/vendor-eval/summary", response_class=HTMLResponse)
-async def master_vendor_eval_summary(session_token: str = Cookie(default=None)):
+async def master_vendor_eval_summary(session_token: str = Cookie(default=None), branch: str = "", month: str = ""):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
 
     conn = get_conn()
 
-    vendor_rows = conn.execute("""
+    where_clause = "WHERE 1=1"
+    params = []
+    if branch:
+        where_clause += " AND branch_code = ?"
+        params.append(branch)
+    if month:
+        where_clause += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+        params.append(month)
+
+    vendor_rows = conn.execute(f"""
         SELECT vendor_name,
                COUNT(*) as cnt,
                ROUND(AVG(quality_score), 1) as avg_quality,
@@ -2169,26 +2178,35 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None)):
                ROUND(AVG(speed_score), 1) as avg_speed,
                ROUND(AVG(total_score), 1) as avg_total
         FROM vendor_evaluation
+        {where_clause}
         GROUP BY vendor_name
         ORDER BY avg_total DESC
-    """).fetchall()
+    """, params).fetchall()
 
-    branch_rows = conn.execute("""
-        SELECT branch_name,
-               COUNT(*) as cnt,
-               ROUND(AVG(quality_score), 1) as avg_quality,
-               ROUND(AVG(attitude_score), 1) as avg_attitude,
-               ROUND(AVG(speed_score), 1) as avg_speed,
-               ROUND(AVG(total_score), 1) as avg_total
-        FROM vendor_evaluation
-        GROUP BY branch_name
-        ORDER BY avg_total DESC
-    """).fetchall()
+    branch_rows = []
+    if not branch:
+        month_where = "WHERE 1=1"
+        month_params = []
+        if month:
+            month_where += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+            month_params.append(month)
+        branch_rows = conn.execute(f"""
+            SELECT branch_name,
+                   COUNT(*) as cnt,
+                   ROUND(AVG(quality_score), 1) as avg_quality,
+                   ROUND(AVG(attitude_score), 1) as avg_attitude,
+                   ROUND(AVG(speed_score), 1) as avg_speed,
+                   ROUND(AVG(total_score), 1) as avg_total
+            FROM vendor_evaluation
+            {month_where}
+            GROUP BY branch_name
+            ORDER BY avg_total DESC
+        """, month_params).fetchall()
     conn.close()
 
     vendor_rows_html = ""
     if not vendor_rows:
-        vendor_rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
+        vendor_rows_html = '<tr><td colspan="7" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
     for i, r in enumerate(vendor_rows, start=1):
         vendor_rows_html += f"""
         <tr>
@@ -2198,20 +2216,53 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None)):
         </tr>
         """
 
-    branch_rows_html = ""
-    if not branch_rows:
-        branch_rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
-    for r in branch_rows:
-        branch_rows_html += f"""
-        <tr>
-            <td>{r['branch_name']}</td><td>{r['cnt']}건</td>
-            <td>{r['avg_quality']}</td><td>{r['avg_attitude']}</td><td>{r['avg_speed']}</td>
-            <td><b>{r['avg_total']}</b></td>
-        </tr>
+    branch_section = ""
+    if branch:
+        branch_name_disp = next((b["branch_name"] for b in BRANCHES if b["branch_code"] == branch), branch)
+        branch_section = f"""
+        <div class="card">
+          <p style="font-size:13px;color:#888;">지점 필터가 적용되어 있어 지점별 비교는 생략됩니다 (현재: {branch_name_disp}).</p>
+        </div>
+        """
+    else:
+        branch_rows_html = ""
+        if not branch_rows:
+            branch_rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
+        for r in branch_rows:
+            branch_rows_html += f"""
+            <tr>
+                <td>{r['branch_name']}</td><td>{r['cnt']}건</td>
+                <td>{r['avg_quality']}</td><td>{r['avg_attitude']}</td><td>{r['avg_speed']}</td>
+                <td><b>{r['avg_total']}</b></td>
+            </tr>
+            """
+        branch_section = f"""
+        <div class="card">
+          <h3 style="font-size:15px;margin-bottom:12px;">지점별 평가 성향 비교</h3>
+          <table>
+              <thead><tr>
+                  <th>지점</th><th>평가건수</th>
+                  <th>품질평균</th><th>태도평균</th><th>속도평균</th><th>총점평균</th>
+              </tr></thead>
+              <tbody>{branch_rows_html}</tbody>
+          </table>
+          <p style="font-size:12px;color:#888;margin-top:8px;">
+            ※ 총점평균이 낮을수록 그 지점이 거래처를 상대적으로 엄격하게 평가하는 경향입니다.
+          </p>
+        </div>
         """
 
+    filter_label = []
+    if branch:
+        branch_name_disp = next((b["branch_name"] for b in BRANCHES if b["branch_code"] == branch), branch)
+        filter_label.append(f"지점: {branch_name_disp}")
+    if month:
+        filter_label.append(f"기간: {month}")
+    filter_display = f'<p style="color:#888;font-size:13px;margin-bottom:12px;">현재 필터 — {" / ".join(filter_label)}</p>' if filter_label else ""
+
     content = f"""
-    <h2 style="margin-bottom:16px;">📊 거래처 평가 종합분석</h2>
+    <h2 style="margin-bottom:8px;">📊 거래처 평가 종합분석</h2>
+    {filter_display}
 
     <div class="card">
       <h3 style="font-size:15px;margin-bottom:12px;">거래처별 랭킹 (총점 높은 순)</h3>
@@ -2224,21 +2275,9 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None)):
       </table>
     </div>
 
-    <div class="card">
-      <h3 style="font-size:15px;margin-bottom:12px;">지점별 평가 성향 비교</h3>
-      <table>
-          <thead><tr>
-              <th>지점</th><th>평가건수</th>
-              <th>품질평균</th><th>태도평균</th><th>속도평균</th><th>총점평균</th>
-          </tr></thead>
-          <tbody>{branch_rows_html}</tbody>
-      </table>
-      <p style="font-size:12px;color:#888;margin-top:8px;">
-        ※ 총점평균이 낮을수록 그 지점이 거래처를 상대적으로 엄격하게 평가하는 경향입니다.
-      </p>
-    </div>
+    {branch_section}
 
-    <a href="/master/vendor-eval" style="display:inline-block;margin-top:8px;color:#2563eb;font-size:13px;text-decoration:none;">← 상세 목록으로 돌아가기</a>
+    <a href="/master/vendor-eval?branch={branch}&month={month}" style="display:inline-block;margin-top:8px;color:#2563eb;font-size:13px;text-decoration:none;">← 상세 목록으로 돌아가기</a>
     """
     return HTMLResponse(content=render_page(content, user, "vendor-eval"))
 
