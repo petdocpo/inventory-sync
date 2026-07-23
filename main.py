@@ -1690,6 +1690,43 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
     if user["role"] == "master":
         return RedirectResponse(url="/master/vendor-eval", status_code=303)
 
+    branch_code = user["branch_code"]
+
+    conn = get_conn()
+    all_vendors = conn.execute("SELECT vendor_name FROM vendor_master ORDER BY vendor_name").fetchall()
+    done_vendors = conn.execute("""
+        SELECT DISTINCT vendor_name FROM vendor_evaluation
+        WHERE branch_code = ? AND TO_CHAR(eval_date, 'YYYY-MM') = TO_CHAR(CURRENT_DATE, 'YYYY-MM')
+    """, (branch_code,)).fetchall()
+    conn.close()
+
+    done_set = {v["vendor_name"] for v in done_vendors}
+    remaining = [v["vendor_name"] for v in all_vendors if v["vendor_name"] not in done_set]
+
+    total_count = len(all_vendors)
+    done_count = total_count - len(remaining)
+
+    if not all_vendors:
+        content = """
+        <div class="card" style="text-align:center;padding:40px;">
+          <div style="font-size:32px;">🏢</div>
+          <p style="color:#888;margin-top:12px;">등록된 거래처가 없습니다. 마스터에게 거래처 등록을 요청해주세요.</p>
+        </div>
+        """
+        return HTMLResponse(content=render_page(content, user, "vendor-eval"))
+
+    if not remaining:
+        content = f"""
+        <div class="card" style="text-align:center;padding:40px;">
+          <div style="font-size:32px;">✅</div>
+          <p style="font-weight:bold;margin-top:12px;">이번 달 거래처 평가가 완료되었습니다.</p>
+          <p style="color:#888;font-size:13px;margin-top:4px;">{total_count}개 거래처 평가 완료</p>
+        </div>
+        """
+        return HTMLResponse(content=render_page(content, user, "vendor-eval"))
+
+    current_vendor = remaining[0]
+
     quality_options = [
         {"score": 1, "label": "불량", "desc": "사용 불가"},
         {"score": 2, "label": "미흡", "desc": "포장 가능 등 기존 제품 품질 사전 이슈"},
@@ -1715,15 +1752,17 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
     quality_js = json.dumps(quality_options, ensure_ascii=False)
     attitude_js = json.dumps(attitude_options, ensure_ascii=False)
     speed_js = json.dumps(speed_options, ensure_ascii=False)
+    current_vendor_js = json.dumps(current_vendor, ensure_ascii=False)
 
     content = f"""
     <style>
         .ve-card {{ background:#fff; border-radius:12px; padding:20px; max-width:520px; margin:0 auto; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
         .ve-card h2 {{ font-size:18px; margin-bottom:4px; }}
+        .ve-progress {{ color:#2563eb; font-size:13px; font-weight:bold; margin-bottom:4px; }}
         .ve-step-indicator {{ color:#888; font-size:13px; margin-bottom:16px; }}
         .ve-field {{ margin-bottom:14px; }}
         .ve-field label {{ display:block; font-weight:bold; margin-bottom:6px; font-size:14px; }}
-        .ve-card input[type=text], .ve-card input[type=date] {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; }}
+        .ve-card input[type=date] {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; }}
         .ve-option {{ border:1px solid #ddd; border-radius:8px; padding:10px; margin-bottom:8px; cursor:pointer; }}
         .ve-option.selected {{ border-color:#2563eb; background:#eff6ff; }}
         .ve-option .ve-label {{ font-weight:bold; font-size:14px; }}
@@ -1738,14 +1777,11 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
         .ve-step.active {{ display:block; }}
     </style>
     <div class="ve-card">
-        <h2>거래처 평가</h2>
+        <div class="ve-progress">진행 상황: {done_count + 1} / {total_count}</div>
+        <h2>거래처 평가 — {current_vendor}</h2>
         <div class="ve-step-indicator" id="stepIndicator">기본 정보</div>
 
         <div class="ve-step active" id="step0">
-            <div class="ve-field">
-                <label>거래처명</label>
-                <input type="text" id="vendorName" placeholder="거래처명 입력">
-            </div>
             <div class="ve-field">
                 <label>평가일</label>
                 <input type="date" id="evalDate">
@@ -1795,6 +1831,7 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
         const qualityOptions = {quality_js};
         const attitudeOptions = {attitude_js};
         const speedOptions = {speed_js};
+        const currentVendor = {current_vendor_js};
 
         let selected = {{ quality: null, attitude: null, speed: null }};
 
@@ -1841,10 +1878,6 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
 
         const stepNames = ['기본 정보', '1/3 제품 품질', '2/3 대응 태도', '3/3 대응 속도'];
         function goStep(n) {{
-            if (n === 1 && !document.getElementById('vendorName').value.trim()) {{
-                alert('거래처명을 입력하세요.');
-                return;
-            }}
             document.querySelectorAll('.ve-step').forEach(s => s.classList.remove('active'));
             document.getElementById('step' + n).classList.add('active');
             document.getElementById('stepIndicator').innerText = stepNames[n];
@@ -1852,7 +1885,7 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
 
         async function submitEval() {{
             const payload = {{
-                vendor_name: document.getElementById('vendorName').value.trim(),
+                vendor_name: currentVendor,
                 eval_date: document.getElementById('evalDate').value,
                 quality_score: selected.quality,
                 quality_comment: document.getElementById('qualityComment').value.trim(),
@@ -1866,7 +1899,6 @@ async def vendor_eval_page(session_token: str = Cookie(default=None)):
                 body: JSON.stringify(payload)
             }});
             if (res.ok) {{
-                alert('평가가 등록되었습니다.');
                 window.location.href = '/vendor-eval';
             }} else {{
                 const err = await res.json();
@@ -1888,7 +1920,7 @@ async def vendor_eval_submit(request: Request, session_token: str = Cookie(defau
     branch_name = next((b["branch_name"] for b in BRANCHES if b["branch_code"] == branch_code), branch_code)
 
     data = await request.json()
-    vendor_name = data.get("vendor_name", "").strip()
+    vendor_name = data.get("vendor_name", "").strip()  # 순차진행 화면에서 자동으로 넘어온 값 (서버가 지정한 대상)
     eval_date = data.get("eval_date") or None
     quality_score = data.get("quality_score")
     quality_comment = data.get("quality_comment", "").strip()
