@@ -1891,12 +1891,14 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
                     selected[key] = opt.score;
                     document.querySelectorAll('#' + containerId + ' .ve-option').forEach(o => o.classList.remove('selected'));
                     div.classList.add('selected');
-                    const commentEl = document.getElementById(key + 'Comment');
-                    if (hasComment && opt.score <= 3) {{
-                        commentEl.style.display = 'block';
-                    }} else {{
-                        commentEl.style.display = 'none';
-                        commentEl.value = '';
+                    if (hasComment) {{
+                        const commentEl = document.getElementById(key + 'Comment');
+                        if (opt.score <= 3) {{
+                            commentEl.style.display = 'block';
+                        }} else {{
+                            commentEl.style.display = 'none';
+                            commentEl.value = '';
+                        }}
                     }}
                     checkStepValid(key);
                 }};
