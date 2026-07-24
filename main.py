@@ -3622,6 +3622,197 @@ async def raw_upload_ajax(
         return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
     return await _process_raw_upload_master(file)
 
+async def _fetch_and_process_s3_csv():
+    """S3의 유비플러스 재고현황 CSV를 다운로드하여 재고수불부 형식과 동일하게 파싱/반영"""
+    import httpx
+    import csv
+    import io as io_module
+
+    CSV_URL = "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/stock/유비플러스_재고현황.csv"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(CSV_URL)
+        resp.raise_for_status()
+        raw_bytes = resp.content
+
+    # 인코딩 자동 판별 (한글 CSV는 보통 cp949 또는 utf-8-sig)
+    try:
+        text = raw_bytes.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        text = raw_bytes.decode('cp949')
+
+    reader = csv.reader(io_module.StringIO(text))
+    rows_raw = list(reader)
+
+    header_row_idx = None
+    col_map = {}
+    KEYWORDS = {
+        "branch": ["지점"],
+        "item_name": ["상품명"],
+        "item_code": ["품번"],
+        "qty": ["기말수량"],
+        "h": ["증가수량"],
+        "q": ["재고조정"],
+    }
+    for row_idx in range(min(5, len(rows_raw))):
+        row_vals = rows_raw[row_idx]
+        found = {}
+        for col_idx, cell_val in enumerate(row_vals):
+            if not cell_val:
+                continue
+            text_val = str(cell_val).strip()
+            for key, keywords in KEYWORDS.items():
+                if key in found:
+                    continue
+                if any(kw in text_val for kw in keywords):
+                    found[key] = col_idx
+        if all(k in found for k in ("branch", "item_name", "item_code")):
+            header_row_idx = row_idx
+            col_map = found
+            break
+
+    if header_row_idx is None:
+        return {"success": 0, "skipped": 0, "errors": ["CSV 헤더를 찾을 수 없습니다."]}
+
+    branch_map = {}
+    for b in BRANCHES:
+        branch_map[b["branch_name"]] = b["branch_code"]
+        branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
+        branch_map[b["branch_code"]] = b["branch_code"]
+
+    now = datetime.now().isoformat()
+    success, skipped, errors = 0, 0, []
+    hq_adjustments = []
+    debug_hq_log = []
+    data_start_row = header_row_idx + 1
+
+    branches_in_file = set()
+    parsed_rows = []
+    for idx in range(data_start_row, len(rows_raw)):
+        row = rows_raw[idx]
+        branch_col = col_map.get("branch")
+        if branch_col is None or branch_col >= len(row) or not row[branch_col]:
+            continue
+        branch_name = str(row[branch_col]).strip()
+        branch_code = (branch_map.get(branch_name)
+                       or branch_map.get(branch_name.replace(" ", ""))
+                       or branch_name)
+        branches_in_file.add(branch_code)
+        parsed_rows.append((idx, row, branch_code, branch_name))
+
+    if not branches_in_file:
+        return {"success": 0, "skipped": 0, "errors": ["CSV에서 유효한 지점 데이터를 찾지 못했습니다."]}
+
+    conn = get_conn()
+    for bc in branches_in_file:
+        conn.execute("DELETE FROM raw_inventory WHERE branch_code=?", (bc,))
+    old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
+    old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
+    for bc in branches_in_file:
+        conn.execute("DELETE FROM hq_bonus_log WHERE branch_code=?", (bc,))
+    conn.commit()
+
+    for idx, row, branch_code, branch_name in parsed_rows:
+        try:
+            item_name = str(row[col_map["item_name"]]).strip() if col_map["item_name"] < len(row) and row[col_map["item_name"]] else ""
+            item_code = str(row[col_map["item_code"]]).strip() if col_map["item_code"] < len(row) and row[col_map["item_code"]] else ""
+
+            if not item_code:
+                import hashlib
+                name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
+                item_code = f"미지정_{name_hash}"
+
+            qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
+            qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
+            qty_q = row[col_map["q"]] if "q" in col_map and col_map["q"] < len(row) else None
+
+            raw_quantity = int(float(str(qty_n))) if qty_n not in (None, "") else 0
+            add_h = int(float(str(qty_h))) if qty_h not in (None, "") else 0
+            add_q = int(float(str(qty_q))) if qty_q not in (None, "") else 0
+            hq_total = add_h + add_q
+
+            conn.execute("""
+                INSERT INTO raw_inventory
+                  (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
+                VALUES (?, ?, ?, ?, ?, 'auto_s3', ?)
+                ON CONFLICT(branch_code, item_code) DO UPDATE SET
+                  quantity=excluded.quantity,
+                  item_name=excluded.item_name,
+                  branch_name=excluded.branch_name,
+                  source=excluded.source,
+                  uploaded_at=excluded.uploaded_at
+            """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
+
+            existing_item = conn.execute(
+                "SELECT id FROM items WHERE branch_code=? AND item_code=?",
+                (branch_code, item_code)
+            ).fetchone()
+            if not existing_item:
+                conn.execute("""
+                    INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
+                """, (branch_code, branch_name, item_name, item_code, now))
+                conn.execute("""
+                    INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
+                    VALUES (?, ?, ?, 0, ?)
+                    ON CONFLICT(branch_code, item_code) DO NOTHING
+                """, (branch_code, item_name, item_code, now))
+
+            if item_code.startswith("미지정_"):
+                conn.execute("""
+                    UPDATE inventory SET quantity=?, last_updated=?
+                    WHERE branch_code=? AND item_code=?
+                """, (raw_quantity, now, branch_code, item_code))
+
+            if hq_total != 0:
+                hq_adjustments.append((branch_code, item_name, item_code, hq_total))
+                debug_hq_log.append(f"{item_name}({item_code}): 증가={add_h}, 조정={add_q}, 합계={hq_total}")
+
+            success += 1
+        except Exception as e:
+            errors.append(f"행 {idx}: {str(e)[:50]}")
+            skipped += 1
+
+    conn.commit()
+    conn.close()
+
+    for branch_code, item_name, item_code, new_hq_total in hq_adjustments:
+        conn2 = get_conn()
+        prev_hq_total = old_hq_map.get(f"{branch_code}|{item_code}", 0)
+        net_delta = new_hq_total - prev_hq_total
+        if net_delta != 0:
+            new_qty = adjust_quantity(branch_code, item_code, net_delta, absolute=False)
+            conn2.execute(
+                "INSERT INTO adjustment_log (branch_code, item_name, item_code, delta, result_quantity, adjusted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (branch_code, item_name, item_code, net_delta, new_qty, now)
+            )
+        conn2.execute("""
+            INSERT INTO hq_bonus_log (branch_code, item_code, last_hq_total, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(branch_code, item_code) DO UPDATE SET
+              last_hq_total=excluded.last_hq_total, updated_at=excluded.updated_at
+        """, (branch_code, item_code, new_hq_total, now))
+        conn2.commit()
+        conn2.close()
+
+    return {"success": success, "skipped": skipped, "errors": errors[:10],
+            "header_row_used": header_row_idx,
+            "hq_debug": debug_hq_log[:20],
+            "synced_at": now}
+
+
+@app.get("/api/cron/sync-raw-inventory")
+async def cron_sync_raw_inventory(request: Request):
+    # Vercel Cron 요청 검증 (Authorization 헤더로 비인가 접근 차단)
+    auth_header = request.headers.get("authorization", "")
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+    result = await _fetch_and_process_s3_csv()
+    return JSONResponse(content=result)
+
 async def _process_raw_upload_master(file: UploadFile):
     """마스터 전용 — 헤더가 2행에 있고 컬럼명이 다른 '재고수불부' 형식 처리
     ⚠️ 2026-07 수정: 업로드된 엑셀에 실제로 존재하는 지점만 삭제/갱신하도록 변경
