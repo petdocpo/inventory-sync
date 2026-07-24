@@ -1,0 +1,16 @@
+name: Sync Raw Inventory from S3 CSV
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call sync endpoint
+        run: |
+          curl -sf -X GET "https://inventory-sync-teal.vercel.app/api/cron/sync-raw-inventory" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            --max-time 60
