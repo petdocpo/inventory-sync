@@ -2861,7 +2861,10 @@ async def eval_criteria_page(session_token: str = Cookie(default=None)):
       async function deleteCriteria(id) {{
         if (!confirm('이 문항과 모든 단계 옵션을 삭제합니다. 계속할까요?')) return;
         const res = await fetch('/master/eval-criteria/' + id + '/delete', {{ method: 'POST' }});
-        if (res.ok) {{ location.reload(); }} else {{ alert('삭제 실패'); }}
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert(err.detail || '삭제 실패');
+        }}
       }}
 
       async function toggleActive(id, newActive) {{
@@ -2932,7 +2935,18 @@ async def eval_criteria_delete(criteria_id: int, session_token: str = Cookie(def
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
     conn = get_conn()
+    usage_count = conn.execute(
+        "SELECT COUNT(*) as cnt FROM vendor_evaluation_answer WHERE criteria_id=?", (criteria_id,)
+    ).fetchone()["cnt"]
+
+    if usage_count > 0:
+        conn.close()
+        return JSONResponse(status_code=400, content={
+            "detail": f"이미 {usage_count}건의 평가에 사용된 문항이라 삭제할 수 없습니다. 대신 '비활성화'를 사용해주세요."
+        })
+
     conn.execute("DELETE FROM eval_criteria WHERE id=?", (criteria_id,))
     conn.commit()
     conn.close()
@@ -3746,6 +3760,13 @@ async def _process_raw_upload_master(file: UploadFile):
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
 
+            # ⚠️ 품번 없는 상품(미지정_): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
+            if item_code.startswith("미지정_"):
+                conn.execute("""
+                    UPDATE inventory SET quantity=?, last_updated=?
+                    WHERE branch_code=? AND item_code=?
+                """, (raw_quantity, now, branch_code, item_code))
+
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
                 debug_hq_log.append(f"{item_name}({item_code}): 증가={add_h}, 조정={add_q}, 합계={hq_total}")
@@ -3915,6 +3936,13 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                     VALUES (?, ?, ?, 0, ?)
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
+
+            # ⚠️ 품번 없는 상품(미지정_): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
+            if item_code.startswith("미지정_"):
+                conn.execute("""
+                    UPDATE inventory SET quantity=?, last_updated=?
+                    WHERE branch_code=? AND item_code=?
+                """, (raw_quantity, now, branch_code, item_code))
 
             if hq_total != 0:
                 hq_adjustments.append((branch_code, item_name, item_code, hq_total))
