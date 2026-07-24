@@ -1777,26 +1777,8 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
     current_vendor_js = json.dumps(current_vendor, ensure_ascii=False)
     eval_month_js = json.dumps(eval_month, ensure_ascii=False)
 
-    month_selector_html = ""
-    if is_first_of_round:
-        month_options = ""
-        for i in range(6):
-            m = today.month - i
-            y = today.year
-            while m <= 0:
-                m += 12
-                y -= 1
-            val = f"{y}-{m:02d}"
-            sel = "selected" if val == eval_month else ""
-            month_options += f'<option value="{val}" {sel}>{val}</option>'
-        month_selector_html = f"""
-        <div class="ve-field">
-            <label>평가월 (이번 라운드 전체에 적용됩니다)</label>
-            <select id="evalMonthSelect" onchange="changeMonth()">{month_options}</select>
-        </div>
-        """
-    else:
-        month_selector_html = f'<p style="color:#888;font-size:12px;margin-bottom:12px;">평가월: {eval_month}</p>'
+    eval_month = default_month  # 항상 전월로 고정, 선택 불가
+    month_selector_html = f'<p style="color:#888;font-size:12px;margin-bottom:12px;">평가월: {eval_month} (전월 고정)</p>'
 
     step_divs = f"""
     <div class="ve-step active" id="step0">
@@ -1867,12 +1849,6 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
 
         let selected = {{}};
         criteriaData.forEach(c => selected[c.key] = null);
-
-        function changeMonth() {{
-            const sel = document.getElementById('evalMonthSelect');
-            currentEvalMonth = sel.value;
-            window.location.href = '/vendor-eval?eval_month=' + encodeURIComponent(currentEvalMonth);
-        }}
 
         function renderOptions(criteria) {{
             const container = document.getElementById('options_' + criteria.key);
