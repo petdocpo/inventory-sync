@@ -1737,9 +1737,16 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
 
     done_vendors = conn.execute("""
         SELECT DISTINCT vendor_name FROM vendor_evaluation_v2
-        WHERE branch_code = ? AND eval_month = ?
+        WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
+    """, (branch_code, eval_month)).fetchall()
+
+    resubmit_requests = conn.execute("""
+        SELECT vendor_name FROM vendor_evaluation_v2
+        WHERE branch_code = ? AND eval_month = ? AND status = 'resubmit_requested'
     """, (branch_code, eval_month)).fetchall()
     conn.close()
+
+    resubmit_names = [r["vendor_name"] for r in resubmit_requests]
 
     done_set = {v["vendor_name"] for v in done_vendors}
     remaining = [v["vendor_name"] for v in all_vendors if v["vendor_name"] not in done_set]
@@ -1812,7 +1819,17 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
 
     step_names_js = json.dumps(["기본 정보"] + [f"{i+1}/{n_criteria} {c['label']}" for i, c in enumerate(criteria_data)], ensure_ascii=False)
 
+    resubmit_banner = ""
+    if resubmit_names:
+        names_str = ", ".join(resubmit_names)
+        resubmit_banner = f"""
+        <div class="card" style="background:#FEF3C7;border:1px solid #F59E0B;max-width:520px;margin:0 auto 12px;">
+          <p style="font-size:13px;color:#92400E;">⚠️ 마스터가 재제출을 요청한 거래처가 있습니다: <b>{names_str}</b></p>
+        </div>
+        """
+
     content = f"""
+    {resubmit_banner}
     <style>
         .ve-card {{ background:#fff; border-radius:12px; padding:20px; max-width:520px; margin:0 auto; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
         .ve-card h2 {{ font-size:18px; margin-bottom:4px; }}
@@ -1968,10 +1985,18 @@ async def vendor_eval_submit(request: Request, session_token: str = Cookie(defau
 
     total_score = round(sum(normalized_scores) / len(normalized_scores), 1) if normalized_scores else 0
 
+    # 재제출 요청 상태였던 기존 레코드가 있으면 삭제 후 재생성 (같은 거래처+월 중복 방지)
+    existing_resubmit = conn.execute(
+        "SELECT id FROM vendor_evaluation_v2 WHERE branch_code=? AND vendor_name=? AND eval_month=? AND status='resubmit_requested'",
+        (branch_code, vendor_name, eval_month)
+    ).fetchone()
+    if existing_resubmit:
+        conn.execute("DELETE FROM vendor_evaluation_v2 WHERE id=?", (existing_resubmit["id"],))
+
     cur_result = conn.execute("""
         INSERT INTO vendor_evaluation_v2
-        (branch_code, branch_name, vendor_name, eval_month, total_score, evaluated_by)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (branch_code, branch_name, vendor_name, eval_month, total_score, evaluated_by, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'completed')
     """, (branch_code, branch_name, vendor_name, eval_month, total_score, user["login_id"]))
 
     new_id_row = conn.execute("SELECT id FROM vendor_evaluation_v2 WHERE branch_code=? AND vendor_name=? AND eval_month=? ORDER BY created_at DESC LIMIT 1",
