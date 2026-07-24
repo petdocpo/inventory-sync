@@ -2265,28 +2265,23 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
 
     conn = get_conn()
 
-    branches = conn.execute("SELECT DISTINCT branch_code, branch_name FROM vendor_evaluation ORDER BY branch_name").fetchall()
+    branches = conn.execute("SELECT DISTINCT branch_code, branch_name FROM vendor_evaluation_v2 ORDER BY branch_name").fetchall()
     months = conn.execute("""
-        SELECT DISTINCT TO_CHAR(eval_date, 'YYYY-MM') as ym FROM vendor_evaluation
-        WHERE eval_date IS NOT NULL ORDER BY ym DESC
+        SELECT DISTINCT eval_month as ym FROM vendor_evaluation_v2
+        WHERE eval_month IS NOT NULL ORDER BY ym DESC
     """).fetchall()
 
-    query = """
-        SELECT id, branch_name, vendor_name, eval_date, quality_score, quality_comment,
-               attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
-        FROM vendor_evaluation WHERE 1=1
-    """
+    query = "SELECT * FROM vendor_evaluation_v2 WHERE 1=1"
     params = []
     if branch:
         query += " AND branch_code = ?"
         params.append(branch)
     if month:
-        query += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+        query += " AND eval_month = ?"
         params.append(month)
     query += " ORDER BY created_at DESC"
 
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+    evaluations = conn.execute(query, params).fetchall()
 
     branch_options_html = '<option value="">전체 지점</option>'
     for b in branches:
@@ -2300,21 +2295,32 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
         month_options_html += f'<option value="{ym}" {sel}>{ym}</option>'
 
     rows_html = ""
-    if not rows:
-        rows_html = '<tr><td colspan="12" style="text-align:center;padding:20px;color:#888;">평가 데이터 없음</td></tr>'
-    for r in rows:
+    if not evaluations:
+        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">평가 데이터 없음</td></tr>'
+    for ev in evaluations:
+        answers = conn.execute("""
+            SELECT a.score, a.comment, c.label
+            FROM vendor_evaluation_answer a
+            JOIN eval_criteria c ON c.id = a.criteria_id
+            WHERE a.evaluation_id = ?
+            ORDER BY c.display_order
+        """, (ev["id"],)).fetchall()
+        answers_html = "<br>".join(
+            f"<b>{a['label']}</b>: {a['score']}점" + (f" ({a['comment']})" if a['comment'] else "")
+            for a in answers
+        )
         rows_html += f"""
         <tr>
             <td style="text-align:center;">
-              <input type="checkbox" name="selected_ids" value="{r['id']}" class="ve-check" style="width:16px;height:16px;">
+              <input type="checkbox" name="selected_ids" value="{ev['id']}" class="ve-check" style="width:16px;height:16px;">
             </td>
-            <td>{r['branch_name']}</td><td>{r['vendor_name']}</td><td>{r['eval_date']}</td>
-            <td>{r['quality_score']}점</td><td>{r['quality_comment']}</td>
-            <td>{r['attitude_score']}점</td><td>{r['attitude_comment']}</td>
-            <td>{r['speed_score']}점</td><td><b>{r['total_score']}</b></td>
-            <td>{r['evaluated_by']}</td><td>{r['created_at']}</td>
+            <td>{ev['branch_name']}</td><td>{ev['vendor_name']}</td><td>{ev['eval_month']}</td>
+            <td style="font-size:12px;">{answers_html}</td>
+            <td><b>{ev['total_score']}</b></td>
+            <td>{ev['evaluated_by']}<br><span style="font-size:11px;color:#888;">{str(ev['created_at'])[:16]}</span></td>
         </tr>
         """
+    conn.close()
 
     query_string = f"branch={branch}&month={month}"
 
@@ -2340,7 +2346,7 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
     <div class="card">
       <form method="post" action="/master/vendor-eval/delete">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-          <span style="font-size:13px;color:#888;">{len(rows)}개 항목</span>
+          <span style="font-size:13px;color:#888;">{len(evaluations)}개 항목</span>
           <div style="display:flex;gap:8px;">
             <button type="button" class="btn" id="veSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
             <button type="submit" class="btn btn-red" style="font-size:12px;padding:6px 12px;"
@@ -2351,11 +2357,8 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
         <table>
             <thead><tr>
                 <th style="width:40px;text-align:center;"><input type="checkbox" id="veAllCheck" style="width:16px;height:16px;"></th>
-                <th>지점</th><th>거래처</th><th>평가일</th>
-                <th>품질점수</th><th>품질사유</th>
-                <th>태도점수</th><th>태도사유</th>
-                <th>속도점수</th><th>총점</th>
-                <th>등록자</th><th>등록일시</th>
+                <th>지점</th><th>거래처</th><th>평가월</th>
+                <th>답변 내역</th><th>총점</th><th>등록자/일시</th>
             </tr></thead>
             <tbody>{rows_html}</tbody>
         </table>
@@ -2404,7 +2407,7 @@ async def master_vendor_eval_delete(request: Request, session_token: str = Cooki
     if ids:
         conn = get_conn()
         conn.execute(
-            f"DELETE FROM vendor_evaluation WHERE id IN ({','.join('?' for _ in ids)})",
+            f"DELETE FROM vendor_evaluation_v2 WHERE id IN ({','.join('?' for _ in ids)})",
             [int(i) for i in ids]
         )
         conn.commit()
@@ -2421,13 +2424,13 @@ async def master_vendor_eval_delete_all(request: Request, session_token: str = C
     branch = form.get("branch", "")
     month = form.get("month", "")
 
-    query = "DELETE FROM vendor_evaluation WHERE 1=1"
+    query = "DELETE FROM vendor_evaluation_v2 WHERE 1=1"
     params = []
     if branch:
         query += " AND branch_code = ?"
         params.append(branch)
     if month:
-        query += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+        query += " AND eval_month = ?"
         params.append(month)
 
     conn = get_conn()
@@ -2443,23 +2446,18 @@ async def master_vendor_eval_export(session_token: str = Cookie(default=None), b
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
 
-    query = """
-        SELECT branch_name, vendor_name, eval_date, quality_score, quality_comment,
-               attitude_score, attitude_comment, speed_score, total_score, evaluated_by, created_at
-        FROM vendor_evaluation WHERE 1=1
-    """
+    query = "SELECT * FROM vendor_evaluation_v2 WHERE 1=1"
     params = []
     if branch:
         query += " AND branch_code = ?"
         params.append(branch)
     if month:
-        query += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+        query += " AND eval_month = ?"
         params.append(month)
     query += " ORDER BY created_at DESC"
 
     conn = get_conn()
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+    evaluations = conn.execute(query, params).fetchall()
 
     import io
     from openpyxl import Workbook
@@ -2467,16 +2465,26 @@ async def master_vendor_eval_export(session_token: str = Cookie(default=None), b
     ws = wb.active
     assert ws is not None
     ws.title = "거래처평가"
-    headers = ["지점", "거래처", "평가일", "품질점수", "품질사유", "태도점수", "태도사유", "속도점수", "총점", "등록자", "등록일시"]
+    headers = ["지점", "거래처", "평가월", "문항", "점수", "사유", "총점", "등록자", "등록일시"]
     ws.append(headers)
-    for r in rows:
-        ws.append([
-            r["branch_name"], r["vendor_name"], str(r["eval_date"]) if r["eval_date"] else "",
-            r["quality_score"], r["quality_comment"],
-            r["attitude_score"], r["attitude_comment"],
-            r["speed_score"], float(r["total_score"]) if r["total_score"] is not None else None,
-            r["evaluated_by"], str(r["created_at"]) if r["created_at"] else ""
-        ])
+
+    for ev in evaluations:
+        answers = conn.execute("""
+            SELECT a.score, a.comment, c.label
+            FROM vendor_evaluation_answer a
+            JOIN eval_criteria c ON c.id = a.criteria_id
+            WHERE a.evaluation_id = ?
+            ORDER BY c.display_order
+        """, (ev["id"],)).fetchall()
+        if not answers:
+            ws.append([ev["branch_name"], ev["vendor_name"], ev["eval_month"], "-", "-", "-",
+                       float(ev["total_score"]) if ev["total_score"] is not None else None,
+                       ev["evaluated_by"], str(ev["created_at"]) if ev["created_at"] else ""])
+        for a in answers:
+            ws.append([ev["branch_name"], ev["vendor_name"], ev["eval_month"], a["label"], a["score"], a["comment"],
+                       float(ev["total_score"]) if ev["total_score"] is not None else None,
+                       ev["evaluated_by"], str(ev["created_at"]) if ev["created_at"] else ""])
+    conn.close()
 
     for col_idx in range(1, len(headers) + 1):
         ws.column_dimensions[chr(64 + col_idx)].width = 18
@@ -2495,6 +2503,7 @@ async def master_vendor_eval_export(session_token: str = Cookie(default=None), b
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
     )
 
+
 @app.get("/master/vendor-eval/summary", response_class=HTMLResponse)
 async def master_vendor_eval_summary(session_token: str = Cookie(default=None), branch: str = "", month: str = ""):
     user = get_session(session_token)
@@ -2509,17 +2518,14 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
         where_clause += " AND branch_code = ?"
         params.append(branch)
     if month:
-        where_clause += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+        where_clause += " AND eval_month = ?"
         params.append(month)
 
     vendor_rows = conn.execute(f"""
         SELECT vendor_name,
                COUNT(*) as cnt,
-               ROUND(AVG(quality_score), 1) as avg_quality,
-               ROUND(AVG(attitude_score), 1) as avg_attitude,
-               ROUND(AVG(speed_score), 1) as avg_speed,
                ROUND(AVG(total_score), 1) as avg_total
-        FROM vendor_evaluation
+        FROM vendor_evaluation_v2
         {where_clause}
         GROUP BY vendor_name
         ORDER BY avg_total DESC
@@ -2530,16 +2536,13 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
         month_where = "WHERE 1=1"
         month_params = []
         if month:
-            month_where += " AND TO_CHAR(eval_date, 'YYYY-MM') = ?"
+            month_where += " AND eval_month = ?"
             month_params.append(month)
         branch_rows = conn.execute(f"""
             SELECT branch_name,
                    COUNT(*) as cnt,
-                   ROUND(AVG(quality_score), 1) as avg_quality,
-                   ROUND(AVG(attitude_score), 1) as avg_attitude,
-                   ROUND(AVG(speed_score), 1) as avg_speed,
                    ROUND(AVG(total_score), 1) as avg_total
-            FROM vendor_evaluation
+            FROM vendor_evaluation_v2
             {month_where}
             GROUP BY branch_name
             ORDER BY avg_total DESC
@@ -2548,12 +2551,11 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
 
     vendor_rows_html = ""
     if not vendor_rows:
-        vendor_rows_html = '<tr><td colspan="7" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
+        vendor_rows_html = '<tr><td colspan="4" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
     for i, r in enumerate(vendor_rows, start=1):
         vendor_rows_html += f"""
         <tr>
             <td>{i}</td><td>{r['vendor_name']}</td><td>{r['cnt']}건</td>
-            <td>{r['avg_quality']}</td><td>{r['avg_attitude']}</td><td>{r['avg_speed']}</td>
             <td><b>{r['avg_total']}</b></td>
         </tr>
         """
@@ -2569,12 +2571,11 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
     else:
         branch_rows_html = ""
         if not branch_rows:
-            branch_rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
+            branch_rows_html = '<tr><td colspan="3" style="text-align:center;padding:20px;color:#888;">데이터 없음</td></tr>'
         for r in branch_rows:
             branch_rows_html += f"""
             <tr>
                 <td>{r['branch_name']}</td><td>{r['cnt']}건</td>
-                <td>{r['avg_quality']}</td><td>{r['avg_attitude']}</td><td>{r['avg_speed']}</td>
                 <td><b>{r['avg_total']}</b></td>
             </tr>
             """
@@ -2582,10 +2583,7 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
         <div class="card">
           <h3 style="font-size:15px;margin-bottom:12px;">지점별 평가 성향 비교</h3>
           <table>
-              <thead><tr>
-                  <th>지점</th><th>평가건수</th>
-                  <th>품질평균</th><th>태도평균</th><th>속도평균</th><th>총점평균</th>
-              </tr></thead>
+              <thead><tr><th>지점</th><th>평가건수</th><th>총점평균</th></tr></thead>
               <tbody>{branch_rows_html}</tbody>
           </table>
           <p style="font-size:12px;color:#888;margin-top:8px;">
@@ -2609,10 +2607,7 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
     <div class="card">
       <h3 style="font-size:15px;margin-bottom:12px;">거래처별 랭킹 (총점 높은 순)</h3>
       <table>
-          <thead><tr>
-              <th>순위</th><th>거래처</th><th>평가건수</th>
-              <th>품질평균</th><th>태도평균</th><th>속도평균</th><th>총점평균</th>
-          </tr></thead>
+          <thead><tr><th>순위</th><th>거래처</th><th>평가건수</th><th>총점평균</th></tr></thead>
           <tbody>{vendor_rows_html}</tbody>
       </table>
     </div>
@@ -2622,6 +2617,7 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
     <a href="/master/vendor-eval?branch={branch}&month={month}" style="display:inline-block;margin-top:8px;color:#2563eb;font-size:13px;text-decoration:none;">← 상세 목록으로 돌아가기</a>
     """
     return HTMLResponse(content=render_page(content, user, "vendor-eval"))
+
 
 @app.get("/master/vendor-master", response_class=HTMLResponse)
 async def vendor_master_page(session_token: str = Cookie(default=None)):
