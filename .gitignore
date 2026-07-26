@@ -8,3 +8,4 @@ uploads/
 venv/
 .vercel
 .env*
+__pycache__/
