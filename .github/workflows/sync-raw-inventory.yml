@@ -6,11 +6,65 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  sync:
+  check-and-sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Call sync endpoint
+      - name: Download current CSV
+        run: |
+          curl -sf "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/stock/유비플러스_재고현황.csv" \
+            -o current.csv --max-time 60
+
+      - name: Compute hash
+        id: hash
+        run: |
+          echo "value=$(sha256sum current.csv | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore previous hash
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: last_hash.txt
+          key: inventory-hash-${{ github.run_id }}
+          restore-keys: |
+            inventory-hash-
+
+      - name: Compare hashes
+        id: compare
+        run: |
+          if [ -f last_hash.txt ]; then
+            PREV=$(cat last_hash.txt)
+          else
+            PREV=""
+          fi
+          CURR="${{ steps.hash.outputs.value }}"
+          echo "previous=$PREV" >> "$GITHUB_OUTPUT"
+          echo "current=$CURR" >> "$GITHUB_OUTPUT"
+          if [ "$PREV" == "$CURR" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log result
+        run: |
+          echo "이전 해시: ${{ steps.compare.outputs.previous }}"
+          echo "현재 해시: ${{ steps.compare.outputs.current }}"
+          echo "변경 여부: ${{ steps.compare.outputs.changed }}"
+
+      - name: Call sync endpoint (only if changed)
+        if: steps.compare.outputs.changed == 'true'
         run: |
           curl -sf -X GET "https://inventory-sync-teal.vercel.app/api/cron/sync-raw-inventory" \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
             --max-time 60
+
+      - name: Save new hash
+        if: always()
+        run: echo "${{ steps.hash.outputs.value }}" > last_hash.txt
+
+      - name: Cache new hash
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: last_hash.txt
+          key: inventory-hash-${{ github.run_id }}

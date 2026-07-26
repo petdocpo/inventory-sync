@@ -6,3 +6,5 @@ qr_codes/
 uploads/
 .vscode/
 venv/
+.vercel
+.env*
