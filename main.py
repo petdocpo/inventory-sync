@@ -2171,8 +2171,9 @@ async def vendor_eval_edit_page(evaluation_id: int, session_token: str = Cookie(
                 body: JSON.stringify(payload)
             }});
             if (res.ok) {{
+                const result = await res.json();
                 alert('수정되었습니다.');
-                window.location.href = '/vendor-eval/history?eval_month=' + encodeURIComponent(evalMonth) + '&edit=1';
+                window.location.href = result.next_url || '/vendor-eval';
             }} else {{
                 const err = await res.json();
                 alert('오류: ' + (err.detail || '수정 실패'));
@@ -2228,10 +2229,24 @@ async def vendor_eval_edit_submit(evaluation_id: int, request: Request, session_
             (evaluation_id, a.get("criteria_id"), a.get("score"), a.get("comment", "").strip())
         )
     conn.execute("UPDATE vendor_evaluation_v2 SET total_score=? WHERE id=?", (total_score, evaluation_id))
+
+    branch_code = ev["branch_code"]
+    eval_month = ev["eval_month"]
+    all_vendors = conn.execute("SELECT vendor_name FROM vendor_master ORDER BY vendor_name").fetchall()
+    done_vendors = conn.execute("""
+        SELECT DISTINCT vendor_name FROM vendor_evaluation_v2
+        WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
+    """, (branch_code, eval_month)).fetchall()
     conn.commit()
     conn.close()
 
-    return JSONResponse(content={"status": "ok"})
+    done_set = {v["vendor_name"] for v in done_vendors}
+    remaining = [v["vendor_name"] for v in all_vendors if v["vendor_name"] not in done_set]
+
+    # 아직 미완료 거래처가 남아있으면 등록 화면으로, 없으면 제출 내역으로 이동
+    next_url = "/vendor-eval" if remaining else f"/vendor-eval/history?eval_month={eval_month}&edit=1"
+
+    return JSONResponse(content={"status": "ok", "next_url": next_url})
 
 
 @app.get("/master/vendor-eval", response_class=HTMLResponse)
