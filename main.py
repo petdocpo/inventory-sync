@@ -1803,7 +1803,7 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
         names_str = ", ".join(resubmit_names)
         resubmit_banner = f"""
         <div class="card" style="background:#FEF3C7;border:1px solid #F59E0B;max-width:520px;margin:0 auto 12px;">
-          <p style="font-size:13px;color:#92400E;">⚠️ 마스터가 재제출을 요청한 거래처가 있습니다: <b>{names_str}</b></p>
+          <p style="font-size:13px;color:#92400E;">⚠️ 재평가가 필요한 거래처가 있습니다: <b>{names_str}</b></p>
         </div>
         """
 
@@ -2774,19 +2774,23 @@ async def eval_criteria_page(session_token: str = Cookie(default=None)):
             </tr>
             """
         active_badge = '<span class="badge-green">사용중</span>' if c["active"] else '<span class="badge-red">비활성</span>'
+        safe_c_label = c['label'].replace("'", "")
+        safe_c_desc = (c['description'] or '').replace("'", "")
         criteria_html += f"""
         <div class="card">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
             <div>
               <b>{c['display_order']}. {c['label']}</b> {active_badge}
               <span style="color:#888;font-size:12px;">(최대 {c['max_score']}단계)</span>
             </div>
             <div style="display:flex;gap:6px;">
+              <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editCriteriaInfo({c['id']}, '{safe_c_label}', '{safe_c_desc}')">문항 수정</button>
               <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="toggleActive({c['id']}, {str(not c['active']).lower()})">{'비활성화' if c['active'] else '활성화'}</button>
               <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="addOption({c['id']})">단계 추가</button>
               <button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteCriteria({c['id']})">문항 삭제</button>
             </div>
           </div>
+          <p style="color:#888;font-size:12px;margin-bottom:8px;">{c['description'] or '(설명 없음 — "문항 수정" 버튼으로 추가 가능)'}</p>
           <table>
             <thead><tr><th>점수</th><th>라벨</th><th>설명</th><th>사유</th><th></th></tr></thead>
             <tbody>{opt_rows}</tbody>
@@ -2821,6 +2825,21 @@ async def eval_criteria_page(session_token: str = Cookie(default=None)):
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
           document.getElementById('addCriteriaResult').innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+
+      async function editCriteriaInfo(id, currentLabel, currentDesc) {{
+        const label = prompt('문항명 수정:', currentLabel);
+        if (label === null || !label.trim()) return;
+        const description = prompt('문항 설명 수정 (전체 안내문, 선택 입력):', currentDesc);
+        if (description === null) return;
+        const res = await fetch('/master/eval-criteria/' + id + '/info', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ label: label.trim(), description: description.trim() }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '수정 실패'));
         }}
       }}
 
@@ -2859,6 +2878,7 @@ async def eval_criteria_page(session_token: str = Cookie(default=None)):
         const label = prompt('라벨 수정:', currentLabel);
         if (label === null) return;
         const description = prompt('설명 수정 (선택):', currentDesc);
+        if (description === null) return;
         const requiresComment = confirm('이 단계 선택 시 사유 입력을 필수로 할까요? (확인=필수, 취소=선택)');
         const res = await fetch('/master/eval-criteria/option/' + optionId + '/edit', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
@@ -2890,6 +2910,27 @@ async def eval_criteria_add(request: Request, session_token: str = Cookie(defaul
     conn.execute(
         "INSERT INTO eval_criteria (criteria_key, label, display_order, active, max_score) VALUES (?, ?, ?, TRUE, 5)",
         (f"{criteria_key}_{int(datetime.now().timestamp())}", label, max_order + 1)
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/eval-criteria/{criteria_id}/info")
+async def eval_criteria_update_info(criteria_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    label = data.get("label", "").strip()
+    description = data.get("description", "").strip()
+    if not label:
+        return JSONResponse(status_code=400, content={"detail": "문항명을 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "UPDATE eval_criteria SET label=?, description=? WHERE id=?",
+        (label, description, criteria_id)
     )
     conn.commit()
     conn.close()
