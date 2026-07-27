@@ -1778,46 +1778,25 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
         return HTMLResponse(content=render_page(content, user, "vendor-eval"))
 
     current_vendor = remaining[0]
-    is_first_of_round = (done_count == 0)
 
     criteria_js = json.dumps(criteria_data, ensure_ascii=False)
     current_vendor_js = json.dumps(current_vendor, ensure_ascii=False)
-    eval_month_js = json.dumps(eval_month, ensure_ascii=False)
 
     eval_month = default_month  # 항상 전월로 고정, 선택 불가
     month_selector_html = f'<p style="color:#888;font-size:12px;margin-bottom:12px;">평가월: {eval_month} (전월 고정)</p>'
+    eval_month_js = json.dumps(eval_month, ensure_ascii=False)
 
-    step_divs = f"""
-    <div class="ve-step active" id="step0">
-        {month_selector_html}
-        <div class="ve-btn-row">
-            <button class="ve-btn-next" onclick="goStep(1)">다음</button>
-        </div>
-    </div>
-    """
-    n_criteria = len(criteria_data)
+    # 전체 문항을 한 화면에 렌더링 (순차진행 폐지)
+    criteria_blocks = ""
     for idx, c in enumerate(criteria_data):
-        step_num = idx + 1
-        is_last = (step_num == n_criteria)
-        prev_btn = f'<button class="ve-btn-prev" onclick="goStep({step_num - 1})">이전</button>'
-        next_action = "submitEval()" if is_last else f"goStep({step_num + 1})"
-        next_label = "제출" if is_last else "다음"
-        next_id = "submitBtn" if is_last else f"nextBtn{step_num}"
-        step_divs += f"""
-        <div class="ve-step" id="step{step_num}">
-            <div class="ve-field">
-                <label>{step_num}. {c['label']}</label>
-                <div id="options_{c['key']}"></div>
-                <textarea id="comment_{c['key']}" placeholder="사유를 입력하세요 (필수)"></textarea>
-            </div>
-            <div class="ve-btn-row">
-                {prev_btn}
-                <button class="ve-btn-next" id="{next_id}" onclick="{next_action}" disabled>{next_label}</button>
-            </div>
+        num = idx + 1
+        criteria_blocks += f"""
+        <div class="ve-field">
+            <label>{num}. {c['label']}</label>
+            <div id="options_{c['key']}"></div>
+            <textarea id="comment_{c['key']}" placeholder="사유를 입력하세요 (필수)"></textarea>
         </div>
         """
-
-    step_names_js = json.dumps(["기본 정보"] + [f"{i+1}/{n_criteria} {c['label']}" for i, c in enumerate(criteria_data)], ensure_ascii=False)
 
     resubmit_banner = ""
     if resubmit_names:
@@ -1833,36 +1812,30 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
     <style>
         .ve-card {{ background:#fff; border-radius:12px; padding:20px; max-width:520px; margin:0 auto; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
         .ve-card h2 {{ font-size:18px; margin-bottom:4px; }}
-        .ve-progress {{ color:#2563eb; font-size:13px; font-weight:bold; margin-bottom:4px; }}
-        .ve-step-indicator {{ color:#888; font-size:13px; margin-bottom:16px; }}
-        .ve-field {{ margin-bottom:14px; }}
+        .ve-progress {{ color:#2563eb; font-size:13px; font-weight:bold; margin-bottom:16px; }}
+        .ve-field {{ margin-bottom:20px; padding-bottom:16px; border-bottom:1px solid #eee; }}
         .ve-field label {{ display:block; font-weight:bold; margin-bottom:6px; font-size:14px; }}
-        .ve-card select {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; }}
         .ve-option {{ border:1px solid #ddd; border-radius:8px; padding:10px; margin-bottom:8px; cursor:pointer; }}
         .ve-option.selected {{ border-color:#2563eb; background:#eff6ff; }}
         .ve-option .ve-label {{ font-weight:bold; font-size:14px; }}
         .ve-option .ve-desc {{ font-size:12px; color:#888; margin-top:2px; }}
         .ve-card textarea {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; min-height:70px; margin-top:8px; display:none; }}
-        .ve-btn-row {{ display:flex; justify-content:space-between; margin-top:16px; }}
-        .ve-card button {{ padding:10px 20px; border:none; border-radius:6px; font-size:14px; cursor:pointer; }}
-        .ve-btn-next {{ background:#2563eb; color:#fff; margin-left:auto; }}
-        .ve-btn-prev {{ background:#eee; color:#333; }}
-        .ve-btn-next:disabled {{ background:#ccc; cursor:not-allowed; }}
-        .ve-step {{ display:none; }}
-        .ve-step.active {{ display:block; }}
+        .ve-card button {{ padding:12px 20px; border:none; border-radius:6px; font-size:15px; cursor:pointer; width:100%; }}
+        .ve-btn-submit {{ background:#2563eb; color:#fff; }}
+        .ve-btn-submit:disabled {{ background:#ccc; cursor:not-allowed; }}
     </style>
     <div class="ve-card">
         <div class="ve-progress">진행 상황: {done_count + 1} / {total_count}</div>
         <h2>거래처 평가 — {current_vendor}</h2>
-        <div class="ve-step-indicator" id="stepIndicator">기본 정보</div>
-        {step_divs}
+        <p style="color:#888;font-size:12px;margin-bottom:16px;">평가월: {eval_month} (전월 고정)</p>
+        {criteria_blocks}
+        <button class="ve-btn-submit" id="submitBtn" onclick="submitEval()" disabled>제출</button>
     </div>
 
     <script>
         const criteriaData = {criteria_js};
         const currentVendor = {current_vendor_js};
         let currentEvalMonth = {eval_month_js};
-        const stepNames = {step_names_js};
 
         let selected = {{}};
         criteriaData.forEach(c => selected[c.key] = null);
@@ -1886,33 +1859,29 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
                         commentEl.style.display = 'none';
                         commentEl.value = '';
                     }}
-                    checkStepValid(criteria);
+                    checkAllValid();
                 }};
                 container.appendChild(div);
             }});
         }}
 
-        function checkStepValid(criteria) {{
-            const score = selected[criteria.key];
-            const opt = criteria.options.find(o => o.score === score);
-            const needsComment = opt && opt.requires_comment;
-            const comment = document.getElementById('comment_' + criteria.key).value.trim();
-            const stepIdx = criteriaData.indexOf(criteria) + 1;
-            const isLast = stepIdx === criteriaData.length;
-            const btnId = isLast ? 'submitBtn' : ('nextBtn' + stepIdx);
-            document.getElementById(btnId).disabled = !(score && (!needsComment || comment));
+        function checkAllValid() {{
+            const allValid = criteriaData.every(c => {{
+                const score = selected[c.key];
+                if (!score) return false;
+                const opt = c.options.find(o => o.score === score);
+                const needsComment = opt && opt.requires_comment;
+                if (!needsComment) return true;
+                const comment = document.getElementById('comment_' + c.key).value.trim();
+                return comment.length > 0;
+            }});
+            document.getElementById('submitBtn').disabled = !allValid;
         }}
 
         criteriaData.forEach(c => {{
             renderOptions(c);
-            document.getElementById('comment_' + c.key).addEventListener('input', () => checkStepValid(c));
+            document.getElementById('comment_' + c.key).addEventListener('input', checkAllValid);
         }});
-
-        function goStep(n) {{
-            document.querySelectorAll('.ve-step').forEach(s => s.classList.remove('active'));
-            document.getElementById('step' + n).classList.add('active');
-            document.getElementById('stepIndicator').innerText = stepNames[n];
-        }}
 
         async function submitEval() {{
             const answers = criteriaData.map(c => ({{
