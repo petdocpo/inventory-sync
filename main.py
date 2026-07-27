@@ -417,16 +417,50 @@ async def dashboard(
                 "SELECT * FROM inventory WHERE branch_code=? ORDER BY item_code",
                 (filter_branch,)
             ).fetchall()
+            scan_last = conn.execute(
+                "SELECT MAX(scanned_at) as t FROM scan_log WHERE branch_code=?",
+                (filter_branch,)
+            ).fetchone()
+            raw_last = conn.execute(
+                "SELECT MAX(uploaded_at) as t FROM raw_inventory WHERE branch_code=?",
+                (filter_branch,)
+            ).fetchone()
         else:
             rows = conn.execute(
                 "SELECT * FROM inventory ORDER BY branch_code, item_code"
             ).fetchall()
+            scan_last = conn.execute("SELECT MAX(scanned_at) as t FROM scan_log").fetchone()
+            raw_last = conn.execute("SELECT MAX(uploaded_at) as t FROM raw_inventory").fetchone()
     else:
         rows = conn.execute(
             "SELECT * FROM inventory WHERE branch_code=? ORDER BY item_code",
             (user["branch_code"],)
         ).fetchall()
+        scan_last = conn.execute(
+            "SELECT MAX(scanned_at) as t FROM scan_log WHERE branch_code=?",
+            (user["branch_code"],)
+        ).fetchone()
+        raw_last = conn.execute(
+            "SELECT MAX(uploaded_at) as t FROM raw_inventory WHERE branch_code=?",
+            (user["branch_code"],)
+        ).fetchone()
     conn.close()
+
+    def format_kst(raw_value):
+        if not raw_value:
+            return "기록 없음"
+        try:
+            from datetime import timezone, timedelta
+            dt = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            kst = dt.astimezone(timezone(timedelta(hours=9)))
+            return kst.strftime('%m/%d %H:%M')
+        except Exception:
+            return str(raw_value)[:16]
+
+    scan_last_display = format_kst(scan_last["t"] if scan_last else None)
+    raw_last_display = format_kst(raw_last["t"] if raw_last else None)
 
     raw_mock = fetch_raw_inventory()
     raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in raw_mock}
@@ -489,10 +523,12 @@ async def dashboard(
         <div style="font-size:28px;font-weight:bold;color:#EF4444;">{disc_count}</div>
       </div>
       <div class="card" style="flex:1;text-align:center;padding:16px;">
-        <div style="color:#888;font-size:12px;">마지막 확인</div>
-        <div style="font-size:13px;font-weight:bold;color:#1E2761;">
-          {datetime.now().strftime('%m/%d %H:%M')}
-        </div>
+        <div style="color:#888;font-size:12px;">QR 마지막 스캔</div>
+        <div style="font-size:13px;font-weight:bold;color:#1E2761;">{scan_last_display}</div>
+      </div>
+      <div class="card" style="flex:1;text-align:center;padding:16px;">
+        <div style="color:#888;font-size:12px;">RAW 마지막 확인</div>
+        <div style="font-size:13px;font-weight:bold;color:#1E2761;">{raw_last_display}</div>
       </div>
     </div>
     <div class="card">
