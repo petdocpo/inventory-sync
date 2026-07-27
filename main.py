@@ -2349,15 +2349,11 @@ async def master_vendor_eval_status(session_token: str = Cookie(default=None), m
         month = f"{prev_month_year}-{prev_month_num:02d}"
 
     conn = get_conn()
-    all_branches = conn.execute(
-        "SELECT DISTINCT branch_code, branch_name FROM users WHERE role='branch' ORDER BY branch_name"
-    ).fetchall()
-
     total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
 
     rows_html = ""
     submitted_count = 0
-    for b in all_branches:
+    for b in BRANCHES:
         done_cnt = conn.execute("""
             SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
             WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
@@ -2381,7 +2377,7 @@ async def master_vendor_eval_status(session_token: str = Cookie(default=None), m
         """
     conn.close()
 
-    total_branches = len(all_branches)
+    total_branches = len(BRANCHES)
     month_options = ""
     for i in range(6):
         m = today.month - i
