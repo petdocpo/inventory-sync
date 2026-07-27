@@ -2386,13 +2386,14 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
       </form>
     </div>
     <div class="card">
-      <form method="post" action="/master/vendor-eval/delete">
+      <form method="post" action="/master/vendor-eval/delete" id="veDeleteForm">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
           <span style="font-size:13px;color:#888;">{len(evaluations)}개 항목</span>
           <div style="display:flex;gap:8px;">
             <button type="button" class="btn" id="veSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+            <button type="button" class="btn" id="veResubmitBtn" style="background:#F59E0B;font-size:12px;padding:6px 12px;">재제출 요청</button>
             <button type="submit" class="btn btn-red" style="font-size:12px;padding:6px 12px;"
-                    onclick="return confirm('선택한 평가를 삭제할까요?')">선택삭제</button>
+                    onclick="return confirm('선택한 평가를 완전 삭제합니다. 되돌릴 수 없습니다. 계속할까요?')">완전삭제</button>
             <button type="button" class="btn btn-red" id="veDeleteAllBtn" style="font-size:12px;padding:6px 12px;">전체삭제</button>
           </div>
         </div>
@@ -2433,11 +2434,39 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
             }}
           }});
         }}
+        var resubmitBtn = document.getElementById('veResubmitBtn');
+        if (resubmitBtn) {{
+          resubmitBtn.addEventListener('click', function() {{
+            var checked = document.querySelectorAll('.ve-check:checked');
+            if (checked.length === 0) {{ alert('재제출을 요청할 항목을 선택하세요.'); return; }}
+            if (confirm(checked.length + '건에 대해 재제출을 요청합니다. 지점에 재평가 알림이 표시됩니다. 계속할까요?')) {{
+              var form = document.getElementById('veDeleteForm');
+              form.action = '/master/vendor-eval/request-resubmit';
+              form.submit();
+            }}
+          }});
+        }}
       }})();
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "vendor-eval"))
 
+@app.post("/master/vendor-eval/request-resubmit")
+async def master_vendor_eval_request_resubmit(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    form = await request.form()
+    ids = form.getlist("selected_ids")
+    if ids:
+        conn = get_conn()
+        conn.execute(
+            f"UPDATE vendor_evaluation_v2 SET status='resubmit_requested' WHERE id IN ({','.join('?' for _ in ids)})",
+            [int(i) for i in ids]
+        )
+        conn.commit()
+        conn.close()
+    return RedirectResponse(url="/master/vendor-eval", status_code=303)
 
 @app.post("/master/vendor-eval/delete")
 async def master_vendor_eval_delete(request: Request, session_token: str = Cookie(default=None)):
