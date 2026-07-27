@@ -1770,9 +1770,10 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
           <div style="font-size:32px;">✅</div>
           <p style="font-weight:bold;margin-top:12px;">{eval_month} 거래처 평가가 완료되었습니다.</p>
           <p style="color:#888;font-size:13px;margin-top:4px;">{total_count}개 거래처 평가 완료</p>
-          <div style="display:flex;gap:8px;justify-content:center;margin-top:16px;">
+          <div style="display:flex;gap:8px;justify-content:center;margin-top:16px;flex-wrap:wrap;">
             <a href="/vendor-eval/history?eval_month={eval_month}" class="btn" style="text-decoration:none;">📋 제출 내역 확인</a>
-            <a href="/vendor-eval/history?eval_month={eval_month}&edit=1" class="btn" style="text-decoration:none;background:#F59E0B;">✏️ 수정하기</a>
+            <a href="/vendor-eval/history?eval_month={eval_month}&edit=1" class="btn" style="text-decoration:none;background:#F59E0B;">✏️ 거래처별 수정</a>
+            <a href="/vendor-eval/reeval?eval_month={eval_month}" class="btn" style="text-decoration:none;background:#8B5CF6;">🔄 전체 재평가</a>
           </div>
         </div>
         """
@@ -2045,9 +2046,27 @@ async def vendor_eval_history(session_token: str = Cookie(default=None), eval_mo
     """
     return HTMLResponse(content=render_page(content, user, "vendor-eval"))
 
+@app.get("/vendor-eval/reeval")
+async def vendor_eval_reeval_start(eval_month: str, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    first_ev = conn.execute("""
+        SELECT id FROM vendor_evaluation_v2
+        WHERE branch_code = ? AND eval_month = ?
+        ORDER BY vendor_name LIMIT 1
+    """, (user["branch_code"], eval_month)).fetchone()
+    conn.close()
+
+    if not first_ev:
+        return RedirectResponse(url="/vendor-eval", status_code=303)
+
+    return RedirectResponse(url=f"/vendor-eval/edit/{first_ev['id']}?reeval=1", status_code=303)
 
 @app.get("/vendor-eval/edit/{evaluation_id}", response_class=HTMLResponse)
-async def vendor_eval_edit_page(evaluation_id: int, session_token: str = Cookie(default=None)):
+async def vendor_eval_edit_page(evaluation_id: int, session_token: str = Cookie(default=None), reeval: str = ""):
     user = get_session(session_token)
     if not user or user["role"] == "master":
         return RedirectResponse(url="/login", status_code=303)
@@ -2122,6 +2141,8 @@ async def vendor_eval_edit_page(evaluation_id: int, session_token: str = Cookie(
         const vendorName = {vendor_name_js};
         const evalMonth = {eval_month_js};
         const evaluationId = {evaluation_id};
+        const reevalMode = {json.dumps(bool(reeval))};
+        const currentEvalMonth = {json.dumps(ev["eval_month"], ensure_ascii=False)};
 
         let selected = {{}};
         criteriaData.forEach(c => selected[c.key] = c.existing_score);
@@ -2171,9 +2192,15 @@ async def vendor_eval_edit_page(evaluation_id: int, session_token: str = Cookie(
                 body: JSON.stringify(payload)
             }});
             if (res.ok) {{
-                const result = await res.json();
                 alert('수정되었습니다.');
-                window.location.href = result.next_url || '/vendor-eval';
+                if (reevalMode) {{
+                    const nextRes = await fetch('/vendor-eval/reeval/next?evaluation_id=' + evaluationId + '&eval_month=' + encodeURIComponent(currentEvalMonth));
+                    const nextData = await nextRes.json();
+                    window.location.href = nextData.next_url;
+                }} else {{
+                    const result = await res.json();
+                    window.location.href = result.next_url || '/vendor-eval';
+                }}
             }} else {{
                 const err = await res.json();
                 alert('오류: ' + (err.detail || '수정 실패'));
@@ -2248,6 +2275,29 @@ async def vendor_eval_edit_submit(evaluation_id: int, request: Request, session_
 
     return JSONResponse(content={"status": "ok", "next_url": next_url})
 
+@app.get("/vendor-eval/reeval/next")
+async def vendor_eval_reeval_next(evaluation_id: int, eval_month: str, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    current_ev = conn.execute("SELECT vendor_name FROM vendor_evaluation_v2 WHERE id=?", (evaluation_id,)).fetchone()
+    if not current_ev:
+        conn.close()
+        return JSONResponse(content={"next_url": "/vendor-eval"})
+
+    next_ev = conn.execute("""
+        SELECT id FROM vendor_evaluation_v2
+        WHERE branch_code = ? AND eval_month = ? AND vendor_name > ?
+        ORDER BY vendor_name LIMIT 1
+    """, (user["branch_code"], eval_month, current_ev["vendor_name"])).fetchone()
+    conn.close()
+
+    if next_ev:
+        return JSONResponse(content={"next_url": f"/vendor-eval/edit/{next_ev['id']}?reeval=1"})
+    else:
+        return JSONResponse(content={"next_url": f"/vendor-eval/history?eval_month={eval_month}&edit=1"})
 
 @app.get("/master/vendor-eval", response_class=HTMLResponse)
 async def master_vendor_eval_page(session_token: str = Cookie(default=None), branch: str = "", month: str = ""):
