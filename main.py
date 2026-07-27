@@ -1720,6 +1720,7 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
         ).fetchall()
         criteria_data.append({
             "id": c["id"], "key": c["criteria_key"], "label": c["label"], "max_score": c["max_score"],
+            "description": c["description"] or "",
             "options": [{"score": o["score"], "label": o["label"], "desc": o["description"] or "",
                          "requires_comment": bool(o["requires_comment"])} for o in options]
         })
@@ -1790,9 +1791,11 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
     criteria_blocks = ""
     for idx, c in enumerate(criteria_data):
         num = idx + 1
+        desc_html = f'<p style="color:#888;font-size:12px;margin-bottom:8px;">{c["description"]}</p>' if c["description"] else ""
         criteria_blocks += f"""
         <div class="ve-field">
             <label>{num}. {c['label']}</label>
+            {desc_html}
             <div id="options_{c['key']}"></div>
             <textarea id="comment_{c['key']}" placeholder="사유를 입력하세요 (필수)"></textarea>
         </div>
@@ -1803,7 +1806,7 @@ async def vendor_eval_page(session_token: str = Cookie(default=None), eval_month
         names_str = ", ".join(resubmit_names)
         resubmit_banner = f"""
         <div class="card" style="background:#FEF3C7;border:1px solid #F59E0B;max-width:520px;margin:0 auto 12px;">
-          <p style="font-size:13px;color:#92400E;">⚠️ 재평가가 필요한 거래처가 있습니다: <b>{names_str}</b></p>
+          <p style="font-size:13px;color:#92400E;">⚠️ 재평가를 요청한 거래처가 있습니다: <b>{names_str}</b></p>
         </div>
         """
 
@@ -2770,7 +2773,10 @@ async def eval_criteria_page(session_token: str = Cookie(default=None)):
             <tr>
               <td>{o['score']}</td><td>{o['label']}</td><td style="font-size:12px;color:#888;">{o['description'] or '-'}</td>
               <td>{comment_badge}</td>
-              <td><button class="btn" style="font-size:11px;padding:4px 8px;" onclick="editOption({o['id']}, '{safe_label}', '{safe_desc}', {str(o['requires_comment']).lower()})">수정</button></td>
+              <td>
+                <button class="btn" style="font-size:11px;padding:4px 8px;" onclick="editOption({o['id']}, '{safe_label}', '{safe_desc}', {str(o['requires_comment']).lower()})">수정</button>
+                <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteOption({o['id']})">삭제</button>
+              </td>
             </tr>
             """
         active_badge = '<span class="badge-green">사용중</span>' if c["active"] else '<span class="badge-red">비활성</span>'
@@ -2886,6 +2892,17 @@ async def eval_criteria_page(session_token: str = Cookie(default=None)):
         }});
         if (res.ok) {{ location.reload(); }} else {{ alert('수정 실패'); }}
       }}
+
+      async function deleteOption(optionId) {{
+        if (!confirm('이 단계를 삭제합니다. 계속할까요?')) return;
+        const res = await fetch('/master/eval-criteria/option/' + optionId + '/delete', {{ method: 'POST' }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert(err.detail || '삭제 실패');
+        }}
+      }}
+
+
     </script>
     """
     conn.close()
@@ -2996,6 +3013,31 @@ async def eval_criteria_option_add(criteria_id: int, request: Request, session_t
         (criteria_id, new_score, label, description, requires_comment)
     )
     conn.execute("UPDATE eval_criteria SET max_score=? WHERE id=?", (new_score, criteria_id))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+@app.post("/master/eval-criteria/option/{option_id}/delete")
+async def eval_criteria_option_delete(option_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    usage_count = conn.execute(
+        "SELECT COUNT(*) as cnt FROM vendor_evaluation_answer WHERE score IN "
+        "(SELECT score FROM eval_criteria_option WHERE id=?) AND criteria_id IN "
+        "(SELECT criteria_id FROM eval_criteria_option WHERE id=?)",
+        (option_id, option_id)
+    ).fetchone()["cnt"]
+
+    if usage_count > 0:
+        conn.close()
+        return JSONResponse(status_code=400, content={
+            "detail": f"이미 {usage_count}건의 평가에 사용된 단계라 삭제할 수 없습니다."
+        })
+
+    conn.execute("DELETE FROM eval_criteria_option WHERE id=?", (option_id,))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
