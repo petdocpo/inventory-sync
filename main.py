@@ -2299,6 +2299,84 @@ async def vendor_eval_reeval_next(evaluation_id: int, eval_month: str, session_t
     else:
         return JSONResponse(content={"next_url": f"/vendor-eval/history?eval_month={eval_month}&edit=1"})
 
+@app.get("/master/vendor-eval/status", response_class=HTMLResponse)
+async def master_vendor_eval_status(session_token: str = Cookie(default=None), month: str = ""):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    from datetime import date
+    today = date.today()
+    if not month:
+        prev_month_num = today.month - 1 if today.month > 1 else 12
+        prev_month_year = today.year if today.month > 1 else today.year - 1
+        month = f"{prev_month_year}-{prev_month_num:02d}"
+
+    conn = get_conn()
+    all_branches = conn.execute(
+        "SELECT DISTINCT branch_code, branch_name FROM users WHERE role='branch' ORDER BY branch_name"
+    ).fetchall()
+
+    total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
+
+    rows_html = ""
+    submitted_count = 0
+    for b in all_branches:
+        done_cnt = conn.execute("""
+            SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
+            WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
+        """, (b["branch_code"], month)).fetchone()["cnt"]
+
+        is_complete = (done_cnt >= total_vendors and total_vendors > 0)
+        if is_complete:
+            submitted_count += 1
+            status_badge = '<span class="badge-green">제출완료</span>'
+        elif done_cnt > 0:
+            status_badge = '<span class="badge-red">일부제출</span>'
+        else:
+            status_badge = '<span class="badge-red">미제출</span>'
+
+        rows_html += f"""
+        <tr>
+            <td>{b['branch_name']}</td>
+            <td>{done_cnt} / {total_vendors}</td>
+            <td>{status_badge}</td>
+        </tr>
+        """
+    conn.close()
+
+    total_branches = len(all_branches)
+    month_options = ""
+    for i in range(6):
+        m = today.month - i
+        y = today.year
+        while m <= 0:
+            m += 12
+            y -= 1
+        ym = f"{y}-{m:02d}"
+        sel = 'selected' if ym == month else ''
+        month_options += f'<option value="{ym}" {sel}>{ym}</option>'
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📊 거래처평가 제출 현황</h2>
+    <div class="card">
+      <form method="get" action="/master/vendor-eval/status" style="display:flex;gap:8px;align-items:flex-end;">
+        <div>
+          <label style="font-size:12px;color:#888;">평가월</label>
+          <select name="month" onchange="this.form.submit()">{month_options}</select>
+        </div>
+      </form>
+    </div>
+    <div class="card">
+      <p style="font-size:14px;margin-bottom:12px;"><b>{month}</b> 기준 — 전체 {total_branches}개 지점 중 <b style="color:#22C55E;">{submitted_count}개 제출완료</b>, <b style="color:#EF4444;">{total_branches - submitted_count}개 미완료</b></p>
+      <table>
+        <thead><tr><th>지점</th><th>제출 거래처 수</th><th>상태</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "vendor-eval"))
+
 @app.get("/master/vendor-eval", response_class=HTMLResponse)
 async def master_vendor_eval_page(session_token: str = Cookie(default=None), branch: str = "", month: str = ""):
     user = get_session(session_token)
