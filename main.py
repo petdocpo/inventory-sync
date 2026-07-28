@@ -2978,19 +2978,27 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     rows_html = ""
     for t in targets:
         info = existing.get(t["branch_code"])
-        if info and info["url"]:
+        has_webhook = bool(info and info["url"])
+        if has_webhook:
             channel_display = info["name"] if info["name"] else "(이름 미설정)"
             url_display = info["url"][:40] + "..."
         else:
             channel_display = "-"
             url_display = "(미등록)"
         safe_channel_name = (info["name"] if info else "").replace("'", "")
+        checkbox_disabled = "" if has_webhook else "disabled"
         rows_html += f"""
         <tr>
+            <td style="text-align:center;">
+              <input type="checkbox" class="tw-check" value="{t['branch_code']}" {checkbox_disabled} style="width:16px;height:16px;">
+            </td>
             <td>{t['branch_name']}</td>
             <td style="font-size:12px;">{channel_display}</td>
             <td style="font-size:12px;color:#888;">{url_display}</td>
-            <td><button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editWebhook('{t['branch_code']}', '{t['branch_name']}', '{safe_channel_name}')">등록/수정</button></td>
+            <td style="display:flex;gap:6px;">
+              <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editWebhook('{t['branch_code']}', '{t['branch_name']}', '{safe_channel_name}')">등록/수정</button>
+              {'<button class="btn" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="testSend(\'' + t['branch_code'] + '\', \'' + t['branch_name'] + '\')">테스트</button>' if has_webhook else ''}
+            </td>
         </tr>
         """
 
@@ -3000,12 +3008,96 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
       <p style="font-size:13px;color:#1E40AF;">각 지점 및 마스터의 Teams 채널에서 발급받은 웹훅 URL을 등록하세요. 미등록 지점은 알림이 발송되지 않습니다.</p>
     </div>
     <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <button type="button" class="btn" id="twSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+        <button type="button" class="btn" id="twSendBtn" style="background:#2563eb;font-size:12px;padding:6px 12px;">✉️ 선택 채널에 메시지 보내기</button>
+      </div>
       <table>
-        <thead><tr><th>대상</th><th>채널 이름</th><th>등록된 웹훅</th><th></th></tr></thead>
+        <thead><tr>
+          <th style="width:40px;text-align:center;"><input type="checkbox" id="twAllCheck" style="width:16px;height:16px;"></th>
+          <th>대상</th><th>채널 이름</th><th>등록된 웹훅</th><th></th>
+        </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
+
+    <div id="twMessageModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:480px;width:90%;">
+        <h3 style="margin-bottom:12px;">메시지 보내기</h3>
+        <p id="twSelectedList" style="font-size:12px;color:#888;margin-bottom:12px;"></p>
+        <input type="text" id="twMsgTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <textarea id="twMsgBody" placeholder="메시지 내용을 입력하세요" style="width:100%;min-height:120px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
+        <div style="display:flex;gap:8px;margin-top:16px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeMessageModal()">취소</button>
+          <button class="btn" style="flex:1;" onclick="sendMessage()">보내기</button>
+        </div>
+      </div>
+    </div>
+
     <script>
+      (function() {{
+        var allCheck = document.getElementById('twAllCheck');
+        var selectBtn = document.getElementById('twSelectAllBtn');
+        function applyAll(checked) {{
+          document.querySelectorAll('.tw-check:not([disabled])').forEach(function(c) {{ c.checked = checked; }});
+          if (allCheck) allCheck.checked = checked;
+        }}
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ applyAll(allCheck.checked); }}); }}
+        if (selectBtn) {{
+          selectBtn.addEventListener('click', function() {{
+            var next = !(allCheck && allCheck.checked);
+            applyAll(next);
+          }});
+        }}
+        document.getElementById('twSendBtn').addEventListener('click', function() {{
+          var checked = Array.from(document.querySelectorAll('.tw-check:checked')).map(c => c.value);
+          if (checked.length === 0) {{ alert('메시지를 보낼 대상을 선택하세요.'); return; }}
+          document.getElementById('twSelectedList').innerText = checked.length + '개 채널에 발송됩니다.';
+          document.getElementById('twMessageModal').style.display = 'flex';
+          document.getElementById('twMessageModal').dataset.targets = JSON.stringify(checked);
+        }});
+      }})();
+
+      function closeMessageModal() {{
+        document.getElementById('twMessageModal').style.display = 'none';
+        document.getElementById('twMsgTitle').value = '';
+        document.getElementById('twMsgBody').value = '';
+      }}
+
+      async function sendMessage() {{
+        const targets = JSON.parse(document.getElementById('twMessageModal').dataset.targets || '[]');
+        const title = document.getElementById('twMsgTitle').value.trim();
+        const body = document.getElementById('twMsgBody').value.trim();
+        if (!body) {{ alert('메시지 내용을 입력하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/broadcast', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_codes: targets, title: title, message: body }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('발송 완료: 성공 ' + result.success + '건, 실패 ' + result.failed + '건');
+          closeMessageModal();
+        }} else {{
+          alert('오류: ' + (result.detail || '발송 실패'));
+        }}
+      }}
+
+      async function testSend(branchCode, branchName) {{
+        if (!confirm(branchName + ' 채널로 테스트 메시지를 보낼까요?')) return;
+        const res = await fetch('/master/teams-webhook/broadcast', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_codes: [branchCode], title: '테스트 알림', message: '이 메시지가 보이면 웹훅이 정상 연결된 것입니다.' }})
+        }});
+        const result = await res.json();
+        if (res.ok && result.success > 0) {{
+          alert('테스트 발송 성공! Teams 채널을 확인하세요.');
+        }} else {{
+          alert('발송 실패. 웹훅 URL을 다시 확인해주세요.');
+        }}
+      }}
+
       async function editWebhook(branchCode, branchName, currentChannelName) {{
         const url = prompt(branchName + '의 Teams 웹훅 URL을 입력하세요:');
         if (url === null) return;
@@ -3063,6 +3155,32 @@ async def master_teams_webhook_save(request: Request, session_token: str = Cooki
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/teams-webhook/broadcast")
+async def master_teams_webhook_broadcast(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    branch_codes = data.get("branch_codes", [])
+    title = data.get("title", "").strip() or "알림"
+    message = data.get("message", "").strip()
+
+    if not branch_codes or not message:
+        return JSONResponse(status_code=400, content={"detail": "대상 또는 메시지가 비어있습니다."})
+
+    success_count = 0
+    fail_count = 0
+    for bc in branch_codes:
+        ok = send_teams_notification(bc, title, message)
+        if ok:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    return JSONResponse(content={"status": "ok", "success": success_count, "failed": fail_count})
 
 @app.get("/master/eval-criteria", response_class=HTMLResponse)
 async def eval_criteria_page(session_token: str = Cookie(default=None)):
