@@ -169,6 +169,8 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("vendor-eval", vendor_eval_href, "🤝", "거래처평가"),
     ]
     if is_master:
+        menus.append(("vendor-eval-status", "/master/vendor-eval/status", "📊", "평가현황"))
+        menus.append(("teams-webhook", "/master/teams-webhook", "🔔", "팀즈웹훅"))
         menus.append(("master", "/master", "⚙️", "마스터"))
     menu_html = ""
     for key, href, icon, label in menus:
