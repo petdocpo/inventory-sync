@@ -427,6 +427,16 @@ def send_teams_notification(branch_code: str, title: str, message: str, color: s
     try:
         with httpx.Client(timeout=10) as client:
             resp = client.post(row["webhook_url"], json=payload)
+            if resp.status_code >= 300:
+                print(f"[TEAMS_DEBUG] status={resp.status_code} body={resp.text[:500]}")
+            return resp.status_code < 300
+    except Exception as e:
+        print(f"[TEAMS_DEBUG] exception={str(e)[:500]}")
+        return False
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(row["webhook_url"], json=payload)
             return resp.status_code < 300
     except Exception:
         return False
