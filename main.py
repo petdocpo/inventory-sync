@@ -383,6 +383,33 @@ async def auto_login(token: str):
     return resp
 
 
+def send_teams_notification(branch_code: str, title: str, message: str, color: str = "0078D4"):
+    """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송. 웹훅 미등록 시 조용히 무시."""
+    import httpx
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT webhook_url FROM teams_webhook WHERE branch_code=?", (branch_code,)
+    ).fetchone()
+    conn.close()
+
+    if not row or not row["webhook_url"]:
+        return False
+
+    payload = {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "themeColor": color,
+        "title": title,
+        "text": message
+    }
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(row["webhook_url"], json=payload)
+            return resp.status_code < 300
+    except Exception:
+        return False
+
 # ── RAW 목 데이터 (추후 MSSQL 교체) ─────────────────────
 
 def fetch_raw_inventory() -> List[Dict[str, Any]]:
@@ -2934,6 +2961,87 @@ async def vendor_master_delete(request: Request, session_token: str = Cookie(def
         conn.commit()
         conn.close()
     return RedirectResponse(url="/master/vendor-master", status_code=303)
+
+@app.get("/master/teams-webhook", response_class=HTMLResponse)
+async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    existing = {r["branch_code"]: r["webhook_url"] for r in conn.execute("SELECT branch_code, webhook_url FROM teams_webhook").fetchall()}
+    conn.close()
+
+    targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + BRANCHES
+
+    rows_html = ""
+    for t in targets:
+        current_url = existing.get(t["branch_code"], "")
+        masked = (current_url[:40] + "...") if current_url else "(미등록)"
+        rows_html += f"""
+        <tr>
+            <td>{t['branch_name']}</td>
+            <td style="font-size:12px;color:#888;">{masked}</td>
+            <td><button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editWebhook('{t['branch_code']}', '{t['branch_name']}')">등록/수정</button></td>
+        </tr>
+        """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">🔔 Teams 웹훅 관리</h2>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">각 지점 및 마스터의 Teams 채널에서 발급받은 웹훅 URL을 등록하세요. 미등록 지점은 알림이 발송되지 않습니다.</p>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>대상</th><th>등록된 웹훅</th><th></th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    <script>
+      async function editWebhook(branchCode, branchName) {{
+        const url = prompt(branchName + '의 Teams 웹훅 URL을 입력하세요:');
+        if (url === null) return;
+        if (url.trim() && !url.trim().startsWith('https://')) {{
+          alert('올바른 URL 형식이 아닙니다 (https://로 시작해야 함)');
+          return;
+        }}
+        const res = await fetch('/master/teams-webhook/save', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: branchCode, webhook_url: url.trim() }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('저장 실패'); }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "vendor-eval"))
+
+
+@app.post("/master/teams-webhook/save")
+async def master_teams_webhook_save(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    webhook_url = data.get("webhook_url", "").strip()
+
+    if not branch_code:
+        return JSONResponse(status_code=400, content={"detail": "대상이 지정되지 않았습니다."})
+
+    conn = get_conn()
+    existing = conn.execute("SELECT id FROM teams_webhook WHERE branch_code=?", (branch_code,)).fetchone()
+    if existing:
+        if webhook_url:
+            conn.execute("UPDATE teams_webhook SET webhook_url=?, updated_at=NOW() WHERE branch_code=?", (webhook_url, branch_code))
+        else:
+            conn.execute("DELETE FROM teams_webhook WHERE branch_code=?", (branch_code,))
+    elif webhook_url:
+        conn.execute("INSERT INTO teams_webhook (branch_code, webhook_url) VALUES (?, ?)", (branch_code, webhook_url))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
 
 @app.get("/master/eval-criteria", response_class=HTMLResponse)
 async def eval_criteria_page(session_token: str = Cookie(default=None)):
