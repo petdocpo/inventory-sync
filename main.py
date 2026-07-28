@@ -386,6 +386,7 @@ async def auto_login(token: str):
 def send_teams_notification(branch_code: str, title: str, message: str, color: str = "0078D4"):
     """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송 (Adaptive Card 형식). 웹훅 미등록 시 조용히 무시."""
     import httpx
+    import logging
     conn = get_conn()
     row = conn.execute(
         "SELECT webhook_url FROM teams_webhook WHERE branch_code=?", (branch_code,)
@@ -428,10 +429,10 @@ def send_teams_notification(branch_code: str, title: str, message: str, color: s
         with httpx.Client(timeout=10) as client:
             resp = client.post(row["webhook_url"], json=payload)
             if resp.status_code >= 300:
-                print(f"[TEAMS_DEBUG] status={resp.status_code} body={resp.text[:500]}")
+                logging.error(f"[TEAMS_DEBUG] branch={branch_code} status={resp.status_code} body={resp.text[:500]}")
             return resp.status_code < 300
     except Exception as e:
-        print(f"[TEAMS_DEBUG] exception={str(e)[:500]}")
+        logging.error(f"[TEAMS_DEBUG] branch={branch_code} exception={str(e)[:500]}")
         return False
 
     try:
