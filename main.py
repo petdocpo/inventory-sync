@@ -2969,20 +2969,28 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         return RedirectResponse(url="/login", status_code=303)
 
     conn = get_conn()
-    existing = {r["branch_code"]: r["webhook_url"] for r in conn.execute("SELECT branch_code, webhook_url FROM teams_webhook").fetchall()}
+    existing_rows = conn.execute("SELECT branch_code, webhook_url, channel_name FROM teams_webhook").fetchall()
+    existing = {r["branch_code"]: {"url": r["webhook_url"], "name": r["channel_name"] or ""} for r in existing_rows}
     conn.close()
 
     targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + BRANCHES
 
     rows_html = ""
     for t in targets:
-        current_url = existing.get(t["branch_code"], "")
-        masked = (current_url[:40] + "...") if current_url else "(미등록)"
+        info = existing.get(t["branch_code"])
+        if info and info["url"]:
+            channel_display = info["name"] if info["name"] else "(이름 미설정)"
+            url_display = info["url"][:40] + "..."
+        else:
+            channel_display = "-"
+            url_display = "(미등록)"
+        safe_channel_name = (info["name"] if info else "").replace("'", "")
         rows_html += f"""
         <tr>
             <td>{t['branch_name']}</td>
-            <td style="font-size:12px;color:#888;">{masked}</td>
-            <td><button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editWebhook('{t['branch_code']}', '{t['branch_name']}')">등록/수정</button></td>
+            <td style="font-size:12px;">{channel_display}</td>
+            <td style="font-size:12px;color:#888;">{url_display}</td>
+            <td><button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editWebhook('{t['branch_code']}', '{t['branch_name']}', '{safe_channel_name}')">등록/수정</button></td>
         </tr>
         """
 
@@ -2993,22 +3001,28 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     </div>
     <div class="card">
       <table>
-        <thead><tr><th>대상</th><th>등록된 웹훅</th><th></th></tr></thead>
+        <thead><tr><th>대상</th><th>채널 이름</th><th>등록된 웹훅</th><th></th></tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
     <script>
-      async function editWebhook(branchCode, branchName) {{
+      async function editWebhook(branchCode, branchName, currentChannelName) {{
         const url = prompt(branchName + '의 Teams 웹훅 URL을 입력하세요:');
         if (url === null) return;
         if (url.trim() && !url.trim().startsWith('https://')) {{
           alert('올바른 URL 형식이 아닙니다 (https://로 시작해야 함)');
           return;
         }}
+        let channelName = currentChannelName;
+        if (url.trim()) {{
+          const nameInput = prompt('채널 이름을 입력하세요 (예: 본사 재고관리방):', currentChannelName);
+          if (nameInput === null) return;
+          channelName = nameInput.trim();
+        }}
         const res = await fetch('/master/teams-webhook/save', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_code: branchCode, webhook_url: url.trim() }})
+          body: JSON.stringify({{ branch_code: branchCode, webhook_url: url.trim(), channel_name: channelName }})
         }});
         if (res.ok) {{ location.reload(); }} else {{ alert('저장 실패'); }}
       }}
@@ -3026,6 +3040,7 @@ async def master_teams_webhook_save(request: Request, session_token: str = Cooki
     data = await request.json()
     branch_code = data.get("branch_code", "").strip()
     webhook_url = data.get("webhook_url", "").strip()
+    channel_name = data.get("channel_name", "").strip()
 
     if not branch_code:
         return JSONResponse(status_code=400, content={"detail": "대상이 지정되지 않았습니다."})
@@ -3034,11 +3049,17 @@ async def master_teams_webhook_save(request: Request, session_token: str = Cooki
     existing = conn.execute("SELECT id FROM teams_webhook WHERE branch_code=?", (branch_code,)).fetchone()
     if existing:
         if webhook_url:
-            conn.execute("UPDATE teams_webhook SET webhook_url=?, updated_at=NOW() WHERE branch_code=?", (webhook_url, branch_code))
+            conn.execute(
+                "UPDATE teams_webhook SET webhook_url=?, channel_name=?, updated_at=NOW() WHERE branch_code=?",
+                (webhook_url, channel_name, branch_code)
+            )
         else:
             conn.execute("DELETE FROM teams_webhook WHERE branch_code=?", (branch_code,))
     elif webhook_url:
-        conn.execute("INSERT INTO teams_webhook (branch_code, webhook_url) VALUES (?, ?)", (branch_code, webhook_url))
+        conn.execute(
+            "INSERT INTO teams_webhook (branch_code, webhook_url, channel_name) VALUES (?, ?, ?)",
+            (branch_code, webhook_url, channel_name)
+        )
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
