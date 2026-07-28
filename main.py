@@ -3746,6 +3746,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">문항 추가/삭제/수정</div>
         </div>
       </a>
+      <a href="/master/vendor-eval/status" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📊</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처평가 제출현황</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">지점별 제출/미제출 확인</div>
+        </div>
+      </a>
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
