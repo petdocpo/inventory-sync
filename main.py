@@ -169,7 +169,6 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("vendor-eval", vendor_eval_href, "🤝", "거래처평가"),
     ]
     if is_master:
-        menus.append(("vendor-eval-status", "/master/vendor-eval/status", "📊", "평가현황"))
         menus.append(("teams-webhook", "/master/teams-webhook", "🔔", "팀즈웹훅"))
         menus.append(("master", "/master", "⚙️", "마스터"))
     menu_html = ""
@@ -385,18 +384,36 @@ async def auto_login(token: str):
     return resp
 
 
-def send_teams_notification(branch_code: str, title: str, message: str, color: str = "0078D4"):
-    """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송 (Adaptive Card 형식). 웹훅 미등록 시 조용히 무시.
+def send_teams_notification(branch_code: str, title: str, message: str, link_url: str = "", link_text: str = "", sent_by: str = "", device_info: str = ""):
+    """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송 (Adaptive Card 형식, 링크 지원).
+    웹훅 미등록 시 조용히 무시. 모든 시도를 teams_send_log에 기록.
     반환값: (성공여부: bool, 상세정보: str)"""
     import httpx
     conn = get_conn()
     row = conn.execute(
         "SELECT webhook_url FROM teams_webhook WHERE branch_code=?", (branch_code,)
     ).fetchone()
-    conn.close()
 
     if not row or not row["webhook_url"]:
+        conn.execute(
+            "INSERT INTO teams_send_log (branch_code, title, message, success, detail, sent_by, device_info) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (branch_code, title, message, False, "웹훅 미등록", sent_by, device_info)
+        )
+        conn.commit()
+        conn.close()
         return False, "웹훅 미등록"
+
+    body_blocks = [
+        {"type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": True},
+        {"type": "TextBlock", "text": message, "wrap": True}
+    ]
+    if link_url:
+        body_blocks.append({
+            "type": "ActionSet",
+            "actions": [
+                {"type": "Action.OpenUrl", "title": link_text or "바로가기", "url": link_url}
+            ]
+        })
 
     payload = {
         "type": "message",
@@ -408,40 +425,34 @@ def send_teams_notification(branch_code: str, title: str, message: str, color: s
                     "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                     "type": "AdaptiveCard",
                     "version": "1.4",
-                    "body": [
-                        {
-                            "type": "TextBlock",
-                            "text": title,
-                            "weight": "Bolder",
-                            "size": "Medium",
-                            "wrap": True
-                        },
-                        {
-                            "type": "TextBlock",
-                            "text": message,
-                            "wrap": True
-                        }
-                    ]
+                    "body": body_blocks
                 }
             }
         ]
     }
 
+    success = False
+    detail = ""
     try:
         with httpx.Client(timeout=10) as client:
             resp = client.post(row["webhook_url"], json=payload)
             if resp.status_code >= 300:
-                return False, f"status={resp.status_code} body={resp.text[:300]}"
-            return True, "성공"
+                detail = f"status={resp.status_code} body={resp.text[:300]}"
+                success = False
+            else:
+                detail = "성공"
+                success = True
     except Exception as e:
-        return False, f"exception={str(e)[:300]}"
+        detail = f"exception={str(e)[:300]}"
+        success = False
 
-    try:
-        with httpx.Client(timeout=10) as client:
-            resp = client.post(row["webhook_url"], json=payload)
-            return resp.status_code < 300
-    except Exception:
-        return False
+    conn.execute(
+        "INSERT INTO teams_send_log (branch_code, title, message, success, detail, sent_by, device_info) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (branch_code, title, message, success, detail, sent_by, device_info)
+    )
+    conn.commit()
+    conn.close()
+    return success, detail
 
     payload = {
         "@type": "MessageCard",
@@ -3075,6 +3086,8 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         <p id="twSelectedList" style="font-size:12px;color:#888;margin-bottom:12px;"></p>
         <input type="text" id="twMsgTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
         <textarea id="twMsgBody" placeholder="메시지 내용을 입력하세요" style="width:100%;min-height:120px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
+        <input type="text" id="twMsgLinkUrl" placeholder="링크 URL (선택, 예: https://inventory-sync-teal.vercel.app)" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;box-sizing:border-box;">
+        <input type="text" id="twMsgLinkText" placeholder="링크 버튼 텍스트 (선택, 예: 바로가기)" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;box-sizing:border-box;">
         <div style="display:flex;gap:8px;margin-top:16px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeMessageModal()">취소</button>
           <button class="btn" style="flex:1;" onclick="sendMessage()">보내기</button>
@@ -3110,17 +3123,21 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         document.getElementById('twMessageModal').style.display = 'none';
         document.getElementById('twMsgTitle').value = '';
         document.getElementById('twMsgBody').value = '';
+        document.getElementById('twMsgLinkUrl').value = '';
+        document.getElementById('twMsgLinkText').value = '';
       }}
 
       async function sendMessage() {{
         const targets = JSON.parse(document.getElementById('twMessageModal').dataset.targets || '[]');
         const title = document.getElementById('twMsgTitle').value.trim();
         const body = document.getElementById('twMsgBody').value.trim();
+        const linkUrl = document.getElementById('twMsgLinkUrl').value.trim();
+        const linkText = document.getElementById('twMsgLinkText').value.trim();
         if (!body) {{ alert('메시지 내용을 입력하세요.'); return; }}
         const res = await fetch('/master/teams-webhook/broadcast', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_codes: targets, title: title, message: body }})
+          body: JSON.stringify({{ branch_codes: targets, title: title, message: body, link_url: linkUrl, link_text: linkText }})
         }});
         const result = await res.json();
         if (res.ok) {{
@@ -3136,7 +3153,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         const res = await fetch('/master/teams-webhook/broadcast', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_codes: [branchCode], title: '테스트 알림', message: '이 메시지가 보이면 웹훅이 정상 연결된 것입니다.' }})
+          body: JSON.stringify({{ branch_codes: [branchCode], title: '테스트 알림', message: '이 메시지가 보이면 웹훅이 정상 연결된 것입니다.', link_url: 'https://inventory-sync-teal.vercel.app', link_text: '앱 바로가기' }})
         }});
         const result = await res.json();
         if (res.ok && result.success > 0) {{
@@ -3215,15 +3232,19 @@ async def master_teams_webhook_broadcast(request: Request, session_token: str = 
     branch_codes = data.get("branch_codes", [])
     title = data.get("title", "").strip() or "알림"
     message = data.get("message", "").strip()
+    link_url = data.get("link_url", "").strip()
+    link_text = data.get("link_text", "").strip()
 
     if not branch_codes or not message:
         return JSONResponse(status_code=400, content={"detail": "대상 또는 메시지가 비어있습니다."})
+
+    device_info = request.headers.get("user-agent", "")[:200]
 
     success_count = 0
     fail_count = 0
     fail_details = []
     for bc in branch_codes:
-        ok, detail = send_teams_notification(bc, title, message)
+        ok, detail = send_teams_notification(bc, title, message, link_url, link_text, user["branch_code"], device_info)
         if ok:
             success_count += 1
         else:
