@@ -384,9 +384,9 @@ async def auto_login(token: str):
 
 
 def send_teams_notification(branch_code: str, title: str, message: str, color: str = "0078D4"):
-    """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송 (Adaptive Card 형식). 웹훅 미등록 시 조용히 무시."""
+    """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송 (Adaptive Card 형식). 웹훅 미등록 시 조용히 무시.
+    반환값: (성공여부: bool, 상세정보: str)"""
     import httpx
-    import logging
     conn = get_conn()
     row = conn.execute(
         "SELECT webhook_url FROM teams_webhook WHERE branch_code=?", (branch_code,)
@@ -394,7 +394,7 @@ def send_teams_notification(branch_code: str, title: str, message: str, color: s
     conn.close()
 
     if not row or not row["webhook_url"]:
-        return False
+        return False, "웹훅 미등록"
 
     payload = {
         "type": "message",
@@ -429,11 +429,10 @@ def send_teams_notification(branch_code: str, title: str, message: str, color: s
         with httpx.Client(timeout=10) as client:
             resp = client.post(row["webhook_url"], json=payload)
             if resp.status_code >= 300:
-                logging.error(f"[TEAMS_DEBUG] branch={branch_code} status={resp.status_code} body={resp.text[:500]}")
-            return resp.status_code < 300
+                return False, f"status={resp.status_code} body={resp.text[:300]}"
+            return True, "성공"
     except Exception as e:
-        logging.error(f"[TEAMS_DEBUG] branch={branch_code} exception={str(e)[:500]}")
-        return False
+        return False, f"exception={str(e)[:300]}"
 
     try:
         with httpx.Client(timeout=10) as client:
@@ -3141,7 +3140,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         if (res.ok && result.success > 0) {{
           alert('테스트 발송 성공! Teams 채널을 확인하세요.');
         }} else {{
-          alert('발송 실패. 웹훅 URL을 다시 확인해주세요.');
+          alert('발송 실패:\\n' + (result.fail_details ? result.fail_details.join('\\n') : '알 수 없는 오류'));
         }}
       }}
 
@@ -3220,14 +3219,21 @@ async def master_teams_webhook_broadcast(request: Request, session_token: str = 
 
     success_count = 0
     fail_count = 0
+    fail_details = []
     for bc in branch_codes:
-        ok = send_teams_notification(bc, title, message)
+        ok, detail = send_teams_notification(bc, title, message)
         if ok:
             success_count += 1
         else:
             fail_count += 1
+            fail_details.append(f"{bc}: {detail}")
 
-    return JSONResponse(content={"status": "ok", "success": success_count, "failed": fail_count})
+    return JSONResponse(content={
+        "status": "ok",
+        "success": success_count,
+        "failed": fail_count,
+        "fail_details": fail_details
+    })
 
 @app.get("/master/eval-criteria", response_class=HTMLResponse)
 async def eval_criteria_page(session_token: str = Cookie(default=None)):
