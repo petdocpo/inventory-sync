@@ -384,7 +384,7 @@ async def auto_login(token: str):
 
 
 def send_teams_notification(branch_code: str, title: str, message: str, color: str = "0078D4"):
-    """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송. 웹훅 미등록 시 조용히 무시."""
+    """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송 (Adaptive Card 형식). 웹훅 미등록 시 조용히 무시."""
     import httpx
     conn = get_conn()
     row = conn.execute(
@@ -393,6 +393,42 @@ def send_teams_notification(branch_code: str, title: str, message: str, color: s
     conn.close()
 
     if not row or not row["webhook_url"]:
+        return False
+
+    payload = {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "contentUrl": None,
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": title,
+                            "weight": "Bolder",
+                            "size": "Medium",
+                            "wrap": True
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": message,
+                            "wrap": True
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(row["webhook_url"], json=payload)
+            return resp.status_code < 300
+    except Exception:
         return False
 
     payload = {
