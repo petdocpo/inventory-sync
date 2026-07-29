@@ -3756,7 +3756,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
           for (const code of checked) {{
             await fetch('/master/teams-webhook/save', {{
               method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify({{ branch_code: code, webhook_url: '', channel_name: '' }})
+              body: JSON.stringify({{ branch_code: code, webhook_url: '', channel_name: '', delete: true }})
             }});
           }}
           location.reload();
@@ -3823,13 +3823,11 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
       async function addFreeChannel() {{
         const code = document.getElementById('newChannelCode').value.trim();
         const name = document.getElementById('newChannelName').value.trim();
-        if (!code || !name) {{ alert('채널 코드와 이름을 입력하세요.'); return; }}
+        if (!code) {{ alert('채널 코드를 입력하세요.'); return; }}
         if (code.includes(' ')) {{ alert('채널 코드에는 공백을 사용할 수 없습니다.'); return; }}
-        const url = prompt('Teams 웹훅 URL을 입력하세요:');
-        if (!url || !url.trim().startsWith('https://')) {{ alert('올바른 URL을 입력하세요.'); return; }}
         const res = await fetch('/master/teams-webhook/save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_code: code, webhook_url: url.trim(), channel_name: name, is_new_free_channel: true }})
+          body: JSON.stringify({{ branch_code: code, webhook_url: '', channel_name: name }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
@@ -3939,8 +3937,13 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         }});
         const result = await res.json();
         if (res.ok && result.success > 0) {{
+          await fetch('/master/teams-webhook/draft/delete', {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ branch_code: branchCode }})
+          }});
           alert('발송 완료');
           closeDraft();
+          location.reload();
         }} else {{ alert('발송 실패'); }}
       }}
     </script>
@@ -3962,17 +3965,19 @@ async def master_teams_webhook_save(request: Request, session_token: str = Cooki
     if not branch_code:
         return JSONResponse(status_code=400, content={"detail": "대상이 지정되지 않았습니다."})
 
+    delete_requested = data.get("delete", False)
+
     conn = get_conn()
     existing = conn.execute("SELECT id FROM teams_webhook WHERE branch_code=?", (branch_code,)).fetchone()
     if existing:
-        if webhook_url:
+        if delete_requested:
+            conn.execute("DELETE FROM teams_webhook WHERE branch_code=?", (branch_code,))
+        else:
             conn.execute(
                 "UPDATE teams_webhook SET webhook_url=?, channel_name=?, updated_at=NOW() WHERE branch_code=?",
                 (webhook_url, channel_name, branch_code)
             )
-        else:
-            conn.execute("DELETE FROM teams_webhook WHERE branch_code=?", (branch_code,))
-    elif webhook_url:
+    else:
         conn.execute(
             "INSERT INTO teams_webhook (branch_code, webhook_url, channel_name) VALUES (?, ?, ?)",
             (branch_code, webhook_url, channel_name)
@@ -4113,6 +4118,19 @@ async def master_draft_save(request: Request, session_token: str = Cookie(defaul
         conn.execute("UPDATE teams_draft_message SET title=?, message=?, updated_at=NOW() WHERE branch_code=?", (title, message, branch_code))
     else:
         conn.execute("INSERT INTO teams_draft_message (branch_code, title, message) VALUES (?, ?, ?)", (branch_code, title, message))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+@app.post("/master/teams-webhook/draft/delete")
+async def master_draft_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    conn = get_conn()
+    conn.execute("DELETE FROM teams_draft_message WHERE branch_code=?", (branch_code,))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
@@ -4618,13 +4636,6 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">🏬</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 관리</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">지점 추가/삭제</div>
-        </div>
-      </a>
-      <a href="/master/custom-channel" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">📡</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">자유 채널 & 반복 메시지</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">별도 채널 관리, 예약 발송</div>
         </div>
       </a>
     </div>
