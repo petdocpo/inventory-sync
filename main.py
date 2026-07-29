@@ -3598,6 +3598,12 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     conn = get_conn()
     existing_rows = conn.execute("SELECT branch_code, webhook_url, channel_name FROM teams_webhook").fetchall()
     existing = {r["branch_code"]: {"url": r["webhook_url"], "name": r["channel_name"] or ""} for r in existing_rows}
+    drafts = {r["branch_code"]: dict(r) for r in conn.execute("SELECT * FROM teams_draft_message").fetchall()}
+    schedules = conn.execute("SELECT * FROM teams_scheduled_message WHERE target_type='branch'").fetchall()
+    schedule_map = {}
+    for s in schedules:
+        for code in s["target_codes"].split(","):
+            schedule_map.setdefault(code, []).append(dict(s))
     conn.close()
 
     targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + get_branches()
@@ -3606,43 +3612,69 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     for t in targets:
         info = existing.get(t["branch_code"])
         has_webhook = bool(info and info["url"])
-        if has_webhook:
-            channel_display = info["name"] if info["name"] else "(이름 미설정)"
-            url_display = info["url"][:40] + "..."
-        else:
-            channel_display = "-"
-            url_display = "(미등록)"
+        channel_display = (info["name"] if info["name"] else "(이름 미설정)") if has_webhook else "-"
+        url_display = (info["url"][:35] + "...") if has_webhook else "(미등록)"
         safe_channel_name = (info["name"] if info else "").replace("'", "")
-        checkbox_disabled = "" if has_webhook else "disabled"
+
+        draft = drafts.get(t["branch_code"])
+        draft_badge = f'<span class="badge-green">임시저장 있음</span>' if draft else ''
+
+        sched_list = schedule_map.get(t["branch_code"], [])
+        sched_badge = f'<span class="badge-green">반복 {len(sched_list)}건</span>' if sched_list else ''
+
         rows_html += f"""
         <tr>
             <td style="text-align:center;">
-              <input type="checkbox" class="tw-check" value="{t['branch_code']}" {checkbox_disabled} style="width:16px;height:16px;">
+              <input type="checkbox" class="tw-check" value="{t['branch_code']}" {'disabled' if not has_webhook else ''} style="width:16px;height:16px;">
             </td>
             <td>{t['branch_name']}</td>
             <td style="font-size:12px;">{channel_display}</td>
             <td style="font-size:12px;color:#888;">{url_display}</td>
-            <td style="display:flex;gap:6px;">
-              <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editWebhook('{t['branch_code']}', '{t['branch_name']}', '{safe_channel_name}')">등록/수정</button>
-              {'<button class="btn" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="testSend(\'' + t['branch_code'] + '\', \'' + t['branch_name'] + '\')">테스트</button>' if has_webhook else ''}
+            <td>{draft_badge} {sched_badge}</td>
+            <td style="display:flex;gap:4px;flex-wrap:wrap;">
+              <button class="btn" style="font-size:11px;padding:4px 8px;" onclick="editWebhook('{t['branch_code']}', '{t['branch_name']}', '{safe_channel_name}')">등록/수정</button>
+              {'<button class="btn" style="font-size:11px;padding:4px 8px;background:#64748B;" onclick="testSend(\'' + t['branch_code'] + '\', \'' + t['branch_name'] + '\')">테스트</button>' if has_webhook else ''}
+              {'<button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="openBranchSchedule(\'' + t['branch_code'] + '\', \'' + t['branch_name'] + '\')">예약</button>' if has_webhook else ''}
+              {'<button class="btn" style="font-size:11px;padding:4px 8px;background:#F59E0B;" onclick="openDraft(\'' + t['branch_code'] + '\', \'' + t['branch_name'] + '\')">임시저장</button>' if has_webhook else ''}
             </td>
         </tr>
         """
 
+    if not existing.get("__DUMMY__"):
+        pass
+
+    branch_options_html = ""
+    for t in targets:
+        branch_options_html += f'<option value="{t["branch_code"]}">{t["branch_name"]}</option>'
+
     content = f"""
     <h2 style="margin-bottom:16px;">🔔 Teams 웹훅 관리</h2>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <p style="font-size:13px;color:#1E40AF;">각 지점 및 마스터의 Teams 채널에서 발급받은 웹훅 URL을 등록하세요. 미등록 지점은 알림이 발송되지 않습니다.</p>
+      <p style="font-size:13px;color:#1E40AF;">각 지점/마스터/별도 채널의 Teams 웹훅 URL을 등록하세요. 미등록 대상은 알림이 발송되지 않습니다.</p>
     </div>
+
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+      <h3 style="margin-bottom:8px;">새 채널 추가</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;max-width:600px;">
+        <input type="text" id="newChannelCode" placeholder="채널 코드 (예: 운영기획팀, 공백없이)" style="flex:1;min-width:160px;">
+        <input type="text" id="newChannelName" placeholder="채널 이름 (예: 운영기획팀 공지방)" style="flex:1;min-width:160px;">
+        <button class="btn" type="button" onclick="addFreeChannel()">추가</button>
+      </div>
+      <div id="addChannelResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
         <button type="button" class="btn" id="twSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
-        <button type="button" class="btn" id="twSendBtn" style="background:#2563eb;font-size:12px;padding:6px 12px;">✉️ 선택 채널에 메시지 보내기</button>
+        <div style="display:flex;gap:8px;">
+          <button type="button" class="btn" id="twSendBtn" style="background:#2563eb;font-size:12px;padding:6px 12px;">✉️ 선택 채널에 메시지 보내기</button>
+          <button type="button" class="btn btn-red" id="twDeleteBtn" style="font-size:12px;padding:6px 12px;">선택 채널 삭제</button>
+        </div>
       </div>
       <table>
         <thead><tr>
-          <th style="width:40px;text-align:center;"><input type="checkbox" id="twAllCheck" style="width:16px;height:16px;"></th>
-          <th>대상</th><th>채널 이름</th><th>등록된 웹훅</th><th></th>
+          <th style="width:36px;text-align:center;"><input type="checkbox" id="twAllCheck" style="width:16px;height:16px;"></th>
+          <th>대상</th><th>채널 이름</th><th>등록된 웹훅</th><th>설정</th><th></th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
@@ -3653,12 +3685,44 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         <h3 style="margin-bottom:12px;">메시지 보내기</h3>
         <p id="twSelectedList" style="font-size:12px;color:#888;margin-bottom:12px;"></p>
         <input type="text" id="twMsgTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
-        <textarea id="twMsgBody" placeholder="메시지 내용을 입력하세요" style="width:100%;min-height:120px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
-        <input type="text" id="twMsgLinkUrl" placeholder="링크 URL (선택, 예: https://inventory-sync-teal.vercel.app)" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;box-sizing:border-box;">
-        <input type="text" id="twMsgLinkText" placeholder="링크 버튼 텍스트 (선택, 예: 바로가기)" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;box-sizing:border-box;">
+        <textarea id="twMsgBody" placeholder="메시지 내용을 입력하세요" style="width:100%;min-height:100px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
+        <input type="text" id="twMsgLinkUrl" placeholder="링크 URL (선택)" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;box-sizing:border-box;">
+        <input type="text" id="twMsgLinkText" placeholder="링크 버튼 텍스트 (선택)" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;box-sizing:border-box;">
         <div style="display:flex;gap:8px;margin-top:16px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeMessageModal()">취소</button>
           <button class="btn" style="flex:1;" onclick="sendMessage()">보내기</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="branchScheduleModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:480px;width:90%;max-height:85vh;overflow-y:auto;">
+        <h3 id="schBranchTitle" style="margin-bottom:12px;">반복 메시지 예약</h3>
+        <div id="schExistingList" style="margin-bottom:12px;"></div>
+        <input type="text" id="schTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <textarea id="schMessage" placeholder="메시지 내용" style="width:100%;min-height:80px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:8px;"></textarea>
+        <label style="font-size:12px;color:#888;">시작일</label>
+        <input type="date" id="schStartDate" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <label style="font-size:12px;color:#888;">반복 간격 (일)</label>
+        <input type="number" id="schInterval" value="5" min="1" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;box-sizing:border-box;">
+        <input type="hidden" id="schBranchCode">
+        <div style="display:flex;gap:8px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeBranchSchedule()">닫기</button>
+          <button class="btn" style="flex:1;" onclick="saveBranchSchedule()">새 예약 추가</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="draftModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:480px;width:90%;">
+        <h3 id="draftTitle" style="margin-bottom:12px;">임시 저장 메시지</h3>
+        <input type="text" id="draftMsgTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <textarea id="draftMsgBody" placeholder="메시지 내용" style="width:100%;min-height:100px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
+        <input type="hidden" id="draftBranchCode">
+        <div style="display:flex;gap:8px;margin-top:16px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeDraft()">취소</button>
+          <button class="btn" style="flex:1;background:#F59E0B;" onclick="saveDraft()">임시저장</button>
+          <button class="btn" style="flex:1;" onclick="sendFromDraft()">바로 발송</button>
         </div>
       </div>
     </div>
@@ -3685,6 +3749,18 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
           document.getElementById('twMessageModal').style.display = 'flex';
           document.getElementById('twMessageModal').dataset.targets = JSON.stringify(checked);
         }});
+        document.getElementById('twDeleteBtn').addEventListener('click', async function() {{
+          var checked = Array.from(document.querySelectorAll('.tw-check:checked')).map(c => c.value);
+          if (checked.length === 0) {{ alert('삭제할 채널을 선택하세요.'); return; }}
+          if (!confirm(checked.length + '개 채널의 웹훅 등록을 삭제합니다. 계속할까요?')) return;
+          for (const code of checked) {{
+            await fetch('/master/teams-webhook/save', {{
+              method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ branch_code: code, webhook_url: '', channel_name: '' }})
+            }});
+          }}
+          location.reload();
+        }});
       }})();
 
       function closeMessageModal() {{
@@ -3703,24 +3779,20 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         const linkText = document.getElementById('twMsgLinkText').value.trim();
         if (!body) {{ alert('메시지 내용을 입력하세요.'); return; }}
         const res = await fetch('/master/teams-webhook/broadcast', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{ branch_codes: targets, title: title, message: body, link_url: linkUrl, link_text: linkText }})
         }});
         const result = await res.json();
         if (res.ok) {{
           alert('발송 완료: 성공 ' + result.success + '건, 실패 ' + result.failed + '건');
           closeMessageModal();
-        }} else {{
-          alert('오류: ' + (result.detail || '발송 실패'));
-        }}
+        }} else {{ alert('오류: ' + (result.detail || '발송 실패')); }}
       }}
 
       async function testSend(branchCode, branchName) {{
         if (!confirm(branchName + ' 채널로 테스트 메시지를 보낼까요?')) return;
         const res = await fetch('/master/teams-webhook/broadcast', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{ branch_codes: [branchCode], title: '테스트 알림', message: '이 메시지가 보이면 웹훅이 정상 연결된 것입니다.', link_url: 'https://inventory-sync-teal.vercel.app', link_text: '앱 바로가기' }})
         }});
         const result = await res.json();
@@ -3734,26 +3806,146 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
       async function editWebhook(branchCode, branchName, currentChannelName) {{
         const url = prompt(branchName + '의 Teams 웹훅 URL을 입력하세요:');
         if (url === null) return;
-        if (url.trim() && !url.trim().startsWith('https://')) {{
-          alert('올바른 URL 형식이 아닙니다 (https://로 시작해야 함)');
-          return;
-        }}
+        if (url.trim() && !url.trim().startsWith('https://')) {{ alert('올바른 URL 형식이 아닙니다.'); return; }}
         let channelName = currentChannelName;
         if (url.trim()) {{
-          const nameInput = prompt('채널 이름을 입력하세요 (예: 본사 재고관리방):', currentChannelName);
+          const nameInput = prompt('채널 이름을 입력하세요:', currentChannelName);
           if (nameInput === null) return;
           channelName = nameInput.trim();
         }}
         const res = await fetch('/master/teams-webhook/save', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{ branch_code: branchCode, webhook_url: url.trim(), channel_name: channelName }})
         }});
         if (res.ok) {{ location.reload(); }} else {{ alert('저장 실패'); }}
       }}
+
+      async function addFreeChannel() {{
+        const code = document.getElementById('newChannelCode').value.trim();
+        const name = document.getElementById('newChannelName').value.trim();
+        if (!code || !name) {{ alert('채널 코드와 이름을 입력하세요.'); return; }}
+        if (code.includes(' ')) {{ alert('채널 코드에는 공백을 사용할 수 없습니다.'); return; }}
+        const url = prompt('Teams 웹훅 URL을 입력하세요:');
+        if (!url || !url.trim().startsWith('https://')) {{ alert('올바른 URL을 입력하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: code, webhook_url: url.trim(), channel_name: name, is_new_free_channel: true }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('addChannelResult').innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+
+      function openBranchSchedule(branchCode, branchName) {{
+        document.getElementById('schBranchTitle').innerText = branchName + ' — 반복 메시지 예약';
+        document.getElementById('schBranchCode').value = branchCode;
+        document.getElementById('schStartDate').value = new Date().toISOString().slice(0, 10);
+        document.getElementById('schTitle').value = '';
+        document.getElementById('schMessage').value = '';
+        loadBranchSchedules(branchCode);
+        document.getElementById('branchScheduleModal').style.display = 'flex';
+      }}
+
+      async function loadBranchSchedules(branchCode) {{
+        const res = await fetch('/master/teams-webhook/schedule/list?branch_code=' + encodeURIComponent(branchCode));
+        const data = await res.json();
+        const container = document.getElementById('schExistingList');
+        if (!data.schedules || data.schedules.length === 0) {{
+          container.innerHTML = '<p style="font-size:12px;color:#888;">등록된 반복 메시지가 없습니다.</p>';
+          return;
+        }}
+        container.innerHTML = data.schedules.map(s =>
+          '<div style="border:1px solid #ddd;border-radius:6px;padding:8px;margin-bottom:6px;font-size:12px;">' +
+          '<b>' + (s.title || '(제목없음)') + '</b> — ' + s.interval_days + '일 간격 (' + (s.active ? '활성' : '중지') + ')' +
+          '<div style="margin-top:4px;"><button class="btn" style="font-size:11px;padding:3px 8px;" onclick="toggleSched(' + s.id + ', ' + (!s.active) + ', \\'' + branchCode + '\\')">' + (s.active ? '중지' : '재개') + '</button> ' +
+          '<button class="btn btn-red" style="font-size:11px;padding:3px 8px;" onclick="deleteSched(' + s.id + ', \\'' + branchCode + '\\')">삭제</button></div></div>'
+        ).join('');
+      }}
+
+      async function toggleSched(id, active, branchCode) {{
+        await fetch('/master/teams-webhook/schedule/toggle', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ schedule_id: id, active: active }})
+        }});
+        loadBranchSchedules(branchCode);
+      }}
+
+      async function deleteSched(id, branchCode) {{
+        if (!confirm('삭제할까요?')) return;
+        await fetch('/master/teams-webhook/schedule/delete', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ schedule_id: id }})
+        }});
+        loadBranchSchedules(branchCode);
+      }}
+
+      function closeBranchSchedule() {{
+        document.getElementById('branchScheduleModal').style.display = 'none';
+      }}
+
+      async function saveBranchSchedule() {{
+        const branchCode = document.getElementById('schBranchCode').value;
+        const title = document.getElementById('schTitle').value.trim();
+        const message = document.getElementById('schMessage').value.trim();
+        const startDate = document.getElementById('schStartDate').value;
+        const interval = parseInt(document.getElementById('schInterval').value);
+        if (!message || !startDate || !interval) {{ alert('메시지, 시작일, 간격을 입력하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/schedule/add', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: branchCode, title: title, message: message, start_date: startDate, interval_days: interval }})
+        }});
+        if (res.ok) {{
+          document.getElementById('schTitle').value = '';
+          document.getElementById('schMessage').value = '';
+          loadBranchSchedules(branchCode);
+          location.reload();
+        }} else {{ alert('저장 실패'); }}
+      }}
+
+      async function openDraft(branchCode, branchName) {{
+        document.getElementById('draftTitle').innerText = branchName + ' — 임시 저장 메시지';
+        document.getElementById('draftBranchCode').value = branchCode;
+        const res = await fetch('/master/teams-webhook/draft/get?branch_code=' + encodeURIComponent(branchCode));
+        const data = await res.json();
+        document.getElementById('draftMsgTitle').value = data.title || '';
+        document.getElementById('draftMsgBody').value = data.message || '';
+        document.getElementById('draftModal').style.display = 'flex';
+      }}
+
+      function closeDraft() {{
+        document.getElementById('draftModal').style.display = 'none';
+      }}
+
+      async function saveDraft() {{
+        const branchCode = document.getElementById('draftBranchCode').value;
+        const title = document.getElementById('draftMsgTitle').value.trim();
+        const message = document.getElementById('draftMsgBody').value.trim();
+        const res = await fetch('/master/teams-webhook/draft/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: branchCode, title: title, message: message }})
+        }});
+        if (res.ok) {{ alert('임시저장 완료'); location.reload(); }} else {{ alert('저장 실패'); }}
+      }}
+
+      async function sendFromDraft() {{
+        const branchCode = document.getElementById('draftBranchCode').value;
+        const title = document.getElementById('draftMsgTitle').value.trim();
+        const message = document.getElementById('draftMsgBody').value.trim();
+        if (!message) {{ alert('메시지 내용을 입력하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/broadcast', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_codes: [branchCode], title: title, message: message }})
+        }});
+        const result = await res.json();
+        if (res.ok && result.success > 0) {{
+          alert('발송 완료');
+          closeDraft();
+        }} else {{ alert('발송 실패'); }}
+      }}
     </script>
     """
-    return HTMLResponse(content=render_page(content, user, "vendor-eval"))
+    return HTMLResponse(content=render_page(content, user, "master"))
 
 
 @app.post("/master/teams-webhook/save")
@@ -3785,6 +3977,142 @@ async def master_teams_webhook_save(request: Request, session_token: str = Cooki
             "INSERT INTO teams_webhook (branch_code, webhook_url, channel_name) VALUES (?, ?, ?)",
             (branch_code, webhook_url, channel_name)
         )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/teams-webhook/broadcast")
+async def master_teams_webhook_broadcast(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    branch_codes = data.get("branch_codes", [])
+    title = data.get("title", "").strip() or "알림"
+    message = data.get("message", "").strip()
+    link_url = data.get("link_url", "").strip()
+    link_text = data.get("link_text", "").strip()
+
+    if not branch_codes or not message:
+        return JSONResponse(status_code=400, content={"detail": "대상 또는 메시지가 비어있습니다."})
+
+    device_info = request.headers.get("user-agent", "")[:200]
+
+    success_count = 0
+    fail_count = 0
+    fail_details = []
+    for bc in branch_codes:
+        ok, detail = send_teams_notification(bc, title, message, link_url, link_text, user["branch_code"], device_info)
+        if ok:
+            success_count += 1
+        else:
+            fail_count += 1
+            fail_details.append(f"{bc}: {detail}")
+
+    return JSONResponse(content={
+        "status": "ok",
+        "success": success_count,
+        "failed": fail_count,
+        "fail_details": fail_details
+    })
+
+
+@app.post("/master/teams-webhook/schedule/add")
+async def master_branch_schedule_add(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    title = data.get("title", "").strip()
+    message = data.get("message", "").strip()
+    start_date = data.get("start_date", "").strip()
+    interval_days = data.get("interval_days")
+
+    if not branch_code or not message or not start_date or not interval_days:
+        return JSONResponse(status_code=400, content={"detail": "모든 필드를 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO teams_scheduled_message (title, message, target_type, target_codes, start_date, interval_days, created_by) VALUES (?, ?, 'branch', ?, ?, ?, ?)",
+        (title, message, branch_code, start_date, interval_days, user["branch_code"])
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/master/teams-webhook/schedule/list")
+async def master_branch_schedule_list(branch_code: str, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM teams_scheduled_message WHERE target_type='branch' AND target_codes=?", (branch_code,)
+    ).fetchall()
+    conn.close()
+    return JSONResponse(content={"schedules": [dict(r) for r in rows]})
+
+
+@app.post("/master/teams-webhook/schedule/toggle")
+async def master_branch_schedule_toggle(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    conn = get_conn()
+    conn.execute("UPDATE teams_scheduled_message SET active=? WHERE id=?", (data.get("active"), data.get("schedule_id")))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/teams-webhook/schedule/delete")
+async def master_branch_schedule_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    conn = get_conn()
+    conn.execute("DELETE FROM teams_scheduled_message WHERE id=?", (data.get("schedule_id"),))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/master/teams-webhook/draft/get")
+async def master_draft_get(branch_code: str, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    conn = get_conn()
+    row = conn.execute("SELECT title, message FROM teams_draft_message WHERE branch_code=?", (branch_code,)).fetchone()
+    conn.close()
+    if row:
+        return JSONResponse(content={"title": row["title"], "message": row["message"]})
+    return JSONResponse(content={"title": "", "message": ""})
+
+
+@app.post("/master/teams-webhook/draft/save")
+async def master_draft_save(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    title = data.get("title", "").strip()
+    message = data.get("message", "").strip()
+    if not branch_code:
+        return JSONResponse(status_code=400, content={"detail": "대상이 지정되지 않았습니다."})
+    conn = get_conn()
+    existing = conn.execute("SELECT branch_code FROM teams_draft_message WHERE branch_code=?", (branch_code,)).fetchone()
+    if existing:
+        conn.execute("UPDATE teams_draft_message SET title=?, message=?, updated_at=NOW() WHERE branch_code=?", (title, message, branch_code))
+    else:
+        conn.execute("INSERT INTO teams_draft_message (branch_code, title, message) VALUES (?, ?, ?)", (branch_code, title, message))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
