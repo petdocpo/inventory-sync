@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, Request, Form, File, UploadFile, Cookie
+from fastapi import FastAPI, Request, Form, File, UploadFile, Cookie, HTTPException, Depends, Header, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -384,6 +384,48 @@ async def auto_login(token: str):
     resp.set_cookie(key="session_token", value=session_token, max_age=7 * 24 * 3600, httponly=True)
     return resp
 
+def send_teams_notification_to_url(webhook_url: str, title: str, message: str, link_url: str = "", link_text: str = "", sent_by: str = "", device_info: str = "", target_label: str = "custom"):
+    """webhook_url을 직접 지정해서 발송 (자유 채널용). teams_send_log에도 기록."""
+    import httpx
+    body_blocks = [
+        {"type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": True},
+        {"type": "TextBlock", "text": message, "wrap": True}
+    ]
+    if link_url:
+        body_blocks.append({
+            "type": "ActionSet",
+            "actions": [{"type": "Action.OpenUrl", "title": link_text or "바로가기", "url": link_url}]
+        })
+    payload = {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": None,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard", "version": "1.4", "body": body_blocks
+            }
+        }]
+    }
+    success, detail = False, ""
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(webhook_url, json=payload)
+            if resp.status_code >= 300:
+                detail = f"status={resp.status_code} body={resp.text[:300]}"
+            else:
+                detail, success = "성공", True
+    except Exception as e:
+        detail = f"exception={str(e)[:300]}"
+
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO teams_send_log (branch_code, title, message, success, detail, sent_by, device_info) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (target_label, title, message, success, detail, sent_by, device_info)
+    )
+    conn.commit()
+    conn.close()
+    return success, detail
 
 def send_teams_notification(branch_code: str, title: str, message: str, link_url: str = "", link_text: str = "", sent_by: str = "", device_info: str = ""):
     """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송 (Adaptive Card 형식, 링크 지원).
@@ -3135,6 +3177,418 @@ async def master_branch_manage_delete(request: Request, session_token: str = Coo
         return JSONResponse(status_code=400, content={"detail": err})
     return JSONResponse(content={"status": "ok"})
 
+@app.get("/master/custom-channel", response_class=HTMLResponse)
+async def master_custom_channel_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    channels = conn.execute("SELECT * FROM teams_custom_channel ORDER BY created_at DESC").fetchall()
+    schedules = conn.execute("SELECT * FROM teams_scheduled_message ORDER BY created_at DESC").fetchall()
+    conn.close()
+
+    channel_rows = ""
+    for c in channels:
+        channel_rows += f"""
+        <tr>
+            <td><input type="checkbox" class="cc-check" value="{c['id']}" style="width:16px;height:16px;"></td>
+            <td>{c['channel_name']}</td>
+            <td style="font-size:12px;color:#888;">{c['webhook_url'][:40]}...</td>
+            <td><button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteChannel({c['id']}, '{c['channel_name']}')">삭제</button></td>
+        </tr>
+        """
+
+    schedule_rows = ""
+    for s in schedules:
+        status_badge = '<span class="badge-green">활성</span>' if s['active'] else '<span class="badge-red">중지</span>'
+        last_sent = s['last_sent_date'] if s['last_sent_date'] else '없음'
+        schedule_rows += f"""
+        <tr>
+            <td>{s['title'] or '(제목없음)'}</td>
+            <td style="font-size:12px;">{s['message'][:30]}...</td>
+            <td>{s['start_date']} / {s['interval_days']}일 간격</td>
+            <td style="font-size:12px;">{last_sent}</td>
+            <td>{status_badge}</td>
+            <td>
+              <button class="btn" style="font-size:11px;padding:4px 8px;background:#64748B;" onclick="toggleSchedule({s['id']}, {str(not s['active']).lower()})">{'중지' if s['active'] else '재개'}</button>
+              <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteSchedule({s['id']})">삭제</button>
+            </td>
+        </tr>
+        """
+
+    all_targets_json = json.dumps(
+        [{"code": "master", "name": "마스터(본사)", "type": "branch"}] +
+        [{"code": b["branch_code"], "name": b["branch_name"], "type": "branch"} for b in get_branches()] +
+        [{"code": str(c["id"]), "name": c["channel_name"], "type": "custom"} for c in channels],
+        ensure_ascii=False
+    )
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📡 자유 채널 & 반복 메시지</h2>
+
+    <div class="card">
+      <h3 style="margin-bottom:8px;">새 채널 추가</h3>
+      <div style="display:flex;flex-direction:column;gap:8px;max-width:500px;">
+        <input type="text" id="newChannelName" placeholder="채널 이름 (예: 운영기획팀 공지방)">
+        <input type="text" id="newChannelUrl" placeholder="Teams 웹훅 URL (https://로 시작)">
+        <button class="btn" type="button" onclick="addChannel()">채널 추가</button>
+      </div>
+      <div id="addChannelResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-bottom:8px;">등록된 채널</h3>
+      <div style="margin-bottom:8px;">
+        <button type="button" class="btn" id="ccSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+        <button type="button" class="btn" id="ccSendBtn" style="background:#2563eb;font-size:12px;padding:6px 12px;">✉️ 선택 채널에 메시지 보내기</button>
+      </div>
+      <table>
+        <thead><tr><th style="width:40px;"><input type="checkbox" id="ccAllCheck" style="width:16px;height:16px;"></th><th>채널명</th><th>웹훅</th><th></th></tr></thead>
+        <tbody>{channel_rows if channel_rows else '<tr><td colspan="4" style="text-align:center;color:#888;">등록된 채널이 없습니다.</td></tr>'}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-bottom:8px;">🔁 반복 메시지 예약</h3>
+      <div id="scheduleResult" style="margin-bottom:8px;font-size:13px;"></div>
+      <button class="btn" type="button" onclick="openScheduleModal()">새 반복 메시지 만들기</button>
+      <table style="margin-top:12px;">
+        <thead><tr><th>제목</th><th>내용</th><th>주기</th><th>마지막 발송</th><th>상태</th><th></th></tr></thead>
+        <tbody>{schedule_rows if schedule_rows else '<tr><td colspan="6" style="text-align:center;color:#888;">등록된 반복 메시지가 없습니다.</td></tr>'}</tbody>
+      </table>
+    </div>
+
+    <div id="ccMessageModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:480px;width:90%;">
+        <h3 style="margin-bottom:12px;">메시지 보내기</h3>
+        <p id="ccSelectedList" style="font-size:12px;color:#888;margin-bottom:12px;"></p>
+        <input type="text" id="ccMsgTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <textarea id="ccMsgBody" placeholder="메시지 내용" style="width:100%;min-height:100px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
+        <div style="display:flex;gap:8px;margin-top:16px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeCcModal()">취소</button>
+          <button class="btn" style="flex:1;" onclick="sendCcMessage()">보내기</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="scheduleModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:520px;width:90%;max-height:85vh;overflow-y:auto;">
+        <h3 style="margin-bottom:12px;">반복 메시지 예약</h3>
+        <p style="font-size:12px;color:#888;margin-bottom:8px;">대상 선택</p>
+        <div id="scheduleTargets" style="max-height:150px;overflow-y:auto;border:1px solid #ddd;border-radius:6px;padding:8px;margin-bottom:12px;"></div>
+        <input type="text" id="schTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <textarea id="schMessage" placeholder="메시지 내용" style="width:100%;min-height:80px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:8px;"></textarea>
+        <label style="font-size:12px;color:#888;">시작일</label>
+        <input type="date" id="schStartDate" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <label style="font-size:12px;color:#888;">반복 간격 (일)</label>
+        <input type="number" id="schInterval" value="5" min="1" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;box-sizing:border-box;">
+        <div style="display:flex;gap:8px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeScheduleModal()">취소</button>
+          <button class="btn" style="flex:1;" onclick="saveSchedule()">저장</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const allTargets = {all_targets_json};
+
+      (function() {{
+        var allCheck = document.getElementById('ccAllCheck');
+        var selectBtn = document.getElementById('ccSelectAllBtn');
+        function applyAll(checked) {{
+          document.querySelectorAll('.cc-check').forEach(function(c) {{ c.checked = checked; }});
+          if (allCheck) allCheck.checked = checked;
+        }}
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ applyAll(allCheck.checked); }}); }}
+        if (selectBtn) {{
+          selectBtn.addEventListener('click', function() {{
+            var next = !(allCheck && allCheck.checked);
+            applyAll(next);
+          }});
+        }}
+        document.getElementById('ccSendBtn').addEventListener('click', function() {{
+          var checked = Array.from(document.querySelectorAll('.cc-check:checked')).map(c => c.value);
+          if (checked.length === 0) {{ alert('메시지를 보낼 채널을 선택하세요.'); return; }}
+          document.getElementById('ccSelectedList').innerText = checked.length + '개 채널에 발송됩니다.';
+          document.getElementById('ccMessageModal').style.display = 'flex';
+          document.getElementById('ccMessageModal').dataset.targets = JSON.stringify(checked);
+        }});
+      }})();
+
+      function closeCcModal() {{
+        document.getElementById('ccMessageModal').style.display = 'none';
+        document.getElementById('ccMsgTitle').value = '';
+        document.getElementById('ccMsgBody').value = '';
+      }}
+
+      async function sendCcMessage() {{
+        const targets = JSON.parse(document.getElementById('ccMessageModal').dataset.targets || '[]');
+        const title = document.getElementById('ccMsgTitle').value.trim();
+        const body = document.getElementById('ccMsgBody').value.trim();
+        if (!body) {{ alert('메시지 내용을 입력하세요.'); return; }}
+        const res = await fetch('/master/custom-channel/broadcast', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ channel_ids: targets, title: title, message: body }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('발송 완료: 성공 ' + result.success + '건, 실패 ' + result.failed + '건');
+          closeCcModal();
+        }} else {{ alert('오류: ' + (result.detail || '발송 실패')); }}
+      }}
+
+      async function addChannel() {{
+        const name = document.getElementById('newChannelName').value.trim();
+        const url = document.getElementById('newChannelUrl').value.trim();
+        if (!name || !url) {{ alert('채널명과 URL을 입력하세요.'); return; }}
+        if (!url.startsWith('https://')) {{ alert('올바른 URL 형식이 아닙니다.'); return; }}
+        const res = await fetch('/master/custom-channel/add', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ channel_name: name, webhook_url: url }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('addChannelResult').innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+
+      async function deleteChannel(id, name) {{
+        if (!confirm(name + ' 채널을 삭제합니다. 계속할까요?')) return;
+        const res = await fetch('/master/custom-channel/delete', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ channel_id: id }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('삭제 실패'); }}
+      }}
+
+      function openScheduleModal() {{
+        const container = document.getElementById('scheduleTargets');
+        container.innerHTML = '';
+        allTargets.forEach(t => {{
+          const label = document.createElement('label');
+          label.style.display = 'block';
+          label.style.fontSize = '13px';
+          label.style.marginBottom = '4px';
+          label.innerHTML = '<input type="checkbox" class="sch-target" value="' + t.type + ':' + t.code + '" style="margin-right:6px;">' + t.name;
+          container.appendChild(label);
+        }});
+        document.getElementById('schStartDate').value = new Date().toISOString().slice(0, 10);
+        document.getElementById('scheduleModal').style.display = 'flex';
+      }}
+
+      function closeScheduleModal() {{
+        document.getElementById('scheduleModal').style.display = 'none';
+      }}
+
+      async function saveSchedule() {{
+        const targets = Array.from(document.querySelectorAll('.sch-target:checked')).map(c => c.value);
+        const title = document.getElementById('schTitle').value.trim();
+        const message = document.getElementById('schMessage').value.trim();
+        const startDate = document.getElementById('schStartDate').value;
+        const interval = parseInt(document.getElementById('schInterval').value);
+        if (targets.length === 0) {{ alert('대상을 선택하세요.'); return; }}
+        if (!message) {{ alert('메시지 내용을 입력하세요.'); return; }}
+        if (!startDate || !interval) {{ alert('시작일과 반복 간격을 입력하세요.'); return; }}
+        const res = await fetch('/master/custom-channel/schedule/add', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ targets: targets, title: title, message: message, start_date: startDate, interval_days: interval }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('scheduleResult').innerText = '오류: ' + (err.detail || '저장 실패');
+        }}
+      }}
+
+      async function toggleSchedule(id, newActive) {{
+        const res = await fetch('/master/custom-channel/schedule/toggle', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ schedule_id: id, active: newActive }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('변경 실패'); }}
+      }}
+
+      async function deleteSchedule(id) {{
+        if (!confirm('이 반복 메시지를 삭제할까요?')) return;
+        const res = await fetch('/master/custom-channel/schedule/delete', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ schedule_id: id }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('삭제 실패'); }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/custom-channel/add")
+async def master_custom_channel_add(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    channel_name = data.get("channel_name", "").strip()
+    webhook_url = data.get("webhook_url", "").strip()
+    if not channel_name or not webhook_url:
+        return JSONResponse(status_code=400, content={"detail": "채널명과 URL을 입력하세요."})
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO teams_custom_channel (channel_name, webhook_url) VALUES (?, ?)",
+        (channel_name, webhook_url)
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/custom-channel/delete")
+async def master_custom_channel_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    channel_id = data.get("channel_id")
+    if not channel_id:
+        return JSONResponse(status_code=400, content={"detail": "채널이 지정되지 않았습니다."})
+    conn = get_conn()
+    conn.execute("DELETE FROM teams_custom_channel WHERE id=?", (channel_id,))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/custom-channel/broadcast")
+async def master_custom_channel_broadcast(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    channel_ids = data.get("channel_ids", [])
+    title = data.get("title", "").strip() or "알림"
+    message = data.get("message", "").strip()
+    if not channel_ids or not message:
+        return JSONResponse(status_code=400, content={"detail": "대상 또는 메시지가 비어있습니다."})
+
+    device_info = request.headers.get("user-agent", "")[:200]
+    conn = get_conn()
+    success_count = 0
+    fail_count = 0
+    for cid in channel_ids:
+        row = conn.execute("SELECT webhook_url, channel_name FROM teams_custom_channel WHERE id=?", (cid,)).fetchone()
+        if not row:
+            fail_count += 1
+            continue
+        ok, detail = send_teams_notification_to_url(row["webhook_url"], title, message, sent_by=user["branch_code"], device_info=device_info, target_label=f"custom:{row['channel_name']}")
+        if ok:
+            success_count += 1
+        else:
+            fail_count += 1
+    conn.close()
+    return JSONResponse(content={"status": "ok", "success": success_count, "failed": fail_count})
+
+
+@app.post("/master/custom-channel/schedule/add")
+async def master_schedule_add(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    targets = data.get("targets", [])
+    title = data.get("title", "").strip()
+    message = data.get("message", "").strip()
+    start_date = data.get("start_date", "").strip()
+    interval_days = data.get("interval_days")
+
+    if not targets or not message or not start_date or not interval_days:
+        return JSONResponse(status_code=400, content={"detail": "모든 필드를 입력하세요."})
+
+    branch_targets = [t.split(":", 1)[1] for t in targets if t.startswith("branch:")]
+    custom_targets = [t.split(":", 1)[1] for t in targets if t.startswith("custom:")]
+
+    conn = get_conn()
+    if branch_targets:
+        conn.execute(
+            "INSERT INTO teams_scheduled_message (title, message, target_type, target_codes, start_date, interval_days, created_by) VALUES (?, ?, 'branch', ?, ?, ?, ?)",
+            (title, message, ",".join(branch_targets), start_date, interval_days, user["branch_code"])
+        )
+    if custom_targets:
+        conn.execute(
+            "INSERT INTO teams_scheduled_message (title, message, target_type, target_codes, start_date, interval_days, created_by) VALUES (?, ?, 'custom', ?, ?, ?, ?)",
+            (title, message, ",".join(custom_targets), start_date, interval_days, user["branch_code"])
+        )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/custom-channel/schedule/toggle")
+async def master_schedule_toggle(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    schedule_id = data.get("schedule_id")
+    active = data.get("active")
+    conn = get_conn()
+    conn.execute("UPDATE teams_scheduled_message SET active=? WHERE id=?", (active, schedule_id))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/custom-channel/schedule/delete")
+async def master_schedule_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    schedule_id = data.get("schedule_id")
+    conn = get_conn()
+    conn.execute("DELETE FROM teams_scheduled_message WHERE id=?", (schedule_id,))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/api/cron/send-scheduled-messages")
+async def cron_send_scheduled_messages(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    from datetime import date
+    today = date.today()
+    conn = get_conn()
+    schedules = conn.execute("SELECT * FROM teams_scheduled_message WHERE active = TRUE").fetchall()
+
+    sent_count = 0
+    for s in schedules:
+        start = s["start_date"] if isinstance(s["start_date"], date) else datetime.strptime(str(s["start_date"]), "%Y-%m-%d").date()
+        if today < start:
+            continue
+        days_since_start = (today - start).days
+        if days_since_start % s["interval_days"] != 0:
+            continue
+        if s["last_sent_date"]:
+            last = s["last_sent_date"] if isinstance(s["last_sent_date"], date) else datetime.strptime(str(s["last_sent_date"]), "%Y-%m-%d").date()
+            if last == today:
+                continue
+
+        codes = s["target_codes"].split(",")
+        for code in codes:
+            if s["target_type"] == "branch":
+                send_teams_notification(code, s["title"] or "반복 알림", s["message"], sent_by="system_cron")
+            else:
+                row = conn.execute("SELECT webhook_url, channel_name FROM teams_custom_channel WHERE id=?", (code,)).fetchone()
+                if row:
+                    send_teams_notification_to_url(row["webhook_url"], s["title"] or "반복 알림", s["message"], sent_by="system_cron", target_label=f"custom:{row['channel_name']}")
+        conn.execute("UPDATE teams_scheduled_message SET last_sent_date=? WHERE id=?", (today.isoformat(), s["id"]))
+        sent_count += 1
+
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"processed": sent_count, "date": today.isoformat()})
+
 @app.get("/master/teams-webhook", response_class=HTMLResponse)
 async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -3872,6 +4326,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">🏬</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 관리</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">지점 추가/삭제</div>
+        </div>
+      </a>
+      <a href="/master/custom-channel" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📡</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">자유 채널 & 반복 메시지</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">별도 채널 관리, 예약 발송</div>
         </div>
       </a>
     </div>
