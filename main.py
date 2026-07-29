@@ -4118,42 +4118,6 @@ async def master_draft_save(request: Request, session_token: str = Cookie(defaul
     return JSONResponse(content={"status": "ok"})
 
 
-@app.post("/master/teams-webhook/broadcast")
-async def master_teams_webhook_broadcast(request: Request, session_token: str = Cookie(default=None)):
-    user = get_session(session_token)
-    if not user or user["role"] != "master":
-        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
-
-    data = await request.json()
-    branch_codes = data.get("branch_codes", [])
-    title = data.get("title", "").strip() or "알림"
-    message = data.get("message", "").strip()
-    link_url = data.get("link_url", "").strip()
-    link_text = data.get("link_text", "").strip()
-
-    if not branch_codes or not message:
-        return JSONResponse(status_code=400, content={"detail": "대상 또는 메시지가 비어있습니다."})
-
-    device_info = request.headers.get("user-agent", "")[:200]
-
-    success_count = 0
-    fail_count = 0
-    fail_details = []
-    for bc in branch_codes:
-        ok, detail = send_teams_notification(bc, title, message, link_url, link_text, user["branch_code"], device_info)
-        if ok:
-            success_count += 1
-        else:
-            fail_count += 1
-            fail_details.append(f"{bc}: {detail}")
-
-    return JSONResponse(content={
-        "status": "ok",
-        "success": success_count,
-        "failed": fail_count,
-        "fail_details": fail_details
-    })
-
 @app.get("/master/eval-criteria", response_class=HTMLResponse)
 async def eval_criteria_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
