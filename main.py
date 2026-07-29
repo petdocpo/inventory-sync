@@ -27,7 +27,8 @@ app = FastAPI(title="재고 관리 시스템", version="1.2.0")
 
 from auth.login import (  # noqa: E402
     init_auth_db, authenticate, create_session, get_session,
-    delete_session, create_auto_login_token, get_auto_login_info, BRANCHES
+    delete_session, create_auto_login_token, get_auto_login_info,
+    get_branches, add_branch, delete_branch
 )
 init_auth_db()
 
@@ -583,7 +584,8 @@ async def dashboard(
     branch_filter_html = ""
     if user["role"] == "master":
         branch_options = '<option value="">전체 지점</option>'
-        for b in BRANCHES:
+        branches = get_branches()
+        for b in branches:
             sel = "selected" if filter_branch == b["branch_code"] else ""
             branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
         branch_filter_html = f"""
@@ -1020,7 +1022,8 @@ async def qr_page(
 
     if user["role"] == "master":
         branch_options = '<option value="">전체 지점</option>'
-        for b in BRANCHES:
+        branches = get_branches()
+        for b in branches:
             sel = "selected" if filter_branch == b["branch_code"] else ""
             branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
 
@@ -1360,7 +1363,8 @@ async def adjust_get(
     branch_filter_html = ""
     if user["role"] == "master":
         branch_options = '<option value="">전체 지점</option>'
-        for b in BRANCHES:
+        branches = get_branches()
+        for b in branches:
             sel = "selected" if filter_branch == b["branch_code"] else ""
             branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
         branch_filter_html = f"""
@@ -1716,7 +1720,8 @@ async def scan_log_page(
     branch_filter_html = ""
     if user["role"] == "master":
         branch_options = '<option value="">전체 지점</option>'
-        for b in BRANCHES:
+        branches = get_branches()
+        for b in branches:
             sel = "selected" if filter_branch == b["branch_code"] else ""
             branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
         branch_filter_html = f"""
@@ -2048,7 +2053,7 @@ async def vendor_eval_submit(request: Request, session_token: str = Cookie(defau
         return JSONResponse(status_code=403, content={"detail": "지점 계정만 등록 가능합니다."})
 
     branch_code = user["branch_code"]
-    branch_name = next((b["branch_name"] for b in BRANCHES if b["branch_code"] == branch_code), branch_code)
+    branch_name = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_code)
 
     data = await request.json()
     vendor_name = data.get("vendor_name", "").strip()
@@ -2439,7 +2444,8 @@ async def master_vendor_eval_status(session_token: str = Cookie(default=None), m
 
     rows_html = ""
     submitted_count = 0
-    for b in BRANCHES:
+    branches = get_branches()
+    for b in branches:
         done_cnt = conn.execute("""
             SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
             WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
@@ -2463,7 +2469,7 @@ async def master_vendor_eval_status(session_token: str = Cookie(default=None), m
         """
     conn.close()
 
-    total_branches = len(BRANCHES)
+    total_branches = len(get_branches())
     month_options = ""
     for i in range(6):
         m = today.month - i
@@ -2522,6 +2528,7 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
     evaluations = conn.execute(query, params).fetchall()
 
     branch_options_html = '<option value="">전체 지점</option>'
+    branches = get_branches()
     for b in branches:
         sel = 'selected' if branch == b["branch_code"] else ''
         branch_options_html += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
@@ -2829,7 +2836,7 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
 
     branch_section = ""
     if branch:
-        branch_name_disp = next((b["branch_name"] for b in BRANCHES if b["branch_code"] == branch), branch)
+        branch_name_disp = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch), branch)
         branch_section = f"""
         <div class="card">
           <p style="font-size:13px;color:#888;">지점 필터가 적용되어 있어 지점별 비교는 생략됩니다 (현재: {branch_name_disp}).</p>
@@ -2861,7 +2868,7 @@ async def master_vendor_eval_summary(session_token: str = Cookie(default=None), 
 
     filter_label = []
     if branch:
-        branch_name_disp = next((b["branch_name"] for b in BRANCHES if b["branch_code"] == branch), branch)
+        branch_name_disp = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch), branch)
         filter_label.append(f"지점: {branch_name_disp}")
     if month:
         filter_label.append(f"기간: {month}")
@@ -3021,6 +3028,113 @@ async def vendor_master_delete(request: Request, session_token: str = Cookie(def
         conn.close()
     return RedirectResponse(url="/master/vendor-master", status_code=303)
 
+@app.get("/master/branch-manage", response_class=HTMLResponse)
+async def master_branch_manage_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    branches = get_branches()
+    rows_html = ""
+    branches = get_branches()
+    for b in branches:
+        rows_html += f"""
+        <tr>
+            <td>{b['branch_name']}</td>
+            <td>{b['branch_code']}</td>
+            <td>{b['login_id']}</td>
+            <td><button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteBranch('{b['branch_code']}', '{b['branch_name']}')">삭제</button></td>
+        </tr>
+        """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">🏬 지점 관리</h2>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">새 지점을 추가하면 로그인 계정이 함께 생성됩니다. 삭제 시 계정도 함께 삭제되며, 되돌릴 수 없습니다.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-bottom:8px;">새 지점 추가</h3>
+      <div style="display:flex;flex-direction:column;gap:8px;max-width:400px;">
+        <input type="text" id="newBranchName" placeholder="지점명 (예: 경기 파주점)">
+        <input type="text" id="newBranchCode" placeholder="지점코드/로그인ID (예: 경기파주점, 공백없이)">
+        <input type="password" id="newBranchPassword" placeholder="초기 비밀번호 (미입력시 1234)">
+        <button class="btn" type="button" onclick="addBranch()">지점 추가</button>
+      </div>
+      <div id="addBranchResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>지점명</th><th>지점코드</th><th>로그인ID</th><th></th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    <script>
+      async function addBranch() {{
+        const name = document.getElementById('newBranchName').value.trim();
+        const code = document.getElementById('newBranchCode').value.trim();
+        const pw = document.getElementById('newBranchPassword').value.trim() || '1234';
+        if (!name || !code) {{ alert('지점명과 지점코드를 입력하세요.'); return; }}
+        if (code.includes(' ')) {{ alert('지점코드에는 공백을 사용할 수 없습니다.'); return; }}
+        const res = await fetch('/master/branch-manage/add', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_name: name, branch_code: code, login_id: code, password: pw }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('addBranchResult').innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+      async function deleteBranch(branchCode, branchName) {{
+        if (!confirm(branchName + ' 지점을 삭제합니다. 계정도 함께 삭제되며 되돌릴 수 없습니다. 계속할까요?')) return;
+        const res = await fetch('/master/branch-manage/delete', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: branchCode }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '삭제 실패'));
+        }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/branch-manage/add")
+async def master_branch_manage_add(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    branch_name = data.get("branch_name", "").strip()
+    branch_code = data.get("branch_code", "").strip()
+    login_id = data.get("login_id", "").strip() or branch_code
+    password = data.get("password", "").strip() or "1234"
+
+    if not branch_name or not branch_code:
+        return JSONResponse(status_code=400, content={"detail": "지점명과 지점코드를 입력하세요."})
+
+    err = add_branch(branch_code, branch_name, login_id, password)
+    if err:
+        return JSONResponse(status_code=400, content={"detail": err})
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/branch-manage/delete")
+async def master_branch_manage_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    if not branch_code:
+        return JSONResponse(status_code=400, content={"detail": "지점코드가 지정되지 않았습니다."})
+
+    err = delete_branch(branch_code)
+    if err:
+        return JSONResponse(status_code=400, content={"detail": err})
+    return JSONResponse(content={"status": "ok"})
+
 @app.get("/master/teams-webhook", response_class=HTMLResponse)
 async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -3032,7 +3146,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     existing = {r["branch_code"]: {"url": r["webhook_url"], "name": r["channel_name"] or ""} for r in existing_rows}
     conn.close()
 
-    targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + BRANCHES
+    targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + get_branches()
 
     rows_html = ""
     for t in targets:
@@ -3753,6 +3867,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">지점별 제출/미제출 확인</div>
         </div>
       </a>
+      <a href="/master/branch-manage" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🏬</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">지점 추가/삭제</div>
+        </div>
+      </a>
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -3822,7 +3943,7 @@ async def master_data_page(
             <label style="font-size:12px;color:#888;">지점</label>
             <select name="branch_code" required style="margin-top:4px;">
               <option value="">선택</option>
-              {''.join(f'<option value="{b["branch_code"]}">{b["branch_name"]}</option>' for b in BRANCHES)}
+              {''.join(f'<option value="{b["branch_code"]}">{b["branch_name"]}</option>' for b in get_branches())}
             </select>
           </div>
           <div style="flex:1;min-width:130px;">
@@ -3939,7 +4060,7 @@ async def master_data_add(
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
     branch_name = next(
-        (b["branch_name"] for b in BRANCHES if b["branch_code"] == branch_code), branch_code)
+        (b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_code)
     conn = get_conn()
     now = datetime.now().isoformat()
     try:
@@ -3990,7 +4111,8 @@ async def master_data_upload(
     if ws is None:
         return RedirectResponse(url="/master/data", status_code=303)
     branch_map = {}
-    for b in BRANCHES:
+    branches = get_branches()
+    for b in branches:
         branch_map[b["branch_name"]] = b["branch_code"]
         branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
         branch_map[b["branch_code"]] = b["branch_code"]
@@ -4238,7 +4360,8 @@ async def _fetch_and_process_s3_csv():
         return {"success": 0, "skipped": 0, "errors": ["CSV 헤더를 찾을 수 없습니다."]}
 
     branch_map = {}
-    for b in BRANCHES:
+    branches = get_branches()
+    for b in branches:
         branch_map[b["branch_name"]] = b["branch_code"]
         branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
         branch_map[b["branch_code"]] = b["branch_code"]
@@ -4422,7 +4545,8 @@ async def _process_raw_upload_master(file: UploadFile):
                 "errors": ["헤더를 찾을 수 없습니다. '지점/상품명/품번' 컬럼명이 포함된 행이 있는지 확인해주세요."]}
 
     branch_map = {}
-    for b in BRANCHES:
+    branches = get_branches()
+    for b in branches:
         branch_map[b["branch_name"]] = b["branch_code"]
         branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
         branch_map[b["branch_code"]] = b["branch_code"]
@@ -4605,7 +4729,8 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                 "errors": ["헤더를 찾을 수 없습니다. '지점명/상품명/품번' 컬럼명이 포함된 행이 있는지 확인해주세요."]}
 
     branch_map = {}
-    for b in BRANCHES:
+    branches = get_branches()
+    for b in branches:
         branch_map[b["branch_name"]] = b["branch_code"]
         branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
         branch_map[b["branch_code"]] = b["branch_code"]
@@ -4954,7 +5079,8 @@ async def qr_init_upload_ajax(
         return {"success": 0, "skipped": 0, "errors": ["시트를 찾을 수 없습니다."]}
 
     branch_map = {}
-    for b in BRANCHES:
+    branches = get_branches()
+    for b in branches:
         branch_map[b["branch_name"]] = b["branch_code"]
         branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
         branch_map[b["branch_code"]] = b["branch_code"]
@@ -5023,7 +5149,8 @@ async def qr_init_upload(
         return RedirectResponse(url="/master/qr-init", status_code=303)
 
     branch_map = {}
-    for b in BRANCHES:
+    branches = get_branches()
+    for b in branches:
         branch_map[b["branch_name"]] = b["branch_code"]
         branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
         branch_map[b["branch_code"]] = b["branch_code"]

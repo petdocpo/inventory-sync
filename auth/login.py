@@ -2,15 +2,16 @@
 로그인 및 세션 관리 모듈.
 지점 계정(자기 지점만 접근) + 마스터 계정(전체 접근) 구분.
 SQLite / Supabase(PostgreSQL) 겸용 — db.py의 get_conn() 사용.
+지점 목록은 accounts 테이블 기준으로 동적 조회 (마스터가 지점 추가/삭제 가능).
 """
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from db import get_conn, pk_column
 
-# 지점 마스터 목록 (초기 하드코딩, 나중에 데이터관리에서 수정 가능하게 확장 예정)
-BRANCHES = [
+# 초기 시딩용 지점 목록 (최초 1회만 사용, 이후로는 accounts 테이블이 정본)
+_INITIAL_BRANCHES = [
     {"branch_code": "경기김포점",   "branch_name": "경기 김포점",   "login_id": "경기김포점"},
     {"branch_code": "경기광주점",   "branch_name": "경기 광주점",   "login_id": "경기광주점"},
     {"branch_code": "경기양주점",   "branch_name": "경기 양주점",   "login_id": "경기양주점"},
@@ -69,7 +70,7 @@ def init_auth_db():
             (MASTER_ID, MASTER_PASSWORD)
         )
 
-    for b in BRANCHES:
+    for b in _INITIAL_BRANCHES:
         existing = conn.execute("SELECT id FROM accounts WHERE login_id=?", (b["login_id"],)).fetchone()
         if not existing:
             conn.execute(
@@ -79,6 +80,45 @@ def init_auth_db():
 
     conn.commit()
     conn.close()
+
+
+def get_branches() -> List[Dict]:
+    """현재 등록된 모든 지점 계정 목록을 DB에서 동적으로 조회 (BRANCHES 하드코딩 대체)."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT branch_code, branch_name, login_id FROM accounts WHERE role='branch' ORDER BY branch_name"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_branch(branch_code: str, branch_name: str, login_id: str, password: str) -> Optional[str]:
+    """새 지점 계정 추가. 성공 시 None, 실패 시 에러 메시지 반환."""
+    conn = get_conn()
+    existing = conn.execute("SELECT id FROM accounts WHERE login_id=?", (login_id,)).fetchone()
+    if existing:
+        conn.close()
+        return "이미 존재하는 로그인 ID입니다."
+    conn.execute(
+        "INSERT INTO accounts (login_id, password, role, branch_code, branch_name) VALUES (?, ?, 'branch', ?, ?)",
+        (login_id, password, branch_code, branch_name)
+    )
+    conn.commit()
+    conn.close()
+    return None
+
+
+def delete_branch(branch_code: str) -> Optional[str]:
+    """지점 계정 삭제. 성공 시 None, 실패 시 에러 메시지 반환."""
+    conn = get_conn()
+    existing = conn.execute("SELECT id FROM accounts WHERE branch_code=? AND role='branch'", (branch_code,)).fetchone()
+    if not existing:
+        conn.close()
+        return "해당 지점 계정을 찾을 수 없습니다."
+    conn.execute("DELETE FROM accounts WHERE branch_code=? AND role='branch'", (branch_code,))
+    conn.commit()
+    conn.close()
+    return None
 
 
 def authenticate(login_id: str, password: str) -> Optional[Dict]:
