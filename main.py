@@ -3714,6 +3714,15 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + get_branches() + free_channels
 
     rows_html = ""
+    reminder_setting_row = None
+    conn2 = get_conn()
+    reminder_setting_row = conn2.execute(
+        "SELECT value FROM system_settings WHERE key='unsubmitted_reminder_enabled'"
+    ).fetchone()
+    conn2.close()
+    reminder_enabled = (reminder_setting_row["value"] == "true") if reminder_setting_row else True
+    reminder_status_text = "🟢 켜짐 (매월 5,10,15,20,25,30일 자동발송)" if reminder_enabled else "🔴 꺼짐 (자동발송 안 함)"
+    reminder_btn_label = "끄기" if reminder_enabled else "켜기"
     for t in targets:
         info = existing.get(t["branch_code"])
         is_registered = bool(info)
@@ -3756,6 +3765,12 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
 
     content = f"""
     <h2 style="margin-bottom:16px;">🔔 Teams 웹훅 관리</h2>
+    <div class="card" style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <div style="font-size:14px;">거래처평가 미제출 알림: {reminder_status_text}</div>
+      <form method="post" action="/master/toggle-unsubmitted-reminder" style="margin:0;">
+        <button type="submit" class="btn" style="font-size:12px;padding:6px 14px;">{reminder_btn_label}</button>
+      </form>
+    </div>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">각 지점/마스터/별도 채널의 Teams 웹훅 URL을 등록하세요. 미등록 대상은 알림이 발송되지 않습니다.</p>
     </div>
