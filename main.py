@@ -3606,14 +3606,21 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
             schedule_map.setdefault(code, []).append(dict(s))
     conn.close()
 
-    targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + get_branches()
+    known_codes = {"master"} | {b["branch_code"] for b in get_branches()}
+    free_channels = [
+        {"branch_code": code, "branch_name": info["name"] or code}
+        for code, info in existing.items()
+        if code not in known_codes
+    ]
+    targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + get_branches() + free_channels
 
     rows_html = ""
     for t in targets:
         info = existing.get(t["branch_code"])
+        is_registered = bool(info)
         has_webhook = bool(info and info["url"])
-        channel_display = (info["name"] if info["name"] else "(이름 미설정)") if has_webhook else "-"
-        url_display = (info["url"][:35] + "...") if has_webhook else "(미등록)"
+        channel_display = (info["name"] if info and info["name"] else "(이름 미설정)") if is_registered else "-"
+        url_display = (info["url"][:35] + "...") if has_webhook else "(URL 미등록)" if is_registered else "(미등록)"
         safe_channel_name = (info["name"] if info else "").replace("'", "")
 
         draft = drafts.get(t["branch_code"])
@@ -3626,6 +3633,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         <tr>
             <td style="text-align:center;">
               <input type="checkbox" class="tw-check" value="{t['branch_code']}" {'disabled' if not has_webhook else ''} style="width:16px;height:16px;">
+              <!-- 체크박스는 발송 가능(has_webhook)한 경우만 활성화, 등록만 된 채널은 등록/수정으로 URL 추가 필요 -->
             </td>
             <td>{t['branch_name']}</td>
             <td style="font-size:12px;">{channel_display}</td>
