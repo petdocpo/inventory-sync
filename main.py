@@ -3598,8 +3598,20 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
     from datetime import date
     today = date.today()
 
+    conn = get_conn()
+
+    setting_row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='unsubmitted_reminder_enabled'"
+    ).fetchone()
+    reminder_enabled = (setting_row["value"] == "true") if setting_row else True
+
+    if not reminder_enabled:
+        conn.close()
+        return JSONResponse(content={"skipped": True, "reason": "reminder disabled", "date": today.isoformat()})
+
     # 5, 10, 15, 20, 25, 30일에만 발송 (그 외 날짜에 호출되면 조용히 스킵)
     if today.day not in (5, 10, 15, 20, 25, 30):
+        conn.close()
         return JSONResponse(content={"skipped": True, "reason": "not a reminder day", "date": today.isoformat()})
 
     # vendor-eval/status와 동일한 "전월" 계산 로직
@@ -3607,7 +3619,6 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
     prev_month_year = today.year if today.month > 1 else today.year - 1
     month = f"{prev_month_year}-{prev_month_num:02d}"
 
-    conn = get_conn()
     total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
 
     unsubmitted_branches = []
@@ -3649,6 +3660,33 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
         "date": today.isoformat(),
         "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
     })
+
+@app.post("/master/toggle-unsubmitted-reminder")
+async def master_toggle_unsubmitted_reminder(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='unsubmitted_reminder_enabled'"
+    ).fetchone()
+    current = (row["value"] == "true") if row else True
+    new_value = "false" if current else "true"
+
+    if row:
+        conn.execute(
+            "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='unsubmitted_reminder_enabled'",
+            (new_value,)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO system_settings (key, value) VALUES ('unsubmitted_reminder_enabled', ?)",
+            (new_value,)
+        )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/master/teams-webhook", status_code=303)
 
 @app.get("/master/teams-webhook", response_class=HTMLResponse)
 async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
