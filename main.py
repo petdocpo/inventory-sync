@@ -3632,7 +3632,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         rows_html += f"""
         <tr>
             <td style="text-align:center;">
-              <input type="checkbox" class="tw-check" value="{t['branch_code']}" {'disabled' if not has_webhook else ''} style="width:16px;height:16px;">
+              <input type="checkbox" class="tw-check" value="{t['branch_code']}" {'disabled' if not is_registered else ''} style="width:16px;height:16px;">
               <!-- 체크박스는 발송 가능(has_webhook)한 경우만 활성화, 등록만 된 채널은 등록/수정으로 URL 추가 필요 -->
             </td>
             <td>{t['branch_name']}</td>
