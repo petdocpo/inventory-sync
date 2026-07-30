@@ -3589,6 +3589,67 @@ async def cron_send_scheduled_messages(authorization: str = Header(default="")):
     conn.close()
     return JSONResponse(content={"processed": sent_count, "date": today.isoformat()})
 
+@app.get("/api/cron/send-unsubmitted-reminder")
+async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    from datetime import date
+    today = date.today()
+
+    # 5, 10, 15, 20, 25, 30일에만 발송 (그 외 날짜에 호출되면 조용히 스킵)
+    if today.day not in (5, 10, 15, 20, 25, 30):
+        return JSONResponse(content={"skipped": True, "reason": "not a reminder day", "date": today.isoformat()})
+
+    # vendor-eval/status와 동일한 "전월" 계산 로직
+    prev_month_num = today.month - 1 if today.month > 1 else 12
+    prev_month_year = today.year if today.month > 1 else today.year - 1
+    month = f"{prev_month_year}-{prev_month_num:02d}"
+
+    conn = get_conn()
+    total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
+
+    unsubmitted_branches = []
+    branches = get_branches()
+    for b in branches:
+        done_cnt = conn.execute("""
+            SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
+            WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
+        """, (b["branch_code"], month)).fetchone()["cnt"]
+
+        is_complete = (done_cnt >= total_vendors and total_vendors > 0)
+        if not is_complete:
+            unsubmitted_branches.append({
+                "branch_code": b["branch_code"],
+                "branch_name": b["branch_name"],
+                "done_cnt": done_cnt,
+                "total_vendors": total_vendors
+            })
+
+    sent_count = 0
+    for ub in unsubmitted_branches:
+        message = (
+            f"{month} 거래처평가 미제출 안내드립니다.\n"
+            f"현재 진행률: {ub['done_cnt']} / {ub['total_vendors']}\n"
+            f"빠른 시일 내 제출 부탁드립니다."
+        )
+        send_teams_notification(
+            ub["branch_code"],
+            "거래처평가 미제출 알림",
+            message,
+            sent_by="system_cron_unsubmitted"
+        )
+        sent_count += 1
+
+    conn.close()
+    return JSONResponse(content={
+        "processed": sent_count,
+        "month": month,
+        "date": today.isoformat(),
+        "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
+    })
+
 @app.get("/master/teams-webhook", response_class=HTMLResponse)
 async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
