@@ -3107,21 +3107,29 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
 
     branches = get_branches()
     rows_html = ""
-    branches = get_branches()
     for b in branches:
+        b_type = b.get("branch_type") or "branch"
+        type_badge = '<span class="badge-green">지점</span>' if b_type == "branch" else '<span class="badge-red">본사</span>'
+        safe_name = b["branch_name"].replace("'", "")
+        safe_login = b["login_id"].replace("'", "")
         rows_html += f"""
         <tr>
             <td>{b['branch_name']}</td>
             <td>{b['branch_code']}</td>
             <td>{b['login_id']}</td>
-            <td><button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteBranch('{b['branch_code']}', '{b['branch_name']}')">삭제</button></td>
+            <td>{b.get('password', '-')}</td>
+            <td>{type_badge}</td>
+            <td style="display:flex;gap:4px;flex-wrap:wrap;">
+              <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editBranch('{b['branch_code']}', '{safe_name}', '{safe_login}', '{b.get('password','')}', '{b_type}')">수정</button>
+              <button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteBranch('{b['branch_code']}', '{safe_name}')">삭제</button>
+            </td>
         </tr>
         """
 
     content = f"""
     <h2 style="margin-bottom:16px;">🏬 지점 관리</h2>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <p style="font-size:13px;color:#1E40AF;">새 지점을 추가하면 로그인 계정이 함께 생성됩니다. 삭제 시 계정도 함께 삭제되며, 되돌릴 수 없습니다.</p>
+      <p style="font-size:13px;color:#1E40AF;">새 지점을 추가하면 로그인 계정이 함께 생성됩니다. 삭제 시 계정도 함께 삭제되며, 되돌릴 수 없습니다. "본사"로 등록하면 로그인 드롭다운과 미제출 알림 대상에서 제외됩니다.</p>
     </div>
     <div class="card">
       <h3 style="margin-bottom:8px;">새 지점 추가</h3>
@@ -3129,26 +3137,53 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
         <input type="text" id="newBranchName" placeholder="지점명 (예: 경기 파주점)">
         <input type="text" id="newBranchCode" placeholder="지점코드/로그인ID (예: 경기파주점, 공백없이)">
         <input type="password" id="newBranchPassword" placeholder="초기 비밀번호 (미입력시 1234)">
+        <div style="display:flex;gap:16px;font-size:14px;">
+          <label><input type="radio" name="newBranchType" value="branch" checked> 지점</label>
+          <label><input type="radio" name="newBranchType" value="hq"> 본사</label>
+        </div>
         <button class="btn" type="button" onclick="addBranch()">지점 추가</button>
       </div>
       <div id="addBranchResult" style="margin-top:8px;font-size:13px;"></div>
     </div>
     <div class="card">
       <table>
-        <thead><tr><th>지점명</th><th>지점코드</th><th>로그인ID</th><th></th></tr></thead>
+        <thead><tr><th>지점명</th><th>지점코드</th><th>로그인ID</th><th>비밀번호</th><th>구분</th><th></th></tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
+
+    <div id="editBranchModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:400px;width:90%;">
+        <h3 style="margin-bottom:12px;">계정 정보 수정</h3>
+        <input type="hidden" id="editBranchCode">
+        <label style="font-size:13px;color:#555;">지점명</label>
+        <input type="text" id="editBranchName" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <label style="font-size:13px;color:#555;">로그인 ID</label>
+        <input type="text" id="editLoginId" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <label style="font-size:13px;color:#555;">비밀번호</label>
+        <input type="text" id="editPassword" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
+        <div style="display:flex;gap:16px;font-size:14px;margin-bottom:16px;">
+          <label><input type="radio" name="editBranchType" value="branch"> 지점</label>
+          <label><input type="radio" name="editBranchType" value="hq"> 본사</label>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeEditBranch()">취소</button>
+          <button class="btn" style="flex:1;" onclick="saveEditBranch()">저장</button>
+        </div>
+      </div>
+    </div>
+
     <script>
       async function addBranch() {{
         const name = document.getElementById('newBranchName').value.trim();
         const code = document.getElementById('newBranchCode').value.trim();
         const pw = document.getElementById('newBranchPassword').value.trim() || '1234';
+        const type = document.querySelector('input[name="newBranchType"]:checked').value;
         if (!name || !code) {{ alert('지점명과 지점코드를 입력하세요.'); return; }}
         if (code.includes(' ')) {{ alert('지점코드에는 공백을 사용할 수 없습니다.'); return; }}
         const res = await fetch('/master/branch-manage/add', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_name: name, branch_code: code, login_id: code, password: pw }})
+          body: JSON.stringify({{ branch_name: name, branch_code: code, login_id: code, password: pw, branch_type: type }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
@@ -3166,6 +3201,33 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
           alert('오류: ' + (err.detail || '삭제 실패'));
         }}
       }}
+      function editBranch(branchCode, branchName, loginId, password, branchType) {{
+        document.getElementById('editBranchCode').value = branchCode;
+        document.getElementById('editBranchName').value = branchName;
+        document.getElementById('editLoginId').value = loginId;
+        document.getElementById('editPassword').value = password;
+        document.querySelector('input[name="editBranchType"][value="' + branchType + '"]').checked = true;
+        document.getElementById('editBranchModal').style.display = 'flex';
+      }}
+      function closeEditBranch() {{
+        document.getElementById('editBranchModal').style.display = 'none';
+      }}
+      async function saveEditBranch() {{
+        const branchCode = document.getElementById('editBranchCode').value;
+        const branchName = document.getElementById('editBranchName').value.trim();
+        const loginId = document.getElementById('editLoginId').value.trim();
+        const password = document.getElementById('editPassword').value.trim();
+        const branchType = document.querySelector('input[name="editBranchType"]:checked').value;
+        if (!branchName || !loginId || !password) {{ alert('모든 항목을 입력하세요.'); return; }}
+        const res = await fetch('/master/branch-manage/update', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: branchCode, branch_name: branchName, login_id: loginId, password: password, branch_type: branchType }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '수정 실패'));
+        }}
+      }}
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -3181,11 +3243,12 @@ async def master_branch_manage_add(request: Request, session_token: str = Cookie
     branch_code = data.get("branch_code", "").strip()
     login_id = data.get("login_id", "").strip() or branch_code
     password = data.get("password", "").strip() or "1234"
+    branch_type = data.get("branch_type", "branch").strip() or "branch"
 
     if not branch_name or not branch_code:
         return JSONResponse(status_code=400, content={"detail": "지점명과 지점코드를 입력하세요."})
 
-    err = add_branch(branch_code, branch_name, login_id, password)
+    err = add_branch(branch_code, branch_name, login_id, password, branch_type)
     if err:
         return JSONResponse(status_code=400, content={"detail": err})
     return JSONResponse(content={"status": "ok"})
@@ -3202,6 +3265,26 @@ async def master_branch_manage_delete(request: Request, session_token: str = Coo
         return JSONResponse(status_code=400, content={"detail": "지점코드가 지정되지 않았습니다."})
 
     err = delete_branch(branch_code)
+    if err:
+        return JSONResponse(status_code=400, content={"detail": err})
+    return JSONResponse(content={"status": "ok"})
+
+@app.post("/master/branch-manage/update")
+async def master_branch_manage_update(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    branch_name = data.get("branch_name", "").strip()
+    login_id = data.get("login_id", "").strip()
+    password = data.get("password", "").strip()
+    branch_type = data.get("branch_type", "branch").strip() or "branch"
+
+    if not branch_code or not branch_name or not login_id or not password:
+        return JSONResponse(status_code=400, content={"detail": "모든 항목을 입력하세요."})
+
+    err = update_branch_account(branch_code, branch_name, login_id, password, branch_type)
     if err:
         return JSONResponse(status_code=400, content={"detail": err})
     return JSONResponse(content={"status": "ok"})
