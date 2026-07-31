@@ -3661,6 +3661,70 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
         "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
     })
 
+    @app.post("/master/teams-webhook/test-unsubmitted-reminder")
+async def master_test_unsubmitted_reminder(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    data = await request.json()
+    target_branch_code = data.get("branch_code", "").strip()
+    if not target_branch_code:
+        return JSONResponse(status_code=400, content={"detail": "테스트 대상 채널 코드가 필요합니다."})
+
+    from datetime import date
+    today = date.today()
+
+    prev_month_num = today.month - 1 if today.month > 1 else 12
+    prev_month_year = today.year if today.month > 1 else today.year - 1
+    month = f"{prev_month_year}-{prev_month_num:02d}"
+
+    conn = get_conn()
+    total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
+
+    unsubmitted_branches = []
+    branches = get_branches()
+    for b in branches:
+        done_cnt = conn.execute("""
+            SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
+            WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
+        """, (b["branch_code"], month)).fetchone()["cnt"]
+
+        is_complete = (done_cnt >= total_vendors and total_vendors > 0)
+        if not is_complete:
+            unsubmitted_branches.append({
+                "branch_code": b["branch_code"],
+                "branch_name": b["branch_name"],
+                "done_cnt": done_cnt,
+                "total_vendors": total_vendors
+            })
+    conn.close()
+
+    preview_lines = "\n".join(
+        f"- {ub['branch_name']}: {ub['done_cnt']}/{ub['total_vendors']}"
+        for ub in unsubmitted_branches
+    ) or "(현재 미제출 지점 없음)"
+
+    message = (
+        f"[테스트 발송] {month} 거래처평가 미제출 현황\n"
+        f"실제 지점에는 발송되지 않고, 이 채널로만 미리보기가 전송됩니다.\n\n"
+        f"{preview_lines}"
+    )
+
+    send_teams_notification(
+        target_branch_code,
+        "🧪 미제출 알림 테스트 발송",
+        message,
+        sent_by=f"test_by_{user['login_id']}"
+    )
+
+    return JSONResponse(content={
+        "success": True,
+        "month": month,
+        "unsubmitted_count": len(unsubmitted_branches),
+        "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
+    })
+
 @app.post("/master/toggle-unsubmitted-reminder")
 async def master_toggle_unsubmitted_reminder(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -3766,6 +3830,22 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     content = f"""
     <h2 style="margin-bottom:16px;">🔔 Teams 웹훅 관리</h2>
     <div class="card" style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <div style="font-size:14px;">거래처평가 미제출 알림: {reminder_status_text}</div>
+      <form method="post" action="/master/toggle-unsubmitted-reminder" style="margin:0;">
+        <button type="submit" class="btn" style="font-size:12px;padding:6px 14px;">{reminder_btn_label}</button>
+      </form>
+    </div>
+    <div class="card" style="margin-bottom:16px;">
+      <h3 style="margin-bottom:8px;font-size:14px;">🧪 미제출 알림 테스트 발송</h3>
+      <p style="font-size:12px;color:#888;margin-bottom:8px;">실제 지점에는 발송되지 않고, 선택한 채널로 현재 미제출 현황 미리보기만 전송됩니다.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <select id="testReminderTarget" style="flex:1;min-width:160px;padding:8px;">
+          {branch_options_html}
+        </select>
+        <button class="btn" type="button" onclick="testUnsubmittedReminder()">테스트 발송</button>
+      </div>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <div style="font-size:14px;">거래처평가 미제출 알림: {reminder_status_text}</div>
       <form method="post" action="/master/toggle-unsubmitted-reminder" style="margin:0;">
         <button type="submit" class="btn" style="font-size:12px;padding:6px 14px;">{reminder_btn_label}</button>
@@ -3922,6 +4002,34 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
           alert('테스트 발송 성공! Teams 채널을 확인하세요.');
         }} else {{
           alert('발송 실패:\\n' + (result.fail_details ? result.fail_details.join('\\n') : '알 수 없는 오류'));
+        }}
+      }}
+
+      async function testSend(branchCode, branchName) {{
+        if (!confirm(branchName + ' 채널로 테스트 메시지를 보낼까요?')) return;
+        const res = await fetch('/master/teams-webhook/broadcast', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_codes: [branchCode], title: '테스트 알림', message: '이 메시지가 보이면 웹훅이 정상 연결된 것입니다.', link_url: 'https://inventory-sync-teal.vercel.app', link_text: '앱 바로가기' }})
+        }});
+        const result = await res.json();
+        if (res.ok && result.success > 0) {{
+          alert('테스트 발송 성공! Teams 채널을 확인하세요.');
+        }} else {{
+          alert('발송 실패:\\n' + (result.fail_details ? result.fail_details.join('\\n') : '알 수 없는 오류'));
+        }}
+      }}
+      async function testUnsubmittedReminder() {{
+        const target = document.getElementById('testReminderTarget').value;
+        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/test-unsubmitted-reminder', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: target }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('테스트 발송 완료! 미제출 지점 ' + result.unsubmitted_count + '곳 (기준월: ' + result.month + ')\\nTeams 채널을 확인하세요.');
+        }} else {{
+          alert('오류: ' + (result.detail || '발송 실패'));
         }}
       }}
 
