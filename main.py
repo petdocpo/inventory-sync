@@ -980,10 +980,141 @@ async def dashboard(
           </div>
         </form>"""
 
+    notif_type_labels_js = json.dumps(
+        {k: {"label": v["label"], "desc": v["desc"]} for k, v in NOTIFICATION_TYPES.items()},
+        ensure_ascii=False
+    )
+
     content = f"""
-    <h2 style="margin-bottom:8px;">⚠️ 대시보드</h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+      <h2 style="margin:0;">⚠️ 대시보드</h2>
+      <button class="btn" type="button" style="font-size:12px;padding:6px 12px;" onclick="openNotifSettings()">🔔 알림 설정</button>
+    </div>
     <p style="color:#888;font-size:13px;margin-bottom:16px;">불일치 품목만 표시됩니다</p>
     {branch_filter_html}
+
+    <div id="notifSettingsModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:85vh;overflow-y:auto;">
+        <h3 style="margin-bottom:12px;">🔔 알림 설정</h3>
+        <div id="notifSettingsBody">
+          <p style="font-size:13px;color:#888;">불러오는 중...</p>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:16px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeNotifSettings()">닫기</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const NOTIF_TYPE_LABELS = {notif_type_labels_js};
+
+      function urlBase64ToUint8Array(base64String) {{
+        var padding = '='.repeat((4 - base64String.length % 4) % 4);
+        var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+        var rawData = window.atob(base64);
+        var outputArray = new Uint8Array(rawData.length);
+        for (var i = 0; i < rawData.length; ++i) {{
+          outputArray[i] = rawData.charCodeAt(i);
+        }}
+        return outputArray;
+      }}
+
+      async function getCurrentEndpoint() {{
+        if (!('serviceWorker' in navigator)) return null;
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.getSubscription();
+        return sub ? sub.endpoint : null;
+      }}
+
+      async function enablePushAndSubscribe() {{
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
+          alert('이 브라우저는 알림 기능을 지원하지 않습니다.');
+          return;
+        }}
+        const permission = await Notification.requestPermission();
+        if (permission !== 'granted') {{
+          alert('알림 권한이 거부되었습니다. 브라우저 설정에서 허용해주세요.');
+          return;
+        }}
+        const reg = await navigator.serviceWorker.ready;
+        let sub = await reg.pushManager.getSubscription();
+        if (!sub) {{
+          const keyRes = await fetch('/api/push/vapid-public-key');
+          const keyData = await keyRes.json();
+          sub = await reg.pushManager.subscribe({{
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(keyData.key)
+          }});
+        }}
+        await fetch('/api/push/subscribe', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(sub)
+        }});
+        await loadNotifSettings();
+      }}
+
+      async function openNotifSettings() {{
+        document.getElementById('notifSettingsModal').style.display = 'flex';
+        await loadNotifSettings();
+      }}
+
+      function closeNotifSettings() {{
+        document.getElementById('notifSettingsModal').style.display = 'none';
+      }}
+
+      async function loadNotifSettings() {{
+        const body = document.getElementById('notifSettingsBody');
+        const endpoint = await getCurrentEndpoint();
+
+        if (!endpoint) {{
+          body.innerHTML = '<p style="font-size:13px;color:#555;margin-bottom:12px;">이 기기에서 아직 알림을 켜지 않았습니다.</p>' +
+            '<button class="btn" style="width:100%;" onclick="enablePushAndSubscribe()">이 기기에서 알림 켜기</button>';
+          return;
+        }}
+
+        const res = await fetch('/api/push/settings?endpoint=' + encodeURIComponent(endpoint));
+        const data = await res.json();
+
+        if (!data.subscribed) {{
+          body.innerHTML = '<p style="font-size:13px;color:#555;margin-bottom:12px;">이 기기에서 아직 알림을 켜지 않았습니다.</p>' +
+            '<button class="btn" style="width:100%;" onclick="enablePushAndSubscribe()">이 기기에서 알림 켜기</button>';
+          return;
+        }}
+
+        const settings = data.settings || {{}};
+        let html = '';
+        html += renderToggleRow('all', '전체 알림', '이 기기의 모든 알림을 켜고 끕니다', settings['all'] !== false);
+        html += '<hr style="margin:12px 0;border:none;border-top:1px solid #eee;">';
+        for (const key in NOTIF_TYPE_LABELS) {{
+          const info = NOTIF_TYPE_LABELS[key];
+          html += renderToggleRow(key, info.label, info.desc, settings[key] !== false);
+        }}
+        body.innerHTML = html;
+
+        document.querySelectorAll('.notif-toggle').forEach(function(el) {{
+          el.addEventListener('change', async function() {{
+            await fetch('/api/push/settings', {{
+              method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{
+                endpoint: endpoint,
+                notification_type: el.dataset.type,
+                enabled: el.checked
+              }})
+            }});
+          }});
+        }});
+      }}
+
+      function renderToggleRow(type, label, desc, checked) {{
+        return '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;">' +
+          '<div><div style="font-size:14px;font-weight:' + (type === 'all' ? 'bold' : 'normal') + ';">' + label + '</div>' +
+          '<div style="font-size:11px;color:#888;">' + desc + '</div></div>' +
+          '<label style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0;margin-left:8px;">' +
+          '<input type="checkbox" class="notif-toggle" data-type="' + type + '" ' + (checked ? 'checked' : '') + ' style="opacity:0;width:0;height:0;">' +
+          '<span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:' + (checked ? '#1E2761' : '#ccc') + ';border-radius:24px;transition:0.2s;"></span>' +
+          '</label></div>';
+      }}
+    </script>
     <div style="display:flex;gap:12px;margin-bottom:16px;">
       <div class="card" style="flex:1;text-align:center;padding:16px;">
         <div style="color:#888;font-size:12px;">불일치 품목</div>
