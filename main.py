@@ -3734,7 +3734,7 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
     total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
 
     unsubmitted_branches = []
-    branches = get_branches()
+    branches = get_branches(branch_type='branch')
     for b in branches:
         done_cnt = conn.execute("""
             SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
@@ -3795,7 +3795,7 @@ async def master_test_unsubmitted_reminder(request: Request, session_token: str 
     total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
 
     unsubmitted_branches = []
-    branches = get_branches()
+    branches = get_branches(branch_type='branch')
     for b in branches:
         done_cnt = conn.execute("""
             SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
