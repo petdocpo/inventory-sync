@@ -5,6 +5,7 @@ FastAPI 기반 / SQLite ↔ Supabase(PostgreSQL) 겸용 / 지점별 로그인
 import os
 import socket
 import json
+import httpx
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -34,6 +35,183 @@ init_auth_db()
 
 
 # ── 공통 함수 ──────────────────────────────────────────
+
+async def fetch_purchase_history(branch_name: str = None, limit: int = 200):
+    """별도 Supabase 프로젝트(purchase_history)에서 발주내역 조회 (읽기 전용, anon 키 사용)."""
+    supabase_url = os.environ.get("PURCHASE_SUPABASE_URL", "")
+    supabase_key = os.environ.get("PURCHASE_SUPABASE_ANON_KEY", "")
+    if not supabase_url or not supabase_key:
+        return [], "발주내역 조회 설정이 되어있지 않습니다. 관리자에게 문의하세요."
+
+    params = {
+        "select": "*",
+        "order": "registered_at.desc",
+        "limit": str(limit)
+    }
+    if branch_name:
+        params["branch"] = f"eq.{branch_name}"
+
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}"
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                f"{supabase_url}/rest/v1/purchase_history",
+                params=params,
+                headers=headers,
+                timeout=15.0
+            )
+        if res.status_code != 200:
+            return [], f"조회 실패 (status {res.status_code})"
+        return res.json(), None
+    except Exception as e:
+        return [], f"조회 중 오류: {str(e)}"
+
+def send_push_notification(branch_code: str, title: str, body: str, event_type: str, url: str = "/"):
+    """특정 지점의 등록된 모든 기기로 웹 푸시 발송 + notification_events 테이블에 기록."""
+    from pywebpush import webpush, WebPushException
+    import json as json_lib
+
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO notification_events (event_type, branch_code, title, body) VALUES (?, ?, ?, ?)",
+        (event_type, branch_code, title, body)
+    )
+    conn.commit()
+
+    subs = conn.execute(
+        "SELECT * FROM push_subscriptions WHERE branch_code=?", (branch_code,)
+    ).fetchall()
+    conn.close()
+
+    vapid_private_key = os.environ.get("VAPID_PRIVATE_KEY", "")
+    vapid_claim_email = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@example.com")
+
+    sent, failed = 0, 0
+    for sub in subs:
+        try:
+            webpush(
+                subscription_info={
+                    "endpoint": sub["endpoint"],
+                    "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]}
+                },
+                data=json_lib.dumps({"title": title, "body": body, "url": url}, ensure_ascii=False),
+                vapid_private_key=vapid_private_key,
+                vapid_claims={"sub": vapid_claim_email}
+            )
+            sent += 1
+        except WebPushException:
+            failed += 1
+    return sent, failed
+
+
+@app.post("/api/push/subscribe")
+async def push_subscribe(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+
+    data = await request.json()
+    endpoint = data.get("endpoint", "")
+    keys = data.get("keys", {})
+    p256dh = keys.get("p256dh", "")
+    auth = keys.get("auth", "")
+
+    if not endpoint or not p256dh or not auth:
+        return JSONResponse(status_code=400, content={"detail": "구독 정보가 올바르지 않습니다."})
+
+    branch_code = user.get("branch_code") or "master"
+
+    conn = get_conn()
+    existing = conn.execute("SELECT id FROM push_subscriptions WHERE endpoint=?", (endpoint,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE push_subscriptions SET branch_code=?, p256dh=?, auth=? WHERE endpoint=?",
+            (branch_code, p256dh, auth, endpoint)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO push_subscriptions (branch_code, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)",
+            (branch_code, endpoint, p256dh, auth)
+        )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/api/push/vapid-public-key")
+async def push_vapid_public_key():
+    return JSONResponse(content={"key": os.environ.get("VAPID_PUBLIC_KEY", "")})
+
+@app.get("/purchase-history", response_class=HTMLResponse)
+async def purchase_history_page(session_token: str = Cookie(default=None), branch_filter: str = ""):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    is_master = user["role"] == "master"
+    if is_master:
+        target_branch = branch_filter or None
+    else:
+        target_branch = user.get("branch_name") or user.get("branch_code")
+
+    rows, err = await fetch_purchase_history(branch_name=target_branch)
+
+    branch_filter_html = ""
+    if is_master:
+        branches = get_branches(branch_type='branch')
+        options = '<option value="">전체 지점</option>'
+        for b in branches:
+            sel = 'selected' if b["branch_name"] == branch_filter else ''
+            options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
+        branch_filter_html = f"""
+        <div class="card">
+          <form method="get" action="/purchase-history" style="display:flex;gap:8px;align-items:flex-end;">
+            <div>
+              <label style="font-size:12px;color:#888;">지점 필터</label>
+              <select name="branch_filter" onchange="this.form.submit()">{options}</select>
+            </div>
+          </form>
+        </div>
+        """
+
+    if err:
+        rows_html = f'<tr><td colspan="6" style="text-align:center;color:#888;padding:24px;">{err}</td></tr>'
+    elif not rows:
+        rows_html = '<tr><td colspan="6" style="text-align:center;color:#888;padding:24px;">발주 내역이 없습니다.</td></tr>'
+    else:
+        rows_html = ""
+        for r in rows:
+            order_dt = r.get("order_datetime") or r.get("registered_at") or "-"
+            status = r.get("send_status") or ""
+            status_badge = '<span class="badge-green">완료</span>' if status == "완료" else '<span class="badge-red">대기</span>'
+            rows_html += f"""
+            <tr>
+                <td style="font-size:12px;">{order_dt}</td>
+                <td>{r.get('branch', '-')}</td>
+                <td>{r.get('vendor', '-')}</td>
+                <td>{r.get('product_name', '-')}</td>
+                <td style="text-align:right;">{r.get('quantity', '-')}</td>
+                <td>{status_badge}</td>
+            </tr>
+            """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📦 발주내역</h2>
+    {branch_filter_html}
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>발주일시</th><th>지점</th><th>거래처</th><th>상품명</th><th>수량</th><th>상태</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "purchase-history"))
 
 def init_db():
     conn = get_conn()
@@ -168,6 +346,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("raw-branch", raw_menu_href, "📤", "유비플러스 재고"),
         ("scanlog", "/scan-log", "📜", "스캔이력"),
         ("vendor-eval", vendor_eval_href, "🤝", "거래처평가"),
+        ("purchase-history", "/purchase-history", "📦", "발주내역"),
     ]
     if is_master:
         menus.append(("teams-webhook", "/master/teams-webhook", "🔔", "팀즈웹훅"))
@@ -196,8 +375,45 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       <script>
         if ('serviceWorker' in navigator) {{
           window.addEventListener('load', function() {{
-            navigator.serviceWorker.register('/sw.js').catch(function() {{}});
+            navigator.serviceWorker.register('/sw.js').then(function(reg) {{
+              window.__swRegistration = reg;
+            }}).catch(function() {{}});
           }});
+        }}
+
+        function urlBase64ToUint8Array(base64String) {{
+          var padding = '='.repeat((4 - base64String.length % 4) % 4);
+          var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+          var rawData = window.atob(base64);
+          var outputArray = new Uint8Array(rawData.length);
+          for (var i = 0; i < rawData.length; ++i) {{
+            outputArray[i] = rawData.charCodeAt(i);
+          }}
+          return outputArray;
+        }}
+
+        async function enablePushNotification() {{
+          if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
+            alert('이 브라우저는 알림 기능을 지원하지 않습니다.');
+            return;
+          }}
+          const permission = await Notification.requestPermission();
+          if (permission !== 'granted') {{
+            alert('알림 권한이 거부되었습니다. 브라우저 설정에서 허용해주세요.');
+            return;
+          }}
+          const reg = window.__swRegistration || await navigator.serviceWorker.ready;
+          const keyRes = await fetch('/api/push/vapid-public-key');
+          const keyData = await keyRes.json();
+          const sub = await reg.pushManager.subscribe({{
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(keyData.key)
+          }});
+          const res = await fetch('/api/push/subscribe', {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify(sub)
+          }});
+          if (res.ok) {{ alert('알림이 활성화되었습니다.'); }} else {{ alert('알림 등록에 실패했습니다.'); }}
         }}
       </script>
       <style>
@@ -4902,6 +5118,27 @@ self.addEventListener('fetch', function(event) {
         headers: { 'Content-Type': 'text/plain; charset=utf-8' }
       });
     })
+  );
+});
+self.addEventListener('push', function(event) {
+  var data = {};
+  try { data = event.data ? event.data.json() : {}; } catch (e) {}
+  var title = data.title || '재고 관리 시스템';
+  var body = data.body || '새 알림이 있습니다.';
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: body,
+      icon: '/icon-192.png',
+      badge: '/icon-192.png',
+      data: { url: data.url || '/' }
+    })
+  );
+});
+self.addEventListener('notificationclick', function(event) {
+  event.notification.close();
+  var url = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(
+    clients.openWindow(url)
   );
 });
 """
