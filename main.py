@@ -28,7 +28,7 @@ app = FastAPI(title="재고 관리 시스템", version="1.2.0")
 from auth.login import (  # noqa: E402
     init_auth_db, authenticate, create_session, get_session,
     delete_session, create_auto_login_token, get_auto_login_info,
-    get_branches, add_branch, delete_branch
+    get_branches, add_branch, delete_branch, update_branch_account
 )
 init_auth_db()
 
