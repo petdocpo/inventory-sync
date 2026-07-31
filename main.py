@@ -24,7 +24,15 @@ from db import get_conn, pk_column  # noqa: E402
 SERVER_PORT = int(os.getenv("SERVER_PORT", "28000"))
 QR_DIR = "./qr_codes"
 
-app = FastAPI(title="재고 관리 시스템", version="1.2.0")
+app = FastAPI(title="포포즈 발주_재고", version="1.2.0")
+
+NOTIFICATION_TYPES = {
+    "qr_raw_mismatch":     {"label": "재고 불일치 알림",      "desc": "QR-RAW 재고 불일치 시 (3시간마다 검사)"},
+    "vendor_eval_missing": {"label": "거래처평가 미제출 알림", "desc": "거래처 미평가 지점 Teams 웹훅 연동"},
+    "purchase_new":        {"label": "발주내역 알림",         "desc": "새 발주 등록 시"},
+    "restock_missing":     {"label": "미입고 알림",           "desc": "(준비 중)"},
+    "safety_stock_change": {"label": "안전재고 변경 알림",     "desc": "(준비 중)"},
+}
 
 from auth.login import (  # noqa: E402
     init_auth_db, authenticate, create_session, get_session,
@@ -71,7 +79,7 @@ async def fetch_purchase_history(branch_name: str = None, limit: int = 200):
         return [], f"조회 중 오류: {str(e)}"
 
 def send_push_notification(branch_code: str, title: str, body: str, event_type: str, url: str = "/"):
-    """특정 지점의 등록된 모든 기기로 웹 푸시 발송 + notification_events 테이블에 기록."""
+    """특정 지점의 등록된 기기 중, 해당 알림 종류를 켜놓은 기기에만 웹 푸시 발송 + notification_events 기록."""
     from pywebpush import webpush, WebPushException
     import json as json_lib
 
@@ -85,13 +93,28 @@ def send_push_notification(branch_code: str, title: str, body: str, event_type: 
     subs = conn.execute(
         "SELECT * FROM push_subscriptions WHERE branch_code=?", (branch_code,)
     ).fetchall()
-    conn.close()
 
     vapid_private_key = os.environ.get("VAPID_PRIVATE_KEY", "")
     vapid_claim_email = os.environ.get("VAPID_CLAIM_EMAIL", "mailto:admin@example.com")
 
-    sent, failed = 0, 0
+    sent, failed, skipped = 0, 0, 0
     for sub in subs:
+        all_setting = conn.execute(
+            "SELECT enabled FROM push_notification_settings WHERE subscription_id=? AND notification_type='all'",
+            (sub["id"],)
+        ).fetchone()
+        type_setting = conn.execute(
+            "SELECT enabled FROM push_notification_settings WHERE subscription_id=? AND notification_type=?",
+            (sub["id"], event_type)
+        ).fetchone()
+
+        all_enabled = bool(all_setting["enabled"]) if all_setting else True
+        type_enabled = bool(type_setting["enabled"]) if type_setting else True
+
+        if not all_enabled or not type_enabled:
+            skipped += 1
+            continue
+
         try:
             webpush(
                 subscription_info={
@@ -105,6 +128,8 @@ def send_push_notification(branch_code: str, title: str, body: str, event_type: 
             sent += 1
         except WebPushException:
             failed += 1
+
+    conn.close()
     return sent, failed
 
 
@@ -132,19 +157,86 @@ async def push_subscribe(request: Request, session_token: str = Cookie(default=N
             "UPDATE push_subscriptions SET branch_code=?, p256dh=?, auth=? WHERE endpoint=?",
             (branch_code, p256dh, auth, endpoint)
         )
+        subscription_id = existing["id"]
     else:
         conn.execute(
             "INSERT INTO push_subscriptions (branch_code, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)",
             (branch_code, endpoint, p256dh, auth)
         )
+        new_row = conn.execute("SELECT id FROM push_subscriptions WHERE endpoint=?", (endpoint,)).fetchone()
+        subscription_id = new_row["id"]
+
+    # 신규/기존 구독 모두, 아직 설정이 없는 알림 종류는 기본값(켜짐)으로 초기화
+    all_types = ["all"] + list(NOTIFICATION_TYPES.keys())
+    for ntype in all_types:
+        exists_setting = conn.execute(
+            "SELECT id FROM push_notification_settings WHERE subscription_id=? AND notification_type=?",
+            (subscription_id, ntype)
+        ).fetchone()
+        if not exists_setting:
+            conn.execute(
+                "INSERT INTO push_notification_settings (subscription_id, notification_type, enabled) VALUES (?, ?, TRUE)",
+                (subscription_id, ntype)
+            )
+
     conn.commit()
     conn.close()
-    return JSONResponse(content={"status": "ok"})
+    return JSONResponse(content={"status": "ok", "subscription_id": subscription_id})
 
 
 @app.get("/api/push/vapid-public-key")
 async def push_vapid_public_key():
     return JSONResponse(content={"key": os.environ.get("VAPID_PUBLIC_KEY", "")})
+
+@app.get("/api/push/settings")
+async def push_get_settings(endpoint: str, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+
+    conn = get_conn()
+    sub = conn.execute("SELECT id FROM push_subscriptions WHERE endpoint=?", (endpoint,)).fetchone()
+    if not sub:
+        conn.close()
+        return JSONResponse(content={"subscribed": False, "settings": {}})
+
+    rows = conn.execute(
+        "SELECT notification_type, enabled FROM push_notification_settings WHERE subscription_id=?",
+        (sub["id"],)
+    ).fetchall()
+    conn.close()
+
+    settings = {r["notification_type"]: bool(r["enabled"]) for r in rows}
+    return JSONResponse(content={"subscribed": True, "settings": settings})
+
+
+@app.post("/api/push/settings")
+async def push_update_settings(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+
+    data = await request.json()
+    endpoint = data.get("endpoint", "")
+    notification_type = data.get("notification_type", "")
+    enabled = bool(data.get("enabled", True))
+
+    if not endpoint or not notification_type:
+        return JSONResponse(status_code=400, content={"detail": "필수 항목이 누락되었습니다."})
+
+    conn = get_conn()
+    sub = conn.execute("SELECT id FROM push_subscriptions WHERE endpoint=?", (endpoint,)).fetchone()
+    if not sub:
+        conn.close()
+        return JSONResponse(status_code=404, content={"detail": "구독 정보를 찾을 수 없습니다."})
+
+    conn.execute(
+        "UPDATE push_notification_settings SET enabled=? WHERE subscription_id=? AND notification_type=?",
+        (enabled, sub["id"], notification_type)
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
 
 @app.get("/purchase-history", response_class=HTMLResponse)
 async def purchase_history_page(session_token: str = Cookie(default=None), branch_filter: str = ""):
