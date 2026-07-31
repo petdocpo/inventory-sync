@@ -3661,7 +3661,7 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
         "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
     })
 
-    @app.post("/master/teams-webhook/test-unsubmitted-reminder")
+@app.post("/master/teams-webhook/test-unsubmitted-reminder")
 async def master_test_unsubmitted_reminder(request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
