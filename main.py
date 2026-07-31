@@ -1091,28 +1091,41 @@ async def dashboard(
         }}
         body.innerHTML = html;
 
-        document.querySelectorAll('.notif-toggle').forEach(function(el) {{
-          el.addEventListener('change', async function() {{
-            await fetch('/api/push/settings', {{
-              method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify({{
-                endpoint: endpoint,
-                notification_type: el.dataset.type,
-                enabled: el.checked
-              }})
-            }});
-          }});
-        }});
+        
       }}
 
       function renderToggleRow(type, label, desc, checked) {{
         return '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;">' +
           '<div><div style="font-size:14px;font-weight:' + (type === 'all' ? 'bold' : 'normal') + ';">' + label + '</div>' +
           '<div style="font-size:11px;color:#888;">' + desc + '</div></div>' +
-          '<label style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0;margin-left:8px;">' +
-          '<input type="checkbox" class="notif-toggle" data-type="' + type + '" ' + (checked ? 'checked' : '') + ' style="opacity:0;width:0;height:0;">' +
-          '<span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:' + (checked ? '#1E2761' : '#ccc') + ';border-radius:24px;transition:0.2s;"></span>' +
-          '</label></div>';
+          '<label style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0;margin-left:8px;" onclick="toggleSwitch(this, \'' + type + '\')">' +
+          '<input type="checkbox" class="notif-toggle" data-type="' + type + '" ' + (checked ? 'checked' : '') + ' style="opacity:0;width:0;height:0;position:absolute;">' +
+          '<span class="notif-toggle-track" style="position:absolute;pointer-events:none;top:0;left:0;right:0;bottom:0;background:' + (checked ? '#1E2761' : '#ccc') + ';border-radius:24px;transition:0.2s;">' +
+          '<span class="notif-toggle-knob" style="position:absolute;height:18px;width:18px;left:' + (checked ? '23px' : '3px') + ';top:3px;background:white;border-radius:50%;transition:0.2s;"></span>' +
+          '</span></label></div>';
+      }}
+
+      async function toggleSwitch(labelEl, type) {{
+        const input = labelEl.querySelector('input.notif-toggle');
+        const newChecked = !input.checked;
+        input.checked = newChecked;
+
+        const track = labelEl.querySelector('.notif-toggle-track');
+        const knob = labelEl.querySelector('.notif-toggle-knob');
+        track.style.background = newChecked ? '#1E2761' : '#ccc';
+        knob.style.left = newChecked ? '23px' : '3px';
+
+        const endpoint = await getCurrentEndpoint();
+        if (!endpoint) return;
+
+        await fetch('/api/push/settings', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            endpoint: endpoint,
+            notification_type: type,
+            enabled: newChecked
+          }})
+        }});
       }}
     </script>
     <div style="display:flex;gap:12px;margin-bottom:16px;">
