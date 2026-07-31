@@ -316,35 +316,64 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page():
-    return HTMLResponse(content="""
+    branches = get_branches()
+    branch_options = "".join(
+        f'<option value="{b["login_id"]}">{b["branch_name"]}</option>' for b in branches
+    )
+    return HTMLResponse(content=f"""
     <html><head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>로그인</title>
       <style>
-        * { box-sizing:border-box; }
-        body { font-family:-apple-system,sans-serif;background:#f5f7fa;
+        * {{ box-sizing:border-box; }}
+        body {{ font-family:-apple-system,sans-serif;background:#f5f7fa;
                display:flex;justify-content:center;align-items:center;
-               height:100vh;margin:0; }
-        .card { background:white;padding:32px;border-radius:16px;
-                box-shadow:0 2px 12px rgba(0,0,0,0.1);width:320px; }
-        input { width:100%;padding:12px;border:1px solid #ddd;
-                border-radius:8px;font-size:14px;margin-top:4px;margin-bottom:14px; }
-        .btn { width:100%;background:#1E2761;color:white;padding:13px;
-               border:none;border-radius:8px;cursor:pointer;font-size:15px; }
+               height:100vh;margin:0; }}
+        .card {{ background:white;padding:32px;border-radius:16px;
+                box-shadow:0 2px 12px rgba(0,0,0,0.1);width:320px; }}
+        input, select {{ width:100%;padding:12px;border:1px solid #ddd;
+                border-radius:8px;font-size:14px;margin-top:4px;margin-bottom:14px; }}
+        .btn {{ width:100%;background:#1E2761;color:white;padding:13px;
+               border:none;border-radius:8px;cursor:pointer;font-size:15px; }}
       </style>
     </head>
     <body>
       <div class="card">
         <h2 style="color:#1E2761;text-align:center;margin-bottom:24px;">📦 재고 관리 시스템</h2>
         <form method="post" action="/login">
-          <label style="font-size:13px;color:#555;">아이디</label>
-          <input name="login_id" required placeholder="아이디 입력">
+          <label style="font-size:13px;color:#555;">지점 선택</label>
+          <select name="login_id" required onchange="document.getElementById('pwInput').focus()">
+            <option value="" disabled selected>지점을 선택하세요</option>
+            {branch_options}
+            <option value="__manual__">직접 입력 (마스터 등)</option>
+          </select>
+          <div id="manualIdWrap" style="display:none;">
+            <label style="font-size:13px;color:#555;">아이디 직접 입력</label>
+            <input name="login_id_manual" id="manualIdInput" placeholder="아이디 입력">
+          </div>
           <label style="font-size:13px;color:#555;">비밀번호</label>
-          <input name="password" type="password" required placeholder="비밀번호 입력">
+          <input name="password" type="password" id="pwInput" required placeholder="비밀번호 입력">
           <button class="btn" type="submit">로그인</button>
         </form>
       </div>
+      <script>
+        const selectEl = document.querySelector('select[name="login_id"]');
+        const manualWrap = document.getElementById('manualIdWrap');
+        const manualInput = document.getElementById('manualIdInput');
+        selectEl.addEventListener('change', function() {{
+          if (selectEl.value === '__manual__') {{
+            manualWrap.style.display = 'block';
+            selectEl.removeAttribute('name');
+            manualInput.setAttribute('name', 'login_id');
+            manualInput.focus();
+          }} else {{
+            manualWrap.style.display = 'none';
+            selectEl.setAttribute('name', 'login_id');
+            manualInput.removeAttribute('name');
+          }}
+        }});
+      </script>
     </body></html>
     """)
 
@@ -3877,15 +3906,6 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         </select>
         <button class="btn" type="button" onclick="testUnsubmittedReminder()">테스트 발송</button>
       </div>
-    </div>
-    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <div style="font-size:14px;">거래처평가 미제출 알림: {reminder_status_text}</div>
-      <form method="post" action="/master/toggle-unsubmitted-reminder" style="margin:0;">
-        <button type="submit" class="btn" style="font-size:12px;padding:6px 14px;">{reminder_btn_label}</button>
-      </form>
-    </div>
-    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <p style="font-size:13px;color:#1E40AF;">각 지점/마스터/별도 채널의 Teams 웹훅 URL을 등록하세요. 미등록 대상은 알림이 발송되지 않습니다.</p>
     </div>
 
     <div class="card">
