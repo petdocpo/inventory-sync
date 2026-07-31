@@ -3700,28 +3700,29 @@ async def master_test_unsubmitted_reminder(request: Request, session_token: str 
             })
     conn.close()
 
-    preview_lines = "\n".join(
-        f"- {ub['branch_name']}: {ub['done_cnt']}/{ub['total_vendors']}"
-        for ub in unsubmitted_branches
-    ) or "(현재 미제출 지점 없음)"
-
-    message = (
-        f"[테스트 발송] {month} 거래처평가 미제출 현황\n"
-        f"실제 지점에는 발송되지 않고, 이 채널로만 미리보기가 전송됩니다.\n\n"
-        f"{preview_lines}"
-    )
-
-    send_teams_notification(
-        target_branch_code,
-        "🧪 미제출 알림 테스트 발송",
-        message,
-        sent_by=f"test_by_{user['login_id']}"
-    )
+    # 실제 운영 로직(cron_send_unsubmitted_reminder)과 동일한 메시지를 지점별로 개별 생성,
+    # 실제 지점이 아닌 target_branch_code(테스트채널) 하나로만 전부 발송
+    sent_count = 0
+    for ub in unsubmitted_branches:
+        message = (
+            f"[테스트] {month} 거래처평가 미제출 안내드립니다.\n"
+            f"(실제 대상 지점: {ub['branch_name']})\n"
+            f"현재 진행률: {ub['done_cnt']} / {ub['total_vendors']}\n"
+            f"빠른 시일 내 제출 부탁드립니다."
+        )
+        send_teams_notification(
+            target_branch_code,
+            f"🧪[테스트] 거래처평가 미제출 알림 ({ub['branch_name']})",
+            message,
+            sent_by=f"test_by_{user['login_id']}"
+        )
+        sent_count += 1
 
     return JSONResponse(content={
         "success": True,
         "month": month,
         "unsubmitted_count": len(unsubmitted_branches),
+        "sent_count": sent_count,
         "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
     })
 
@@ -3751,6 +3752,38 @@ async def master_toggle_unsubmitted_reminder(session_token: str = Cookie(default
     conn.commit()
     conn.close()
     return RedirectResponse(url="/master/teams-webhook", status_code=303)
+
+@app.get("/master/notification-settings", response_class=HTMLResponse)
+async def master_notification_settings_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='unsubmitted_reminder_enabled'"
+    ).fetchone()
+    conn.close()
+    reminder_enabled = (row["value"] == "true") if row else True
+    reminder_status_text = "🟢 켜짐 (매월 5,10,15,20,25,30일 자동발송)" if reminder_enabled else "🔴 꺼짐 (자동발송 안 함)"
+    reminder_btn_label = "끄기" if reminder_enabled else "켜기"
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">⏰ 알림 설정</h2>
+    <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <div>
+        <div style="font-weight:bold;margin-bottom:4px;">거래처평가 미제출 알림</div>
+        <div style="font-size:13px;color:#888;">{reminder_status_text}</div>
+      </div>
+      <form method="post" action="/master/toggle-unsubmitted-reminder" style="margin:0;">
+        <button type="submit" class="btn" style="font-size:13px;padding:8px 16px;">{reminder_btn_label}</button>
+      </form>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">이 설정은 <a href="/master/teams-webhook">팀즈웹훅 관리</a> 페이지의 토글과 동일하게 연동됩니다.</p>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "notif-settings"))
 
 @app.get("/master/teams-webhook", response_class=HTMLResponse)
 async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
@@ -4866,6 +4899,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">🏬</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 관리</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">지점 추가/삭제</div>
+        </div>
+      </a>
+            <a href="/master/notification-settings" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">⏰</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">알림 설정</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">자동 알림 켜기/끄기</div>
         </div>
       </a>
     </div>
