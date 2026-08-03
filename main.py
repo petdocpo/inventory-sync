@@ -3120,8 +3120,47 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
 
     query_string = f"branch={branch}&month={month}"
 
+    from datetime import date as _date
+    _today = _date.today()
+    _prev_month_num = _today.month - 1 if _today.month > 1 else 12
+    _prev_month_year = _today.year if _today.month > 1 else _today.year - 1
+    summary_month = f"{_prev_month_year}-{_prev_month_num:02d}"
+
+    conn3 = get_conn()
+    summary_total_vendors = conn3.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
+
+    summary_chips_html = ""
+    all_branches = get_branches(branch_type='branch')
+    for b in all_branches:
+        done_cnt = conn3.execute("""
+            SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
+            WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
+        """, (b["branch_code"], summary_month)).fetchone()["cnt"]
+
+        is_complete = (done_cnt >= summary_total_vendors and summary_total_vendors > 0)
+        if is_complete:
+            chip_bg, chip_color, chip_icon = "#D1FAE5", "#065F46", "✅"
+        elif done_cnt > 0:
+            chip_bg, chip_color, chip_icon = "#FEF3C7", "#92400E", "⚠️"
+        else:
+            chip_bg, chip_color, chip_icon = "#FEE2E2", "#991B1B", "❌"
+
+        summary_chips_html += f"""
+        <span style="display:inline-flex;align-items:center;gap:4px;background:{chip_bg};color:{chip_color};
+                     padding:6px 12px;border-radius:16px;font-size:12px;font-weight:bold;margin:3px;">
+          {chip_icon} {b['branch_name']} {done_cnt}/{summary_total_vendors}
+        </span>
+        """
+    conn3.close()
+
     content = f"""
     <h2 style="margin-bottom:16px;">🤝 거래처 평가 (마스터 조회)</h2>
+    <div class="card" style="margin-bottom:16px;">
+      <h3 style="margin-bottom:10px;font-size:14px;">📊 {summary_month} 지점별 제출 현황 (전월 기준 자동)</h3>
+      <div style="display:flex;flex-wrap:wrap;">
+        {summary_chips_html}
+      </div>
+    </div>
     <div class="card">
       <form method="get" action="/master/vendor-eval" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
         <div>
