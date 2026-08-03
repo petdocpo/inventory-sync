@@ -4843,21 +4843,6 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         }}
       }}
 
-      async function testQrRawMismatch() {{
-        const target = document.getElementById('testMismatchTarget').value;
-        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
-        const res = await fetch('/master/teams-webhook/test-qr-raw-mismatch', {{
-          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_code: target }})
-        }});
-        const result = await res.json();
-        if (res.ok) {{
-          alert('테스트 발송 완료! 불일치 있는 지점 ' + result.mismatch_branch_count + '곳\\nTeams 채널을 확인하세요.');
-        }} else {{
-          alert('오류: ' + (result.detail || '발송 실패'));
-        }}
-      }}
-
       async function editWebhook(branchCode, branchName, currentChannelName) {{
         const url = prompt(branchName + '의 Teams 웹훅 URL을 입력하세요:');
         if (url === null) return;
