@@ -4507,32 +4507,6 @@ async def master_notification_settings_page(session_token: str = Cookie(default=
             "SELECT value FROM system_settings WHERE key=?", (alert_info["toggle_key"],)
         ).fetchone()
         conn2b.close()
-        is_enabled = (setting_row["value"] == "true") if setting_row else alert_info["default_enabled"]
-        status_icon = "🟢" if is_enabled else "🔴"
-        status_desc = alert_info["on_desc"] if is_enabled else alert_info["off_desc"]
-        btn_label = "끄기" if is_enabled else "켜기"
-        teams_alert_toggles_html += f"""
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f0f0f0;">
-          <div style="font-size:13px;">{alert_info['label']}: {status_icon} {status_desc}</div>
-          <form method="post" action="{alert_info['toggle_route']}" style="margin:0;">
-            <button type="submit" class="btn" style="font-size:11px;padding:5px 12px;">{btn_label}</button>
-          </form>
-        </div>
-        """
-
-    teams_alert_test_cards_html = ""
-    for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
-        teams_alert_test_cards_html += f"""
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #f0f0f0;flex-wrap:wrap;">
-          <div style="font-size:13px;min-width:140px;">{alert_info['label']}</div>
-          <div style="display:flex;gap:6px;flex:1;min-width:220px;">
-            <select id="testTarget_{alert_key}" style="flex:1;padding:6px;font-size:12px;">
-              {branch_options_html}
-            </select>
-            <button class="btn" style="font-size:11px;padding:6px 10px;" onclick="{alert_info['test_js_func']}('{alert_key}')">발송</button>
-          </div>
-        </div>
-        """
 
     qr_teams_enabled = (qr_row["value"] == "true") if qr_row else False
     qr_teams_status_text = "🟢 켜짐 (3시간마다 Teams 발송)" if qr_teams_enabled else "🔴 꺼짐 (Teams 발송 안 함, 웹푸시는 별개로 계속 동작)"
@@ -4638,6 +4612,40 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     branch_options_html = ""
     for t in targets:
         branch_options_html += f'<option value="{t["branch_code"]}">{t["branch_name"]}</option>'
+
+    teams_alert_toggles_html = ""
+    for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
+        conn2b = get_conn()
+        setting_row = conn2b.execute(
+            "SELECT value FROM system_settings WHERE key=?", (alert_info["toggle_key"],)
+        ).fetchone()
+        conn2b.close()
+        is_enabled = (setting_row["value"] == "true") if setting_row else alert_info["default_enabled"]
+        status_icon = "🟢" if is_enabled else "🔴"
+        status_desc = alert_info["on_desc"] if is_enabled else alert_info["off_desc"]
+        btn_label = "끄기" if is_enabled else "켜기"
+        teams_alert_toggles_html += f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f0f0f0;">
+          <div style="font-size:13px;">{alert_info['label']}: {status_icon} {status_desc}</div>
+          <form method="post" action="{alert_info['toggle_route']}" style="margin:0;">
+            <button type="submit" class="btn" style="font-size:11px;padding:5px 12px;">{btn_label}</button>
+          </form>
+        </div>
+        """
+
+    teams_alert_test_cards_html = ""
+    for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
+        teams_alert_test_cards_html += f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #f0f0f0;flex-wrap:wrap;">
+          <div style="font-size:13px;min-width:140px;">{alert_info['label']}</div>
+          <div style="display:flex;gap:6px;flex:1;min-width:220px;">
+            <select id="testTarget_{alert_key}" style="flex:1;padding:6px;font-size:12px;">
+              {branch_options_html}
+            </select>
+            <button class="btn" style="font-size:11px;padding:6px 10px;" onclick="{alert_info['test_js_func']}('{alert_key}')">발송</button>
+          </div>
+        </div>
+        """
 
     content = f"""
     <h2 style="margin-bottom:16px;">🔔 Teams 웹훅 관리</h2>
@@ -4814,7 +4822,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
           alert('발송 실패:\\n' + (result.fail_details ? result.fail_details.join('\\n') : '알 수 없는 오류'));
         }}
       }}
-      
+
       async function testUnsubmittedReminder(alertKey) {{
         const target = document.getElementById('testTarget_' + alertKey).value;
         if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
