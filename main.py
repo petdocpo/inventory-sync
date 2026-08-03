@@ -34,6 +34,29 @@ NOTIFICATION_TYPES = {
     "safety_stock_change": {"label": "안전재고 변경 알림",     "desc": "(준비 중)"},
 }
 
+TEAMS_ALERT_TYPES = {
+    "unsubmitted_reminder": {
+        "label": "거래처평가 미제출 알림",
+        "toggle_key": "unsubmitted_reminder_enabled",
+        "toggle_route": "/master/toggle-unsubmitted-reminder",
+        "test_route": "/master/teams-webhook/test-unsubmitted-reminder",
+        "test_js_func": "testUnsubmittedReminder",
+        "on_desc": "매월 5,10,15,20,25,30일 자동발송",
+        "off_desc": "자동발송 안 함",
+        "default_enabled": True,
+    },
+    "qr_raw_mismatch_teams": {
+        "label": "재고 불일치 Teams 알림",
+        "toggle_key": "qr_raw_mismatch_teams_enabled",
+        "toggle_route": "/master/toggle-qr-raw-mismatch-teams",
+        "test_route": "/master/teams-webhook/test-qr-raw-mismatch",
+        "test_js_func": "testQrRawMismatch",
+        "on_desc": "3시간마다 Teams 발송",
+        "off_desc": "Teams 발송 안 함 (웹푸시는 별개로 계속 동작)",
+        "default_enabled": False,
+    },
+}
+
 from auth.login import (  # noqa: E402
     init_auth_db, authenticate, create_session, get_session,
     delete_session, create_auto_login_token, get_auto_login_info,
@@ -4476,6 +4499,41 @@ async def master_notification_settings_page(session_token: str = Cookie(default=
     reminder_status_text = "🟢 켜짐 (매월 5,10,15,20,25,30일 자동발송)" if reminder_enabled else "🔴 꺼짐 (자동발송 안 함)"
     reminder_btn_label = "끄기" if reminder_enabled else "켜기"
 
+    teams_alert_toggles_html = ""
+    for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
+        setting_row = conn2b = None
+        conn2b = get_conn()
+        setting_row = conn2b.execute(
+            "SELECT value FROM system_settings WHERE key=?", (alert_info["toggle_key"],)
+        ).fetchone()
+        conn2b.close()
+        is_enabled = (setting_row["value"] == "true") if setting_row else alert_info["default_enabled"]
+        status_icon = "🟢" if is_enabled else "🔴"
+        status_desc = alert_info["on_desc"] if is_enabled else alert_info["off_desc"]
+        btn_label = "끄기" if is_enabled else "켜기"
+        teams_alert_toggles_html += f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f0f0f0;">
+          <div style="font-size:13px;">{alert_info['label']}: {status_icon} {status_desc}</div>
+          <form method="post" action="{alert_info['toggle_route']}" style="margin:0;">
+            <button type="submit" class="btn" style="font-size:11px;padding:5px 12px;">{btn_label}</button>
+          </form>
+        </div>
+        """
+
+    teams_alert_test_cards_html = ""
+    for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
+        teams_alert_test_cards_html += f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #f0f0f0;flex-wrap:wrap;">
+          <div style="font-size:13px;min-width:140px;">{alert_info['label']}</div>
+          <div style="display:flex;gap:6px;flex:1;min-width:220px;">
+            <select id="testTarget_{alert_key}" style="flex:1;padding:6px;font-size:12px;">
+              {branch_options_html}
+            </select>
+            <button class="btn" style="font-size:11px;padding:6px 10px;" onclick="{alert_info['test_js_func']}('{alert_key}')">발송</button>
+          </div>
+        </div>
+        """
+
     qr_teams_enabled = (qr_row["value"] == "true") if qr_row else False
     qr_teams_status_text = "🟢 켜짐 (3시간마다 Teams 발송)" if qr_teams_enabled else "🔴 꺼짐 (Teams 발송 안 함, 웹푸시는 별개로 계속 동작)"
     qr_teams_btn_label = "끄기" if qr_teams_enabled else "켜기"
@@ -4583,31 +4641,14 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
 
     content = f"""
     <h2 style="margin-bottom:16px;">🔔 Teams 웹훅 관리</h2>
-    <div class="card" style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-      <div style="font-size:14px;">거래처평가 미제출 알림: {reminder_status_text}</div>
-      <form method="post" action="/master/toggle-unsubmitted-reminder" style="margin:0;">
-        <button type="submit" class="btn" style="font-size:12px;padding:6px 14px;">{reminder_btn_label}</button>
-      </form>
+    <div class="card" style="margin-bottom:16px;">
+      <h3 style="margin-bottom:10px;font-size:14px;">📢 자동 발송 알림 설정</h3>
+      {teams_alert_toggles_html}
     </div>
     <div class="card" style="margin-bottom:16px;">
-      <h3 style="margin-bottom:8px;font-size:14px;">🧪 미제출 알림 테스트 발송</h3>
-      <p style="font-size:12px;color:#888;margin-bottom:8px;">실제 지점에는 발송되지 않고, 선택한 채널로 현재 미제출 현황 미리보기만 전송됩니다.</p>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <select id="testReminderTarget" style="flex:1;min-width:160px;padding:8px;">
-          {branch_options_html}
-        </select>
-        <button class="btn" type="button" onclick="testUnsubmittedReminder()">테스트 발송</button>
-      </div>
-    </div>
-    <div class="card" style="margin-bottom:16px;">
-      <h3 style="margin-bottom:8px;font-size:14px;">🧪 재고 불일치 알림 테스트 발송</h3>
-      <p style="font-size:12px;color:#888;margin-bottom:8px;">실제 지점에는 발송되지 않고, 선택한 채널로 현재 QR-RAW 불일치 현황(지점별 개별 메시지) 미리보기만 전송됩니다.</p>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <select id="testMismatchTarget" style="flex:1;min-width:160px;padding:8px;">
-          {branch_options_html}
-        </select>
-        <button class="btn" type="button" onclick="testQrRawMismatch()">테스트 발송</button>
-      </div>
+      <h3 style="margin-bottom:8px;font-size:14px;">🧪 알림 테스트 발송</h3>
+      <p style="font-size:12px;color:#888;margin-bottom:12px;">실제 지점에는 발송되지 않고, 선택한 채널로 현재 상황 미리보기만 전송됩니다.</p>
+      {teams_alert_test_cards_html}
     </div>
 
     <div class="card">
@@ -4773,8 +4814,9 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
           alert('발송 실패:\\n' + (result.fail_details ? result.fail_details.join('\\n') : '알 수 없는 오류'));
         }}
       }}
-      async function testUnsubmittedReminder() {{
-        const target = document.getElementById('testReminderTarget').value;
+      
+      async function testUnsubmittedReminder(alertKey) {{
+        const target = document.getElementById('testTarget_' + alertKey).value;
         if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
         const res = await fetch('/master/teams-webhook/test-unsubmitted-reminder', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
@@ -4783,6 +4825,20 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         const result = await res.json();
         if (res.ok) {{
           alert('테스트 발송 완료! 미제출 지점 ' + result.unsubmitted_count + '곳 (기준월: ' + result.month + ')\\nTeams 채널을 확인하세요.');
+        }} else {{
+          alert('오류: ' + (result.detail || '발송 실패'));
+        }}
+      }}
+      async function testQrRawMismatch(alertKey) {{
+        const target = document.getElementById('testTarget_' + alertKey).value;
+        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/test-qr-raw-mismatch', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: target }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('테스트 발송 완료! 불일치 있는 지점 ' + result.mismatch_branch_count + '곳\\nTeams 채널을 확인하세요.');
         }} else {{
           alert('오류: ' + (result.detail || '발송 실패'));
         }}
