@@ -1131,7 +1131,7 @@ async def dashboard(
           }})
         }});
       }}
-      
+
     </script>
     <div style="display:flex;gap:12px;margin-bottom:16px;">
       <div class="card" style="flex:1;text-align:center;padding:16px;">
@@ -4229,6 +4229,54 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
         "date": today.isoformat(),
         "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
     })
+
+@app.get("/api/cron/check-qr-raw-mismatch")
+async def cron_check_qr_raw_mismatch(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    conn = get_conn()
+    inventory_rows = conn.execute("SELECT * FROM inventory").fetchall()
+    conn.close()
+
+    raw_rows = fetch_raw_inventory()
+    raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in raw_rows}
+
+    mismatch_by_branch = {}
+    for r in inventory_rows:
+        key = f"{r['branch_code']}|{r['item_code']}"
+        raw_qty = raw_map.get(key, 0)
+        diff = r["quantity"] - raw_qty
+        if diff != 0:
+            mismatch_by_branch.setdefault(r["branch_code"], []).append({
+                "item_name": r["item_name"],
+                "item_code": r["item_code"],
+                "diff": diff
+            })
+
+    branches = get_branches(branch_type='branch')
+    branch_codes_set = {b["branch_code"] for b in branches}
+
+    sent_count = 0
+    for branch_code, items in mismatch_by_branch.items():
+        if branch_code not in branch_codes_set:
+            continue
+
+        count = len(items)
+        preview = "\n".join(f"- {it['item_name']} ({it['item_code']}): {it['diff']:+d}" for it in items[:5])
+        more_note = f"\n...외 {count - 5}건" if count > 5 else ""
+
+        title = "재고 불일치 알림"
+        body = f"불일치 품목 {count}건 발견\n{preview}{more_note}"
+
+        send_push_notification(branch_code, title, body, event_type="qr_raw_mismatch", url="/")
+        sent_count += 1
+
+    return JSONResponse(content={
+        "processed_branches": sent_count,
+        "total_mismatch_branches": len(mismatch_by_branch)
+    })   
 
 @app.post("/master/teams-webhook/test-unsubmitted-reminder")
 async def master_test_unsubmitted_reminder(request: Request, session_token: str = Cookie(default=None)):
