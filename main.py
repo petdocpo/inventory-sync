@@ -101,6 +101,149 @@ async def fetch_purchase_history(branch_name: str = None, limit: int = 200):
     except Exception as e:
         return [], f"조회 중 오류: {str(e)}"
 
+async def delete_purchase_history_rows(order_ids: list):
+    """service_role 키로 purchase_history 특정 행들을 삭제 (RLS 우회, 서버 전용)."""
+    supabase_url = os.environ.get("PURCHASE_SUPABASE_URL", "")
+    service_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
+    if not supabase_url or not service_key or not order_ids:
+        return False, "설정 또는 대상이 없습니다."
+
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}"
+    }
+    id_list = ",".join(order_ids)
+    params = {"order_id": f"in.({id_list})"}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.delete(
+                f"{supabase_url}/rest/v1/purchase_history",
+                params=params,
+                headers=headers,
+                timeout=15.0
+            )
+        if res.status_code not in (200, 204):
+            return False, f"삭제 실패 (status {res.status_code})"
+        return True, None
+    except Exception as e:
+        return False, f"삭제 중 오류: {str(e)}"
+
+
+async def update_purchase_history_quantity(order_id: str, quantity: float):
+    """service_role 키로 특정 발주건의 수량만 수정 (RLS 우회, 서버 전용)."""
+    supabase_url = os.environ.get("PURCHASE_SUPABASE_URL", "")
+    service_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
+    if not supabase_url or not service_key:
+        return False, "설정이 되어있지 않습니다."
+
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": "application/json"
+    }
+    params = {"order_id": f"eq.{order_id}"}
+    body = {"quantity": quantity}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.patch(
+                f"{supabase_url}/rest/v1/purchase_history",
+                params=params,
+                headers=headers,
+                json=body,
+                timeout=15.0
+            )
+        if res.status_code not in (200, 204):
+            return False, f"수정 실패 (status {res.status_code})"
+        return True, None
+    except Exception as e:
+        return False, f"수정 중 오류: {str(e)}"
+
+
+async def delete_old_purchase_history(days: int = 21):
+    """등록일 기준 N일 경과한 발주내역 전체 삭제 (cron 전용)."""
+    supabase_url = os.environ.get("PURCHASE_SUPABASE_URL", "")
+    service_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
+    if not supabase_url or not service_key:
+        return 0, "설정이 되어있지 않습니다."
+
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+        "Prefer": "return=representation"
+    }
+    params = {"registered_at": f"lt.{cutoff}"}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.delete(
+                f"{supabase_url}/rest/v1/purchase_history",
+                params=params,
+                headers=headers,
+                timeout=30.0
+            )
+        if res.status_code not in (200, 204):
+            return 0, f"삭제 실패 (status {res.status_code})"
+        deleted = res.json() if res.text else []
+        return len(deleted), None
+    except Exception as e:
+        return 0, f"삭제 중 오류: {str(e)}"
+
+@app.post("/purchase-history/delete")
+async def purchase_history_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    order_ids = data.get("order_ids", [])
+    if not order_ids:
+        return JSONResponse(status_code=400, content={"detail": "삭제할 항목이 없습니다."})
+
+    success, err = await delete_purchase_history_rows(order_ids)
+    if not success:
+        return JSONResponse(status_code=400, content={"detail": err})
+    return JSONResponse(content={"status": "ok", "deleted_count": len(order_ids)})
+
+
+@app.post("/purchase-history/update-quantity")
+async def purchase_history_update_quantity(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    order_id = data.get("order_id", "")
+    quantity = data.get("quantity")
+    if not order_id or quantity is None:
+        return JSONResponse(status_code=400, content={"detail": "필수 항목이 누락되었습니다."})
+
+    try:
+        quantity = float(quantity)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"detail": "수량은 숫자여야 합니다."})
+
+    success, err = await update_purchase_history_quantity(order_id, quantity)
+    if not success:
+        return JSONResponse(status_code=400, content={"detail": err})
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/api/cron/cleanup-purchase-history")
+async def cron_cleanup_purchase_history(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    deleted_count, err = await delete_old_purchase_history(days=21)
+    if err:
+        return JSONResponse(status_code=500, content={"detail": err})
+    return JSONResponse(content={"deleted_count": deleted_count})
+
 def send_push_notification(branch_code: str, title: str, body: str, event_type: str, url: str = "/"):
     """특정 지점의 등록된 기기 중, 해당 알림 종류를 켜놓은 기기에만 웹 푸시 발송 + notification_events 기록."""
     from pywebpush import webpush, WebPushException
@@ -301,70 +444,146 @@ async def purchase_history_page(
             options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
         branch_filter_html = f"""
         <div>
-          <label style="font-size:12px;color:#888;">지점 필터</label>
-          <select name="branch_filter" style="min-width:140px;">{options}</select>
+          <label style="font-size:12px;color:#888;">지점</label>
+          <select name="branch_filter">{options}</select>
         </div>
         """
 
     content_filter_html = f"""
     <div class="card">
-      <form method="get" action="/purchase-history" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
-        {branch_filter_html}
-        <div>
-          <label style="font-size:12px;color:#888;">거래처</label>
-          <input type="text" name="vendor_filter" value="{vendor_filter}" placeholder="거래처명 검색" style="min-width:140px;">
+      <form method="get" action="/purchase-history">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));gap:10px;margin-bottom:10px;">
+          {branch_filter_html}
+          <div>
+            <label style="font-size:12px;color:#888;">거래처</label>
+            <input type="text" name="vendor_filter" value="{vendor_filter}" placeholder="거래처명 검색">
+          </div>
+          <div>
+            <label style="font-size:12px;color:#888;">상품명</label>
+            <input type="text" name="product_filter" value="{product_filter}" placeholder="상품명 검색">
+          </div>
+          <div>
+            <label style="font-size:12px;color:#888;">시작일</label>
+            <input type="date" name="date_from" value="{date_from}">
+          </div>
+          <div>
+            <label style="font-size:12px;color:#888;">종료일</label>
+            <input type="date" name="date_to" value="{date_to}">
+          </div>
         </div>
-        <div>
-          <label style="font-size:12px;color:#888;">상품명</label>
-          <input type="text" name="product_filter" value="{product_filter}" placeholder="상품명 검색" style="min-width:160px;">
+        <div style="display:flex;gap:8px;">
+          <button class="btn" type="submit">검색</button>
+          <a href="/purchase-history" style="padding:10px 14px;background:#eee;
+             border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
         </div>
-        <div>
-          <label style="font-size:12px;color:#888;">시작일</label>
-          <input type="date" name="date_from" value="{date_from}">
-        </div>
-        <div>
-          <label style="font-size:12px;color:#888;">종료일</label>
-          <input type="date" name="date_to" value="{date_to}">
-        </div>
-        <button class="btn" type="submit">검색</button>
-        <a href="/purchase-history" style="padding:10px 14px;background:#eee;
-           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
       </form>
     </div>
     """
 
+    master_toolbar_html = ""
+    if is_master:
+        master_toolbar_html = """
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+          <button type="button" class="btn" id="phSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+          <button type="button" class="btn btn-red" id="phDeleteBtn" style="font-size:12px;padding:6px 12px;">선택 삭제</button>
+        </div>
+        """
+
     if err:
-        rows_html = f'<tr><td colspan="6" style="text-align:center;color:#888;padding:24px;">{err}</td></tr>'
+        rows_html = f'<tr><td colspan="7" style="text-align:center;color:#888;padding:24px;">{err}</td></tr>'
     elif not rows:
-        rows_html = '<tr><td colspan="6" style="text-align:center;color:#888;padding:24px;">발주 내역이 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="7" style="text-align:center;color:#888;padding:24px;">발주 내역이 없습니다.</td></tr>'
     else:
         rows_html = ""
         for r in rows:
             order_dt = r.get("order_datetime") or r.get("registered_at") or "-"
             status = r.get("send_status") or ""
             status_badge = '<span class="badge-green">완료</span>' if status == "완료" else '<span class="badge-red">대기</span>'
+            oid = r.get("order_id", "")
+            qty = r.get("quantity", "-")
+            check_cell = f'<td style="text-align:center;"><input type="checkbox" class="ph-check" value="{oid}" style="width:16px;height:16px;"></td>' if is_master else ""
+            qty_cell = (
+                f'<td style="text-align:right;"><span id="qtyDisplay_{oid}">{qty}</span> '
+                f'<button class="btn" style="font-size:10px;padding:2px 6px;margin-left:4px;" onclick="editQuantity(\'{oid}\', {qty})">수정</button></td>'
+                if is_master else
+                f'<td style="text-align:right;">{qty}</td>'
+            )
             rows_html += f"""
             <tr>
+                {check_cell}
                 <td style="font-size:12px;">{order_dt}</td>
                 <td>{r.get('branch', '-')}</td>
                 <td>{r.get('vendor', '-')}</td>
                 <td>{r.get('product_name', '-')}</td>
-                <td style="text-align:right;">{r.get('quantity', '-')}</td>
+                {qty_cell}
                 <td>{status_badge}</td>
             </tr>
             """
+
+    check_header = '<th style="width:36px;text-align:center;"><input type="checkbox" id="phAllCheck" style="width:16px;height:16px;"></th>' if is_master else ""
 
     content = f"""
     <h2 style="margin-bottom:16px;">📦 발주내역</h2>
     {content_filter_html}
     <div class="card">
+      {master_toolbar_html}
       <table>
         <thead><tr>
+          {check_header}
           <th>발주일시</th><th>지점</th><th>거래처</th><th>상품명</th><th>수량</th><th>상태</th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
+    <script>
+      (function() {{
+        var allCheck = document.getElementById('phAllCheck');
+        var selectBtn = document.getElementById('phSelectAllBtn');
+        var deleteBtn = document.getElementById('phDeleteBtn');
+        function applyAll(checked) {{
+          document.querySelectorAll('.ph-check').forEach(function(c) {{ c.checked = checked; }});
+          if (allCheck) allCheck.checked = checked;
+        }}
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ applyAll(allCheck.checked); }}); }}
+        if (selectBtn) {{
+          selectBtn.addEventListener('click', function() {{
+            var next = !(allCheck && allCheck.checked);
+            applyAll(next);
+          }});
+        }}
+        if (deleteBtn) {{
+          deleteBtn.addEventListener('click', async function() {{
+            var checked = Array.from(document.querySelectorAll('.ph-check:checked')).map(c => c.value);
+            if (checked.length === 0) {{ alert('삭제할 항목을 선택하세요.'); return; }}
+            if (!confirm(checked.length + '건을 삭제합니다. 되돌릴 수 없습니다. 계속할까요?')) return;
+            const res = await fetch('/purchase-history/delete', {{
+              method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ order_ids: checked }})
+            }});
+            if (res.ok) {{ location.reload(); }} else {{
+              const err = await res.json();
+              alert('오류: ' + (err.detail || '삭제 실패'));
+            }}
+          }});
+        }}
+      }})();
+
+      async function editQuantity(orderId, currentQty) {{
+        const newQty = prompt('새 수량을 입력하세요:', currentQty);
+        if (newQty === null) return;
+        if (isNaN(parseFloat(newQty))) {{ alert('숫자를 입력하세요.'); return; }}
+        const res = await fetch('/purchase-history/update-quantity', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ order_id: orderId, quantity: parseFloat(newQty) }})
+        }});
+        if (res.ok) {{
+          document.getElementById('qtyDisplay_' + orderId).innerText = newQty;
+        }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '수정 실패'));
+        }}
+      }}
+    </script>
     """
     return HTMLResponse(content=render_page(content, user, "purchase-history"))
 
