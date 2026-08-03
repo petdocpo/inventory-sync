@@ -4237,6 +4237,11 @@ async def cron_check_qr_raw_mismatch(authorization: str = Header(default="")):
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
 
     conn = get_conn()
+    teams_setting_row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='qr_raw_mismatch_teams_enabled'"
+    ).fetchone()
+    teams_enabled = (teams_setting_row["value"] == "true") if teams_setting_row else False
+
     inventory_rows = conn.execute("SELECT * FROM inventory").fetchall()
     conn.close()
 
@@ -4271,7 +4276,10 @@ async def cron_check_qr_raw_mismatch(authorization: str = Header(default="")):
         body = f"불일치 품목 {count}건 발견\n{preview}{more_note}"
 
         send_push_notification(branch_code, title, body, event_type="qr_raw_mismatch", url="/")
+        if teams_enabled:
+            send_teams_notification(branch_code, title, body, sent_by="system_cron_qr_raw_mismatch")
         sent_count += 1
+
 
     return JSONResponse(content={
         "processed_branches": sent_count,
@@ -4370,6 +4378,33 @@ async def master_toggle_unsubmitted_reminder(session_token: str = Cookie(default
     conn.close()
     return RedirectResponse(url="/master/teams-webhook", status_code=303)
 
+@app.post("/master/toggle-qr-raw-mismatch-teams")
+async def master_toggle_qr_raw_mismatch_teams(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='qr_raw_mismatch_teams_enabled'"
+    ).fetchone()
+    current = (row["value"] == "true") if row else False
+    new_value = "false" if current else "true"
+
+    if row:
+        conn.execute(
+            "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='qr_raw_mismatch_teams_enabled'",
+            (new_value,)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO system_settings (key, value) VALUES ('qr_raw_mismatch_teams_enabled', ?)",
+            (new_value,)
+        )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/master/notification-settings", status_code=303)
+
 @app.get("/master/notification-settings", response_class=HTMLResponse)
 async def master_notification_settings_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -4380,20 +4415,37 @@ async def master_notification_settings_page(session_token: str = Cookie(default=
     row = conn.execute(
         "SELECT value FROM system_settings WHERE key='unsubmitted_reminder_enabled'"
     ).fetchone()
+    qr_row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='qr_raw_mismatch_teams_enabled'"
+    ).fetchone()
     conn.close()
+
     reminder_enabled = (row["value"] == "true") if row else True
     reminder_status_text = "🟢 켜짐 (매월 5,10,15,20,25,30일 자동발송)" if reminder_enabled else "🔴 꺼짐 (자동발송 안 함)"
     reminder_btn_label = "끄기" if reminder_enabled else "켜기"
 
+    qr_teams_enabled = (qr_row["value"] == "true") if qr_row else False
+    qr_teams_status_text = "🟢 켜짐 (3시간마다 Teams 발송)" if qr_teams_enabled else "🔴 꺼짐 (Teams 발송 안 함, 웹푸시는 별개로 계속 동작)"
+    qr_teams_btn_label = "끄기" if qr_teams_enabled else "켜기"
+
     content = f"""
     <h2 style="margin-bottom:16px;">⏰ 알림 설정</h2>
-    <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+    <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
       <div>
         <div style="font-weight:bold;margin-bottom:4px;">거래처평가 미제출 알림</div>
         <div style="font-size:13px;color:#888;">{reminder_status_text}</div>
       </div>
       <form method="post" action="/master/toggle-unsubmitted-reminder" style="margin:0;">
         <button type="submit" class="btn" style="font-size:13px;padding:8px 16px;">{reminder_btn_label}</button>
+      </form>
+    </div>
+    <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+      <div>
+        <div style="font-weight:bold;margin-bottom:4px;">재고 불일치 Teams 알림</div>
+        <div style="font-size:13px;color:#888;">{qr_teams_status_text}</div>
+      </div>
+      <form method="post" action="/master/toggle-qr-raw-mismatch-teams" style="margin:0;">
+        <button type="submit" class="btn" style="font-size:13px;padding:8px 16px;">{qr_teams_btn_label}</button>
       </form>
     </div>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
