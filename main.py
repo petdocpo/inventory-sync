@@ -4499,15 +4499,6 @@ async def master_notification_settings_page(session_token: str = Cookie(default=
     reminder_status_text = "🟢 켜짐 (매월 5,10,15,20,25,30일 자동발송)" if reminder_enabled else "🔴 꺼짐 (자동발송 안 함)"
     reminder_btn_label = "끄기" if reminder_enabled else "켜기"
 
-    teams_alert_toggles_html = ""
-    for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
-        setting_row = conn2b = None
-        conn2b = get_conn()
-        setting_row = conn2b.execute(
-            "SELECT value FROM system_settings WHERE key=?", (alert_info["toggle_key"],)
-        ).fetchone()
-        conn2b.close()
-
     qr_teams_enabled = (qr_row["value"] == "true") if qr_row else False
     qr_teams_status_text = "🟢 켜짐 (3시간마다 Teams 발송)" if qr_teams_enabled else "🔴 꺼짐 (Teams 발송 안 함, 웹푸시는 별개로 계속 동작)"
     qr_teams_btn_label = "끄기" if qr_teams_enabled else "켜기"
