@@ -262,7 +262,14 @@ async def push_update_settings(request: Request, session_token: str = Cookie(def
     return JSONResponse(content={"status": "ok"})
 
 @app.get("/purchase-history", response_class=HTMLResponse)
-async def purchase_history_page(session_token: str = Cookie(default=None), branch_filter: str = ""):
+async def purchase_history_page(
+    session_token: str = Cookie(default=None),
+    branch_filter: str = "",
+    vendor_filter: str = "",
+    product_filter: str = "",
+    date_from: str = "",
+    date_to: str = ""
+):
     user = get_session(session_token)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
@@ -275,6 +282,16 @@ async def purchase_history_page(session_token: str = Cookie(default=None), branc
 
     rows, err = await fetch_purchase_history(branch_name=target_branch)
 
+    if not err and rows:
+        if vendor_filter:
+            rows = [r for r in rows if vendor_filter.lower() in (r.get("vendor") or "").lower()]
+        if product_filter:
+            rows = [r for r in rows if product_filter.lower() in (r.get("product_name") or "").lower()]
+        if date_from:
+            rows = [r for r in rows if (r.get("order_datetime") or r.get("registered_at") or "") >= date_from]
+        if date_to:
+            rows = [r for r in rows if (r.get("order_datetime") or r.get("registered_at") or "") <= date_to + "T23:59:59"]
+
     branch_filter_html = ""
     if is_master:
         branches = get_branches(branch_type='branch')
@@ -283,15 +300,38 @@ async def purchase_history_page(session_token: str = Cookie(default=None), branc
             sel = 'selected' if b["branch_name"] == branch_filter else ''
             options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
         branch_filter_html = f"""
-        <div class="card">
-          <form method="get" action="/purchase-history" style="display:flex;gap:8px;align-items:flex-end;">
-            <div>
-              <label style="font-size:12px;color:#888;">지점 필터</label>
-              <select name="branch_filter" onchange="this.form.submit()">{options}</select>
-            </div>
-          </form>
+        <div>
+          <label style="font-size:12px;color:#888;">지점 필터</label>
+          <select name="branch_filter" style="min-width:140px;">{options}</select>
         </div>
         """
+
+    content_filter_html = f"""
+    <div class="card">
+      <form method="get" action="/purchase-history" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+        {branch_filter_html}
+        <div>
+          <label style="font-size:12px;color:#888;">거래처</label>
+          <input type="text" name="vendor_filter" value="{vendor_filter}" placeholder="거래처명 검색" style="min-width:140px;">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#888;">상품명</label>
+          <input type="text" name="product_filter" value="{product_filter}" placeholder="상품명 검색" style="min-width:160px;">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#888;">시작일</label>
+          <input type="date" name="date_from" value="{date_from}">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#888;">종료일</label>
+          <input type="date" name="date_to" value="{date_to}">
+        </div>
+        <button class="btn" type="submit">검색</button>
+        <a href="/purchase-history" style="padding:10px 14px;background:#eee;
+           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+      </form>
+    </div>
+    """
 
     if err:
         rows_html = f'<tr><td colspan="6" style="text-align:center;color:#888;padding:24px;">{err}</td></tr>'
@@ -316,7 +356,7 @@ async def purchase_history_page(session_token: str = Cookie(default=None), branc
 
     content = f"""
     <h2 style="margin-bottom:16px;">📦 발주내역</h2>
-    {branch_filter_html}
+    {content_filter_html}
     <div class="card">
       <table>
         <thead><tr>
@@ -3146,10 +3186,10 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
             chip_bg, chip_color, chip_icon = "#FEE2E2", "#991B1B", "❌"
 
         summary_chips_html += f"""
-        <span style="display:inline-flex;align-items:center;gap:4px;background:{chip_bg};color:{chip_color};
-                     padding:6px 12px;border-radius:16px;font-size:12px;font-weight:bold;margin:3px;">
-          {chip_icon} {b['branch_name']} {done_cnt}/{summary_total_vendors}
-        </span>
+        <div style="background:{chip_bg};border-radius:10px;padding:10px 8px;text-align:center;">
+          <div style="font-size:12px;font-weight:bold;color:#333;margin-bottom:4px;">{b['branch_name']}</div>
+          <div style="font-size:13px;font-weight:bold;color:{chip_color};">{chip_icon} {done_cnt}/{summary_total_vendors}</div>
+        </div>
         """
     conn3.close()
 
@@ -3157,7 +3197,7 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
     <h2 style="margin-bottom:16px;">🤝 거래처 평가 (마스터 조회)</h2>
     <div class="card" style="margin-bottom:16px;">
       <h3 style="margin-bottom:10px;font-size:14px;">📊 {summary_month} 지점별 제출 현황 (전월 기준 자동)</h3>
-      <div style="display:flex;flex-wrap:wrap;">
+      <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(110px, 1fr));gap:8px;">
         {summary_chips_html}
       </div>
     </div>
