@@ -4351,6 +4351,58 @@ async def master_test_unsubmitted_reminder(request: Request, session_token: str 
         "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
     })
 
+@app.post("/master/teams-webhook/test-qr-raw-mismatch")
+async def master_test_qr_raw_mismatch(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    data = await request.json()
+    target_branch_code = data.get("branch_code", "").strip()
+    if not target_branch_code:
+        return JSONResponse(status_code=400, content={"detail": "테스트 대상 채널 코드가 필요합니다."})
+
+    conn = get_conn()
+    inventory_rows = conn.execute("SELECT * FROM inventory").fetchall()
+    conn.close()
+
+    raw_rows = fetch_raw_inventory()
+    raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in raw_rows}
+
+    mismatch_by_branch = {}
+    for r in inventory_rows:
+        key = f"{r['branch_code']}|{r['item_code']}"
+        raw_qty = raw_map.get(key, 0)
+        diff = r["quantity"] - raw_qty
+        if diff != 0:
+            mismatch_by_branch.setdefault(r["branch_code"], []).append({
+                "item_name": r["item_name"],
+                "item_code": r["item_code"],
+                "diff": diff
+            })
+
+    branches = get_branches(branch_type='branch')
+    branch_names = {b["branch_code"]: b["branch_name"] for b in branches}
+
+    sent_count = 0
+    for branch_code, items in mismatch_by_branch.items():
+        if branch_code not in branch_names:
+            continue
+        count = len(items)
+        preview = "\n".join(f"- {it['item_name']} ({it['item_code']}): {it['diff']:+d}" for it in items[:5])
+        more_note = f"\n...외 {count - 5}건" if count > 5 else ""
+
+        title = f"🧪[테스트] 재고 불일치 알림 ({branch_names[branch_code]})"
+        body = f"[테스트] 실제 대상 지점: {branch_names[branch_code]}\n불일치 품목 {count}건 발견\n{preview}{more_note}"
+
+        send_teams_notification(target_branch_code, title, body, sent_by=f"test_by_{user['login_id']}")
+        sent_count += 1
+
+    return JSONResponse(content={
+        "success": True,
+        "mismatch_branch_count": sent_count
+    })
+
 @app.post("/master/toggle-unsubmitted-reminder")
 async def master_toggle_unsubmitted_reminder(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -4547,6 +4599,16 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         <button class="btn" type="button" onclick="testUnsubmittedReminder()">테스트 발송</button>
       </div>
     </div>
+    <div class="card" style="margin-bottom:16px;">
+      <h3 style="margin-bottom:8px;font-size:14px;">🧪 재고 불일치 알림 테스트 발송</h3>
+      <p style="font-size:12px;color:#888;margin-bottom:8px;">실제 지점에는 발송되지 않고, 선택한 채널로 현재 QR-RAW 불일치 현황(지점별 개별 메시지) 미리보기만 전송됩니다.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <select id="testMismatchTarget" style="flex:1;min-width:160px;padding:8px;">
+          {branch_options_html}
+        </select>
+        <button class="btn" type="button" onclick="testQrRawMismatch()">테스트 발송</button>
+      </div>
+    </div>
 
     <div class="card">
       <h3 style="margin-bottom:8px;">새 채널 추가</h3>
@@ -4721,6 +4783,21 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         const result = await res.json();
         if (res.ok) {{
           alert('테스트 발송 완료! 미제출 지점 ' + result.unsubmitted_count + '곳 (기준월: ' + result.month + ')\\nTeams 채널을 확인하세요.');
+        }} else {{
+          alert('오류: ' + (result.detail || '발송 실패'));
+        }}
+      }}
+
+      async function testQrRawMismatch() {{
+        const target = document.getElementById('testMismatchTarget').value;
+        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/test-qr-raw-mismatch', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: target }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('테스트 발송 완료! 불일치 있는 지점 ' + result.mismatch_branch_count + '곳\\nTeams 채널을 확인하세요.');
         }} else {{
           alert('오류: ' + (result.detail || '발송 실패'));
         }}
