@@ -240,7 +240,7 @@ async def delete_old_purchase_history(days: int = 21):
             res = await client.delete(
                 f"{supabase_url}/rest/v1/purchase_history",
                 params=params,
-                headers=headers,vercel ls
+                headers=headers,
                 timeout=30.0
             )
         if res.status_code not in (200, 204):
