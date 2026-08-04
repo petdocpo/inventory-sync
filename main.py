@@ -114,8 +114,6 @@ async def delete_purchase_history_rows(order_ids: list):
         "Prefer": "return=representation"
     }
 
-    print(f"[DEBUG delete] order_ids={order_ids}")
-
     try:
         async with httpx.AsyncClient() as client:
             for oid in order_ids:
@@ -167,8 +165,7 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
                 json=body,
                 timeout=15.0
             )
-        print(f"[DEBUG update] status={res.status_code}")
-        print(f"[DEBUG update] body_response={res.text}")
+
         if res.status_code not in (200, 204):
             return False, f"수정 실패 (status {res.status_code}, body: {res.text})"
         return True, None
@@ -537,6 +534,21 @@ async def purchase_history_page(
         </div>
         """
 
+    total_count = len(rows) if not err else 0
+    total_qty = 0
+    if not err and rows:
+        for r in rows:
+            q = r.get("quantity")
+            if isinstance(q, (int, float)):
+                total_qty += q
+
+    summary_bar_html = f"""
+    <div class="card" style="display:flex;gap:24px;padding:12px 16px;">
+      <div><span style="color:#888;font-size:12px;">건수</span> <b style="font-size:16px;">{total_count}건</b></div>
+      <div><span style="color:#888;font-size:12px;">수량 합계</span> <b style="font-size:16px;">{total_qty:g}</b></div>
+    </div>
+    """
+
     if err:
         rows_html = f'<tr><td colspan="7" style="text-align:center;color:#888;padding:24px;">{err}</td></tr>'
     elif not rows:
@@ -575,6 +587,7 @@ async def purchase_history_page(
     content = f"""
     <h2 style="margin-bottom:16px;">📦 발주내역</h2>
     {content_filter_html}
+    {summary_bar_html}
     <div class="card">
       {master_toolbar_html}
       <table>
