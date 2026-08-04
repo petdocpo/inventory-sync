@@ -130,8 +130,7 @@ async def delete_purchase_history_rows(order_ids: list):
 
 
 async def update_purchase_history_quantity(order_id: str, quantity: float):
-    """service_role 키로 특정 발주건의 수량만 수정 (RLS 우회, 서버 전용).
-    수정 요청 후 재조회로 실제 반영 여부를 확인한다."""
+    """service_role 키로 특정 발주건의 수량만 수정 (RLS 우회, 서버 전용)."""
     supabase_url = os.environ.get("PURCHASE_SUPABASE_URL", "")
     service_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
     if not supabase_url or not service_key:
@@ -154,20 +153,9 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
                 json=body,
                 timeout=15.0
             )
-            if res.status_code not in (200, 204):
-                return False, f"수정 요청 실패 (status {res.status_code})"
-
-            check_res = await client.get(
-                f"{supabase_url}/rest/v1/purchase_history",
-                params={"order_id": f'eq."{order_id}"', "select": "quantity"},
-                headers=headers,
-                timeout=15.0
-            )
-            if check_res.status_code == 200 and check_res.text:
-                rows = check_res.json()
-                if rows and float(rows[0]["quantity"]) == float(quantity):
-                    return True, None
-            return False, "수정 확인 실패 (반영되지 않음)"
+        if res.status_code not in (200, 204):
+            return False, f"수정 실패 (status {res.status_code})"
+        return True, None
     except Exception as e:
         return False, f"수정 중 오류: {str(e)}"
     
