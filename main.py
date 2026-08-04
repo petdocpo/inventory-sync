@@ -55,6 +55,16 @@ TEAMS_ALERT_TYPES = {
         "off_desc": "Teams 발송 안 함 (웹푸시는 별개로 계속 동작)",
         "default_enabled": False,
     },
+    "purchase_new_teams": {
+        "label": "발주내역 Teams 알림",
+        "toggle_key": "purchase_new_teams_enabled",
+        "toggle_route": "/master/toggle-purchase-new-teams",
+        "test_route": "/master/teams-webhook/test-purchase-new",
+        "test_js_func": "testPurchaseNew",
+        "on_desc": "10분마다 신규 발주 검사 후 Teams 발송",
+        "off_desc": "Teams 발송 안 함 (웹푸시는 별개로 계속 동작)",
+        "default_enabled": False,
+    },
 }
 
 from auth.login import (  # noqa: E402
@@ -463,10 +473,14 @@ async def purchase_history_page(
         return RedirectResponse(url="/login", status_code=303)
 
     is_master = user["role"] == "master"
+    is_master = user["role"] == "master"
     if is_master:
         target_branch = branch_filter or None
     else:
-        target_branch = user.get("branch_name") or user.get("branch_code")
+        my_branch_code = user.get("branch_code")
+        my_branches = get_branches(branch_type='branch')
+        my_branch_info = next((b for b in my_branches if b["branch_code"] == my_branch_code), None)
+        target_branch = my_branch_info["branch_name"] if my_branch_info else my_branch_code
 
     rows, err = await fetch_purchase_history(branch_name=target_branch)
 
@@ -532,6 +546,7 @@ async def purchase_history_page(
           <button type="button" class="btn" id="phSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
           <button type="button" class="btn btn-red" id="phDeleteBtn" style="font-size:12px;padding:6px 12px;">선택 삭제</button>
         </div>
+        <div id="phSelectedSummary" style="display:none;font-size:12px;color:#1E2761;background:#EFF6FF;padding:6px 10px;border-radius:6px;margin-bottom:10px;"></div>
         """
 
     total_count = len(rows) if not err else 0
@@ -614,6 +629,31 @@ async def purchase_history_page(
             applyAll(next);
           }});
         }}
+        function updateSelectedSummary() {{
+          var checkedBoxes = document.querySelectorAll('.ph-check:checked');
+          var summaryEl = document.getElementById('phSelectedSummary');
+          if (!summaryEl) return;
+          if (checkedBoxes.length === 0) {{
+            summaryEl.style.display = 'none';
+            return;
+          }}
+          var qtySum = 0;
+          checkedBoxes.forEach(function(c) {{
+            var qtyEl = document.getElementById('qtyDisplay_' + c.value);
+            if (qtyEl) {{
+              var v = parseFloat(qtyEl.innerText);
+              if (!isNaN(v)) qtySum += v;
+            }}
+          }});
+          summaryEl.style.display = 'block';
+          summaryEl.innerText = '선택 ' + checkedBoxes.length + '건 / 수량 합계 ' + qtySum;
+        }}
+        document.querySelectorAll('.ph-check').forEach(function(c) {{
+          c.addEventListener('change', updateSelectedSummary);
+        }});
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ setTimeout(updateSelectedSummary, 0); }}); }}
+        if (selectBtn) {{ selectBtn.addEventListener('click', function() {{ setTimeout(updateSelectedSummary, 0); }}); }}
+
         if (deleteBtn) {{
           deleteBtn.addEventListener('click', async function() {{
             var checked = Array.from(document.querySelectorAll('.ph-check:checked')).map(c => c.value);
@@ -4668,7 +4708,77 @@ async def cron_check_qr_raw_mismatch(authorization: str = Header(default="")):
     return JSONResponse(content={
         "processed_branches": sent_count,
         "total_mismatch_branches": len(mismatch_by_branch)
-    })   
+    }) 
+
+@app.get("/api/cron/check-new-purchase")
+async def cron_check_new_purchase(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    conn = get_conn()
+    teams_setting_row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='purchase_new_teams_enabled'"
+    ).fetchone()
+    teams_enabled = (teams_setting_row["value"] == "true") if teams_setting_row else False
+
+    last_check_row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='purchase_new_last_checked_at'"
+    ).fetchone()
+    conn.close()
+
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    if last_check_row and last_check_row["value"]:
+        try:
+            last_checked = datetime.fromisoformat(last_check_row["value"])
+        except Exception:
+            last_checked = now - timedelta(minutes=10)
+    else:
+        last_checked = now - timedelta(minutes=10)
+
+    rows, err = await fetch_purchase_history(limit=500)
+    if err:
+        return JSONResponse(status_code=500, content={"detail": err})
+
+    new_rows = [r for r in rows if r.get("registered_at") and r["registered_at"] > last_checked.isoformat()]
+
+    branches = get_branches(branch_type='branch')
+    branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
+
+    sent_count = 0
+    for r in new_rows:
+        branch_name = r.get("branch", "")
+        branch_code = branch_name_to_code.get(branch_name)
+        if not branch_code:
+            continue
+
+        title = "발주내역 알림"
+        body = f"{branch_name} 신규 발주\n거래처: {r.get('vendor', '-')}\n상품: {r.get('product_name', '-')}\n수량: {r.get('quantity', '-')}"
+
+        send_push_notification(branch_code, title, body, event_type="purchase_new", url="/purchase-history")
+        if teams_enabled:
+            send_teams_notification(branch_code, title, body, sent_by="system_cron_purchase_new")
+        sent_count += 1
+
+    conn2 = get_conn()
+    existing_ts = conn2.execute(
+        "SELECT id FROM system_settings WHERE key='purchase_new_last_checked_at'"
+    ).fetchone()
+    if existing_ts:
+        conn2.execute(
+            "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='purchase_new_last_checked_at'",
+            (now.isoformat(),)
+        )
+    else:
+        conn2.execute(
+            "INSERT INTO system_settings (key, value) VALUES ('purchase_new_last_checked_at', ?)",
+            (now.isoformat(),)
+        )
+    conn2.commit()
+    conn2.close()
+
+    return JSONResponse(content={"new_count": len(new_rows), "sent_count": sent_count})
 
 @app.post("/master/teams-webhook/test-unsubmitted-reminder")
 async def master_test_unsubmitted_reminder(request: Request, session_token: str = Cookie(default=None)):
@@ -4835,6 +4945,33 @@ async def master_toggle_qr_raw_mismatch_teams(session_token: str = Cookie(defaul
     else:
         conn.execute(
             "INSERT INTO system_settings (key, value) VALUES ('qr_raw_mismatch_teams_enabled', ?)",
+            (new_value,)
+        )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/master/notification-settings", status_code=303)
+
+@app.post("/master/toggle-purchase-new-teams")
+async def master_toggle_purchase_new_teams(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='purchase_new_teams_enabled'"
+    ).fetchone()
+    current = (row["value"] == "true") if row else False
+    new_value = "false" if current else "true"
+
+    if row:
+        conn.execute(
+            "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='purchase_new_teams_enabled'",
+            (new_value,)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO system_settings (key, value) VALUES ('purchase_new_teams_enabled', ?)",
             (new_value,)
         )
     conn.commit()
