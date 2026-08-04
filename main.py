@@ -110,22 +110,30 @@ async def delete_purchase_history_rows(order_ids: list):
 
     headers = {
         "apikey": service_key,
-        "Authorization": f"Bearer {service_key}"
+        "Authorization": f"Bearer {service_key}",
+        "Prefer": "return=representation"
     }
+
+    print(f"[DEBUG delete] order_ids={order_ids}")
 
     try:
         async with httpx.AsyncClient() as client:
             for oid in order_ids:
+                params = {"order_id": f"eq.{oid}"}
+                print(f"[DEBUG delete] params={params}")
                 res = await client.delete(
                     f"{supabase_url}/rest/v1/purchase_history",
-                    params={"order_id": f'eq."{oid}"'},
+                    params=params,
                     headers=headers,
                     timeout=15.0
                 )
+                print(f"[DEBUG delete] status={res.status_code}")
+                print(f"[DEBUG delete] body_response={res.text}")
                 if res.status_code not in (200, 204):
-                    return False, f"삭제 요청 실패 (order_id={oid}, status {res.status_code})"
+                    return False, f"삭제 요청 실패 (order_id={oid}, status {res.status_code}, body: {res.text})"
         return True, None
     except Exception as e:
+        print(f"[DEBUG delete] exception={str(e)}")
         return False, f"삭제 중 오류: {str(e)}"
 
 
@@ -541,6 +549,8 @@ async def purchase_history_page(
             status_badge = '<span class="badge-green">완료</span>' if status == "완료" else '<span class="badge-red">대기</span>'
             oid = r.get("order_id", "")
             qty = r.get("quantity", "-")
+            if isinstance(qty, (int, float)):
+                qty = int(qty) if qty == int(qty) else qty
             check_cell = f'<td style="text-align:center;"><input type="checkbox" class="ph-check" value="{oid}" style="width:16px;height:16px;"></td>' if is_master else ""
             qty_cell = (
                 f'<td style="text-align:right;"><span id="qtyDisplay_{oid}">{qty}</span> '
