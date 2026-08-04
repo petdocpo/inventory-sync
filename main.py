@@ -139,7 +139,8 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
     headers = {
         "apikey": service_key,
         "Authorization": f"Bearer {service_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
     }
     params = {"order_id": f'eq."{order_id}"'}
     body = {"quantity": quantity}
