@@ -186,6 +186,38 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
         return False, f"수정 중 오류: {str(e)}"
     
 
+@app.get("/api/debug/check-service-key")
+async def debug_check_service_key(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    import base64
+    import json as json_lib
+
+    def decode_jwt_role(token):
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                return "invalid_format"
+            payload = parts[1]
+            padding = "=" * (-len(payload) % 4)
+            decoded = base64.urlsafe_b64decode(payload + padding)
+            data = json_lib.loads(decoded)
+            return data.get("role", "role_field_missing")
+        except Exception as e:
+            return f"decode_error: {str(e)}"
+
+    key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
+    anon_key = os.environ.get("PURCHASE_SUPABASE_ANON_KEY", "")
+
+    return JSONResponse(content={
+        "service_key_role": decode_jwt_role(key) if key else "(비어있음)",
+        "service_key_length": len(key),
+        "anon_key_role": decode_jwt_role(anon_key) if anon_key else "(비어있음)",
+        "same_as_anon": key == anon_key
+    })
+
 async def delete_old_purchase_history(days: int = 21):
     """등록일 기준 N일 경과한 발주내역 전체 삭제 (cron 전용)."""
     supabase_url = os.environ.get("PURCHASE_SUPABASE_URL", "")
