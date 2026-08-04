@@ -2,7 +2,7 @@ name: Sync Raw Inventory from S3 CSV
 
 on:
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '15 */2 * * *'  # 백업용: 2시간마다 (cron-job.org가 주력, 이건 장애 대비)
   workflow_dispatch: {}
 
 jobs:
