@@ -102,7 +102,8 @@ async def fetch_purchase_history(branch_name: str = None, limit: int = 200):
         return [], f"조회 중 오류: {str(e)}"
 
 async def delete_purchase_history_rows(order_ids: list):
-    """service_role 키로 purchase_history 특정 행들을 삭제 (RLS 우회, 서버 전용)."""
+    """service_role 키로 purchase_history 특정 행들을 삭제 (RLS 우회, 서버 전용).
+    order_id가 UUID 등 특수문자를 포함할 수 있어 각 건을 개별 eq. 조건으로 순회 삭제한다."""
     supabase_url = os.environ.get("PURCHASE_SUPABASE_URL", "")
     service_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
     if not supabase_url or not service_key or not order_ids:
@@ -110,21 +111,26 @@ async def delete_purchase_history_rows(order_ids: list):
 
     headers = {
         "apikey": service_key,
-        "Authorization": f"Bearer {service_key}"
+        "Authorization": f"Bearer {service_key}",
+        "Prefer": "return=representation"
     }
-    id_list = ",".join(order_ids)
-    params = {"order_id": f"in.({id_list})"}
 
+    deleted_total = 0
     try:
         async with httpx.AsyncClient() as client:
-            res = await client.delete(
-                f"{supabase_url}/rest/v1/purchase_history",
-                params=params,
-                headers=headers,
-                timeout=15.0
-            )
-        if res.status_code not in (200, 204):
-            return False, f"삭제 실패 (status {res.status_code})"
+            for oid in order_ids:
+                res = await client.delete(
+                    f"{supabase_url}/rest/v1/purchase_history",
+                    params={"order_id": f"eq.{oid}"},
+                    headers=headers,
+                    timeout=15.0
+                )
+                if res.status_code not in (200, 204):
+                    return False, f"삭제 실패 (order_id={oid}, status {res.status_code})"
+                deleted_rows = res.json() if res.text else []
+                deleted_total += len(deleted_rows)
+        if deleted_total == 0:
+            return False, "삭제 대상을 찾지 못했습니다 (order_id 불일치 가능성)."
         return True, None
     except Exception as e:
         return False, f"삭제 중 오류: {str(e)}"
@@ -140,7 +146,8 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
     headers = {
         "apikey": service_key,
         "Authorization": f"Bearer {service_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
     }
     params = {"order_id": f"eq.{order_id}"}
     body = {"quantity": quantity}
@@ -156,6 +163,9 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
             )
         if res.status_code not in (200, 204):
             return False, f"수정 실패 (status {res.status_code})"
+        updated_rows = res.json() if res.text else []
+        if not updated_rows:
+            return False, "수정 대상을 찾지 못했습니다 (order_id 불일치 가능성)."
         return True, None
     except Exception as e:
         return False, f"수정 중 오류: {str(e)}"
