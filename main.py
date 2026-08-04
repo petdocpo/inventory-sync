@@ -142,8 +142,13 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
         "Content-Type": "application/json",
         "Prefer": "return=representation"
     }
-    params = {"order_id": f'eq."{order_id}"'}
+    params = {"order_id": f"eq.{order_id}"}
     body = {"quantity": quantity}
+
+    print(f"[DEBUG update] url={supabase_url}/rest/v1/purchase_history")
+    print(f"[DEBUG update] params={params}")
+    print(f"[DEBUG update] body={body}")
+    print(f"[DEBUG update] service_key_len={len(service_key)}")
 
     try:
         async with httpx.AsyncClient() as client:
@@ -154,10 +159,13 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
                 json=body,
                 timeout=15.0
             )
+        print(f"[DEBUG update] status={res.status_code}")
+        print(f"[DEBUG update] body_response={res.text}")
         if res.status_code not in (200, 204):
-            return False, f"수정 실패 (status {res.status_code})"
+            return False, f"수정 실패 (status {res.status_code}, body: {res.text})"
         return True, None
     except Exception as e:
+        print(f"[DEBUG update] exception={str(e)}")
         return False, f"수정 중 오류: {str(e)}"
     
 
