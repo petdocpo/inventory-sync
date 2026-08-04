@@ -102,8 +102,7 @@ async def fetch_purchase_history(branch_name: str = None, limit: int = 200):
         return [], f"조회 중 오류: {str(e)}"
 
 async def delete_purchase_history_rows(order_ids: list):
-    """service_role 키로 purchase_history 특정 행들을 삭제 (RLS 우회, 서버 전용).
-    삭제 요청 후 재조회로 실제 삭제 여부를 확인한다 (Prefer 헤더 응답 신뢰 불가)."""
+    """service_role 키로 purchase_history 특정 행들을 삭제 (RLS 우회, 서버 전용)."""
     supabase_url = os.environ.get("PURCHASE_SUPABASE_URL", "")
     service_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
     if not supabase_url or not service_key or not order_ids:
@@ -125,19 +124,6 @@ async def delete_purchase_history_rows(order_ids: list):
                 )
                 if res.status_code not in (200, 204):
                     return False, f"삭제 요청 실패 (order_id={oid}, status {res.status_code})"
-
-            # 재조회로 실제 삭제 여부 확인
-            check_res = await client.get(
-                f"{supabase_url}/rest/v1/purchase_history",
-                params={"order_id": f"in.({','.join(order_ids)})", "select": "order_id"},
-                headers=headers,
-                timeout=15.0
-            )
-            still_exists = check_res.json() if check_res.status_code == 200 and check_res.text else []
-            if still_exists:
-                remaining = [r["order_id"] for r in still_exists]
-                return False, f"삭제 확인 실패, 아직 남아있는 항목: {remaining}"
-
         return True, None
     except Exception as e:
         return False, f"삭제 중 오류: {str(e)}"
