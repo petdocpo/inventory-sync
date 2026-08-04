@@ -121,7 +121,7 @@ async def delete_purchase_history_rows(order_ids: list):
             for oid in order_ids:
                 res = await client.delete(
                     f"{supabase_url}/rest/v1/purchase_history",
-                    params={"order_id": f"eq.{oid}"},
+                    params={"order_id": f'eq."{oid}"'},
                     headers=headers,
                     timeout=15.0
                 )
@@ -149,7 +149,7 @@ async def update_purchase_history_quantity(order_id: str, quantity: float):
         "Content-Type": "application/json",
         "Prefer": "return=representation"
     }
-    params = {"order_id": f"eq.{order_id}"}
+    params = {"order_id": f'eq."{order_id}"'}
     body = {"quantity": quantity}
 
     try:
