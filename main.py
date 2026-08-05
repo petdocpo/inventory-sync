@@ -4642,6 +4642,8 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
             ub["branch_code"],
             "거래처평가 미제출 알림",
             message,
+            link_url="https://inventory-sync-teal.vercel.app/vendor-eval",
+            link_text="거래처 평가하러 가기",
             sent_by="system_cron_unsubmitted"
         )
         sent_count += 1
@@ -4833,6 +4835,8 @@ async def master_test_unsubmitted_reminder(request: Request, session_token: str 
             target_branch_code,
             f"🧪[테스트] 거래처평가 미제출 알림 ({ub['branch_name']})",
             message,
+            link_url="https://inventory-sync-teal.vercel.app/vendor-eval",
+            link_text="거래처 평가하러 가기",
             sent_by=f"test_by_{user['login_id']}"
         )
         sent_count += 1
