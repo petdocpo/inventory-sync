@@ -3980,6 +3980,111 @@ async def vendor_master_delete(request: Request, session_token: str = Cookie(def
         conn.close()
     return RedirectResponse(url="/master/vendor-master", status_code=303)
 
+@app.get("/master/webhook-send-log", response_class=HTMLResponse)
+async def master_webhook_send_log_page(
+    session_token: str = Cookie(default=None),
+    filter_branch: str = "",
+    filter_sender: str = "",
+    date_filter: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    # ⚠️ 자동 발송(system_cron으로 시작하는 sent_by)은 제외 — 마스터/지점이 직접 보낸 메시지만 표시
+    query = "SELECT * FROM teams_send_log WHERE (sent_by IS NULL OR sent_by NOT LIKE 'system_cron%')"
+    params: list = []
+
+    if filter_branch:
+        query += " AND branch_code=?"
+        params.append(filter_branch)
+    if filter_sender:
+        query += " AND sent_by LIKE ?"
+        params.append(f"%{filter_sender}%")
+    if date_filter:
+        query += " AND sent_at::text LIKE ?"
+        params.append(f"{date_filter}%")
+
+    query += " ORDER BY sent_at DESC LIMIT 300"
+    logs = conn.execute(query, params).fetchall()
+    conn.close()
+
+    from datetime import timedelta, timezone
+    KST = timezone(timedelta(hours=9))
+
+    def to_kst_str(raw_value):
+        if not raw_value:
+            return "-"
+        try:
+            dt = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(raw_value)[:16]
+
+    rows_html = ""
+    if not logs:
+        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">발송 이력 없음</td></tr>'
+    else:
+        for lg in logs:
+            status_badge = '<span class="badge-green">성공</span>' if lg["success"] else '<span class="badge-red">실패</span>'
+            msg_preview = (lg["message"] or "")[:60] + ("..." if len(lg["message"] or "") > 60 else "")
+            rows_html += f"""
+            <tr>
+              <td style="font-size:12px;">{to_kst_str(lg['sent_at'])}</td>
+              <td>{lg['sent_by'] or '-'}</td>
+              <td>{lg['branch_code']}</td>
+              <td>{lg['title'] or '-'}</td>
+              <td style="font-size:12px;color:#555;">{msg_preview}</td>
+              <td>{status_badge}</td>
+            </tr>"""
+
+    branch_options = '<option value="">전체 지점/채널</option>'
+    for b in get_branches():
+        sel = "selected" if filter_branch == b["branch_code"] else ""
+        branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>📨 웹훅 발송 이력</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">마스터/지점 계정이 직접 발송한 메시지만 표시됩니다 (자동 cron 발송 제외).</p>
+    </div>
+    <div class="card">
+      <form method="get" action="/master/webhook-send-log" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">대상 지점/채널</label>
+          <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
+        </div>
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">발송자 검색</label>
+          <input name="filter_sender" value="{filter_sender}" placeholder="예: admin_hq" style="margin-top:4px;">
+        </div>
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">날짜</label>
+          <input name="date_filter" type="date" value="{date_filter}" style="margin-top:4px;">
+        </div>
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/webhook-send-log" style="padding:10px 14px;background:#eee;
+           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+      </form>
+    </div>
+    <div class="card">
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(logs)}건 (최근 300건까지 표시)</p>
+      <table>
+        <thead><tr>
+          <th>발송시각</th><th>발송자</th><th>대상</th><th>제목</th><th>내용 미리보기</th><th>결과</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
 @app.get("/master/branch-manage", response_class=HTMLResponse)
 async def master_branch_manage_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -6265,6 +6370,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">⏰</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">알림 설정</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">자동 알림 켜기/끄기</div>
+        </div>
+      </a>
+      <a href="/master/webhook-send-log" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📨</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">웹훅 발송 이력</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">수동 발송 내역 조회</div>
         </div>
       </a>
     </div>
