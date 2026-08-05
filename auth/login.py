@@ -178,13 +178,17 @@ def authenticate(login_id: str, password: str) -> Optional[Dict]:
     return dict(row) if row else None
 
 
-def create_session(login_id: str, role: str, branch_code: Optional[str]) -> str:
+def create_session(login_id: str, role: str, branch_code: Optional[str], device_info: str = "", client_ip: str = "") -> str:
     token = secrets.token_urlsafe(32)
     expires = (datetime.now() + timedelta(days=7)).isoformat()
     conn = get_conn()
     conn.execute(
         "INSERT INTO sessions (session_token, login_id, role, branch_code, expires_at) VALUES (?, ?, ?, ?, ?)",
         (token, login_id, role, branch_code, expires)
+    )
+    conn.execute(
+        "INSERT INTO login_history (login_id, role, branch_code, device_info, client_ip, logged_in_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (login_id, role, branch_code, device_info, client_ip, datetime.now().isoformat())
     )
     conn.commit()
     conn.close()

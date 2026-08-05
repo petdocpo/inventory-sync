@@ -790,6 +790,18 @@ def init_db():
         )
     """)
 
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS login_history (
+            {pk},
+            login_id TEXT NOT NULL,
+            role TEXT,
+            branch_code TEXT,
+            device_info TEXT,
+            client_ip TEXT,
+            logged_in_at TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -1072,7 +1084,7 @@ async def login_page():
 
 
 @app.post("/login")
-async def login_submit(login_id: str = Form(...), password: str = Form(...)):
+async def login_submit(request: Request, login_id: str = Form(...), password: str = Form(...)):
     account = authenticate(login_id, password)
     if not account:
         return HTMLResponse(content="""
@@ -1081,7 +1093,9 @@ async def login_submit(login_id: str = Form(...), password: str = Form(...)):
           <h3>❌ 아이디 또는 비밀번호가 틀렸습니다.</h3>
           <a href="/login">다시 시도</a>
         </body></html>""", status_code=401)
-    token = create_session(account["login_id"], account["role"], account["branch_code"])
+    device_info = request.headers.get("user-agent", "")[:255]
+    client_ip = request.client.host if request.client else ""
+    token = create_session(account["login_id"], account["role"], account["branch_code"], device_info, client_ip)
     resp = RedirectResponse(url="/", status_code=303)
     resp.set_cookie(key="session_token", value=token, max_age=7 * 24 * 3600, httponly=True)
     return resp
@@ -4085,6 +4099,102 @@ async def master_webhook_send_log_page(
     """
     return HTMLResponse(content=render_page(content, user, "master"))
 
+@app.get("/master/login-history", response_class=HTMLResponse)
+async def master_login_history_page(
+    session_token: str = Cookie(default=None),
+    filter_login_id: str = "",
+    date_filter: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    query = "SELECT * FROM login_history WHERE 1=1"
+    params: list = []
+
+    if filter_login_id:
+        query += " AND login_id=?"
+        params.append(filter_login_id)
+    if date_filter:
+        query += " AND logged_in_at LIKE ?"
+        params.append(f"{date_filter}%")
+
+    query += " ORDER BY logged_in_at DESC LIMIT 300"
+    logs = conn.execute(query, params).fetchall()
+
+    all_login_ids = conn.execute(
+        "SELECT DISTINCT login_id FROM login_history ORDER BY login_id"
+    ).fetchall()
+    conn.close()
+
+    from datetime import timedelta, timezone
+    KST = timezone(timedelta(hours=9))
+
+    def to_kst_str(raw_value):
+        if not raw_value:
+            return "-"
+        try:
+            dt = datetime.fromisoformat(str(raw_value))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return str(raw_value)[:16]
+
+    rows_html = ""
+    if not logs:
+        rows_html = '<tr><td colspan="5" style="text-align:center;padding:20px;color:#888;">접속 이력 없음</td></tr>'
+    else:
+        for lg in logs:
+            device_raw = lg["device_info"] or "-"
+            device_short = device_raw[:40] + ("..." if len(device_raw) > 40 else "")
+            rows_html += f"""
+            <tr>
+              <td style="font-size:12px;">{to_kst_str(lg['logged_in_at'])}</td>
+              <td>{lg['login_id']}</td>
+              <td>{lg['role'] or '-'}</td>
+              <td style="font-size:11px;color:#888;" title="{device_raw}">{device_short}</td>
+              <td style="font-size:12px;">{lg['client_ip'] or '-'}</td>
+            </tr>"""
+
+    login_id_options = '<option value="">전체 계정</option>'
+    for lid in all_login_ids:
+        sel = "selected" if filter_login_id == lid["login_id"] else ""
+        login_id_options += f'<option value="{lid["login_id"]}" {sel}>{lid["login_id"]}</option>'
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>🔐 계정별 접속 이력</h2>
+    </div>
+    <div class="card">
+      <form method="get" action="/master/login-history" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">계정</label>
+          <select name="filter_login_id" style="margin-top:4px;">{login_id_options}</select>
+        </div>
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">날짜</label>
+          <input name="date_filter" type="date" value="{date_filter}" style="margin-top:4px;">
+        </div>
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/login-history" style="padding:10px 14px;background:#eee;
+           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+      </form>
+    </div>
+    <div class="card">
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(logs)}건 (최근 300건까지 표시)</p>
+      <table>
+        <thead><tr>
+          <th>접속시각</th><th>계정</th><th>역할</th><th>기기정보</th><th>IP</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
 @app.get("/master/branch-manage", response_class=HTMLResponse)
 async def master_branch_manage_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -4853,15 +4963,28 @@ async def cron_check_new_purchase(authorization: str = Header(default="")):
     branches = get_branches(branch_type='branch')
     branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
 
-    sent_count = 0
+    # 지점별로 신규 발주를 묶음 (요약 알림 1건으로 발송하기 위함)
+    rows_by_branch: Dict[str, list] = {}
     for r in new_rows:
         branch_name = r.get("branch", "")
         branch_code = branch_name_to_code.get(branch_name)
         if not branch_code:
             continue
+        rows_by_branch.setdefault(branch_code, []).append(r)
+
+    sent_count = 0
+    for branch_code, branch_rows in rows_by_branch.items():
+        branch_name = branch_rows[0].get("branch", "")
+        count = len(branch_rows)
+
+        preview = "\n".join(
+            f"{r.get('vendor', '-')} {r.get('product_name', '-')}_{r.get('quantity', '-')}개"
+            for r in branch_rows[:10]
+        )
+        more_note = f"\n...외 {count - 10}건" if count > 10 else ""
 
         title = "발주내역 알림"
-        body = f"{branch_name} 신규 발주\n거래처: {r.get('vendor', '-')}\n상품: {r.get('product_name', '-')}\n수량: {r.get('quantity', '-')}"
+        body = f"{branch_name} 신규 발주 {count}건\n{preview}{more_note}"
 
         send_push_notification(branch_code, title, body, event_type="purchase_new", url="/purchase-history")
         if teams_enabled:
@@ -6377,6 +6500,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">📨</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">웹훅 발송 이력</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">수동 발송 내역 조회</div>
+        </div>
+      </a>
+      <a href="/master/login-history" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🔐</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">접속 이력</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">계정별 로그인 기록</div>
         </div>
       </a>
     </div>
