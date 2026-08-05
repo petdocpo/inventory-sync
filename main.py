@@ -4897,6 +4897,48 @@ async def master_test_qr_raw_mismatch(request: Request, session_token: str = Coo
         "mismatch_branch_count": sent_count
     })
 
+@app.post("/master/teams-webhook/test-purchase-new")
+async def master_test_purchase_new(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    data = await request.json()
+    target_branch_code = data.get("branch_code", "").strip()
+    if not target_branch_code:
+        return JSONResponse(status_code=400, content={"detail": "테스트 대상 채널 코드가 필요합니다."})
+
+    rows, err = await fetch_purchase_history(limit=10)
+    if err:
+        return JSONResponse(status_code=500, content={"detail": err})
+
+    if not rows:
+        return JSONResponse(content={
+            "success": True,
+            "purchase_count": 0
+        })
+
+    branches = get_branches(branch_type='branch')
+    branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
+
+    sent_count = 0
+    for r in rows[:5]:
+        branch_name = r.get("branch", "-")
+        title = f"🧪[테스트] 발주내역 알림 ({branch_name})"
+        body = (
+            f"[테스트] 실제 대상 지점: {branch_name}\n"
+            f"거래처: {r.get('vendor', '-')}\n"
+            f"상품: {r.get('product_name', '-')}\n"
+            f"수량: {r.get('quantity', '-')}"
+        )
+        send_teams_notification(target_branch_code, title, body, sent_by=f"test_by_{user['login_id']}")
+        sent_count += 1
+
+    return JSONResponse(content={
+        "success": True,
+        "purchase_count": sent_count
+    })
+
 @app.post("/master/toggle-unsubmitted-reminder")
 async def master_toggle_unsubmitted_reminder(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -5324,6 +5366,35 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         const result = await res.json();
         if (res.ok) {{
           alert('테스트 발송 완료! 불일치 있는 지점 ' + result.mismatch_branch_count + '곳\\nTeams 채널을 확인하세요.');
+        }} else {{
+          alert('오류: ' + (result.detail || '발송 실패'));
+        }}
+      }}
+      async function testPurchaseNew(alertKey) {{
+        const target = document.getElementById('testTarget_' + alertKey).value;
+        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/test-purchase-new', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: target }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('테스트 발송 완료! 최근 발주 ' + result.purchase_count + '건 미리보기 발송\\nTeams 채널을 확인하세요.');
+        }} else {{
+          alert('오류: ' + (result.detail || '발송 실패'));
+        }}
+      }}
+      
+      async function testPurchaseNew(alertKey) {{
+        const target = document.getElementById('testTarget_' + alertKey).value;
+        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/test-purchase-new', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: target }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('테스트 발송 완료! 최근 발주 ' + result.purchase_count + '건 미리보기 발송\\nTeams 채널을 확인하세요.');
         }} else {{
           alert('오류: ' + (result.detail || '발송 실패'));
         }}
