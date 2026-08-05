@@ -4006,9 +4006,8 @@ async def master_webhook_send_log_page(
         return RedirectResponse(url="/login", status_code=303)
 
     conn = get_conn()
-    # ⚠️ 자동 발송(system_cron으로 시작하는 sent_by)은 제외 — 마스터/지점이 직접 보낸 메시지만 표시
-    query = "SELECT * FROM teams_send_log WHERE (sent_by IS NULL OR sent_by NOT LIKE 'system_cron%')"
-    params: list = []
+    query = "SELECT * FROM teams_send_log WHERE (sent_by IS NULL OR sent_by NOT LIKE ?)"
+    params: list = ["system_cron%"]
 
     if filter_branch:
         query += " AND branch_code=?"
@@ -4017,7 +4016,7 @@ async def master_webhook_send_log_page(
         query += " AND sent_by LIKE ?"
         params.append(f"%{filter_sender}%")
     if date_filter:
-        query += " AND sent_at::text LIKE ?"
+        query += " AND CAST(sent_at AS TEXT) LIKE ?"
         params.append(f"{date_filter}%")
 
     query += " ORDER BY sent_at DESC LIMIT 300"
@@ -4910,7 +4909,7 @@ async def cron_check_qr_raw_mismatch(authorization: str = Header(default="")):
             continue
 
         count = len(items)
-        preview = "\n".join(f"- {it['item_name']} ({it['item_code']}): {it['diff']:+d}" for it in items[:5])
+        preview = "\n".join(f"{it['item_name']}_{it['diff']:+d}" for it in items[:5])
         more_note = f"\n...외 {count - 5}건" if count > 5 else ""
 
         title = "재고 불일치 알림"
