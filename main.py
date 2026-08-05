@@ -4984,43 +4984,31 @@ async def master_notification_settings_page(session_token: str = Cookie(default=
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
 
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT value FROM system_settings WHERE key='unsubmitted_reminder_enabled'"
-    ).fetchone()
-    qr_row = conn.execute(
-        "SELECT value FROM system_settings WHERE key='qr_raw_mismatch_teams_enabled'"
-    ).fetchone()
-    conn.close()
-
-    reminder_enabled = (row["value"] == "true") if row else True
-    reminder_status_text = "🟢 켜짐 (매월 5,10,15,20,25,30일 자동발송)" if reminder_enabled else "🔴 꺼짐 (자동발송 안 함)"
-    reminder_btn_label = "끄기" if reminder_enabled else "켜기"
-
-    qr_teams_enabled = (qr_row["value"] == "true") if qr_row else False
-    qr_teams_status_text = "🟢 켜짐 (3시간마다 Teams 발송)" if qr_teams_enabled else "🔴 꺼짐 (Teams 발송 안 함, 웹푸시는 별개로 계속 동작)"
-    qr_teams_btn_label = "끄기" if qr_teams_enabled else "켜기"
+    toggle_cards_html = ""
+    for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT value FROM system_settings WHERE key=?", (alert_info["toggle_key"],)
+        ).fetchone()
+        conn.close()
+        is_enabled = (row["value"] == "true") if row else alert_info["default_enabled"]
+        status_text = f"🟢 켜짐 ({alert_info['on_desc']})" if is_enabled else f"🔴 꺼짐 ({alert_info['off_desc']})"
+        btn_label = "끄기" if is_enabled else "켜기"
+        toggle_cards_html += f"""
+        <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+          <div>
+            <div style="font-weight:bold;margin-bottom:4px;">{alert_info['label']}</div>
+            <div style="font-size:13px;color:#888;">{status_text}</div>
+          </div>
+          <form method="post" action="{alert_info['toggle_route']}" style="margin:0;">
+            <button type="submit" class="btn" style="font-size:13px;padding:8px 16px;">{btn_label}</button>
+          </form>
+        </div>
+        """
 
     content = f"""
     <h2 style="margin-bottom:16px;">⏰ 알림 설정</h2>
-    <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
-      <div>
-        <div style="font-weight:bold;margin-bottom:4px;">거래처평가 미제출 알림</div>
-        <div style="font-size:13px;color:#888;">{reminder_status_text}</div>
-      </div>
-      <form method="post" action="/master/toggle-unsubmitted-reminder" style="margin:0;">
-        <button type="submit" class="btn" style="font-size:13px;padding:8px 16px;">{reminder_btn_label}</button>
-      </form>
-    </div>
-    <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-      <div>
-        <div style="font-weight:bold;margin-bottom:4px;">재고 불일치 Teams 알림</div>
-        <div style="font-size:13px;color:#888;">{qr_teams_status_text}</div>
-      </div>
-      <form method="post" action="/master/toggle-qr-raw-mismatch-teams" style="margin:0;">
-        <button type="submit" class="btn" style="font-size:13px;padding:8px 16px;">{qr_teams_btn_label}</button>
-      </form>
-    </div>
+    {toggle_cards_html}
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">이 설정은 <a href="/master/teams-webhook">팀즈웹훅 관리</a> 페이지의 토글과 동일하게 연동됩니다.</p>
     </div>
