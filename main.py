@@ -4763,7 +4763,7 @@ async def cron_check_new_purchase(authorization: str = Header(default="")):
 
     conn2 = get_conn()
     existing_ts = conn2.execute(
-        "SELECT id FROM system_settings WHERE key='purchase_new_last_checked_at'"
+        "SELECT value FROM system_settings WHERE key='purchase_new_last_checked_at'"
     ).fetchone()
     if existing_ts:
         conn2.execute(
