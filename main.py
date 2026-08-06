@@ -7429,6 +7429,99 @@ async def _process_purchase_records_upload(file: UploadFile):
 
     return {"success": success, "skipped": skipped, "errors": errors[:10], "header_row_used": header_row}
 
+async def _fetch_and_process_purchase_records_csv():
+    """구매내역 CSV를 외부 소스(URL)에서 다운로드하여 자동 반영. URL은 PURCHASE_RECORDS_CSV_URL 환경변수로 지정."""
+    import httpx
+    import csv
+    import io as io_module
+
+    csv_url = os.environ.get("PURCHASE_RECORDS_CSV_URL", "")
+    if not csv_url:
+        return {"success": 0, "skipped": 0, "errors": ["PURCHASE_RECORDS_CSV_URL 환경변수가 설정되지 않았습니다."]}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(csv_url)
+        resp.raise_for_status()
+        raw_bytes = resp.content
+
+    try:
+        text = raw_bytes.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        text = raw_bytes.decode('cp949')
+
+    reader = csv.reader(io_module.StringIO(text))
+    rows_raw = list(reader)
+
+    header_row_idx = None
+    for row_idx in range(min(5, len(rows_raw))):
+        row_vals = rows_raw[row_idx]
+        if row_vals and row_vals[0] and "구매일시" in str(row_vals[0]):
+            header_row_idx = row_idx
+            break
+
+    if header_row_idx is None:
+        return {"success": 0, "skipped": 0, "errors": ["CSV에서 '구매일시' 헤더를 찾을 수 없습니다."]}
+
+    now = datetime.now().isoformat()
+    success, skipped, errors = 0, 0, []
+    data_start_row = header_row_idx + 1
+
+    conn = get_conn()
+    for idx in range(data_start_row, len(rows_raw)):
+        row = rows_raw[idx]
+        if not row or not row[0]:
+            continue
+        try:
+            purchase_datetime = str(row[0]).strip()
+            vendor = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+            branch_name = str(row[3]).strip() if len(row) > 3 and row[3] else ""
+            item_name = str(row[5]).strip() if len(row) > 5 and row[5] else ""
+            item_code = str(row[6]).strip() if len(row) > 6 and row[6] else ""
+            quantity = float(row[7]) if len(row) > 7 and row[7] not in (None, "") else 0
+            unit_price = float(row[8]) if len(row) > 8 and row[8] not in (None, "") else None
+            total_price = float(row[9]) if len(row) > 9 and row[9] not in (None, "") else None
+
+            if not branch_name or not item_name:
+                skipped += 1
+                continue
+
+            conn.execute("""
+                INSERT INTO purchase_records
+                    (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (purchase_datetime, branch_name, item_name, item_code, quantity)
+                DO UPDATE SET
+                    vendor=excluded.vendor,
+                    unit_price=excluded.unit_price,
+                    total_price=excluded.total_price,
+                    created_at=excluded.created_at
+            """, (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, now))
+            success += 1
+        except Exception as e:
+            errors.append(f"행 {idx}: {str(e)[:50]}")
+            skipped += 1
+
+    conn.commit()
+
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=90)).isoformat()
+    conn.execute("DELETE FROM purchase_records WHERE purchase_datetime < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+    return {"success": success, "skipped": skipped, "errors": errors[:10], "synced_at": now}
+
+
+@app.get("/api/cron/sync-purchase-records")
+async def cron_sync_purchase_records(request: Request):
+    auth_header = request.headers.get("authorization", "")
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+    result = await _fetch_and_process_purchase_records_csv()
+    return JSONResponse(content=result)
+
 async def _process_raw_upload_master(file: UploadFile):
     """마스터 전용 — 헤더가 2행에 있고 컬럼명이 다른 '재고수불부' 형식 처리
     ⚠️ 2026-07 수정: 업로드된 엑셀에 실제로 존재하는 지점만 삭제/갱신하도록 변경
