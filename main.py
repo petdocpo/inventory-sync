@@ -6643,6 +6643,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">계정별 로그인 기록</div>
         </div>
       </a>
+      <a href="/master/purchase-tracking" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📈</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주 주기 트래킹</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">구매 패턴 분석/추천</div>
+        </div>
+      </a>
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -6962,6 +6969,90 @@ async def master_data_delete_all(session_token: str = Cookie(default=None)):
     return RedirectResponse(url="/master/data", status_code=303)
 
 
+@app.get("/master/purchase-tracking", response_class=HTMLResponse)
+async def purchase_tracking_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    record_count = conn.execute("SELECT COUNT(*) as cnt FROM purchase_records").fetchone()["cnt"]
+    leadtime_count = conn.execute("SELECT COUNT(*) as cnt FROM product_lead_time").fetchone()["cnt"]
+    latest_purchase = conn.execute("SELECT MAX(purchase_datetime) as t FROM purchase_records").fetchone()["t"]
+    conn.close()
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>📈 발주 주기 트래킹</h2>
+    </div>
+
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">
+        구매내역과 상품별 리드타임(목표 구매주기)을 업로드하면, 지점×상품별 실제 구매 주기와 목표 주기를 비교해 발주 시기/수량을 추천합니다.
+      </p>
+    </div>
+
+    <div class="card" style="display:flex;gap:24px;padding:16px;">
+      <div><span style="color:#888;font-size:12px;">구매내역 (최근 3개월)</span> <b style="font-size:16px;">{record_count}건</b></div>
+      <div><span style="color:#888;font-size:12px;">리드타임 등록 상품</span> <b style="font-size:16px;">{leadtime_count}개</b></div>
+      <div><span style="color:#888;font-size:12px;">최근 구매일</span> <b style="font-size:16px;">{(latest_purchase or '없음')[:16]}</b></div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-bottom:8px;">📦 구매내역 업로드</h3>
+      <p style="color:#666;font-size:12px;margin-bottom:12px;">
+        컬럼: 구매일시 / 구분 / 거래처 / 지점 / 담당자 / 상품명 / 품번 / 수량 / 단가 / 합계금액 / 메모 / 등록일시 (2행 헤더)
+      </p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="file" id="recordsFile" accept=".xlsx,.xls" style="width:auto;flex:1;">
+        <button class="btn" type="button" onclick="uploadRecords()">업로드</button>
+      </div>
+      <div id="recordsResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;font-size:13px;"></div>
+    </div>
+
+    <script>
+      async function uploadRecords() {{
+        const file = document.getElementById('recordsFile').files[0];
+        if (!file) {{ alert('파일을 선택해주세요.'); return; }}
+        const fd = new FormData();
+        fd.append('file', file);
+        const btn = event.target;
+        btn.textContent = '업로드 중...';
+        btn.disabled = true;
+        try {{
+          const res = await fetch('/master/purchase-tracking/upload-records', {{ method: 'POST', body: fd }});
+          const data = await res.json();
+          const box = document.getElementById('recordsResult');
+          box.style.display = 'block';
+          box.style.background = data.errors && data.errors.length ? '#FEF9C3' : '#D1FAE5';
+          box.innerHTML = `<b>${{data.errors && data.errors.length ? '⚠️' : '✅'}} 업로드 완료</b><br>
+          성공: <b style="color:#22C55E">${{data.success}}건</b> &nbsp;
+          실패: <b style="color:#EF4444">${{data.skipped}}건</b>
+          ${{data.errors && data.errors.length ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${{e}}</li>`).join('') + '</ul>' : ''}}`;
+          setTimeout(() => location.reload(), 2000);
+        }} catch(e) {{
+          alert('업로드 중 오류가 발생했습니다.');
+        }} finally {{
+          btn.textContent = '업로드';
+          btn.disabled = false;
+        }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/purchase-tracking/upload-records")
+async def purchase_tracking_upload_records(
+    session_token: str = Cookie(default=None),
+    file: UploadFile = File(...)
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
+    return await _process_purchase_records_upload(file)
+
 # ── 유비플러스 재고 (RAW 업로드) ────────────────────────
 
 @app.get("/master/raw-upload", response_class=HTMLResponse)
@@ -7267,6 +7358,76 @@ async def cron_sync_raw_inventory(request: Request):
 
     result = await _fetch_and_process_s3_csv()
     return JSONResponse(content=result)
+
+async def _process_purchase_records_upload(file: UploadFile):
+    """구매내역 엑셀 업로드 처리 — 헤더 2행, dedup UPSERT, 3개월 이전 데이터 자동 삭제"""
+    contents = await file.read()
+    import io
+    wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
+    ws = wb.active
+    if ws is None:
+        return {"success": 0, "skipped": 0, "errors": ["시트를 찾을 수 없습니다."]}
+
+    header_row = None
+    for row_idx in range(1, 4):
+        row_vals = next(ws.iter_rows(min_row=row_idx, max_row=row_idx, values_only=True), None)
+        if not row_vals:
+            continue
+        if row_vals[0] and "구매일시" in str(row_vals[0]):
+            header_row = row_idx
+            break
+
+    if header_row is None:
+        return {"success": 0, "skipped": 0, "errors": ["'구매일시' 헤더를 찾을 수 없습니다. 파일 형식을 확인해주세요."]}
+
+    now = datetime.now().isoformat()
+    success, skipped, errors = 0, 0, []
+
+    conn = get_conn()
+    data_start_row = header_row + 1
+
+    for idx, row in enumerate(ws.iter_rows(min_row=data_start_row, values_only=True), start=data_start_row):
+        if not row[0]:
+            continue
+        try:
+            purchase_datetime = str(row[0]).strip()
+            vendor = str(row[2]).strip() if row[2] else ""
+            branch_name = str(row[3]).strip() if row[3] else ""
+            item_name = str(row[5]).strip() if row[5] else ""
+            item_code = str(row[6]).strip() if row[6] else ""
+            quantity = float(row[7]) if row[7] is not None else 0
+            unit_price = float(row[8]) if row[8] is not None else None
+            total_price = float(row[9]) if row[9] is not None else None
+
+            if not branch_name or not item_name:
+                skipped += 1
+                continue
+
+            conn.execute("""
+                INSERT INTO purchase_records
+                    (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (purchase_datetime, branch_name, item_name, item_code, quantity)
+                DO UPDATE SET
+                    vendor=excluded.vendor,
+                    unit_price=excluded.unit_price,
+                    total_price=excluded.total_price,
+                    created_at=excluded.created_at
+            """, (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, now))
+            success += 1
+        except Exception as e:
+            errors.append(f"행 {idx}: {str(e)[:50]}")
+            skipped += 1
+
+    conn.commit()
+
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=90)).isoformat()
+    conn.execute("DELETE FROM purchase_records WHERE purchase_datetime < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+    return {"success": success, "skipped": skipped, "errors": errors[:10], "header_row_used": header_row}
 
 async def _process_raw_upload_master(file: UploadFile):
     """마스터 전용 — 헤더가 2행에 있고 컬럼명이 다른 '재고수불부' 형식 처리
