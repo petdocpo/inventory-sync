@@ -5297,9 +5297,14 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     conn = get_conn()
     existing_rows = conn.execute("SELECT branch_code, webhook_url, channel_name FROM teams_webhook").fetchall()
     existing = {r["branch_code"]: {"url": r["webhook_url"], "name": r["channel_name"] or ""} for r in existing_rows}
-    drafts = {r["branch_code"]: dict(r) for r in conn.execute("SELECT * FROM teams_draft_message").fetchall()}
+
+    draft_rows = conn.execute("SELECT * FROM teams_draft_message ORDER BY updated_at DESC").fetchall()
+    drafts_map: Dict[str, list] = {}
+    for d in draft_rows:
+        drafts_map.setdefault(d["branch_code"], []).append(dict(d))
+
     schedules = conn.execute("SELECT * FROM teams_scheduled_message WHERE target_type='branch'").fetchall()
-    schedule_map = {}
+    schedule_map: Dict[str, list] = {}
     for s in schedules:
         for code in s["target_codes"].split(","):
             schedule_map.setdefault(code, []).append(dict(s))
@@ -5323,6 +5328,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     reminder_enabled = (reminder_setting_row["value"] == "true") if reminder_setting_row else True
     reminder_status_text = "🟢 켜짐 (매월 5,10,15,20,25,30일 자동발송)" if reminder_enabled else "🔴 꺼짐 (자동발송 안 함)"
     reminder_btn_label = "끄기" if reminder_enabled else "켜기"
+
     for t in targets:
         info = existing.get(t["branch_code"])
         is_registered = bool(info)
@@ -5331,17 +5337,78 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         url_display = (info["url"][:35] + "...") if has_webhook else "(URL 미등록)" if is_registered else "(미등록)"
         safe_channel_name = (info["name"] if info else "").replace("'", "")
 
-        draft = drafts.get(t["branch_code"])
-        draft_badge = f'<span class="badge-green">임시저장 있음</span>' if draft else ''
+        branch_drafts = drafts_map.get(t["branch_code"], [])
+        branch_scheds = schedule_map.get(t["branch_code"], [])
+        draft_badge = f'<span class="badge-green">임시저장 {len(branch_drafts)}건</span>' if branch_drafts else ''
+        sched_badge = f'<span class="badge-green">반복 {len(branch_scheds)}건</span>' if branch_scheds else ''
 
-        sched_list = schedule_map.get(t["branch_code"], [])
-        sched_badge = f'<span class="badge-green">반복 {len(sched_list)}건</span>' if sched_list else ''
+        expand_btn = ""
+        detail_row = ""
+        if has_webhook:
+            expand_btn = f'<button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="toggleAccordion(\'{t["branch_code"]}\')">▼ 상세</button>'
+
+            draft_items_html = ""
+            for d in branch_drafts:
+                d_title = (d["title"] or "(제목없음)").replace("'", "")
+                d_msg_preview = (d["message"] or "")[:40].replace("'", "")
+                draft_items_html += f"""
+                <div style="border:1px solid #ddd;border-radius:6px;padding:8px;margin-bottom:6px;font-size:12px;">
+                  <b>{d_title}</b><br>
+                  <span style="color:#888;">{d_msg_preview}{'...' if len(d['message'] or '') > 40 else ''}</span>
+                  <div style="margin-top:6px;display:flex;gap:4px;">
+                    <button class="btn" style="font-size:11px;padding:3px 8px;" onclick="editDraftItem({d['id']}, '{t['branch_code']}')">수정</button>
+                    <button class="btn" style="font-size:11px;padding:3px 8px;background:#2563eb;" onclick="sendDraftItem({d['id']}, '{t['branch_code']}')">바로 발송</button>
+                    <button class="btn btn-red" style="font-size:11px;padding:3px 8px;" onclick="deleteDraftItem({d['id']}, '{t['branch_code']}')">삭제</button>
+                  </div>
+                </div>
+                """
+            if not draft_items_html:
+                draft_items_html = '<p style="font-size:12px;color:#888;">임시저장된 메시지가 없습니다.</p>'
+
+            sched_items_html = ""
+            for s in branch_scheds:
+                s_title = (s["title"] or "(제목없음)").replace("'", "")
+                sched_items_html += f"""
+                <div style="border:1px solid #ddd;border-radius:6px;padding:8px;margin-bottom:6px;font-size:12px;">
+                  <b>{s_title}</b> — {s['interval_days']}일 간격 ({'활성' if s['active'] else '중지'})<br>
+                  <span style="color:#888;">{(s['message'] or '')[:40]}{'...' if len(s['message'] or '') > 40 else ''}</span>
+                  <div style="margin-top:6px;display:flex;gap:4px;flex-wrap:wrap;">
+                    <button class="btn" style="font-size:11px;padding:3px 8px;" onclick="editSchedItem({s['id']}, '{t['branch_code']}')">수정</button>
+                    <button class="btn" style="font-size:11px;padding:3px 8px;background:#64748B;" onclick="toggleSchedItem({s['id']}, {str(not s['active']).lower()}, '{t['branch_code']}')">{'중지' if s['active'] else '재개'}</button>
+                    <button class="btn btn-red" style="font-size:11px;padding:3px 8px;" onclick="deleteSchedItem({s['id']}, '{t['branch_code']}')">삭제</button>
+                  </div>
+                </div>
+                """
+            if not sched_items_html:
+                sched_items_html = '<p style="font-size:12px;color:#888;">등록된 반복 메시지가 없습니다.</p>'
+
+            detail_row = f"""
+            <tr id="accordion_{t['branch_code']}" style="display:none;">
+              <td colspan="6" style="background:#f8fafc;padding:16px;">
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+                  <div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                      <h4 style="font-size:13px;">📝 임시저장 목록</h4>
+                      <button class="btn" style="font-size:11px;padding:4px 8px;background:#F59E0B;" onclick="openNewDraft('{t['branch_code']}', '{t['branch_name']}')">+ 새 임시저장</button>
+                    </div>
+                    <div id="draftList_{t['branch_code']}">{draft_items_html}</div>
+                  </div>
+                  <div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                      <h4 style="font-size:13px;">🔁 반복 메시지 목록</h4>
+                      <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="openNewSchedule('{t['branch_code']}', '{t['branch_name']}')">+ 새 예약</button>
+                    </div>
+                    <div id="schedList_{t['branch_code']}">{sched_items_html}</div>
+                  </div>
+                </div>
+              </td>
+            </tr>
+            """
 
         rows_html += f"""
         <tr>
             <td style="text-align:center;">
               <input type="checkbox" class="tw-check" value="{t['branch_code']}" {'disabled' if not is_registered else ''} style="width:16px;height:16px;">
-              <!-- 체크박스는 발송 가능(has_webhook)한 경우만 활성화, 등록만 된 채널은 등록/수정으로 URL 추가 필요 -->
             </td>
             <td>{t['branch_name']}</td>
             <td style="font-size:12px;">{channel_display}</td>
@@ -5350,14 +5417,11 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
             <td style="display:flex;gap:4px;flex-wrap:wrap;">
               <button class="btn" style="font-size:11px;padding:4px 8px;" onclick="editWebhook('{t['branch_code']}', '{t['branch_name']}', '{safe_channel_name}')">등록/수정</button>
               {'<button class="btn" style="font-size:11px;padding:4px 8px;background:#64748B;" onclick="testSend(\'' + t['branch_code'] + '\', \'' + t['branch_name'] + '\')">테스트</button>' if has_webhook else ''}
-              {'<button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="openBranchSchedule(\'' + t['branch_code'] + '\', \'' + t['branch_name'] + '\')">예약</button>' if has_webhook else ''}
-              {'<button class="btn" style="font-size:11px;padding:4px 8px;background:#F59E0B;" onclick="openDraft(\'' + t['branch_code'] + '\', \'' + t['branch_name'] + '\')">임시저장</button>' if has_webhook else ''}
+              {expand_btn}
             </td>
         </tr>
+        {detail_row}
         """
-
-    if not existing.get("__DUMMY__"):
-        pass
 
     branch_options_html = ""
     for t in targets:
@@ -5454,7 +5518,6 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
     <div id="branchScheduleModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
       <div style="background:#fff;border-radius:12px;padding:24px;max-width:480px;width:90%;max-height:85vh;overflow-y:auto;">
         <h3 id="schBranchTitle" style="margin-bottom:12px;">반복 메시지 예약</h3>
-        <div id="schExistingList" style="margin-bottom:12px;"></div>
         <input type="text" id="schTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
         <textarea id="schMessage" placeholder="메시지 내용" style="width:100%;min-height:80px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:8px;"></textarea>
         <label style="font-size:12px;color:#888;">시작일</label>
@@ -5462,9 +5525,10 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         <label style="font-size:12px;color:#888;">반복 간격 (일)</label>
         <input type="number" id="schInterval" value="5" min="1" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:12px;box-sizing:border-box;">
         <input type="hidden" id="schBranchCode">
+        <input type="hidden" id="schEditId">
         <div style="display:flex;gap:8px;">
-          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeBranchSchedule()">닫기</button>
-          <button class="btn" style="flex:1;" onclick="saveBranchSchedule()">새 예약 추가</button>
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeBranchSchedule()">취소</button>
+          <button class="btn" style="flex:1;" id="schSaveBtn" onclick="saveBranchSchedule()">저장</button>
         </div>
       </div>
     </div>
@@ -5475,6 +5539,7 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         <input type="text" id="draftMsgTitle" placeholder="제목" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-bottom:8px;box-sizing:border-box;">
         <textarea id="draftMsgBody" placeholder="메시지 내용" style="width:100%;min-height:100px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
         <input type="hidden" id="draftBranchCode">
+        <input type="hidden" id="draftEditId">
         <div style="display:flex;gap:8px;margin-top:16px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeDraft()">취소</button>
           <button class="btn" style="flex:1;background:#F59E0B;" onclick="saveDraft()">임시저장</button>
@@ -5519,6 +5584,12 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         }});
       }})();
 
+      function toggleAccordion(branchCode) {{
+        var row = document.getElementById('accordion_' + branchCode);
+        if (!row) return;
+        row.style.display = (row.style.display === 'none') ? 'table-row' : 'none';
+      }}
+
       function closeMessageModal() {{
         document.getElementById('twMessageModal').style.display = 'none';
         document.getElementById('twMsgTitle').value = '';
@@ -5543,20 +5614,6 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
           alert('발송 완료: 성공 ' + result.success + '건, 실패 ' + result.failed + '건');
           closeMessageModal();
         }} else {{ alert('오류: ' + (result.detail || '발송 실패')); }}
-      }}
-
-      async function testSend(branchCode, branchName) {{
-        if (!confirm(branchName + ' 채널로 테스트 메시지를 보낼까요?')) return;
-        const res = await fetch('/master/teams-webhook/broadcast', {{
-          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_codes: [branchCode], title: '테스트 알림', message: '이 메시지가 보이면 웹훅이 정상 연결된 것입니다.', link_url: 'https://inventory-sync-teal.vercel.app', link_text: '앱 바로가기' }})
-        }});
-        const result = await res.json();
-        if (res.ok && result.success > 0) {{
-          alert('테스트 발송 성공! Teams 채널을 확인하세요.');
-        }} else {{
-          alert('발송 실패:\\n' + (result.fail_details ? result.fail_details.join('\\n') : '알 수 없는 오류'));
-        }}
       }}
 
       async function testSend(branchCode, branchName) {{
@@ -5615,21 +5672,6 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
           alert('오류: ' + (result.detail || '발송 실패'));
         }}
       }}
-      
-      async function testPurchaseNew(alertKey) {{
-        const target = document.getElementById('testTarget_' + alertKey).value;
-        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
-        const res = await fetch('/master/teams-webhook/test-purchase-new', {{
-          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_code: target }})
-        }});
-        const result = await res.json();
-        if (res.ok) {{
-          alert('테스트 발송 완료! 최근 발주 ' + result.purchase_count + '건 미리보기 발송\\nTeams 채널을 확인하세요.');
-        }} else {{
-          alert('오류: ' + (result.detail || '발송 실패'));
-        }}
-      }}
 
       async function editWebhook(branchCode, branchName, currentChannelName) {{
         const url = prompt(branchName + '의 Teams 웹훅 URL을 입력하세요:');
@@ -5663,47 +5705,35 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         }}
       }}
 
-      function openBranchSchedule(branchCode, branchName) {{
-        document.getElementById('schBranchTitle').innerText = branchName + ' — 반복 메시지 예약';
+      // ── 반복 메시지: 신규/수정 공용 모달 ──
+      function openNewSchedule(branchCode, branchName) {{
+        document.getElementById('schBranchTitle').innerText = branchName + ' — 새 반복 메시지';
         document.getElementById('schBranchCode').value = branchCode;
+        document.getElementById('schEditId').value = '';
         document.getElementById('schStartDate').value = new Date().toISOString().slice(0, 10);
         document.getElementById('schTitle').value = '';
         document.getElementById('schMessage').value = '';
-        loadBranchSchedules(branchCode);
+        document.getElementById('schInterval').value = '5';
+        document.getElementById('schSaveBtn').innerText = '저장';
         document.getElementById('branchScheduleModal').style.display = 'flex';
       }}
 
-      async function loadBranchSchedules(branchCode) {{
-        const res = await fetch('/master/teams-webhook/schedule/list?branch_code=' + encodeURIComponent(branchCode));
-        const data = await res.json();
-        const container = document.getElementById('schExistingList');
-        if (!data.schedules || data.schedules.length === 0) {{
-          container.innerHTML = '<p style="font-size:12px;color:#888;">등록된 반복 메시지가 없습니다.</p>';
-          return;
-        }}
-        container.innerHTML = data.schedules.map(s =>
-          '<div style="border:1px solid #ddd;border-radius:6px;padding:8px;margin-bottom:6px;font-size:12px;">' +
-          '<b>' + (s.title || '(제목없음)') + '</b> — ' + s.interval_days + '일 간격 (' + (s.active ? '활성' : '중지') + ')' +
-          '<div style="margin-top:4px;"><button class="btn" style="font-size:11px;padding:3px 8px;" onclick="toggleSched(' + s.id + ', ' + (!s.active) + ', \\'' + branchCode + '\\')">' + (s.active ? '중지' : '재개') + '</button> ' +
-          '<button class="btn btn-red" style="font-size:11px;padding:3px 8px;" onclick="deleteSched(' + s.id + ', \\'' + branchCode + '\\')">삭제</button></div></div>'
-        ).join('');
-      }}
-
-      async function toggleSched(id, active, branchCode) {{
-        await fetch('/master/teams-webhook/schedule/toggle', {{
-          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ schedule_id: id, active: active }})
-        }});
-        loadBranchSchedules(branchCode);
-      }}
-
-      async function deleteSched(id, branchCode) {{
-        if (!confirm('삭제할까요?')) return;
-        await fetch('/master/teams-webhook/schedule/delete', {{
-          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ schedule_id: id }})
-        }});
-        loadBranchSchedules(branchCode);
+      function editSchedItem(scheduleId, branchCode) {{
+        document.getElementById('schBranchTitle').innerText = '반복 메시지 수정';
+        document.getElementById('schBranchCode').value = branchCode;
+        document.getElementById('schEditId').value = scheduleId;
+        document.getElementById('schSaveBtn').innerText = '수정 저장';
+        document.getElementById('branchScheduleModal').style.display = 'flex';
+        fetch('/master/teams-webhook/schedule/list?branch_code=' + encodeURIComponent(branchCode))
+          .then(r => r.json())
+          .then(data => {{
+            const target = (data.schedules || []).find(s => s.id === scheduleId);
+            if (!target) return;
+            document.getElementById('schTitle').value = target.title || '';
+            document.getElementById('schMessage').value = target.message || '';
+            document.getElementById('schStartDate').value = target.start_date || '';
+            document.getElementById('schInterval').value = target.interval_days || 5;
+          }});
       }}
 
       function closeBranchSchedule() {{
@@ -5712,30 +5742,67 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
 
       async function saveBranchSchedule() {{
         const branchCode = document.getElementById('schBranchCode').value;
+        const editId = document.getElementById('schEditId').value;
         const title = document.getElementById('schTitle').value.trim();
         const message = document.getElementById('schMessage').value.trim();
         const startDate = document.getElementById('schStartDate').value;
         const interval = parseInt(document.getElementById('schInterval').value);
         if (!message || !startDate || !interval) {{ alert('메시지, 시작일, 간격을 입력하세요.'); return; }}
-        const res = await fetch('/master/teams-webhook/schedule/add', {{
-          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_code: branchCode, title: title, message: message, start_date: startDate, interval_days: interval }})
-        }});
-        if (res.ok) {{
-          document.getElementById('schTitle').value = '';
-          document.getElementById('schMessage').value = '';
-          loadBranchSchedules(branchCode);
-          location.reload();
-        }} else {{ alert('저장 실패'); }}
+
+        let res;
+        if (editId) {{
+          res = await fetch('/master/teams-webhook/schedule/edit', {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ schedule_id: parseInt(editId), title: title, message: message, start_date: startDate, interval_days: interval }})
+          }});
+        }} else {{
+          res = await fetch('/master/teams-webhook/schedule/add', {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ branch_code: branchCode, title: title, message: message, start_date: startDate, interval_days: interval }})
+          }});
+        }}
+        if (res.ok) {{ location.reload(); }} else {{ alert('저장 실패'); }}
       }}
 
-      async function openDraft(branchCode, branchName) {{
-        document.getElementById('draftTitle').innerText = branchName + ' — 임시 저장 메시지';
+      async function toggleSchedItem(id, active, branchCode) {{
+        await fetch('/master/teams-webhook/schedule/toggle', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ schedule_id: id, active: active }})
+        }});
+        location.reload();
+      }}
+
+      async function deleteSchedItem(id, branchCode) {{
+        if (!confirm('삭제할까요?')) return;
+        await fetch('/master/teams-webhook/schedule/delete', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ schedule_id: id }})
+        }});
+        location.reload();
+      }}
+
+      // ── 임시저장: 신규/수정 공용 모달 ──
+      function openNewDraft(branchCode, branchName) {{
+        document.getElementById('draftTitle').innerText = branchName + ' — 새 임시저장';
         document.getElementById('draftBranchCode').value = branchCode;
-        const res = await fetch('/master/teams-webhook/draft/get?branch_code=' + encodeURIComponent(branchCode));
-        const data = await res.json();
-        document.getElementById('draftMsgTitle').value = data.title || '';
-        document.getElementById('draftMsgBody').value = data.message || '';
+        document.getElementById('draftEditId').value = '';
+        document.getElementById('draftMsgTitle').value = '';
+        document.getElementById('draftMsgBody').value = '';
+        document.getElementById('draftModal').style.display = 'flex';
+      }}
+
+      function editDraftItem(draftId, branchCode) {{
+        document.getElementById('draftTitle').innerText = '임시저장 수정';
+        document.getElementById('draftBranchCode').value = branchCode;
+        document.getElementById('draftEditId').value = draftId;
+        fetch('/master/teams-webhook/draft/list?branch_code=' + encodeURIComponent(branchCode))
+          .then(r => r.json())
+          .then(data => {{
+            const target = (data.drafts || []).find(d => d.id === draftId);
+            if (!target) return;
+            document.getElementById('draftMsgTitle').value = target.title || '';
+            document.getElementById('draftMsgBody').value = target.message || '';
+          }});
         document.getElementById('draftModal').style.display = 'flex';
       }}
 
@@ -5745,17 +5812,19 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
 
       async function saveDraft() {{
         const branchCode = document.getElementById('draftBranchCode').value;
+        const editId = document.getElementById('draftEditId').value;
         const title = document.getElementById('draftMsgTitle').value.trim();
         const message = document.getElementById('draftMsgBody').value.trim();
         const res = await fetch('/master/teams-webhook/draft/save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_code: branchCode, title: title, message: message }})
+          body: JSON.stringify({{ branch_code: branchCode, draft_id: editId ? parseInt(editId) : null, title: title, message: message }})
         }});
         if (res.ok) {{ alert('임시저장 완료'); location.reload(); }} else {{ alert('저장 실패'); }}
       }}
 
       async function sendFromDraft() {{
         const branchCode = document.getElementById('draftBranchCode').value;
+        const editId = document.getElementById('draftEditId').value;
         const title = document.getElementById('draftMsgTitle').value.trim();
         const message = document.getElementById('draftMsgBody').value.trim();
         if (!message) {{ alert('메시지 내용을 입력하세요.'); return; }}
@@ -5765,14 +5834,46 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         }});
         const result = await res.json();
         if (res.ok && result.success > 0) {{
-          await fetch('/master/teams-webhook/draft/delete', {{
-            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify({{ branch_code: branchCode }})
-          }});
+          if (editId) {{
+            await fetch('/master/teams-webhook/draft/delete', {{
+              method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ draft_id: parseInt(editId) }})
+            }});
+          }}
           alert('발송 완료');
           closeDraft();
           location.reload();
         }} else {{ alert('발송 실패'); }}
+      }}
+
+      async function sendDraftItem(draftId, branchCode) {{
+        if (!confirm('이 임시저장 메시지를 바로 발송할까요?')) return;
+        const listRes = await fetch('/master/teams-webhook/draft/list?branch_code=' + encodeURIComponent(branchCode));
+        const listData = await listRes.json();
+        const target = (listData.drafts || []).find(d => d.id === draftId);
+        if (!target) {{ alert('메시지를 찾을 수 없습니다.'); return; }}
+        const res = await fetch('/master/teams-webhook/broadcast', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_codes: [branchCode], title: target.title, message: target.message }})
+        }});
+        const result = await res.json();
+        if (res.ok && result.success > 0) {{
+          await fetch('/master/teams-webhook/draft/delete', {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ draft_id: draftId }})
+          }});
+          alert('발송 완료');
+          location.reload();
+        }} else {{ alert('발송 실패'); }}
+      }}
+
+      async function deleteDraftItem(draftId, branchCode) {{
+        if (!confirm('이 임시저장 메시지를 삭제할까요?')) return;
+        await fetch('/master/teams-webhook/draft/delete', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ draft_id: draftId }})
+        }});
+        location.reload();
       }}
     </script>
     """
