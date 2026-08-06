@@ -7395,6 +7395,14 @@ async def _fetch_and_process_s3_csv():
             "hq_debug": debug_hq_log[:20],
             "synced_at": now}
 
+@app.get("/api/cron/compute-purchase-tracking-snapshot")
+async def cron_compute_purchase_tracking_snapshot(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    result = await _compute_purchase_tracking_snapshot()
+    return JSONResponse(content=result)
 
 @app.get("/api/cron/sync-raw-inventory")
 async def cron_sync_raw_inventory(request: Request):
@@ -7476,6 +7484,108 @@ async def _process_purchase_records_upload(file: UploadFile):
     conn.close()
 
     return {"success": success, "skipped": skipped, "errors": errors[:10], "header_row_used": header_row}
+
+def _get_iso_week_str(dt: datetime) -> str:
+    """ISO 주차 문자열 반환 (예: '2026-W32')"""
+    iso_year, iso_week, _ = dt.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+async def _compute_purchase_tracking_snapshot():
+    """지점×상품명별 A(실제간격) vs B(리드타임) 비교, 주간 스냅샷 계산 및 저장"""
+    conn = get_conn()
+
+    leadtime_rows = conn.execute("SELECT item_name, lead_time_days FROM product_lead_time").fetchall()
+    leadtime_map = {r["item_name"]: r["lead_time_days"] for r in leadtime_rows}
+
+    if not leadtime_map:
+        conn.close()
+        return {"processed": 0, "skipped_no_leadtime": 0, "message": "등록된 리드타임이 없습니다."}
+
+    combos = conn.execute("""
+        SELECT DISTINCT branch_name, item_name FROM purchase_records
+    """).fetchall()
+
+    now = datetime.now()
+    snapshot_week = _get_iso_week_str(now)
+    now_iso = now.isoformat()
+
+    processed = 0
+    skipped_no_leadtime = 0
+
+    for combo in combos:
+        branch_name = combo["branch_name"]
+        item_name = combo["item_name"]
+
+        lead_time_days = leadtime_map.get(item_name)
+        if lead_time_days is None:
+            skipped_no_leadtime += 1
+            continue
+
+        history = conn.execute("""
+            SELECT purchase_datetime, quantity FROM purchase_records
+            WHERE branch_name = ? AND item_name = ?
+            ORDER BY purchase_datetime DESC
+            LIMIT 2
+        """, (branch_name, item_name)).fetchall()
+
+        if not history:
+            continue
+
+        last_purchase_date = history[0]["purchase_datetime"]
+        last_qty = float(history[0]["quantity"])
+
+        if len(history) >= 2:
+            try:
+                d1 = datetime.fromisoformat(history[0]["purchase_datetime"])
+                d2 = datetime.fromisoformat(history[1]["purchase_datetime"])
+                actual_interval_days = abs((d1 - d2).days)
+                if actual_interval_days == 0:
+                    actual_interval_days = 1
+            except Exception:
+                actual_interval_days = lead_time_days
+        else:
+            actual_interval_days = lead_time_days
+
+        deviation_days = lead_time_days - actual_interval_days
+
+        try:
+            recommended_qty = round(last_qty * (lead_time_days / actual_interval_days), 1)
+        except ZeroDivisionError:
+            recommended_qty = last_qty
+
+        try:
+            last_dt = datetime.fromisoformat(last_purchase_date)
+            from datetime import timedelta
+            recommended_next_date = (last_dt + timedelta(days=lead_time_days)).date().isoformat()
+        except Exception:
+            recommended_next_date = None
+
+        conn.execute("""
+            INSERT INTO purchase_tracking_snapshot
+                (snapshot_week, branch_name, item_name, last_purchase_date, actual_interval_days,
+                 lead_time_days, deviation_days, recommended_next_date, recommended_qty, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (snapshot_week, branch_name, item_name) DO UPDATE SET
+                last_purchase_date=excluded.last_purchase_date,
+                actual_interval_days=excluded.actual_interval_days,
+                lead_time_days=excluded.lead_time_days,
+                deviation_days=excluded.deviation_days,
+                recommended_next_date=excluded.recommended_next_date,
+                recommended_qty=excluded.recommended_qty,
+                created_at=excluded.created_at
+        """, (snapshot_week, branch_name, item_name, last_purchase_date, actual_interval_days,
+              lead_time_days, deviation_days, recommended_next_date, recommended_qty, now_iso))
+        processed += 1
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "processed": processed,
+        "skipped_no_leadtime": skipped_no_leadtime,
+        "snapshot_week": snapshot_week
+    }
 
 async def _process_lead_time_upload(file: UploadFile):
     """상품별 리드타임(목표 구매주기) 엑셀 업로드 처리 — 헤더 2행, 상품명 기준 UPSERT"""
