@@ -7011,6 +7011,18 @@ async def purchase_tracking_page(session_token: str = Cookie(default=None)):
       <div id="recordsResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;font-size:13px;"></div>
     </div>
 
+    <div class="card">
+      <h3 style="margin-bottom:8px;">🎯 상품별 리드타임(목표 구매주기) 업로드</h3>
+      <p style="color:#666;font-size:12px;margin-bottom:12px;">
+        '상품명', '리드타임' 헤더가 포함된 상품내역 엑셀을 그대로 업로드하면 됩니다 (2행 헤더). 리드타임이 비어있거나 0인 상품은 건너뜁니다.
+      </p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="file" id="leadtimeFile" accept=".xlsx,.xls" style="width:auto;flex:1;">
+        <button class="btn" type="button" onclick="uploadLeadtime()">업로드</button>
+      </div>
+      <div id="leadtimeResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;font-size:13px;"></div>
+    </div>
+
     <script>
       async function uploadRecords() {{
         const file = document.getElementById('recordsFile').files[0];
@@ -7029,6 +7041,33 @@ async def purchase_tracking_page(session_token: str = Cookie(default=None)):
           box.innerHTML = `<b>${{data.errors && data.errors.length ? '⚠️' : '✅'}} 업로드 완료</b><br>
           성공: <b style="color:#22C55E">${{data.success}}건</b> &nbsp;
           실패: <b style="color:#EF4444">${{data.skipped}}건</b>
+          ${{data.errors && data.errors.length ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${{e}}</li>`).join('') + '</ul>' : ''}}`;
+          setTimeout(() => location.reload(), 2000);
+        }} catch(e) {{
+          alert('업로드 중 오류가 발생했습니다.');
+        }} finally {{
+          btn.textContent = '업로드';
+          btn.disabled = false;
+        }}
+      }}
+
+      async function uploadLeadtime() {{
+        const file = document.getElementById('leadtimeFile').files[0];
+        if (!file) {{ alert('파일을 선택해주세요.'); return; }}
+        const fd = new FormData();
+        fd.append('file', file);
+        const btn = event.target;
+        btn.textContent = '업로드 중...';
+        btn.disabled = true;
+        try {{
+          const res = await fetch('/master/purchase-tracking/upload-leadtime', {{ method: 'POST', body: fd }});
+          const data = await res.json();
+          const box = document.getElementById('leadtimeResult');
+          box.style.display = 'block';
+          box.style.background = data.errors && data.errors.length ? '#FEF9C3' : '#D1FAE5';
+          box.innerHTML = `<b>${{data.errors && data.errors.length ? '⚠️' : '✅'}} 업로드 완료</b><br>
+          성공: <b style="color:#22C55E">${{data.success}}건</b> &nbsp;
+          건너뜀(리드타임 없음/0): <b style="color:#888">${{data.skipped}}건</b>
           ${{data.errors && data.errors.length ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${{e}}</li>`).join('') + '</ul>' : ''}}`;
           setTimeout(() => location.reload(), 2000);
         }} catch(e) {{
@@ -7156,6 +7195,15 @@ async def raw_upload_page(session_token: str = Cookie(default=None)):
     """
     return HTMLResponse(content=render_page(content, user, "master"))
 
+@app.post("/master/purchase-tracking/upload-leadtime")
+async def purchase_tracking_upload_leadtime(
+    session_token: str = Cookie(default=None),
+    file: UploadFile = File(...)
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
+    return await _process_lead_time_upload(file)
 
 @app.post("/master/raw-upload/ajax")
 async def raw_upload_ajax(
@@ -7424,6 +7472,75 @@ async def _process_purchase_records_upload(file: UploadFile):
     from datetime import timedelta
     cutoff = (datetime.now() - timedelta(days=90)).isoformat()
     conn.execute("DELETE FROM purchase_records WHERE purchase_datetime < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+    return {"success": success, "skipped": skipped, "errors": errors[:10], "header_row_used": header_row}
+
+async def _process_lead_time_upload(file: UploadFile):
+    """상품별 리드타임(목표 구매주기) 엑셀 업로드 처리 — 헤더 2행, 상품명 기준 UPSERT"""
+    contents = await file.read()
+    import io
+    wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
+    ws = wb.active
+    if ws is None:
+        return {"success": 0, "skipped": 0, "errors": ["시트를 찾을 수 없습니다."]}
+
+    header_row = None
+    col_map = {}
+    for row_idx in range(1, 4):
+        row_vals = next(ws.iter_rows(min_row=row_idx, max_row=row_idx, values_only=True), None)
+        if not row_vals:
+            continue
+        found = {}
+        for col_idx, cell_val in enumerate(row_vals):
+            if not cell_val:
+                continue
+            text = str(cell_val).strip()
+            if text == "상품명" and "item_name" not in found:
+                found["item_name"] = col_idx
+            if text == "리드타임" and "lead_time" not in found:
+                found["lead_time"] = col_idx
+        if "item_name" in found and "lead_time" in found:
+            header_row = row_idx
+            col_map = found
+            break
+
+    if header_row is None:
+        return {"success": 0, "skipped": 0, "errors": ["'상품명' 또는 '리드타임' 헤더를 찾을 수 없습니다."]}
+
+    now = datetime.now().isoformat()
+    success, skipped, errors = 0, 0, []
+    data_start_row = header_row + 1
+
+    conn = get_conn()
+    for idx, row in enumerate(ws.iter_rows(min_row=data_start_row, values_only=True), start=data_start_row):
+        try:
+            item_name_col = col_map["item_name"]
+            lead_time_col = col_map["lead_time"]
+            if item_name_col >= len(row) or not row[item_name_col]:
+                continue
+            item_name = str(row[item_name_col]).strip()
+
+            lead_time_raw = row[lead_time_col] if lead_time_col < len(row) else None
+            if lead_time_raw is None or str(lead_time_raw).strip() in ("", "0"):
+                skipped += 1
+                continue
+
+            lead_time_days = int(float(str(lead_time_raw)))
+
+            conn.execute("""
+                INSERT INTO product_lead_time (item_name, lead_time_days, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT (item_name) DO UPDATE SET
+                    lead_time_days=excluded.lead_time_days,
+                    updated_at=excluded.updated_at
+            """, (item_name, lead_time_days, now))
+            success += 1
+        except Exception as e:
+            errors.append(f"행 {idx}: {str(e)[:50]}")
+            skipped += 1
+
     conn.commit()
     conn.close()
 
