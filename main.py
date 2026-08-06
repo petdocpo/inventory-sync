@@ -5902,6 +5902,30 @@ async def master_branch_schedule_toggle(request: Request, session_token: str = C
     conn.close()
     return JSONResponse(content={"status": "ok"})
 
+@app.post("/master/teams-webhook/schedule/edit")
+async def master_branch_schedule_edit(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    schedule_id = data.get("schedule_id")
+    title = data.get("title", "").strip()
+    message = data.get("message", "").strip()
+    start_date = data.get("start_date", "").strip()
+    interval_days = data.get("interval_days")
+
+    if not schedule_id or not message or not start_date or not interval_days:
+        return JSONResponse(status_code=400, content={"detail": "모든 필드를 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "UPDATE teams_scheduled_message SET title=?, message=?, start_date=?, interval_days=? WHERE id=?",
+        (title, message, start_date, interval_days, schedule_id)
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
 
 @app.post("/master/teams-webhook/schedule/delete")
 async def master_branch_schedule_delete(request: Request, session_token: str = Cookie(default=None)):
@@ -5916,17 +5940,18 @@ async def master_branch_schedule_delete(request: Request, session_token: str = C
     return JSONResponse(content={"status": "ok"})
 
 
-@app.get("/master/teams-webhook/draft/get")
-async def master_draft_get(branch_code: str, session_token: str = Cookie(default=None)):
+@app.get("/master/teams-webhook/draft/list")
+async def master_draft_list(branch_code: str, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
     conn = get_conn()
-    row = conn.execute("SELECT title, message FROM teams_draft_message WHERE branch_code=?", (branch_code,)).fetchone()
+    rows = conn.execute(
+        "SELECT * FROM teams_draft_message WHERE branch_code=? ORDER BY updated_at DESC",
+        (branch_code,)
+    ).fetchall()
     conn.close()
-    if row:
-        return JSONResponse(content={"title": row["title"], "message": row["message"]})
-    return JSONResponse(content={"title": "", "message": ""})
+    return JSONResponse(content={"drafts": [dict(r) for r in rows]})
 
 
 @app.post("/master/teams-webhook/draft/save")
@@ -5936,19 +5961,26 @@ async def master_draft_save(request: Request, session_token: str = Cookie(defaul
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
     data = await request.json()
     branch_code = data.get("branch_code", "").strip()
+    draft_id = data.get("draft_id")
     title = data.get("title", "").strip()
     message = data.get("message", "").strip()
     if not branch_code:
         return JSONResponse(status_code=400, content={"detail": "대상이 지정되지 않았습니다."})
     conn = get_conn()
-    existing = conn.execute("SELECT branch_code FROM teams_draft_message WHERE branch_code=?", (branch_code,)).fetchone()
-    if existing:
-        conn.execute("UPDATE teams_draft_message SET title=?, message=?, updated_at=NOW() WHERE branch_code=?", (title, message, branch_code))
+    if draft_id:
+        conn.execute(
+            "UPDATE teams_draft_message SET title=?, message=?, updated_at=NOW() WHERE id=? AND branch_code=?",
+            (title, message, draft_id, branch_code)
+        )
     else:
-        conn.execute("INSERT INTO teams_draft_message (branch_code, title, message) VALUES (?, ?, ?)", (branch_code, title, message))
+        conn.execute(
+            "INSERT INTO teams_draft_message (branch_code, title, message) VALUES (?, ?, ?)",
+            (branch_code, title, message)
+        )
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
+
 
 @app.post("/master/teams-webhook/draft/delete")
 async def master_draft_delete(request: Request, session_token: str = Cookie(default=None)):
@@ -5956,9 +5988,11 @@ async def master_draft_delete(request: Request, session_token: str = Cookie(defa
     if not user or user["role"] != "master":
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
     data = await request.json()
-    branch_code = data.get("branch_code", "").strip()
+    draft_id = data.get("draft_id")
+    if not draft_id:
+        return JSONResponse(status_code=400, content={"detail": "삭제할 항목이 지정되지 않았습니다."})
     conn = get_conn()
-    conn.execute("DELETE FROM teams_draft_message WHERE branch_code=?", (branch_code,))
+    conn.execute("DELETE FROM teams_draft_message WHERE id=?", (draft_id,))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
