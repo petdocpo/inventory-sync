@@ -6999,6 +6999,11 @@ async def purchase_tracking_page(session_token: str = Cookie(default=None)):
       <div><span style="color:#888;font-size:12px;">최근 구매일</span> <b style="font-size:16px;">{(latest_purchase or '없음')[:16]}</b></div>
     </div>
 
+    <div class="card" style="display:flex;gap:8px;">
+      <a href="/master/purchase-tracking/status" class="btn" style="text-decoration:none;flex:1;text-align:center;">📊 발주 추천 현황 보기</a>
+      <a href="/master/purchase-tracking/history" class="btn" style="text-decoration:none;flex:1;text-align:center;background:#64748B;">📈 편차 추이 히스토리</a>
+    </div>
+
     <div class="card">
       <h3 style="margin-bottom:8px;">📦 구매내역 업로드</h3>
       <p style="color:#666;font-size:12px;margin-bottom:12px;">
@@ -7204,6 +7209,225 @@ async def purchase_tracking_upload_leadtime(
     if not user or user["role"] != "master":
         return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
     return await _process_lead_time_upload(file)
+
+@app.get("/master/purchase-tracking/status", response_class=HTMLResponse)
+async def purchase_tracking_status_page(
+    session_token: str = Cookie(default=None),
+    filter_branch: str = "",
+    search_item: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    latest_week_row = conn.execute(
+        "SELECT MAX(snapshot_week) as w FROM purchase_tracking_snapshot"
+    ).fetchone()
+    latest_week = latest_week_row["w"] if latest_week_row else None
+
+    if not latest_week:
+        conn.close()
+        content = """
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+          <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
+          <h2>📊 발주 추천 현황</h2>
+        </div>
+        <div class="card" style="text-align:center;padding:40px;">
+          <div style="font-size:32px;">📭</div>
+          <p style="color:#888;margin-top:12px;">아직 계산된 스냅샷이 없습니다. cron이 최초 1회 실행된 후 표시됩니다.</p>
+        </div>
+        """
+        return HTMLResponse(content=render_page(content, user, "master"))
+
+    query = "SELECT * FROM purchase_tracking_snapshot WHERE snapshot_week=?"
+    params: list = [latest_week]
+    if filter_branch:
+        query += " AND branch_name=?"
+        params.append(filter_branch)
+    if search_item:
+        query += " AND item_name LIKE ?"
+        params.append(f"%{search_item}%")
+    query += " ORDER BY ABS(deviation_days) DESC LIMIT 500"
+
+    rows = conn.execute(query, params).fetchall()
+
+    all_branches = conn.execute(
+        "SELECT DISTINCT branch_name FROM purchase_tracking_snapshot WHERE snapshot_week=? ORDER BY branch_name",
+        (latest_week,)
+    ).fetchall()
+    conn.close()
+
+    branch_options = '<option value="">전체 지점</option>'
+    for b in all_branches:
+        sel = "selected" if filter_branch == b["branch_name"] else ""
+        branch_options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
+
+    rows_html = ""
+    if not rows:
+        rows_html = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#888;">조건에 맞는 데이터가 없습니다.</td></tr>'
+    else:
+        for r in rows:
+            dev = r["deviation_days"]
+            if dev is None:
+                dev_display = '<span style="color:#888;">-</span>'
+            elif dev > 3:
+                dev_display = f'<span style="color:#F59E0B;font-weight:bold;">+{dev} (너무 자주 구매)</span>'
+            elif dev < -3:
+                dev_display = f'<span style="color:#EF4444;font-weight:bold;">{dev} (구매 지연)</span>'
+            else:
+                dev_display = f'<span style="color:#22C55E;">{dev:+d} (적정)</span>'
+
+            last_date_display = (r["last_purchase_date"] or "-")[:16]
+            next_date_display = r["recommended_next_date"] or "-"
+            qty_display = f"{r['recommended_qty']:g}" if r["recommended_qty"] is not None else "-"
+
+            rows_html += f"""
+            <tr>
+              <td>{r['branch_name']}</td>
+              <td>{r['item_name']}</td>
+              <td style="font-size:12px;">{last_date_display}</td>
+              <td style="text-align:center;">{r['actual_interval_days']}일</td>
+              <td style="text-align:center;">{r['lead_time_days']}일</td>
+              <td>{dev_display}</td>
+              <td style="font-size:12px;">{next_date_display}</td>
+              <td style="text-align:right;font-weight:bold;">{qty_display}</td>
+            </tr>
+            """
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
+      <h2>📊 발주 추천 현황</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">
+        기준 주차: <b>{latest_week}</b> · 편차가 큰 순서로 정렬됩니다 (가장 시급한 조정이 필요한 상품이 위로).
+        <span style="color:#F59E0B;">주황(너무 자주 구매)</span> / <span style="color:#EF4444;">빨강(구매 지연)</span> / <span style="color:#22C55E;">초록(적정)</span>
+      </p>
+    </div>
+    <div class="card">
+      <form method="get" action="/master/purchase-tracking/status" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">지점 필터</label>
+          <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
+        </div>
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">상품명 검색</label>
+          <input name="search_item" value="{search_item}" placeholder="상품명 검색" style="margin-top:4px;">
+        </div>
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/purchase-tracking/status" style="padding:10px 14px;background:#eee;
+           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+      </form>
+    </div>
+    <div class="card">
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 500건까지 표시)</p>
+      <table>
+        <thead><tr>
+          <th>지점</th><th>상품명</th><th>마지막구매일</th><th>실제주기(A)</th><th>목표주기(B)</th>
+          <th>편차</th><th>다음추천발주일</th><th>추천수량</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.get("/master/purchase-tracking/history", response_class=HTMLResponse)
+async def purchase_tracking_history_page(
+    session_token: str = Cookie(default=None),
+    branch: str = "",
+    item: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+
+    if not branch or not item:
+        combo_rows = conn.execute("""
+            SELECT DISTINCT branch_name, item_name FROM purchase_tracking_snapshot
+            ORDER BY branch_name, item_name LIMIT 1000
+        """).fetchall()
+        conn.close()
+
+        combo_options = ""
+        for c in combo_rows:
+            combo_options += f'<option value="{c["branch_name"]}|{c["item_name"]}">{c["branch_name"]} / {c["item_name"]}</option>'
+
+        content = f"""
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+          <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
+          <h2>📈 편차 추이 히스토리</h2>
+        </div>
+        <div class="card">
+          <label style="font-size:13px;color:#555;">지점 / 상품 선택</label>
+          <select id="comboSelect" style="margin-top:4px;">
+            <option value="">-- 선택하세요 --</option>
+            {combo_options}
+          </select>
+          <button class="btn" style="margin-top:12px;" onclick="goHistory()">조회</button>
+        </div>
+        <script>
+          function goHistory() {{
+            const val = document.getElementById('comboSelect').value;
+            if (!val) {{ alert('지점/상품을 선택하세요.'); return; }}
+            const [branch, item] = val.split('|');
+            window.location.href = '/master/purchase-tracking/history?branch=' + encodeURIComponent(branch) + '&item=' + encodeURIComponent(item);
+          }}
+        </script>
+        """
+        return HTMLResponse(content=render_page(content, user, "master"))
+
+    history_rows = conn.execute("""
+        SELECT * FROM purchase_tracking_snapshot
+        WHERE branch_name=? AND item_name=?
+        ORDER BY snapshot_week ASC
+    """, (branch, item)).fetchall()
+    conn.close()
+
+    rows_html = ""
+    if not history_rows:
+        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">기록 없음</td></tr>'
+    else:
+        for r in history_rows:
+            dev = r["deviation_days"]
+            dev_color = "#22C55E" if (dev is not None and abs(dev) <= 3) else ("#F59E0B" if (dev is not None and dev > 3) else "#EF4444")
+            dev_display = f"{dev:+d}" if dev is not None else "-"
+            qty_val = r["recommended_qty"]
+            qty_display = f"{qty_val:g}" if qty_val is not None else "-"
+            rows_html += f"""
+            <tr>
+              <td>{r['snapshot_week']}</td>
+              <td style="font-size:12px;">{(r['last_purchase_date'] or '-')[:16]}</td>
+              <td style="text-align:center;">{r['actual_interval_days']}일</td>
+              <td style="text-align:center;">{r['lead_time_days']}일</td>
+              <td style="color:{dev_color};font-weight:bold;">{dev_display}</td>
+              <td style="text-align:right;">{qty_display}</td>
+            </tr>
+            """
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/purchase-tracking/history" style="color:#1E2761;">← 다른 상품 선택</a>
+      <h2>📈 편차 추이 히스토리</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;"><b>{branch}</b> / <b>{item}</b> — 주차별 편차가 0에 가까워질수록 발주 주기가 목표에 맞게 개선되고 있는 것입니다.</p>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>주차</th><th>마지막구매일</th><th>실제주기(A)</th><th>목표주기(B)</th><th>편차</th><th>추천수량</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
 
 @app.post("/master/raw-upload/ajax")
 async def raw_upload_ajax(
