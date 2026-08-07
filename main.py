@@ -571,7 +571,8 @@ async def purchase_history_page(
     else:
         rows_html = ""
         for r in rows:
-            order_dt = r.get("order_datetime") or r.get("registered_at") or "-"
+            order_dt_raw = r.get("order_datetime") or r.get("registered_at") or "-"
+            order_dt = order_dt_raw[:10] if order_dt_raw != "-" else "-"
             status = r.get("send_status") or ""
             status_badge = '<span class="badge-green">완료</span>' if status == "완료" else '<span class="badge-red">대기</span>'
             oid = r.get("order_id", "")
@@ -7215,7 +7216,8 @@ async def purchase_tracking_status_page(
     session_token: str = Cookie(default=None),
     filter_branch: str = "",
     search_item: str = "",
-    filter_date: str = ""
+    filter_date: str = "",
+    filter_deviation: str = ""
 ):
     user = get_session(session_token)
     if not user or user["role"] != "master":
@@ -7252,6 +7254,12 @@ async def purchase_tracking_status_page(
     if filter_date:
         query += " AND last_purchase_date LIKE ?"
         params.append(f"{filter_date}%")
+    if filter_deviation == "over":
+        query += " AND deviation_days > 3"
+    elif filter_deviation == "delay":
+        query += " AND deviation_days < -3"
+    elif filter_deviation == "ok":
+        query += " AND deviation_days BETWEEN -3 AND 3"
     query += " ORDER BY ABS(deviation_days) DESC"
 
     rows = conn.execute(query, params).fetchall()
@@ -7283,7 +7291,6 @@ async def purchase_tracking_status_page(
     conn.close()
 
     def fmt_int(val):
-        """소수점 제거 — 정수로 반올림해서 표시"""
         if val is None:
             return "-"
         return f"{round(val):,}"
@@ -7293,73 +7300,72 @@ async def purchase_tracking_status_page(
         sel = "selected" if filter_branch == b["branch_name"] else ""
         branch_options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
 
-    cards_html = ""
+    dev_options = f"""
+        <option value="" {'selected' if not filter_deviation else ''}>전체</option>
+        <option value="over" {'selected' if filter_deviation == 'over' else ''}>과다구매 (너무 자주 구매)</option>
+        <option value="ok" {'selected' if filter_deviation == 'ok' else ''}>적정</option>
+        <option value="delay" {'selected' if filter_deviation == 'delay' else ''}>구매지연</option>
+    """
+
+    rows_html = ""
     if not rows:
-        cards_html = '<div class="card" style="text-align:center;padding:24px;color:#888;">조건에 맞는 데이터가 없습니다.</div>'
+        rows_html = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#888;">조건에 맞는 데이터가 없습니다.</td></tr>'
     else:
         for idx, r in enumerate(rows):
             dev = r["deviation_days"]
             if dev is None:
-                dev_badge = '<span style="color:#888;">-</span>'
-                dev_border = "#ddd"
+                dev_display = '<span style="color:#888;">-</span>'
             elif dev > 3:
-                dev_badge = f'<span style="color:#F59E0B;font-weight:bold;">+{dev} (너무 자주 구매)</span>'
-                dev_border = "#F59E0B"
+                dev_display = f'<span style="color:#F59E0B;font-weight:bold;">+{dev}</span>'
             elif dev < -3:
-                dev_badge = f'<span style="color:#EF4444;font-weight:bold;">{dev} (구매 지연)</span>'
-                dev_border = "#EF4444"
+                dev_display = f'<span style="color:#EF4444;font-weight:bold;">{dev}</span>'
             else:
-                dev_badge = f'<span style="color:#22C55E;">{dev:+d} (적정)</span>'
-                dev_border = "#22C55E"
+                dev_display = f'<span style="color:#22C55E;">{dev:+d}</span>'
 
             raw_qty = r["recommended_qty"]
             if raw_qty is not None and raw_qty < 5:
-                qty_badge = "5개 (최소값)"
+                qty_display = "5 (최소)"
             elif raw_qty is not None:
-                qty_badge = f"{round(raw_qty):,}개"
+                qty_display = f"{round(raw_qty):,}"
             else:
-                qty_badge = "-"
+                qty_display = "-"
 
             key = (r["branch_name"], r["item_name"])
             hist = prev_purchase_map.get(key, [])
             last_qty_display = fmt_int(hist[0]["quantity"]) if len(hist) >= 1 else "-"
-            prev_date_display = hist[1]["purchase_datetime"][:16] if len(hist) >= 2 else "-"
+            prev_date_display = hist[1]["purchase_datetime"][:10] if len(hist) >= 2 else "-"
             prev_qty_display = fmt_int(hist[1]["quantity"]) if len(hist) >= 2 else "-"
 
             branch_code = branch_name_to_code.get(r["branch_name"])
             current_stock = raw_stock_map.get((branch_code, r["item_name"])) if branch_code else None
             stock_display = fmt_int(current_stock)
 
-            last_date_display = (r["last_purchase_date"] or "-")[:16]
+            last_date_display = (r["last_purchase_date"] or "-")[:10]
             next_date_display = r["recommended_next_date"] or "-"
-            card_id = f"ptcard_{idx}"
+            detail_id = f"ptdetail_{idx}"
 
-            cards_html += f"""
-            <div class="card" style="border-left:4px solid {dev_border};margin-bottom:10px;cursor:pointer;" onclick="togglePtCard('{card_id}')">
-              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-                <div style="flex:1;min-width:180px;">
-                  <div style="font-weight:bold;font-size:14px;">{r['branch_name']} · {r['item_name']}</div>
-                  <div style="font-size:13px;margin-top:4px;">{dev_badge}</div>
-                </div>
-                <div style="text-align:right;">
-                  <div style="font-size:11px;color:#888;">추천수량</div>
-                  <div style="font-size:18px;font-weight:bold;color:#1E2761;">{qty_badge}</div>
-                </div>
-                <div style="font-size:18px;color:#aaa;" id="{card_id}_arrow">▼</div>
-              </div>
-              <div id="{card_id}" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #eee;">
-                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));gap:10px;font-size:12px;">
-                  <div><span style="color:#888;">마지막구매일</span><br><b>{last_date_display}</b></div>
-                  <div><span style="color:#888;">마지막수량</span><br><b>{last_qty_display}개</b></div>
+            rows_html += f"""
+            <tr style="cursor:pointer;" onclick="togglePtDetail('{detail_id}')">
+              <td>{r['branch_name']}</td>
+              <td>{r['item_name']}</td>
+              <td style="font-size:11px;">{last_date_display}</td>
+              <td style="text-align:center;">{last_qty_display}</td>
+              <td style="text-align:right;">{stock_display}</td>
+              <td>{dev_display}</td>
+              <td style="text-align:right;font-weight:bold;">{qty_display}</td>
+              <td style="text-align:center;color:#aaa;" id="{detail_id}_arrow">▼</td>
+            </tr>
+            <tr id="{detail_id}" style="display:none;background:#f8fafc;">
+              <td colspan="8" style="padding:10px 16px;">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(130px, 1fr));gap:8px;font-size:11px;">
                   <div><span style="color:#888;">직전구매일</span><br><b>{prev_date_display}</b></div>
-                  <div><span style="color:#888;">직전수량</span><br><b>{prev_qty_display}개</b></div>
+                  <div><span style="color:#888;">직전수량</span><br><b>{prev_qty_display}</b></div>
                   <div><span style="color:#888;">실제주기(A)</span><br><b>{r['actual_interval_days']}일</b></div>
                   <div><span style="color:#888;">목표주기(B)</span><br><b>{r['lead_time_days']}일</b></div>
                   <div><span style="color:#888;">추천발주일</span><br><b>{next_date_display}</b></div>
-                  <div><span style="color:#888;">현재고</span><br><b>{stock_display}개</b></div>
                 </div>
-              </div>
-            </div>
+              </td>
+            </tr>
             """
 
     content = f"""
@@ -7369,41 +7375,52 @@ async def purchase_tracking_status_page(
     </div>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">
-        기준 주차: <b>{latest_week}</b> · 편차가 큰 순서로 정렬됩니다. 카드를 클릭하면 상세정보가 펼쳐집니다.<br>
-        <span style="color:#F59E0B;">주황(너무 자주 구매)</span> / <span style="color:#EF4444;">빨강(구매 지연)</span> / <span style="color:#22C55E;">초록(적정)</span>
+        기준 주차: <b>{latest_week}</b> · 편차가 큰 순서로 정렬됩니다. 행을 클릭하면 상세정보가 펼쳐집니다.<br>
+        <span style="color:#F59E0B;">주황(과다구매)</span> / <span style="color:#EF4444;">빨강(구매지연)</span> / <span style="color:#22C55E;">초록(적정)</span>
         · 추천수량은 최소 5개로 보정됩니다.
       </p>
     </div>
     <div class="card">
       <form method="get" action="/master/purchase-tracking/status" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
-        <div style="flex:1;min-width:140px;">
+        <div style="flex:1;min-width:130px;">
           <label style="font-size:12px;color:#888;">지점 필터</label>
           <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
         </div>
-        <div style="flex:1;min-width:140px;">
+        <div style="flex:1;min-width:130px;">
           <label style="font-size:12px;color:#888;">상품명 검색</label>
           <input name="search_item" value="{search_item}" placeholder="상품명 검색" style="margin-top:4px;">
         </div>
-        <div style="flex:1;min-width:140px;">
+        <div style="flex:1;min-width:130px;">
           <label style="font-size:12px;color:#888;">마지막구매일</label>
           <input name="filter_date" type="date" value="{filter_date}" style="margin-top:4px;">
+        </div>
+        <div style="flex:1;min-width:150px;">
+          <label style="font-size:12px;color:#888;">구매 상태</label>
+          <select name="filter_deviation" style="margin-top:4px;">{dev_options}</select>
         </div>
         <button class="btn" type="submit">검색</button>
         <a href="/master/purchase-tracking/status" style="padding:10px 14px;background:#eee;
            border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
-        <a href="/master/purchase-tracking/status/export?filter_branch={filter_branch}&search_item={search_item}&filter_date={filter_date}"
+        <a href="/master/purchase-tracking/status/export?filter_branch={filter_branch}&search_item={search_item}&filter_date={filter_date}&filter_deviation={filter_deviation}"
            class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
       </form>
     </div>
-    <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (전체 조회)</p>
-    {cards_html}
+    <div class="card">
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (전체 조회)</p>
+      <table>
+        <thead><tr>
+          <th>지점</th><th>상품명</th><th>마지막구매일</th><th>구매수량</th><th>현재고</th><th>편차</th><th>추천수량</th><th></th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
     <script>
-      function togglePtCard(cardId) {{
-        var el = document.getElementById(cardId);
-        var arrow = document.getElementById(cardId + '_arrow');
+      function togglePtDetail(detailId) {{
+        var el = document.getElementById(detailId);
+        var arrow = document.getElementById(detailId + '_arrow');
         if (!el) return;
         var isOpen = el.style.display !== 'none';
-        el.style.display = isOpen ? 'none' : 'block';
+        el.style.display = isOpen ? 'none' : 'table-row';
         if (arrow) arrow.innerText = isOpen ? '▼' : '▲';
       }}
     </script>
@@ -7416,7 +7433,8 @@ async def purchase_tracking_status_export(
     session_token: str = Cookie(default=None),
     filter_branch: str = "",
     search_item: str = "",
-    filter_date: str = ""
+    filter_date: str = "",
+    filter_deviation: str = ""
 ):
     user = get_session(session_token)
     if not user or user["role"] != "master":
@@ -7443,6 +7461,12 @@ async def purchase_tracking_status_export(
     if filter_date:
         query += " AND last_purchase_date LIKE ?"
         params.append(f"{filter_date}%")
+    if filter_deviation == "over":
+        query += " AND deviation_days > 3"
+    elif filter_deviation == "delay":
+        query += " AND deviation_days < -3"
+    elif filter_deviation == "ok":
+        query += " AND deviation_days BETWEEN -3 AND 3"
     query += " ORDER BY ABS(deviation_days) DESC"
 
     rows = conn.execute(query, params).fetchall()
