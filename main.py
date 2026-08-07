@@ -7282,62 +7282,84 @@ async def purchase_tracking_status_page(
 
     conn.close()
 
+    def fmt_int(val):
+        """소수점 제거 — 정수로 반올림해서 표시"""
+        if val is None:
+            return "-"
+        return f"{round(val):,}"
+
     branch_options = '<option value="">전체 지점</option>'
     for b in all_branches:
         sel = "selected" if filter_branch == b["branch_name"] else ""
         branch_options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
 
-    rows_html = ""
+    cards_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="12" style="text-align:center;padding:20px;color:#888;">조건에 맞는 데이터가 없습니다.</td></tr>'
+        cards_html = '<div class="card" style="text-align:center;padding:24px;color:#888;">조건에 맞는 데이터가 없습니다.</div>'
     else:
-        for r in rows:
+        for idx, r in enumerate(rows):
             dev = r["deviation_days"]
             if dev is None:
-                dev_display = '<span style="color:#888;">-</span>'
+                dev_badge = '<span style="color:#888;">-</span>'
+                dev_border = "#ddd"
             elif dev > 3:
-                dev_display = f'<span style="color:#F59E0B;font-weight:bold;">+{dev}</span>'
+                dev_badge = f'<span style="color:#F59E0B;font-weight:bold;">+{dev} (너무 자주 구매)</span>'
+                dev_border = "#F59E0B"
             elif dev < -3:
-                dev_display = f'<span style="color:#EF4444;font-weight:bold;">{dev}</span>'
+                dev_badge = f'<span style="color:#EF4444;font-weight:bold;">{dev} (구매 지연)</span>'
+                dev_border = "#EF4444"
             else:
-                dev_display = f'<span style="color:#22C55E;">{dev:+d}</span>'
-
-            last_date_display = (r["last_purchase_date"] or "-")[:16]
-            next_date_display = r["recommended_next_date"] or "-"
+                dev_badge = f'<span style="color:#22C55E;">{dev:+d} (적정)</span>'
+                dev_border = "#22C55E"
 
             raw_qty = r["recommended_qty"]
             if raw_qty is not None and raw_qty < 5:
-                qty_display = "5 (최소값)"
+                qty_badge = "5개 (최소값)"
             elif raw_qty is not None:
-                qty_display = f"{raw_qty:g}"
+                qty_badge = f"{round(raw_qty):,}개"
             else:
-                qty_display = "-"
+                qty_badge = "-"
 
             key = (r["branch_name"], r["item_name"])
             hist = prev_purchase_map.get(key, [])
-            last_qty_display = f"{hist[0]['quantity']:g}" if len(hist) >= 1 else "-"
+            last_qty_display = fmt_int(hist[0]["quantity"]) if len(hist) >= 1 else "-"
             prev_date_display = hist[1]["purchase_datetime"][:16] if len(hist) >= 2 else "-"
-            prev_qty_display = f"{hist[1]['quantity']:g}" if len(hist) >= 2 else "-"
+            prev_qty_display = fmt_int(hist[1]["quantity"]) if len(hist) >= 2 else "-"
 
             branch_code = branch_name_to_code.get(r["branch_name"])
             current_stock = raw_stock_map.get((branch_code, r["item_name"])) if branch_code else None
-            stock_display = f"{current_stock:g}" if current_stock is not None else "-"
+            stock_display = fmt_int(current_stock)
 
-            rows_html += f"""
-            <tr>
-              <td>{r['branch_name']}</td>
-              <td>{r['item_name']}</td>
-              <td style="font-size:12px;">{last_date_display}</td>
-              <td style="text-align:center;">{last_qty_display}</td>
-              <td style="font-size:12px;color:#888;">{prev_date_display}</td>
-              <td style="text-align:center;color:#888;">{prev_qty_display}</td>
-              <td style="text-align:center;">{r['actual_interval_days']}일</td>
-              <td style="text-align:center;">{r['lead_time_days']}일</td>
-              <td>{dev_display}</td>
-              <td style="font-size:12px;">{next_date_display}</td>
-              <td style="text-align:right;">{stock_display}</td>
-              <td style="text-align:right;font-weight:bold;">{qty_display}</td>
-            </tr>
+            last_date_display = (r["last_purchase_date"] or "-")[:16]
+            next_date_display = r["recommended_next_date"] or "-"
+            card_id = f"ptcard_{idx}"
+
+            cards_html += f"""
+            <div class="card" style="border-left:4px solid {dev_border};margin-bottom:10px;cursor:pointer;" onclick="togglePtCard('{card_id}')">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+                <div style="flex:1;min-width:180px;">
+                  <div style="font-weight:bold;font-size:14px;">{r['branch_name']} · {r['item_name']}</div>
+                  <div style="font-size:13px;margin-top:4px;">{dev_badge}</div>
+                </div>
+                <div style="text-align:right;">
+                  <div style="font-size:11px;color:#888;">추천수량</div>
+                  <div style="font-size:18px;font-weight:bold;color:#1E2761;">{qty_badge}</div>
+                </div>
+                <div style="font-size:18px;color:#aaa;" id="{card_id}_arrow">▼</div>
+              </div>
+              <div id="{card_id}" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #eee;">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));gap:10px;font-size:12px;">
+                  <div><span style="color:#888;">마지막구매일</span><br><b>{last_date_display}</b></div>
+                  <div><span style="color:#888;">마지막수량</span><br><b>{last_qty_display}개</b></div>
+                  <div><span style="color:#888;">직전구매일</span><br><b>{prev_date_display}</b></div>
+                  <div><span style="color:#888;">직전수량</span><br><b>{prev_qty_display}개</b></div>
+                  <div><span style="color:#888;">실제주기(A)</span><br><b>{r['actual_interval_days']}일</b></div>
+                  <div><span style="color:#888;">목표주기(B)</span><br><b>{r['lead_time_days']}일</b></div>
+                  <div><span style="color:#888;">추천발주일</span><br><b>{next_date_display}</b></div>
+                  <div><span style="color:#888;">현재고</span><br><b>{stock_display}개</b></div>
+                </div>
+              </div>
+            </div>
             """
 
     content = f"""
@@ -7347,7 +7369,7 @@ async def purchase_tracking_status_page(
     </div>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">
-        기준 주차: <b>{latest_week}</b> · 편차가 큰 순서로 정렬됩니다.
+        기준 주차: <b>{latest_week}</b> · 편차가 큰 순서로 정렬됩니다. 카드를 클릭하면 상세정보가 펼쳐집니다.<br>
         <span style="color:#F59E0B;">주황(너무 자주 구매)</span> / <span style="color:#EF4444;">빨강(구매 지연)</span> / <span style="color:#22C55E;">초록(적정)</span>
         · 추천수량은 최소 5개로 보정됩니다.
       </p>
@@ -7373,30 +7395,21 @@ async def purchase_tracking_status_page(
            class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
       </form>
     </div>
-    <div class="card">
-      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (전체 조회)</p>
-      <div class="table-scroll-wrap">
-        <table style="min-width:1200px;">
-          <thead><tr>
-            <th style="min-width:90px;">지점</th>
-            <th style="min-width:160px;">상품명</th>
-            <th style="min-width:90px;">마지막구매일</th>
-            <th style="min-width:60px;">마지막수량</th>
-            <th style="min-width:90px;">직전구매일</th>
-            <th style="min-width:60px;">직전수량</th>
-            <th style="min-width:60px;">실제(A)</th>
-            <th style="min-width:60px;">목표(B)</th>
-            <th style="min-width:60px;">편차</th>
-            <th style="min-width:90px;">추천발주일</th>
-            <th style="min-width:70px;">현재고</th>
-            <th style="min-width:80px;">추천수량</th>
-          </tr></thead>
-          <tbody>{rows_html}</tbody>
-        </table>
-      </div>
-    </div>
+    <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (전체 조회)</p>
+    {cards_html}
+    <script>
+      function togglePtCard(cardId) {{
+        var el = document.getElementById(cardId);
+        var arrow = document.getElementById(cardId + '_arrow');
+        if (!el) return;
+        var isOpen = el.style.display !== 'none';
+        el.style.display = isOpen ? 'none' : 'block';
+        if (arrow) arrow.innerText = isOpen ? '▼' : '▲';
+      }}
+    </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
 
 @app.get("/master/purchase-tracking/status/export")
 async def purchase_tracking_status_export(
@@ -7468,15 +7481,16 @@ async def purchase_tracking_status_export(
     for r in rows:
         key = (r["branch_name"], r["item_name"])
         hist = prev_purchase_map.get(key, [])
-        last_qty = hist[0]["quantity"] if len(hist) >= 1 else None
+        last_qty = round(hist[0]["quantity"]) if len(hist) >= 1 else None
         prev_date = hist[1]["purchase_datetime"] if len(hist) >= 2 else None
-        prev_qty = hist[1]["quantity"] if len(hist) >= 2 else None
+        prev_qty = round(hist[1]["quantity"]) if len(hist) >= 2 else None
 
         branch_code = branch_name_to_code.get(r["branch_name"])
         current_stock = raw_stock_map.get((branch_code, r["item_name"])) if branch_code else None
+        current_stock = round(current_stock) if current_stock is not None else None
 
         raw_qty = r["recommended_qty"]
-        final_qty = 5 if (raw_qty is not None and raw_qty < 5) else raw_qty
+        final_qty = 5 if (raw_qty is not None and raw_qty < 5) else (round(raw_qty) if raw_qty is not None else None)
 
         ws.append([
             r["branch_name"], r["item_name"], r["last_purchase_date"], last_qty,
