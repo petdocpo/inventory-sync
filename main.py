@@ -7214,7 +7214,8 @@ async def purchase_tracking_upload_leadtime(
 async def purchase_tracking_status_page(
     session_token: str = Cookie(default=None),
     filter_branch: str = "",
-    search_item: str = ""
+    search_item: str = "",
+    filter_date: str = ""
 ):
     user = get_session(session_token)
     if not user or user["role"] != "master":
@@ -7248,7 +7249,10 @@ async def purchase_tracking_status_page(
     if search_item:
         query += " AND item_name LIKE ?"
         params.append(f"%{search_item}%")
-    query += " ORDER BY ABS(deviation_days) DESC LIMIT 500"
+    if filter_date:
+        query += " AND last_purchase_date LIKE ?"
+        params.append(f"{filter_date}%")
+    query += " ORDER BY ABS(deviation_days) DESC"
 
     rows = conn.execute(query, params).fetchall()
 
@@ -7256,6 +7260,26 @@ async def purchase_tracking_status_page(
         "SELECT DISTINCT branch_name FROM purchase_tracking_snapshot WHERE snapshot_week=? ORDER BY branch_name",
         (latest_week,)
     ).fetchall()
+
+    branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in get_branches()}
+
+    prev_purchase_map = {}
+    for r in rows:
+        key = (r["branch_name"], r["item_name"])
+        if key in prev_purchase_map:
+            continue
+        hist = conn.execute("""
+            SELECT purchase_datetime, quantity FROM purchase_records
+            WHERE branch_name=? AND item_name=?
+            ORDER BY purchase_datetime DESC LIMIT 2
+        """, (r["branch_name"], r["item_name"])).fetchall()
+        prev_purchase_map[key] = hist
+
+    raw_stock_map = {}
+    raw_rows = conn.execute("SELECT branch_code, item_name, quantity FROM raw_inventory").fetchall()
+    for rr in raw_rows:
+        raw_stock_map[(rr["branch_code"], rr["item_name"])] = rr["quantity"]
+
     conn.close()
 
     branch_options = '<option value="">전체 지점</option>'
@@ -7265,32 +7289,53 @@ async def purchase_tracking_status_page(
 
     rows_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#888;">조건에 맞는 데이터가 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="12" style="text-align:center;padding:20px;color:#888;">조건에 맞는 데이터가 없습니다.</td></tr>'
     else:
         for r in rows:
             dev = r["deviation_days"]
             if dev is None:
                 dev_display = '<span style="color:#888;">-</span>'
             elif dev > 3:
-                dev_display = f'<span style="color:#F59E0B;font-weight:bold;">+{dev} (너무 자주 구매)</span>'
+                dev_display = f'<span style="color:#F59E0B;font-weight:bold;">+{dev}</span>'
             elif dev < -3:
-                dev_display = f'<span style="color:#EF4444;font-weight:bold;">{dev} (구매 지연)</span>'
+                dev_display = f'<span style="color:#EF4444;font-weight:bold;">{dev}</span>'
             else:
-                dev_display = f'<span style="color:#22C55E;">{dev:+d} (적정)</span>'
+                dev_display = f'<span style="color:#22C55E;">{dev:+d}</span>'
 
             last_date_display = (r["last_purchase_date"] or "-")[:16]
             next_date_display = r["recommended_next_date"] or "-"
-            qty_display = f"{r['recommended_qty']:g}" if r["recommended_qty"] is not None else "-"
+
+            raw_qty = r["recommended_qty"]
+            if raw_qty is not None and raw_qty < 5:
+                qty_display = "5 (최소값)"
+            elif raw_qty is not None:
+                qty_display = f"{raw_qty:g}"
+            else:
+                qty_display = "-"
+
+            key = (r["branch_name"], r["item_name"])
+            hist = prev_purchase_map.get(key, [])
+            last_qty_display = f"{hist[0]['quantity']:g}" if len(hist) >= 1 else "-"
+            prev_date_display = hist[1]["purchase_datetime"][:16] if len(hist) >= 2 else "-"
+            prev_qty_display = f"{hist[1]['quantity']:g}" if len(hist) >= 2 else "-"
+
+            branch_code = branch_name_to_code.get(r["branch_name"])
+            current_stock = raw_stock_map.get((branch_code, r["item_name"])) if branch_code else None
+            stock_display = f"{current_stock:g}" if current_stock is not None else "-"
 
             rows_html += f"""
             <tr>
               <td>{r['branch_name']}</td>
               <td>{r['item_name']}</td>
               <td style="font-size:12px;">{last_date_display}</td>
+              <td style="text-align:center;">{last_qty_display}</td>
+              <td style="font-size:12px;color:#888;">{prev_date_display}</td>
+              <td style="text-align:center;color:#888;">{prev_qty_display}</td>
               <td style="text-align:center;">{r['actual_interval_days']}일</td>
               <td style="text-align:center;">{r['lead_time_days']}일</td>
               <td>{dev_display}</td>
               <td style="font-size:12px;">{next_date_display}</td>
+              <td style="text-align:right;">{stock_display}</td>
               <td style="text-align:right;font-weight:bold;">{qty_display}</td>
             </tr>
             """
@@ -7302,8 +7347,9 @@ async def purchase_tracking_status_page(
     </div>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">
-        기준 주차: <b>{latest_week}</b> · 편차가 큰 순서로 정렬됩니다 (가장 시급한 조정이 필요한 상품이 위로).
+        기준 주차: <b>{latest_week}</b> · 편차가 큰 순서로 정렬됩니다.
         <span style="color:#F59E0B;">주황(너무 자주 구매)</span> / <span style="color:#EF4444;">빨강(구매 지연)</span> / <span style="color:#22C55E;">초록(적정)</span>
+        · 추천수량은 최소 5개로 보정됩니다.
       </p>
     </div>
     <div class="card">
@@ -7316,24 +7362,144 @@ async def purchase_tracking_status_page(
           <label style="font-size:12px;color:#888;">상품명 검색</label>
           <input name="search_item" value="{search_item}" placeholder="상품명 검색" style="margin-top:4px;">
         </div>
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">마지막구매일</label>
+          <input name="filter_date" type="date" value="{filter_date}" style="margin-top:4px;">
+        </div>
         <button class="btn" type="submit">검색</button>
         <a href="/master/purchase-tracking/status" style="padding:10px 14px;background:#eee;
            border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+        <a href="/master/purchase-tracking/status/export?filter_branch={filter_branch}&search_item={search_item}&filter_date={filter_date}"
+           class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
       </form>
     </div>
     <div class="card">
-      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 500건까지 표시)</p>
-      <table>
-        <thead><tr>
-          <th>지점</th><th>상품명</th><th>마지막구매일</th><th>실제주기(A)</th><th>목표주기(B)</th>
-          <th>편차</th><th>다음추천발주일</th><th>추천수량</th>
-        </tr></thead>
-        <tbody>{rows_html}</tbody>
-      </table>
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (전체 조회)</p>
+      <div class="table-scroll-wrap">
+        <table style="min-width:1200px;">
+          <thead><tr>
+            <th style="min-width:90px;">지점</th>
+            <th style="min-width:160px;">상품명</th>
+            <th style="min-width:90px;">마지막구매일</th>
+            <th style="min-width:60px;">마지막수량</th>
+            <th style="min-width:90px;">직전구매일</th>
+            <th style="min-width:60px;">직전수량</th>
+            <th style="min-width:60px;">실제(A)</th>
+            <th style="min-width:60px;">목표(B)</th>
+            <th style="min-width:60px;">편차</th>
+            <th style="min-width:90px;">추천발주일</th>
+            <th style="min-width:70px;">현재고</th>
+            <th style="min-width:80px;">추천수량</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      </div>
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
 
+@app.get("/master/purchase-tracking/status/export")
+async def purchase_tracking_status_export(
+    session_token: str = Cookie(default=None),
+    filter_branch: str = "",
+    search_item: str = "",
+    filter_date: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    latest_week_row = conn.execute(
+        "SELECT MAX(snapshot_week) as w FROM purchase_tracking_snapshot"
+    ).fetchone()
+    latest_week = latest_week_row["w"] if latest_week_row else None
+
+    if not latest_week:
+        conn.close()
+        return RedirectResponse(url="/master/purchase-tracking/status", status_code=303)
+
+    query = "SELECT * FROM purchase_tracking_snapshot WHERE snapshot_week=?"
+    params: list = [latest_week]
+    if filter_branch:
+        query += " AND branch_name=?"
+        params.append(filter_branch)
+    if search_item:
+        query += " AND item_name LIKE ?"
+        params.append(f"%{search_item}%")
+    if filter_date:
+        query += " AND last_purchase_date LIKE ?"
+        params.append(f"{filter_date}%")
+    query += " ORDER BY ABS(deviation_days) DESC"
+
+    rows = conn.execute(query, params).fetchall()
+
+    branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in get_branches()}
+
+    prev_purchase_map = {}
+    for r in rows:
+        key = (r["branch_name"], r["item_name"])
+        if key in prev_purchase_map:
+            continue
+        hist = conn.execute("""
+            SELECT purchase_datetime, quantity FROM purchase_records
+            WHERE branch_name=? AND item_name=?
+            ORDER BY purchase_datetime DESC LIMIT 2
+        """, (r["branch_name"], r["item_name"])).fetchall()
+        prev_purchase_map[key] = hist
+
+    raw_stock_map = {}
+    raw_rows = conn.execute("SELECT branch_code, item_name, quantity FROM raw_inventory").fetchall()
+    for rr in raw_rows:
+        raw_stock_map[(rr["branch_code"], rr["item_name"])] = rr["quantity"]
+
+    conn.close()
+
+    import io
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "발주추천현황"
+    headers = ["지점", "상품명", "마지막구매일", "마지막수량", "직전구매일", "직전수량",
+               "실제주기(A)", "목표주기(B)", "편차", "추천발주일", "현재고", "추천수량"]
+    ws.append(headers)
+
+    for r in rows:
+        key = (r["branch_name"], r["item_name"])
+        hist = prev_purchase_map.get(key, [])
+        last_qty = hist[0]["quantity"] if len(hist) >= 1 else None
+        prev_date = hist[1]["purchase_datetime"] if len(hist) >= 2 else None
+        prev_qty = hist[1]["quantity"] if len(hist) >= 2 else None
+
+        branch_code = branch_name_to_code.get(r["branch_name"])
+        current_stock = raw_stock_map.get((branch_code, r["item_name"])) if branch_code else None
+
+        raw_qty = r["recommended_qty"]
+        final_qty = 5 if (raw_qty is not None and raw_qty < 5) else raw_qty
+
+        ws.append([
+            r["branch_name"], r["item_name"], r["last_purchase_date"], last_qty,
+            prev_date, prev_qty, r["actual_interval_days"], r["lead_time_days"],
+            r["deviation_days"], r["recommended_next_date"], current_stock, final_qty
+        ])
+
+    for col_idx in range(1, len(headers) + 1):
+        ws.column_dimensions[chr(64 + col_idx)].width = 18
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"발주추천현황_{latest_week}.xlsx"
+    from urllib.parse import quote
+    encoded_filename = quote(filename)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
+    )
 
 @app.get("/master/purchase-tracking/history", response_class=HTMLResponse)
 async def purchase_tracking_history_page(
