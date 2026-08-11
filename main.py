@@ -7633,6 +7633,116 @@ async def purchase_tracking_history_page(
     """
     return HTMLResponse(content=render_page(content, user, "master"))
 
+@app.get("/master/purchase-order/branch-exceptions", response_class=HTMLResponse)
+async def purchase_order_branch_exceptions_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    exception_rows = conn.execute("SELECT branch_code, exception_type FROM purchase_order_branch_exception").fetchall()
+    conn.close()
+
+    exception_set = {(r["branch_code"], r["exception_type"]) for r in exception_rows}
+
+    branches = get_branches(branch_type='branch')
+
+    rows_html = ""
+    for b in branches:
+        monthly_checked = "checked" if (b["branch_code"], "monthly_override") in exception_set else ""
+        consumable_checked = "checked" if (b["branch_code"], "consumable_include") in exception_set else ""
+        rows_html += f"""
+        <tr>
+          <td>{b['branch_name']}</td>
+          <td style="text-align:center;">
+            <input type="checkbox" class="exc-check" data-branch="{b['branch_code']}" data-type="monthly_override" {monthly_checked} style="width:18px;height:18px;">
+          </td>
+          <td style="text-align:center;">
+            <input type="checkbox" class="exc-check" data-branch="{b['branch_code']}" data-type="consumable_include" {consumable_checked} style="width:18px;height:18px;">
+          </td>
+        </tr>
+        """
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>🏬 발주서 지점 예외 설정</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">
+        <b>월 1회 예외</b>: 체크된 지점은 리드타임 35 이하 상품도 전부 월 1회 발주로 처리됩니다 (주간 발주에서 제외).<br>
+        <b>소모품 포함</b>: 체크된 지점은 소모품도 발주 목록에서 제외하지 않고 포함시킵니다.<br>
+        체크박스를 클릭하면 즉시 저장됩니다.
+      </p>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>지점</th><th style="text-align:center;">월 1회 예외</th><th style="text-align:center;">소모품 포함</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    <script>
+      document.querySelectorAll('.exc-check').forEach(function(cb) {{
+        cb.addEventListener('change', async function() {{
+          const branchCode = cb.dataset.branch;
+          const excType = cb.dataset.type;
+          const enabled = cb.checked;
+          try {{
+            const res = await fetch('/master/purchase-order/branch-exceptions/toggle', {{
+              method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ branch_code: branchCode, exception_type: excType, enabled: enabled }})
+            }});
+            if (!res.ok) {{
+              alert('저장 실패');
+              cb.checked = !enabled;
+            }}
+          }} catch(e) {{
+            alert('저장 중 오류가 발생했습니다.');
+            cb.checked = !enabled;
+          }}
+        }});
+      }});
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/purchase-order/branch-exceptions/toggle")
+async def purchase_order_branch_exceptions_toggle(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    exception_type = data.get("exception_type", "").strip()
+    enabled = bool(data.get("enabled", False))
+
+    if not branch_code or exception_type not in ("monthly_override", "consumable_include"):
+        return JSONResponse(status_code=400, content={"detail": "잘못된 요청입니다."})
+
+    conn = get_conn()
+    if enabled:
+        existing = conn.execute(
+            "SELECT id FROM purchase_order_branch_exception WHERE branch_code=? AND exception_type=?",
+            (branch_code, exception_type)
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO purchase_order_branch_exception (branch_code, exception_type, created_at) VALUES (?, ?, ?)",
+                (branch_code, exception_type, datetime.now().isoformat())
+            )
+    else:
+        conn.execute(
+            "DELETE FROM purchase_order_branch_exception WHERE branch_code=? AND exception_type=?",
+            (branch_code, exception_type)
+        )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
 @app.post("/master/raw-upload/ajax")
 async def raw_upload_ajax(
     session_token: str = Cookie(default=None),
@@ -8016,7 +8126,9 @@ async def _compute_purchase_tracking_snapshot():
     }
 
 async def _process_lead_time_upload(file: UploadFile):
-    """상품별 리드타임(목표 구매주기) 엑셀 업로드 처리 — 헤더 2행, 상품명 기준 UPSERT"""
+    """상품별 리드타임/MOQ(단위)/소모품여부 엑셀 업로드 처리 — 헤더 2행, 상품명 기준 UPSERT
+    ⚠️ 2026-08-07 확장: 기존 리드타임 전용 업로드에 단위(MOQ)/소모품종류 파싱 추가 (같은 상품내역 파일 재사용)
+    """
     contents = await file.read()
     import io
     wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True)
@@ -8039,6 +8151,10 @@ async def _process_lead_time_upload(file: UploadFile):
                 found["item_name"] = col_idx
             if text == "리드타임" and "lead_time" not in found:
                 found["lead_time"] = col_idx
+            if text == "단위" and "moq" not in found:
+                found["moq"] = col_idx
+            if text == "소모품종류" and "consumable" not in found:
+                found["consumable"] = col_idx
         if "item_name" in found and "lead_time" in found:
             header_row = row_idx
             col_map = found
@@ -8067,13 +8183,32 @@ async def _process_lead_time_upload(file: UploadFile):
 
             lead_time_days = int(float(str(lead_time_raw)))
 
+            moq = 1
+            if "moq" in col_map:
+                moq_col = col_map["moq"]
+                if moq_col < len(row) and row[moq_col] not in (None, ""):
+                    try:
+                        moq = int(float(str(row[moq_col])))
+                        if moq <= 0:
+                            moq = 1
+                    except Exception:
+                        moq = 1
+
+            is_consumable = False
+            if "consumable" in col_map:
+                cons_col = col_map["consumable"]
+                if cons_col < len(row) and row[cons_col] not in (None, ""):
+                    is_consumable = True
+
             conn.execute("""
-                INSERT INTO product_lead_time (item_name, lead_time_days, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO product_lead_time (item_name, lead_time_days, moq, is_consumable, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT (item_name) DO UPDATE SET
                     lead_time_days=excluded.lead_time_days,
+                    moq=excluded.moq,
+                    is_consumable=excluded.is_consumable,
                     updated_at=excluded.updated_at
-            """, (item_name, lead_time_days, now))
+            """, (item_name, lead_time_days, moq, is_consumable, now))
             success += 1
         except Exception as e:
             errors.append(f"행 {idx}: {str(e)[:50]}")
@@ -8082,7 +8217,8 @@ async def _process_lead_time_upload(file: UploadFile):
     conn.commit()
     conn.close()
 
-    return {"success": success, "skipped": skipped, "errors": errors[:10], "header_row_used": header_row}
+    return {"success": success, "skipped": skipped, "errors": errors[:10], "header_row_used": header_row,
+            "col_map_debug": {k: v for k, v in col_map.items()}}
 
 async def _fetch_and_process_purchase_records_csv():
     """구매내역 CSV를 외부 소스(URL)에서 다운로드하여 자동 반영. URL은 PURCHASE_RECORDS_CSV_URL 환경변수로 지정."""
