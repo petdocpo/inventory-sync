@@ -7248,7 +7248,9 @@ async def purchase_tracking_upload_leadtime(
 @app.get("/master/purchase-order/product-settings", response_class=HTMLResponse)
 async def purchase_order_product_settings_page(
     session_token: str = Cookie(default=None),
-    search_item: str = ""
+    search_item: str = "",
+    filter_consumable: str = "",
+    filter_has_exception: str = ""
 ):
     user = get_session(session_token)
     if not user or user["role"] != "master":
@@ -7260,6 +7262,10 @@ async def purchase_order_product_settings_page(
     if search_item:
         query += " AND item_name LIKE ?"
         params.append(f"%{search_item}%")
+    if filter_consumable == "yes":
+        query += " AND is_consumable = TRUE"
+    elif filter_consumable == "no":
+        query += " AND is_consumable = FALSE"
     query += " ORDER BY item_name LIMIT 300"
     rows = conn.execute(query, params).fetchall()
 
@@ -7319,9 +7325,15 @@ async def purchase_order_product_settings_page(
       <div id="addPsResult" style="margin-top:8px;font-size:13px;"></div>
     </div>
     <div class="card">
-      <form method="get" action="/master/purchase-order/product-settings" style="display:flex;gap:8px;margin-bottom:16px;">
-        <input name="search_item" value="{search_item}" placeholder="상품명 검색" style="flex:1;">
+      <form method="get" action="/master/purchase-order/product-settings" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+        <input name="search_item" value="{search_item}" placeholder="상품명 검색" style="flex:2;min-width:200px;">
+        <select name="filter_consumable" style="flex:1;min-width:120px;">
+          <option value="" {'selected' if not filter_consumable else ''}>전체</option>
+          <option value="yes" {'selected' if filter_consumable == 'yes' else ''}>소모품만</option>
+          <option value="no" {'selected' if filter_consumable == 'no' else ''}>일반상품만</option>
+        </select>
         <button class="btn" type="submit">검색</button>
+        <a href="/master/purchase-order/product-settings" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
       </form>
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
       <table>
