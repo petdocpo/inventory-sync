@@ -6671,6 +6671,20 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">구매 패턴 분석/추천</div>
         </div>
       </a>
+      <a href="/master/purchase-order/product-settings" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📝</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">상품 설정</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">리드타임/MOQ/소모품/예외</div>
+        </div>
+      </a>
+      <a href="/master/purchase-order/branch-exceptions" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🏬</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주서 지점 예외</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">소모품 포함 지점 설정</div>
+        </div>
+      </a>
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -7248,20 +7262,39 @@ async def purchase_order_product_settings_page(
         params.append(f"%{search_item}%")
     query += " ORDER BY item_name LIMIT 300"
     rows = conn.execute(query, params).fetchall()
+
+    monthly_exc_rows = conn.execute("SELECT item_name, branch_code FROM purchase_order_monthly_exception").fetchall()
     conn.close()
+
+    monthly_exc_map: Dict[str, list] = {}
+    for r in monthly_exc_rows:
+        monthly_exc_map.setdefault(r["item_name"], []).append(r["branch_code"])
+
+    branches = get_branches(branch_type='branch')
+    branch_name_map = {b["branch_code"]: b["branch_name"] for b in branches}
+    branch_options_json = json.dumps(
+        [{"code": b["branch_code"], "name": b["branch_name"]} for b in branches], ensure_ascii=False
+    )
 
     rows_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="5" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
     else:
         for r in rows:
             consumable_checked = "checked" if r["is_consumable"] else ""
+            exc_branches = monthly_exc_map.get(r["item_name"], [])
+            exc_badge = f'<span class="badge-green">{len(exc_branches)}개 지점</span>' if exc_branches else '<span style="color:#888;font-size:11px;">없음</span>'
+            safe_item_name = r["item_name"].replace("'", "")
             rows_html += f"""
             <tr>
               <td>{r['item_name']}</td>
               <td><input type="number" class="ps-leadtime" data-id="{r['id']}" value="{r['lead_time_days']}" style="width:80px;padding:6px;"></td>
               <td><input type="number" class="ps-moq" data-id="{r['id']}" value="{r['moq'] or 1}" style="width:80px;padding:6px;"></td>
               <td style="text-align:center;"><input type="checkbox" class="ps-consumable" data-id="{r['id']}" {consumable_checked} style="width:18px;height:18px;"></td>
+              <td>
+                {exc_badge}
+                <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="openMonthlyExc('{safe_item_name}')">설정</button>
+              </td>
               <td><button class="btn" style="font-size:12px;padding:6px 12px;" onclick="savePsRow({r['id']})">저장</button></td>
             </tr>
             """
@@ -7269,10 +7302,10 @@ async def purchase_order_product_settings_page(
     content = f"""
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
       <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
-      <h2>📝 상품 설정 (리드타임/MOQ/소모품)</h2>
+      <h2>📝 상품 설정 (리드타임/MOQ/소모품/월1회예외)</h2>
     </div>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <p style="font-size:13px;color:#1E40AF;">기존 리드타임 엑셀 업로드로 등록된 상품을 화면에서 직접 수정하거나, 새 상품을 추가할 수 있습니다.</p>
+      <p style="font-size:13px;color:#1E40AF;">기존 리드타임 엑셀 업로드로 등록된 상품을 화면에서 직접 수정하거나, 새 상품을 추가할 수 있습니다. "월1회예외" 열에서 상품별로 예외 지점을 지정하세요.</p>
     </div>
     <div class="card">
       <h3 style="margin-bottom:8px;">새 상품 추가</h3>
@@ -7292,11 +7325,53 @@ async def purchase_order_product_settings_page(
       </form>
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
       <table>
-        <thead><tr><th>상품명</th><th>리드타임(일)</th><th>MOQ</th><th>소모품</th><th></th></tr></thead>
+        <thead><tr><th>상품명</th><th>리드타임(일)</th><th>MOQ</th><th>소모품</th><th>월1회예외 지점</th><th></th></tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
+
+    <div id="monthlyExcModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:80vh;overflow-y:auto;">
+        <h3 id="monthlyExcTitle" style="margin-bottom:12px;">월1회 예외 지점 설정</h3>
+        <div id="monthlyExcBranchList" style="margin-bottom:16px;"></div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeMonthlyExc()">닫기</button>
+          <button class="btn" style="flex:1;" onclick="saveMonthlyExc()">저장</button>
+        </div>
+      </div>
+    </div>
+
     <script>
+      const allBranches = {branch_options_json};
+      let currentExcItemName = '';
+
+      async function openMonthlyExc(itemName) {{
+        currentExcItemName = itemName;
+        document.getElementById('monthlyExcTitle').innerText = itemName + ' — 월1회 예외 지점';
+        const res = await fetch('/master/purchase-order/monthly-exception/list?item_name=' + encodeURIComponent(itemName));
+        const data = await res.json();
+        const checkedSet = new Set(data.branches || []);
+        const container = document.getElementById('monthlyExcBranchList');
+        container.innerHTML = allBranches.map(b =>
+          '<label style="display:block;font-size:13px;margin-bottom:6px;"><input type="checkbox" class="mexc-branch" value="' + b.code + '" ' +
+          (checkedSet.has(b.code) ? 'checked' : '') + ' style="margin-right:6px;">' + b.name + '</label>'
+        ).join('');
+        document.getElementById('monthlyExcModal').style.display = 'flex';
+      }}
+
+      function closeMonthlyExc() {{
+        document.getElementById('monthlyExcModal').style.display = 'none';
+      }}
+
+      async function saveMonthlyExc() {{
+        const checked = Array.from(document.querySelectorAll('.mexc-branch:checked')).map(c => c.value);
+        const res = await fetch('/master/purchase-order/monthly-exception/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ item_name: currentExcItemName, branch_codes: checked }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('저장 실패'); }}
+      }}
+
       async function addPsItem() {{
         const name = document.getElementById('newItemName').value.trim();
         const leadTime = parseInt(document.getElementById('newLeadTime').value);
@@ -7366,6 +7441,44 @@ async def purchase_order_product_settings_save(request: Request, session_token: 
                 lead_time_days=excluded.lead_time_days, moq=excluded.moq,
                 is_consumable=excluded.is_consumable, updated_at=excluded.updated_at
         """, (item_name, lead_time_days, moq, is_consumable, now))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/master/purchase-order/monthly-exception/list")
+async def purchase_order_monthly_exception_list(item_name: str, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT branch_code FROM purchase_order_monthly_exception WHERE item_name=?", (item_name,)
+    ).fetchall()
+    conn.close()
+    return JSONResponse(content={"branches": [r["branch_code"] for r in rows]})
+
+
+@app.post("/master/purchase-order/monthly-exception/save")
+async def purchase_order_monthly_exception_save(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    item_name = data.get("item_name", "").strip()
+    branch_codes = data.get("branch_codes", [])
+
+    if not item_name:
+        return JSONResponse(status_code=400, content={"detail": "상품명이 지정되지 않았습니다."})
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    conn.execute("DELETE FROM purchase_order_monthly_exception WHERE item_name=?", (item_name,))
+    for bc in branch_codes:
+        conn.execute(
+            "INSERT INTO purchase_order_monthly_exception (branch_code, item_name, created_at) VALUES (?, ?, ?)",
+            (bc, item_name, now)
+        )
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
@@ -7799,23 +7912,21 @@ async def purchase_order_branch_exceptions_page(session_token: str = Cookie(defa
         return RedirectResponse(url="/login", status_code=303)
 
     conn = get_conn()
-    exception_rows = conn.execute("SELECT branch_code, exception_type FROM purchase_order_branch_exception").fetchall()
+    exception_rows = conn.execute(
+        "SELECT branch_code FROM purchase_order_branch_exception WHERE exception_type='consumable_include'"
+    ).fetchall()
     conn.close()
 
-    exception_set = {(r["branch_code"], r["exception_type"]) for r in exception_rows}
+    exception_set = {r["branch_code"] for r in exception_rows}
 
     branches = get_branches(branch_type='branch')
 
     rows_html = ""
     for b in branches:
-        monthly_checked = "checked" if (b["branch_code"], "monthly_override") in exception_set else ""
-        consumable_checked = "checked" if (b["branch_code"], "consumable_include") in exception_set else ""
+        consumable_checked = "checked" if b["branch_code"] in exception_set else ""
         rows_html += f"""
         <tr>
           <td>{b['branch_name']}</td>
-          <td style="text-align:center;">
-            <input type="checkbox" class="exc-check" data-branch="{b['branch_code']}" data-type="monthly_override" {monthly_checked} style="width:18px;height:18px;">
-          </td>
           <td style="text-align:center;">
             <input type="checkbox" class="exc-check" data-branch="{b['branch_code']}" data-type="consumable_include" {consumable_checked} style="width:18px;height:18px;">
           </td>
@@ -7829,15 +7940,15 @@ async def purchase_order_branch_exceptions_page(session_token: str = Cookie(defa
     </div>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">
-        <b>월 1회 예외</b>: 체크된 지점은 리드타임 35 이하 상품도 전부 월 1회 발주로 처리됩니다 (주간 발주에서 제외).<br>
         <b>소모품 포함</b>: 체크된 지점은 소모품도 발주 목록에서 제외하지 않고 포함시킵니다.<br>
-        체크박스를 클릭하면 즉시 저장됩니다.
+        체크박스를 클릭하면 즉시 저장됩니다.<br>
+        <b>월 1회 예외(지점+상품별 개별 지정)</b>는 <a href="/master/purchase-order/product-settings" style="color:#1E40AF;text-decoration:underline;">상품 설정 페이지</a>에서 상품별로 지정합니다.
       </p>
     </div>
     <div class="card">
       <table>
         <thead><tr>
-          <th>지점</th><th style="text-align:center;">월 1회 예외</th><th style="text-align:center;">소모품 포함</th>
+          <th>지점</th><th style="text-align:center;">소모품 포함</th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
@@ -7879,7 +7990,7 @@ async def purchase_order_branch_exceptions_toggle(request: Request, session_toke
     exception_type = data.get("exception_type", "").strip()
     enabled = bool(data.get("enabled", False))
 
-    if not branch_code or exception_type not in ("monthly_override", "consumable_include"):
+    if not branch_code or exception_type != "consumable_include":
         return JSONResponse(status_code=400, content={"detail": "잘못된 요청입니다."})
 
     conn = get_conn()
@@ -7901,6 +8012,7 @@ async def purchase_order_branch_exceptions_toggle(request: Request, session_toke
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
+
 
 @app.post("/master/raw-upload/ajax")
 async def raw_upload_ajax(
