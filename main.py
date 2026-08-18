@@ -7250,11 +7250,18 @@ async def purchase_order_product_settings_page(
     session_token: str = Cookie(default=None),
     search_item: str = "",
     filter_consumable: str = "",
-    filter_has_exception: str = ""
+    filter_has_exception: str = "",
+    sort_by: str = "item_name",
+    sort_dir: str = "asc"
 ):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+
+    allowed_sort_cols = {"item_name", "lead_time_days", "moq", "is_consumable"}
+    if sort_by not in allowed_sort_cols:
+        sort_by = "item_name"
+    sort_dir_sql = "DESC" if sort_dir == "desc" else "ASC"
 
     conn = get_conn()
     query = "SELECT * FROM product_lead_time WHERE 1=1"
@@ -7266,7 +7273,7 @@ async def purchase_order_product_settings_page(
         query += " AND is_consumable = TRUE"
     elif filter_consumable == "no":
         query += " AND is_consumable = FALSE"
-    query += " ORDER BY item_name LIMIT 300"
+    query += f" ORDER BY {sort_by} {sort_dir_sql} LIMIT 300"
     rows = conn.execute(query, params).fetchall()
 
     monthly_exc_rows = conn.execute("SELECT item_name, branch_code FROM purchase_order_monthly_exception").fetchall()
@@ -7337,7 +7344,13 @@ async def purchase_order_product_settings_page(
       </form>
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
       <table>
-        <thead><tr><th>상품명</th><th>리드타임(일)</th><th>MOQ</th><th>소모품</th><th>월1회예외 지점</th><th></th></tr></thead>
+        <thead><tr><th>상품명</th><th>리드타임(일)</th><th>MOQ</th><        <thead><tr>
+          <th style="cursor:pointer;" onclick="sortPs('item_name')">상품명 {'▲' if sort_by=='item_name' and sort_dir=='asc' else ('▼' if sort_by=='item_name' else '')}</th>
+          <th style="cursor:pointer;" onclick="sortPs('lead_time_days')">리드타임(일) {'▲' if sort_by=='lead_time_days' and sort_dir=='asc' else ('▼' if sort_by=='lead_time_days' else '')}</th>
+          <th style="cursor:pointer;" onclick="sortPs('moq')">MOQ {'▲' if sort_by=='moq' and sort_dir=='asc' else ('▼' if sort_by=='moq' else '')}</th>
+          <th style="cursor:pointer;" onclick="sortPs('is_consumable')">소모품 {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
+          <th>월1회예외 지점</th><th></th>
+        </tr></thead>th>소모품</th><th>월1회예외 지점</th><th></th></tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
@@ -7355,6 +7368,17 @@ async def purchase_order_product_settings_page(
 
     <script>
       const allBranches = {branch_options_json};
+
+        function sortPs(col) {{
+        const params = new URLSearchParams(window.location.search);
+        const curSort = params.get('sort_by') || 'item_name';
+        const curDir = params.get('sort_dir') || 'asc';
+        const newDir = (curSort === col && curDir === 'asc') ? 'desc' : 'asc';
+        params.set('sort_by', col);
+        params.set('sort_dir', newDir);
+        window.location.search = params.toString();
+      }}
+
       let currentExcItemName = '';
 
       async function openMonthlyExc(itemName) {{
@@ -7501,7 +7525,9 @@ async def purchase_tracking_status_page(
     filter_branch: str = "",
     search_item: str = "",
     filter_date: str = "",
-    filter_deviation: str = ""
+    filter_deviation: str = "",
+    sort_by: str = "deviation_abs",
+    sort_dir: str = "desc"
 ):
     user = get_session(session_token)
     if not user or user["role"] != "master":
@@ -7544,7 +7570,18 @@ async def purchase_tracking_status_page(
         query += " AND deviation_days < -3"
     elif filter_deviation == "ok":
         query += " AND deviation_days BETWEEN -3 AND 3"
-    query += " ORDER BY ABS(deviation_days) DESC"
+
+    sort_dir_sql = "DESC" if sort_dir == "desc" else "ASC"
+    allowed_sort_map = {
+        "branch_name": "branch_name",
+        "item_name": "item_name",
+        "last_purchase_date": "last_purchase_date",
+        "deviation": "deviation_days",
+        "recommended_qty": "recommended_qty",
+        "deviation_abs": "ABS(deviation_days)",
+    }
+    sort_col_sql = allowed_sort_map.get(sort_by, "ABS(deviation_days)")
+    query += f" ORDER BY {sort_col_sql} {sort_dir_sql}"
 
     rows = conn.execute(query, params).fetchall()
 
@@ -7591,9 +7628,14 @@ async def purchase_tracking_status_page(
         <option value="delay" {'selected' if filter_deviation == 'delay' else ''}>구매지연</option>
     """
 
+    def sort_arrow(col):
+        if sort_by != col:
+            return ""
+        return "▲" if sort_dir == "asc" else "▼"
+
     rows_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#888;">조건에 맞는 데이터가 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="9" style="text-align:center;padding:20px;color:#888;">조건에 맞는 데이터가 없습니다.</td></tr>'
     else:
         for idx, r in enumerate(rows):
             dev = r["deviation_days"]
@@ -7630,20 +7672,20 @@ async def purchase_tracking_status_page(
 
             rows_html += f"""
             <tr style="cursor:pointer;" onclick="togglePtDetail('{detail_id}')">
-              <td>{r['branch_name']}</td>
-              <td>{r['item_name']}</td>
-              <td style="font-size:11px;">{last_date_display}</td>
-              <td style="text-align:center;">{last_qty_display}</td>
-              <td style="text-align:right;">{stock_display}</td>
-              <td>{dev_display}</td>
-              <td style="text-align:right;font-weight:bold;">{qty_display}</td>
-              <td style="text-align:center;color:#aaa;" id="{detail_id}_arrow">▼</td>
+              <td class="pt-col-branch">{r['branch_name']}</td>
+              <td class="pt-col-item">{r['item_name']}</td>
+              <td class="pt-col-prevdate" style="font-size:11px;color:#888;">{prev_date_display}</td>
+              <td class="pt-col-prevqty" style="text-align:center;color:#888;">{prev_qty_display}</td>
+              <td class="pt-col-lastdate" style="font-size:11px;">{last_date_display}</td>
+              <td class="pt-col-lastqty" style="text-align:center;">{last_qty_display}</td>
+              <td class="pt-col-stock" style="text-align:right;">{stock_display}</td>
+              <td class="pt-col-deviation">{dev_display}</td>
+              <td class="pt-col-qty" style="text-align:right;font-weight:bold;">{qty_display}</td>
+              <td class="pt-col-arrow" style="text-align:center;color:#aaa;" id="{detail_id}_arrow">▼</td>
             </tr>
             <tr id="{detail_id}" style="display:none;background:#f8fafc;">
-              <td colspan="8" style="padding:10px 16px;">
+              <td colspan="10" style="padding:10px 16px;">
                 <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(130px, 1fr));gap:8px;font-size:11px;">
-                  <div><span style="color:#888;">직전구매일</span><br><b>{prev_date_display}</b></div>
-                  <div><span style="color:#888;">직전수량</span><br><b>{prev_qty_display}</b></div>
                   <div><span style="color:#888;">실제주기(A)</span><br><b>{r['actual_interval_days']}일</b></div>
                   <div><span style="color:#888;">목표주기(B)</span><br><b>{r['lead_time_days']}일</b></div>
                   <div><span style="color:#888;">추천발주일</span><br><b>{next_date_display}</b></div>
@@ -7659,13 +7701,15 @@ async def purchase_tracking_status_page(
     </div>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">
-        기준 주차: <b>{latest_week}</b> · 편차가 큰 순서로 정렬됩니다. 행을 클릭하면 상세정보가 펼쳐집니다.<br>
+        기준 주차: <b>{latest_week}</b> · 컬럼 헤더를 클릭하면 정렬됩니다. 행을 클릭하면 상세정보가 펼쳐집니다.<br>
         <span style="color:#F59E0B;">주황(과다구매)</span> / <span style="color:#EF4444;">빨강(구매지연)</span> / <span style="color:#22C55E;">초록(적정)</span>
         · 추천수량은 최소 5개로 보정됩니다.
       </p>
     </div>
     <div class="card">
       <form method="get" action="/master/purchase-tracking/status" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <input type="hidden" name="sort_by" value="{sort_by}">
+        <input type="hidden" name="sort_dir" value="{sort_dir}">
         <div style="flex:1;min-width:130px;">
           <label style="font-size:12px;color:#888;">지점 필터</label>
           <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
@@ -7685,20 +7729,111 @@ async def purchase_tracking_status_page(
         <button class="btn" type="submit">검색</button>
         <a href="/master/purchase-tracking/status" style="padding:10px 14px;background:#eee;
            border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+        <button type="button" class="btn" style="background:#64748B;" onclick="openColSettings()">⚙️ 컬럼 설정</button>
         <a href="/master/purchase-tracking/status/export?filter_branch={filter_branch}&search_item={search_item}&filter_date={filter_date}&filter_deviation={filter_deviation}"
            class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
       </form>
     </div>
     <div class="card">
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (전체 조회)</p>
-      <table>
+      <table id="ptTable">
         <thead><tr>
-          <th>지점</th><th>상품명</th><th>마지막구매일</th><th>구매수량</th><th>현재고</th><th>편차</th><th>추천수량</th><th></th>
+          <th class="pt-col-branch" style="cursor:pointer;" onclick="sortPt('branch_name')">지점 {sort_arrow('branch_name')}</th>
+          <th class="pt-col-item" style="cursor:pointer;" onclick="sortPt('item_name')">상품명 {sort_arrow('item_name')}</th>
+          <th class="pt-col-prevdate">직전구매일</th>
+          <th class="pt-col-prevqty">직전수량</th>
+          <th class="pt-col-lastdate" style="cursor:pointer;" onclick="sortPt('last_purchase_date')">마지막구매일 {sort_arrow('last_purchase_date')}</th>
+          <th class="pt-col-lastqty">구매수량</th>
+          <th class="pt-col-stock">현재고</th>
+          <th class="pt-col-deviation" style="cursor:pointer;" onclick="sortPt('deviation')">편차 {sort_arrow('deviation')}</th>
+          <th class="pt-col-qty" style="cursor:pointer;" onclick="sortPt('recommended_qty')">추천수량 {sort_arrow('recommended_qty')}</th>
+          <th class="pt-col-arrow"></th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
+
+    <div id="colSettingsModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:360px;width:90%;">
+        <h3 style="margin-bottom:12px;">⚙️ 표시할 컬럼 선택</h3>
+        <div id="colCheckboxList" style="display:flex;flex-direction:column;gap:8px;font-size:14px;"></div>
+        <div style="display:flex;gap:8px;margin-top:16px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeColSettings()">닫기</button>
+          <button class="btn" style="flex:1;" onclick="applyColSettings()">적용</button>
+        </div>
+      </div>
+    </div>
+
     <script>
+      const PT_COLUMNS = [
+        {{ key: 'branch', label: '지점', locked: true }},
+        {{ key: 'item', label: '상품명', locked: true }},
+        {{ key: 'prevdate', label: '직전구매일', locked: false }},
+        {{ key: 'prevqty', label: '직전수량', locked: false }},
+        {{ key: 'lastdate', label: '마지막구매일', locked: false }},
+        {{ key: 'lastqty', label: '구매수량', locked: false }},
+        {{ key: 'stock', label: '현재고', locked: false }},
+        {{ key: 'deviation', label: '편차', locked: true }},
+        {{ key: 'qty', label: '추천수량', locked: true }},
+      ];
+      const PT_STORAGE_KEY = 'pt_status_col_settings';
+
+      function getColSettings() {{
+        try {{
+          const saved = localStorage.getItem(PT_STORAGE_KEY);
+          if (saved) return JSON.parse(saved);
+        }} catch(e) {{}}
+        const defaults = {{}};
+        PT_COLUMNS.forEach(c => defaults[c.key] = true);
+        return defaults;
+      }}
+
+      function applyColVisibility() {{
+        const settings = getColSettings();
+        PT_COLUMNS.forEach(c => {{
+          const visible = settings[c.key] !== false;
+          document.querySelectorAll('.pt-col-' + c.key).forEach(el => {{
+            el.style.display = visible ? '' : 'none';
+          }});
+        }});
+      }}
+
+      function openColSettings() {{
+        const settings = getColSettings();
+        const container = document.getElementById('colCheckboxList');
+        container.innerHTML = PT_COLUMNS.map(c =>
+          '<label style="display:flex;align-items:center;gap:8px;' + (c.locked ? 'opacity:0.5;' : '') + '">' +
+          '<input type="checkbox" class="col-setting-check" data-key="' + c.key + '" ' +
+          (settings[c.key] !== false ? 'checked' : '') + (c.locked ? ' disabled' : '') + '>' +
+          c.label + (c.locked ? ' (필수)' : '') + '</label>'
+        ).join('');
+        document.getElementById('colSettingsModal').style.display = 'flex';
+      }}
+
+      function closeColSettings() {{
+        document.getElementById('colSettingsModal').style.display = 'none';
+      }}
+
+      function applyColSettings() {{
+        const settings = {{}};
+        document.querySelectorAll('.col-setting-check').forEach(cb => {{
+          settings[cb.dataset.key] = cb.checked;
+        }});
+        localStorage.setItem(PT_STORAGE_KEY, JSON.stringify(settings));
+        applyColVisibility();
+        closeColSettings();
+      }}
+
+      function sortPt(col) {{
+        const params = new URLSearchParams(window.location.search);
+        const curSort = params.get('sort_by') || 'deviation_abs';
+        const curDir = params.get('sort_dir') || 'desc';
+        const newDir = (curSort === col && curDir === 'asc') ? 'desc' : 'asc';
+        params.set('sort_by', col);
+        params.set('sort_dir', newDir);
+        window.location.search = params.toString();
+      }}
+
       function togglePtDetail(detailId) {{
         var el = document.getElementById(detailId);
         var arrow = document.getElementById(detailId + '_arrow');
@@ -7707,6 +7842,8 @@ async def purchase_tracking_status_page(
         el.style.display = isOpen ? 'none' : 'table-row';
         if (arrow) arrow.innerText = isOpen ? '▼' : '▲';
       }}
+
+      applyColVisibility();
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
