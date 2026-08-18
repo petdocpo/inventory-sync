@@ -572,7 +572,17 @@ async def purchase_history_page(
         rows_html = ""
         for r in rows:
             order_dt_raw = r.get("order_datetime") or r.get("registered_at") or "-"
-            order_dt = order_dt_raw[:10] if order_dt_raw != "-" else "-"
+            if order_dt_raw != "-":
+                try:
+                    from datetime import timezone as _tz, timedelta as _td
+                    _dt = datetime.fromisoformat(str(order_dt_raw).replace("Z", "+00:00"))
+                    if _dt.tzinfo is None:
+                        _dt = _dt.replace(tzinfo=_tz.utc)
+                    order_dt = _dt.astimezone(_tz(_td(hours=9))).strftime("%Y-%m-%d")
+                except Exception:
+                    order_dt = order_dt_raw[:10]
+            else:
+                order_dt = "-"
             status = r.get("send_status") or ""
             status_badge = '<span class="badge-green">완료</span>' if status == "완료" else '<span class="badge-red">대기</span>'
             oid = r.get("order_id", "")
@@ -2317,14 +2327,24 @@ async def adjust_get(
     if not logs:
         log_rows = '<tr><td colspan="7" style="text-align:center;padding:16px;color:#888;">이력 없음</td></tr>'
     else:
+        from datetime import timezone as _tz, timedelta as _td
         for lg in logs:
             delta_str = f"+{lg['delta']}" if lg['delta'] > 0 else str(lg['delta'])
+            adj_display = "-"
+            if lg['adjusted_at']:
+                try:
+                    _dt = datetime.fromisoformat(str(lg['adjusted_at']).replace("Z", "+00:00"))
+                    if _dt.tzinfo is None:
+                        _dt = _dt.replace(tzinfo=_tz.utc)
+                    adj_display = _dt.astimezone(_tz(_td(hours=9))).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    adj_display = lg['adjusted_at'][:16]
             log_rows += f"""
             <tr>
               <td style="text-align:center;">
                 <input type="checkbox" name="log_ids" value="{lg['id']}" class="log-check" style="width:16px;height:16px;">
               </td>
-              <td>{lg['adjusted_at'][:16] if lg['adjusted_at'] else '-'}</td>
+              <td>{adj_display}</td>
               <td>{lg['branch_code']}</td>
               <td>{lg['item_name'] or '-'}</td>
               <td>{lg['item_code']}</td>
@@ -7210,6 +7230,145 @@ async def purchase_tracking_upload_leadtime(
     if not user or user["role"] != "master":
         return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
     return await _process_lead_time_upload(file)
+
+@app.get("/master/purchase-order/product-settings", response_class=HTMLResponse)
+async def purchase_order_product_settings_page(
+    session_token: str = Cookie(default=None),
+    search_item: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    query = "SELECT * FROM product_lead_time WHERE 1=1"
+    params: list = []
+    if search_item:
+        query += " AND item_name LIKE ?"
+        params.append(f"%{search_item}%")
+    query += " ORDER BY item_name LIMIT 300"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    rows_html = ""
+    if not rows:
+        rows_html = '<tr><td colspan="5" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
+    else:
+        for r in rows:
+            consumable_checked = "checked" if r["is_consumable"] else ""
+            rows_html += f"""
+            <tr>
+              <td>{r['item_name']}</td>
+              <td><input type="number" class="ps-leadtime" data-id="{r['id']}" value="{r['lead_time_days']}" style="width:80px;padding:6px;"></td>
+              <td><input type="number" class="ps-moq" data-id="{r['id']}" value="{r['moq'] or 1}" style="width:80px;padding:6px;"></td>
+              <td style="text-align:center;"><input type="checkbox" class="ps-consumable" data-id="{r['id']}" {consumable_checked} style="width:18px;height:18px;"></td>
+              <td><button class="btn" style="font-size:12px;padding:6px 12px;" onclick="savePsRow({r['id']})">저장</button></td>
+            </tr>
+            """
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
+      <h2>📝 상품 설정 (리드타임/MOQ/소모품)</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">기존 리드타임 엑셀 업로드로 등록된 상품을 화면에서 직접 수정하거나, 새 상품을 추가할 수 있습니다.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-bottom:8px;">새 상품 추가</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input type="text" id="newItemName" placeholder="상품명" style="flex:2;min-width:200px;">
+        <input type="number" id="newLeadTime" placeholder="리드타임(일)" style="flex:1;min-width:100px;">
+        <input type="number" id="newMoq" placeholder="MOQ(기본 1)" style="flex:1;min-width:100px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="newConsumable"> 소모품</label>
+        <button class="btn" type="button" onclick="addPsItem()">추가</button>
+      </div>
+      <div id="addPsResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+    <div class="card">
+      <form method="get" action="/master/purchase-order/product-settings" style="display:flex;gap:8px;margin-bottom:16px;">
+        <input name="search_item" value="{search_item}" placeholder="상품명 검색" style="flex:1;">
+        <button class="btn" type="submit">검색</button>
+      </form>
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
+      <table>
+        <thead><tr><th>상품명</th><th>리드타임(일)</th><th>MOQ</th><th>소모품</th><th></th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    <script>
+      async function addPsItem() {{
+        const name = document.getElementById('newItemName').value.trim();
+        const leadTime = parseInt(document.getElementById('newLeadTime').value);
+        const moq = parseInt(document.getElementById('newMoq').value) || 1;
+        const consumable = document.getElementById('newConsumable').checked;
+        if (!name || !leadTime) {{ alert('상품명과 리드타임을 입력하세요.'); return; }}
+        const res = await fetch('/master/purchase-order/product-settings/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ item_name: name, lead_time_days: leadTime, moq: moq, is_consumable: consumable }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('addPsResult').innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+      async function savePsRow(id) {{
+        const leadTimeEl = document.querySelector('.ps-leadtime[data-id="' + id + '"]');
+        const moqEl = document.querySelector('.ps-moq[data-id="' + id + '"]');
+        const consumableEl = document.querySelector('.ps-consumable[data-id="' + id + '"]');
+        const res = await fetch('/master/purchase-order/product-settings/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            id: id,
+            lead_time_days: parseInt(leadTimeEl.value),
+            moq: parseInt(moqEl.value) || 1,
+            is_consumable: consumableEl.checked
+          }})
+        }});
+        if (res.ok) {{ alert('저장되었습니다.'); }} else {{ alert('저장 실패'); }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/purchase-order/product-settings/save")
+async def purchase_order_product_settings_save(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    row_id = data.get("id")
+    item_name = data.get("item_name", "").strip()
+    lead_time_days = data.get("lead_time_days")
+    moq = data.get("moq", 1)
+    is_consumable = bool(data.get("is_consumable", False))
+
+    if lead_time_days is None:
+        return JSONResponse(status_code=400, content={"detail": "리드타임을 입력하세요."})
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    if row_id:
+        conn.execute(
+            "UPDATE product_lead_time SET lead_time_days=?, moq=?, is_consumable=?, updated_at=? WHERE id=?",
+            (lead_time_days, moq, is_consumable, now, row_id)
+        )
+    else:
+        if not item_name:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "상품명을 입력하세요."})
+        conn.execute("""
+            INSERT INTO product_lead_time (item_name, lead_time_days, moq, is_consumable, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (item_name) DO UPDATE SET
+                lead_time_days=excluded.lead_time_days, moq=excluded.moq,
+                is_consumable=excluded.is_consumable, updated_at=excluded.updated_at
+        """, (item_name, lead_time_days, moq, is_consumable, now))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
 
 @app.get("/master/purchase-tracking/status", response_class=HTMLResponse)
 async def purchase_tracking_status_page(
