@@ -2673,9 +2673,9 @@ async def scan_log_page(
         branches = get_branches()
         for b in branches:
             sel = "selected" if filter_branch == b["branch_code"] else ""
-            branch_options += f'<op        for b in branches:
+        for b in branches:
             sel = "selected" if effective_branch == b["branch_code"] else ""
-            branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'tion value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
+            branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
         branch_filter_html = f"""
         <div style="flex:1;min-width:140px;">
           <label style="font-size:12px;color:#888;">지점 필터</label>
