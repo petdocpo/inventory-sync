@@ -7249,12 +7249,24 @@ async def purchase_tracking_upload_leadtime(
         return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
     return await _process_lead_time_upload(file)
 
+# ============================================================
+# CSS는 f-string 밖에서 별도 상수로 관리 (중괄호 이스케이프 문제 원천 차단)
+# ============================================================
+PRODUCT_SETTINGS_EXTRA_CSS = """
+<style>
+#colCheckboxList input[type="checkbox"] { width: auto !important; }
+.pm-table input[type="text"], .pm-table input[type="number"] { width: 100%; padding: 6px; box-sizing: border-box; }
+.pm-upload-box { border: 2px dashed #93C5FD; border-radius: 10px; padding: 16px; background: #EFF6FF; }
+</style>
+"""
+
+
 @app.get("/master/purchase-order/product-settings", response_class=HTMLResponse)
 async def purchase_order_product_settings_page(
     session_token: str = Cookie(default=None),
     search_item: str = "",
+    filter_branch: str = "",
     filter_consumable: str = "",
-    filter_has_exception: str = "",
     sort_by: str = "item_name",
     sort_dir: str = "asc"
 ):
@@ -7262,17 +7274,21 @@ async def purchase_order_product_settings_page(
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
 
-    allowed_sort_cols = {"item_name", "lead_time_days", "moq", "is_consumable"}
+    allowed_sort_cols = {"item_name", "branch_name", "lead_time_days", "moq", "is_consumable", "purchase_price"}
     if sort_by not in allowed_sort_cols:
         sort_by = "item_name"
     sort_dir_sql = "DESC" if sort_dir == "desc" else "ASC"
 
     conn = get_conn()
-    query = "SELECT * FROM product_lead_time WHERE 1=1"
+    query = "SELECT * FROM product_master WHERE 1=1"
     params: list = []
     if search_item:
-        query += " AND item_name LIKE ?"
+        query += " AND (item_name LIKE ? OR item_code LIKE ?)"
         params.append(f"%{search_item}%")
+        params.append(f"%{search_item}%")
+    if filter_branch:
+        query += " AND branch_name = ?"
+        params.append(filter_branch)
     if filter_consumable == "yes":
         query += " AND is_consumable = TRUE"
     elif filter_consumable == "no":
@@ -7280,7 +7296,9 @@ async def purchase_order_product_settings_page(
     query += f" ORDER BY {sort_by} {sort_dir_sql} LIMIT 300"
     rows = conn.execute(query, params).fetchall()
 
-    monthly_exc_rows = conn.execute("SELECT item_name, branch_code FROM purchase_order_monthly_exception").fetchall()
+    monthly_exc_rows = conn.execute(
+        "SELECT item_name, branch_code FROM purchase_order_monthly_exception"
+    ).fetchall()
     conn.close()
 
     monthly_exc_map: Dict[str, list] = {}
@@ -7288,56 +7306,88 @@ async def purchase_order_product_settings_page(
         monthly_exc_map.setdefault(r["item_name"], []).append(r["branch_code"])
 
     branches = get_branches(branch_type='branch')
-    branch_name_map = {b["branch_code"]: b["branch_name"] for b in branches}
     branch_options_json = json.dumps(
         [{"code": b["branch_code"], "name": b["branch_name"]} for b in branches], ensure_ascii=False
     )
+    branch_filter_options = '<option value="">전체 지점</option>'
+    for b in branches:
+        sel = "selected" if filter_branch == b["branch_name"] else ""
+        branch_filter_options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
 
     rows_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="9" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
     else:
         for r in rows:
             consumable_checked = "checked" if r["is_consumable"] else ""
             exc_branches = monthly_exc_map.get(r["item_name"], [])
-            exc_badge = f'<span class="badge-green">{len(exc_branches)}개 지점</span>' if exc_branches else '<span style="color:#888;font-size:11px;">없음</span>'
-            safe_item_name = r["item_name"].replace("'", "")
+            exc_badge = (
+                f'<span class="badge-green">{len(exc_branches)}개 지점</span>'
+                if exc_branches else '<span style="color:#888;font-size:11px;">없음</span>'
+            )
+            safe_item_name = (r["item_name"] or "").replace("'", "")
             rows_html += f"""
             <tr>
-              <td>{r['item_name']}</td>
-              <td><input type="number" class="ps-leadtime" data-id="{r['id']}" value="{r['lead_time_days']}" style="width:80px;padding:6px;"></td>
-              <td><input type="number" class="ps-moq" data-id="{r['id']}" value="{r['moq'] or 1}" style="width:80px;padding:6px;"></td>
-              <td style="text-align:center;"><input type="checkbox" class="ps-consumable" data-id="{r['id']}" {consumable_checked} style="width:18px;height:18px;"></td>
+              <td>{r['branch_name'] or ''}</td>
+              <td>{r['item_name'] or ''}</td>
+              <td>{r['item_code'] or ''}</td>
+              <td><input type="number" class="pm-price" data-id="{r['id']}" value="{r['purchase_price'] or 0}"></td>
+              <td>{r['supplier'] or ''}</td>
+              <td>{r['tax_setting'] or ''}</td>
+              <td><input type="number" class="pm-leadtime" data-id="{r['id']}" value="{r['lead_time_days'] or 0}"></td>
+              <td><input type="number" class="pm-moq" data-id="{r['id']}" value="{r['moq'] or 1}"></td>
+              <td style="text-align:center;"><input type="checkbox" class="pm-consumable" data-id="{r['id']}" {consumable_checked} style="width:18px;height:18px;"></td>
               <td>
                 {exc_badge}
                 <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="openMonthlyExc('{safe_item_name}')">설정</button>
               </td>
-              <td><button class="btn" style="font-size:12px;padding:6px 12px;" onclick="savePsRow({r['id']})">저장</button></td>
+              <td><button class="btn" style="font-size:12px;padding:6px 12px;" onclick="savePmRow({r['id']})">저장</button></td>
             </tr>
             """
 
     content = f"""
+    {PRODUCT_SETTINGS_EXTRA_CSS}
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
       <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
-      <h2>📝 상품 설정 (리드타임/MOQ/소모품/월1회예외)</h2>
+      <h2>📝 상품 마스터 (단가/거래처/리드타임/MOQ/소모품)</h2>
     </div>
+
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <p style="font-size:13px;color:#1E40AF;">기존 리드타임 엑셀 업로드로 등록된 상품을 화면에서 직접 수정하거나, 새 상품을 추가할 수 있습니다. "월1회예외" 열에서 상품별로 예외 지점을 지정하세요.</p>
+      <p style="font-size:13px;color:#1E40AF;">상품별 단가, 거래처, 과세설정, 리드타임, MOQ, 소모품 여부를 관리합니다. 발주서 자동생성 시 이 정보를 사용합니다.</p>
     </div>
+
     <div class="card">
-      <h3 style="margin-bottom:8px;">새 상품 추가</h3>
+      <h3 style="margin-bottom:8px;">새 상품 수동 등록</h3>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <input type="text" id="newItemName" placeholder="상품명" style="flex:2;min-width:200px;">
-        <input type="number" id="newLeadTime" placeholder="리드타임(일)" style="flex:1;min-width:100px;">
-        <input type="number" id="newMoq" placeholder="MOQ(기본 1)" style="flex:1;min-width:100px;">
-        <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="newConsumable"> 소모품</label>
-        <button class="btn" type="button" onclick="addPsItem()">추가</button>
+        <input type="text" id="pmBranch" placeholder="지점명" style="flex:1;min-width:100px;">
+        <input type="text" id="pmItemName" placeholder="상품명" style="flex:2;min-width:180px;">
+        <input type="text" id="pmItemCode" placeholder="품번" style="flex:1;min-width:120px;">
+        <input type="number" id="pmPrice" placeholder="구매금액" style="flex:1;min-width:100px;">
+        <input type="text" id="pmSupplier" placeholder="거래처명" style="flex:1;min-width:100px;">
+        <input type="text" id="pmTax" placeholder="과세설정(예: 과세)" style="flex:1;min-width:100px;">
+        <input type="number" id="pmLeadTime" placeholder="리드타임(일)" style="flex:1;min-width:100px;">
+        <input type="number" id="pmMoq" placeholder="MOQ(기본 1)" style="flex:1;min-width:100px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="pmConsumable"> 소모품</label>
+        <button class="btn" type="button" onclick="addPmItem()">추가</button>
       </div>
-      <div id="addPsResult" style="margin-top:8px;font-size:13px;"></div>
+      <div id="pmAddResult" style="margin-top:8px;font-size:13px;"></div>
     </div>
+
+    <div class="card pm-upload-box">
+      <h3 style="margin-bottom:8px;">엑셀 업로드 (상품마스터 일괄 등록/갱신)</h3>
+      <p style="font-size:12px;color:#1E40AF;margin-bottom:8px;">
+        헤더 포함, 컬럼: 지점명 | 상품분류 | 상품명 | 상품내용 | 출고금액 | 구매금액 | 상품타입 | 품번 | 규격 | 판매금액 | 단위 | 과세설정 | ... | 리드타임 | ... | 구매처<br>
+        (지점명+품번 기준으로 이미 있으면 덮어씁니다.)
+      </p>
+      <input type="file" id="pmExcelFile" accept=".xlsx,.xls">
+      <button class="btn" type="button" onclick="uploadPmExcel()">업로드</button>
+      <div id="pmUploadResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+
     <div class="card">
       <form method="get" action="/master/purchase-order/product-settings" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
-        <input name="search_item" value="{search_item}" placeholder="상품명 검색" style="flex:2;min-width:200px;">
+        <input name="search_item" value="{search_item}" placeholder="상품명/품번 검색" style="flex:2;min-width:180px;">
+        <select name="filter_branch" style="flex:1;min-width:120px;">{branch_filter_options}</select>
         <select name="filter_consumable" style="flex:1;min-width:120px;">
           <option value="" {'selected' if not filter_consumable else ''}>전체</option>
           <option value="yes" {'selected' if filter_consumable == 'yes' else ''}>소모품만</option>
@@ -7347,12 +7397,17 @@ async def purchase_order_product_settings_page(
         <a href="/master/purchase-order/product-settings" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
       </form>
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
-      <table>
+      <table class="pm-table">
         <thead><tr>
-          <th style="cursor:pointer;" onclick="sortPs('item_name')">상품명 {'▲' if sort_by=='item_name' and sort_dir=='asc' else ('▼' if sort_by=='item_name' else '')}</th>
-          <th style="cursor:pointer;" onclick="sortPs('lead_time_days')">리드타임(일) {'▲' if sort_by=='lead_time_days' and sort_dir=='asc' else ('▼' if sort_by=='lead_time_days' else '')}</th>
-          <th style="cursor:pointer;" onclick="sortPs('moq')">MOQ {'▲' if sort_by=='moq' and sort_dir=='asc' else ('▼' if sort_by=='moq' else '')}</th>
-          <th style="cursor:pointer;" onclick="sortPs('is_consumable')">소모품 {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
+          <th>지점</th>
+          <th style="cursor:pointer;" onclick="sortPm('item_name')">상품명 {'▲' if sort_by=='item_name' and sort_dir=='asc' else ('▼' if sort_by=='item_name' else '')}</th>
+          <th>품번</th>
+          <th style="cursor:pointer;" onclick="sortPm('purchase_price')">구매금액 {'▲' if sort_by=='purchase_price' and sort_dir=='asc' else ('▼' if sort_by=='purchase_price' else '')}</th>
+          <th>거래처</th>
+          <th>과세설정</th>
+          <th style="cursor:pointer;" onclick="sortPm('lead_time_days')">리드타임(일) {'▲' if sort_by=='lead_time_days' and sort_dir=='asc' else ('▼' if sort_by=='lead_time_days' else '')}</th>
+          <th style="cursor:pointer;" onclick="sortPm('moq')">MOQ {'▲' if sort_by=='moq' and sort_dir=='asc' else ('▼' if sort_by=='moq' else '')}</th>
+          <th style="cursor:pointer;" onclick="sortPm('is_consumable')">소모품 {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
           <th>월1회예외 지점</th><th></th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
@@ -7373,7 +7428,7 @@ async def purchase_order_product_settings_page(
     <script>
       const allBranches = {branch_options_json};
 
-        function sortPs(col) {{
+      function sortPm(col) {{
         const params = new URLSearchParams(window.location.search);
         const curSort = params.get('sort_by') || 'item_name';
         const curDir = params.get('sort_dir') || 'asc';
@@ -7412,78 +7467,196 @@ async def purchase_order_product_settings_page(
         if (res.ok) {{ location.reload(); }} else {{ alert('저장 실패'); }}
       }}
 
-      async function addPsItem() {{
-        const name = document.getElementById('newItemName').value.trim();
-        const leadTime = parseInt(document.getElementById('newLeadTime').value);
-        const moq = parseInt(document.getElementById('newMoq').value) || 1;
-        const consumable = document.getElementById('newConsumable').checked;
-        if (!name || !leadTime) {{ alert('상품명과 리드타임을 입력하세요.'); return; }}
-        const res = await fetch('/master/purchase-order/product-settings/save', {{
+      async function addPmItem() {{
+        const branch = document.getElementById('pmBranch').value.trim();
+        const name = document.getElementById('pmItemName').value.trim();
+        const code = document.getElementById('pmItemCode').value.trim();
+        const price = parseFloat(document.getElementById('pmPrice').value) || 0;
+        const supplier = document.getElementById('pmSupplier').value.trim();
+        const tax = document.getElementById('pmTax').value.trim();
+        const leadTime = parseInt(document.getElementById('pmLeadTime').value) || 0;
+        const moq = parseInt(document.getElementById('pmMoq').value) || 1;
+        const consumable = document.getElementById('pmConsumable').checked;
+        if (!branch || !name) {{ alert('지점명과 상품명을 입력하세요.'); return; }}
+        const res = await fetch('/master/purchase-order/product-master/save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ item_name: name, lead_time_days: leadTime, moq: moq, is_consumable: consumable }})
+          body: JSON.stringify({{
+            branch_name: branch, item_name: name, item_code: code, purchase_price: price,
+            supplier: supplier, tax_setting: tax, lead_time_days: leadTime, moq: moq, is_consumable: consumable
+          }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
-          document.getElementById('addPsResult').innerText = '오류: ' + (err.detail || '추가 실패');
+          document.getElementById('pmAddResult').innerText = '오류: ' + (err.detail || '추가 실패');
         }}
       }}
-      async function savePsRow(id) {{
-        const leadTimeEl = document.querySelector('.ps-leadtime[data-id="' + id + '"]');
-        const moqEl = document.querySelector('.ps-moq[data-id="' + id + '"]');
-        const consumableEl = document.querySelector('.ps-consumable[data-id="' + id + '"]');
-        const res = await fetch('/master/purchase-order/product-settings/save', {{
+
+      async function savePmRow(id) {{
+        const priceEl = document.querySelector('.pm-price[data-id="' + id + '"]');
+        const leadTimeEl = document.querySelector('.pm-leadtime[data-id="' + id + '"]');
+        const moqEl = document.querySelector('.pm-moq[data-id="' + id + '"]');
+        const consumableEl = document.querySelector('.pm-consumable[data-id="' + id + '"]');
+        const res = await fetch('/master/purchase-order/product-master/save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{
             id: id,
-            lead_time_days: parseInt(leadTimeEl.value),
+            purchase_price: parseFloat(priceEl.value) || 0,
+            lead_time_days: parseInt(leadTimeEl.value) || 0,
             moq: parseInt(moqEl.value) || 1,
             is_consumable: consumableEl.checked
           }})
         }});
         if (res.ok) {{ alert('저장되었습니다.'); }} else {{ alert('저장 실패'); }}
       }}
+
+      async function uploadPmExcel() {{
+        const fileEl = document.getElementById('pmExcelFile');
+        if (!fileEl.files.length) {{ alert('파일을 선택하세요.'); return; }}
+        const formData = new FormData();
+        formData.append('file', fileEl.files[0]);
+        document.getElementById('pmUploadResult').innerText = '업로드 중...';
+        const res = await fetch('/master/purchase-order/product-master/upload', {{
+          method: 'POST', body: formData
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          document.getElementById('pmUploadResult').innerText = '완료: ' + data.inserted + '건 등록/갱신';
+          setTimeout(() => location.reload(), 1200);
+        }} else {{
+          document.getElementById('pmUploadResult').innerText = '오류: ' + (data.detail || '업로드 실패');
+        }}
+      }}
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
 
 
-@app.post("/master/purchase-order/product-settings/save")
-async def purchase_order_product_settings_save(request: Request, session_token: str = Cookie(default=None)):
+@app.post("/master/purchase-order/product-master/save")
+async def purchase_order_product_master_save(request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
 
     data = await request.json()
     row_id = data.get("id")
-    item_name = data.get("item_name", "").strip()
-    lead_time_days = data.get("lead_time_days")
+    branch_name = (data.get("branch_name") or "").strip()
+    item_name = (data.get("item_name") or "").strip()
+    item_code = (data.get("item_code") or "").strip()
+    purchase_price = data.get("purchase_price", 0)
+    supplier = (data.get("supplier") or "").strip()
+    tax_setting = (data.get("tax_setting") or "").strip()
+    lead_time_days = data.get("lead_time_days", 0)
     moq = data.get("moq", 1)
     is_consumable = bool(data.get("is_consumable", False))
-
-    if lead_time_days is None:
-        return JSONResponse(status_code=400, content={"detail": "리드타임을 입력하세요."})
 
     now = datetime.now().isoformat()
     conn = get_conn()
     if row_id:
         conn.execute(
-            "UPDATE product_lead_time SET lead_time_days=?, moq=?, is_consumable=?, updated_at=? WHERE id=?",
-            (lead_time_days, moq, is_consumable, now, row_id)
+            """UPDATE product_master
+               SET purchase_price=?, lead_time_days=?, moq=?, is_consumable=?, updated_at=?
+               WHERE id=?""",
+            (purchase_price, lead_time_days, moq, is_consumable, now, row_id)
         )
     else:
-        if not item_name:
+        if not branch_name or not item_name:
             conn.close()
-            return JSONResponse(status_code=400, content={"detail": "상품명을 입력하세요."})
+            return JSONResponse(status_code=400, content={"detail": "지점명과 상품명을 입력하세요."})
         conn.execute("""
-            INSERT INTO product_lead_time (item_name, lead_time_days, moq, is_consumable, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (item_name) DO UPDATE SET
+            INSERT INTO product_master
+                (branch_name, item_name, item_code, purchase_price, supplier,
+                 tax_setting, lead_time_days, moq, is_consumable, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (branch_name, item_code) DO UPDATE SET
+                item_name=excluded.item_name, purchase_price=excluded.purchase_price,
+                supplier=excluded.supplier, tax_setting=excluded.tax_setting,
                 lead_time_days=excluded.lead_time_days, moq=excluded.moq,
                 is_consumable=excluded.is_consumable, updated_at=excluded.updated_at
-        """, (item_name, lead_time_days, moq, is_consumable, now))
+        """, (branch_name, item_name, item_code, purchase_price, supplier,
+              tax_setting, lead_time_days, moq, is_consumable, now))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/purchase-order/product-master/upload")
+async def purchase_order_product_master_upload(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse(status_code=400, content={"detail": "파일이 없습니다."})
+
+    import openpyxl
+    from io import BytesIO
+    raw = await file.read()
+    wb = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+    ws = wb.active
+
+    header_row_idx = None
+    header_map = {}
+    for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=5, values_only=True), start=1):
+        if row and "지점명" in row and "상품명" in row:
+            header_row_idx = idx
+            for col_idx, col_name in enumerate(row):
+                if col_name:
+                    header_map[col_name.strip()] = col_idx
+            break
+
+    if header_row_idx is None:
+        return JSONResponse(status_code=400, content={"detail": "헤더(지점명/상품명 등)를 찾을 수 없습니다."})
+
+    required = ["지점명", "상품명"]
+    for col in required:
+        if col not in header_map:
+            return JSONResponse(status_code=400, content={"detail": f"필수 컬럼 누락: {col}"})
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    inserted = 0
+    for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        if not row:
+            continue
+
+        def get_col(name, default=None):
+            idx = header_map.get(name)
+            if idx is None or idx >= len(row):
+                return default
+            val = row[idx]
+            return val if val is not None else default
+
+        branch_name = str(get_col("지점명", "") or "").strip()
+        item_name = str(get_col("상품명", "") or "").strip()
+        if not branch_name or not item_name:
+            continue
+
+        item_code = str(get_col("품번", "") or "").strip()
+        purchase_price = get_col("구매금액", 0) or 0
+        supplier = str(get_col("구매처", "") or "").strip()
+        tax_setting = str(get_col("과세설정", "") or "").strip()
+        lead_time_raw = get_col("리드타임", 0)
+        try:
+            lead_time_days = int(lead_time_raw) if lead_time_raw not in (None, "") else 0
+        except (ValueError, TypeError):
+            lead_time_days = 0
+
+        conn.execute("""
+            INSERT INTO product_master
+                (branch_name, item_name, item_code, purchase_price, supplier, tax_setting, lead_time_days, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (branch_name, item_code) DO UPDATE SET
+                item_name=excluded.item_name, purchase_price=excluded.purchase_price,
+                supplier=excluded.supplier, tax_setting=excluded.tax_setting,
+                lead_time_days=excluded.lead_time_days, updated_at=excluded.updated_at
+        """, (branch_name, item_name, item_code, purchase_price, supplier, tax_setting, lead_time_days, now))
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok", "inserted": inserted})
 
 
 @app.get("/master/purchase-order/monthly-exception/list")
@@ -7505,19 +7678,18 @@ async def purchase_order_monthly_exception_save(request: Request, session_token:
     if not user or user["role"] != "master":
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
     data = await request.json()
-    item_name = data.get("item_name", "").strip()
+    item_name = (data.get("item_name") or "").strip()
     branch_codes = data.get("branch_codes", [])
 
     if not item_name:
-        return JSONResponse(status_code=400, content={"detail": "상품명이 지정되지 않았습니다."})
+        return JSONResponse(status_code=400, content={"detail": "상품명이 없습니다."})
 
-    now = datetime.now().isoformat()
     conn = get_conn()
     conn.execute("DELETE FROM purchase_order_monthly_exception WHERE item_name=?", (item_name,))
     for bc in branch_codes:
         conn.execute(
-            "INSERT INTO purchase_order_monthly_exception (branch_code, item_name, created_at) VALUES (?, ?, ?)",
-            (bc, item_name, now)
+            "INSERT INTO purchase_order_monthly_exception (item_name, branch_code) VALUES (?, ?)",
+            (item_name, bc)
         )
     conn.commit()
     conn.close()
