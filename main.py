@@ -7761,7 +7761,7 @@ async def purchase_tracking_status_page(
       <div style="background:#fff;border-radius:12px;padding:24px;max-width:360px;width:90%;">
         <h3 style="margin-bottom:12px;">⚙️ 표시할 컬럼 선택</h3>
         <div id="colCheckboxList" style="display:flex;flex-direction:column;gap:8px;font-size:14px;"></div>
-        <style>#colCheckboxList input[type="checkbox"] { width: auto !important; }</style>
+        <style>#colCheckboxList input[type="checkbox"] {{ width: auto !important; }}</style>
         <div style="display:flex;gap:8px;margin-top:16px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeColSettings()">닫기</button>
           <button class="btn" style="flex:1;" onclick="applyColSettings()">적용</button>
