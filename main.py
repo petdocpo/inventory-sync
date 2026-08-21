@@ -2308,6 +2308,8 @@ async def adjust_get(
         branch_filter_html = f"""
         <div class="card">
           <form method="get" action="/adjust" style="display:flex;gap:8px;align-items:flex-end;">
+            <input type="hidden" name="preset_branch" value="{preset_branch}">
+            <input type="hidden" name="preset_code" value="{preset_code}">
             <div style="flex:1;max-width:220px;">
               <label style="font-size:12px;color:#888;">지점 필터</label>
               <select name="filter_branch" style="margin-top:4px;">{branch_options}</select>
@@ -2671,7 +2673,9 @@ async def scan_log_page(
         branches = get_branches()
         for b in branches:
             sel = "selected" if filter_branch == b["branch_code"] else ""
-            branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
+            branch_options += f'<op        for b in branches:
+            sel = "selected" if effective_branch == b["branch_code"] else ""
+            branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'tion value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
         branch_filter_html = f"""
         <div style="flex:1;min-width:140px;">
           <label style="font-size:12px;color:#888;">지점 필터</label>
@@ -7344,13 +7348,13 @@ async def purchase_order_product_settings_page(
       </form>
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
       <table>
-        <thead><tr><th>상품명</th><th>리드타임(일)</th><th>MOQ</th><        <thead><tr>
+        <thead><tr>
           <th style="cursor:pointer;" onclick="sortPs('item_name')">상품명 {'▲' if sort_by=='item_name' and sort_dir=='asc' else ('▼' if sort_by=='item_name' else '')}</th>
           <th style="cursor:pointer;" onclick="sortPs('lead_time_days')">리드타임(일) {'▲' if sort_by=='lead_time_days' and sort_dir=='asc' else ('▼' if sort_by=='lead_time_days' else '')}</th>
           <th style="cursor:pointer;" onclick="sortPs('moq')">MOQ {'▲' if sort_by=='moq' and sort_dir=='asc' else ('▼' if sort_by=='moq' else '')}</th>
           <th style="cursor:pointer;" onclick="sortPs('is_consumable')">소모품 {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
           <th>월1회예외 지점</th><th></th>
-        </tr></thead>th>소모품</th><th>월1회예외 지점</th><th></th></tr></thead>
+        </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
     </div>
@@ -7757,6 +7761,7 @@ async def purchase_tracking_status_page(
       <div style="background:#fff;border-radius:12px;padding:24px;max-width:360px;width:90%;">
         <h3 style="margin-bottom:12px;">⚙️ 표시할 컬럼 선택</h3>
         <div id="colCheckboxList" style="display:flex;flex-direction:column;gap:8px;font-size:14px;"></div>
+        <style>#colCheckboxList input[type="checkbox"] { width: auto !important; }</style>
         <div style="display:flex;gap:8px;margin-top:16px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeColSettings()">닫기</button>
           <button class="btn" style="flex:1;" onclick="applyColSettings()">적용</button>
@@ -7803,9 +7808,9 @@ async def purchase_tracking_status_page(
         const container = document.getElementById('colCheckboxList');
         container.innerHTML = PT_COLUMNS.map(c =>
           '<label style="display:flex;align-items:center;gap:8px;' + (c.locked ? 'opacity:0.5;' : '') + '">' +
-          '<input type="checkbox" class="col-setting-check" data-key="' + c.key + '" ' +
+          '<input type="checkbox" class="col-setting-check" data-key="' + c.key + '" style="width:18px;height:18px;flex-shrink:0;" ' +
           (settings[c.key] !== false ? 'checked' : '') + (c.locked ? ' disabled' : '') + '>' +
-          c.label + (c.locked ? ' (필수)' : '') + '</label>'
+          '<span>' + c.label + (c.locked ? ' (필수)' : '') + '</span></label>'
         ).join('');
         document.getElementById('colSettingsModal').style.display = 'flex';
       }}
