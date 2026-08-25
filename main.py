@@ -9673,9 +9673,6 @@ async def master_qr_generate_bulk(
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
     )
 
-SAFETY_STOCK_EXTRA_CSS = """
-
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
