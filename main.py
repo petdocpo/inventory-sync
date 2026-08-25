@@ -9673,6 +9673,351 @@ async def master_qr_generate_bulk(
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
     )
 
+SAFETY_STOCK_EXTRA_CSS = """
+<style>
+.ss-table input[type="number"] { width: 100%; padding: 6px; box-sizing: border-box; }
+.ss-upload-box { border: 2px dashed #93C5FD; border-radius: 10px; padding: 16px; background: #EFF6FF; }
+</style>
+"""
+
+
+@app.get("/master/purchase-order/safety-stock", response_class=HTMLResponse)
+async def safety_stock_page(
+    session_token: str = Cookie(default=None),
+    search_item: str = "",
+    filter_branch: str = "",
+    sort_by: str = "item_name",
+    sort_dir: str = "asc"
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    allowed_sort_cols = {"item_name", "branch_name", "qty", "updated_at"}
+    if sort_by not in allowed_sort_cols:
+        sort_by = "item_name"
+    sort_dir_sql = "DESC" if sort_dir == "desc" else "ASC"
+
+    conn = get_conn()
+    query = "SELECT * FROM safety_stock WHERE 1=1"
+    params: list = []
+    if search_item:
+        query += " AND (item_name LIKE ? OR item_code LIKE ?)"
+        params.append(f"%{search_item}%")
+        params.append(f"%{search_item}%")
+    if filter_branch:
+        query += " AND branch_name = ?"
+        params.append(filter_branch)
+    query += f" ORDER BY {sort_by} {sort_dir_sql} LIMIT 300"
+    rows = conn.execute(query, params).fetchall()
+
+    # 드롭다운용: safety_stock에 이미 등록된 지점×상품 전체 목록 (검색 실패 없이 바로 선택 가능)
+    existing_rows = conn.execute(
+        "SELECT DISTINCT branch_name, item_name, item_code FROM safety_stock ORDER BY branch_name, item_name LIMIT 5000"
+    ).fetchall()
+    conn.close()
+
+    branches = get_branches(branch_type='branch')
+
+    branch_filter_options = '<option value="">전체 지점</option>'
+    for b in branches:
+        sel = "selected" if filter_branch == b["branch_name"] else ""
+        branch_filter_options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
+
+    branch_select_options = '<option value="">지점 선택</option>'
+    for b in branches:
+        branch_select_options += f'<option value="{b["branch_name"]}">{b["branch_name"]}</option>'
+
+    # branch -> [{name, code}] 매핑을 JS로 내려서, 지점 선택 시 그 지점 상품만 드롭다운에 표시
+    existing_by_branch: Dict[str, list] = {}
+    for r in existing_rows:
+        existing_by_branch.setdefault(r["branch_name"], []).append(
+            {"name": r["item_name"], "code": r["item_code"] or ""}
+        )
+    existing_by_branch_json = json.dumps(existing_by_branch, ensure_ascii=False)
+
+    rows_html = ""
+    if not rows:
+        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">등록된 안전재고가 없습니다.</td></tr>'
+    else:
+        for r in rows:
+            updated_display = (r["updated_at"] or "-")[:16] if r["updated_at"] else "-"
+            rows_html += f"""
+            <tr>
+              <td>{r['branch_name'] or ''}</td>
+              <td>{r['item_name'] or ''}</td>
+              <td>{r['item_code'] or ''}</td>
+              <td><input type="number" class="ss-qty" data-id="{r['id']}" value="{r['qty'] or 0}"></td>
+              <td style="font-size:11px;color:#888;">{updated_display}</td>
+              <td><button class="btn" style="font-size:12px;padding:6px 12px;" onclick="saveSsRow({r['id']})">저장</button></td>
+            </tr>
+            """
+
+    content = f"""
+    {SAFETY_STOCK_EXTRA_CSS}
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
+      <h2>🎯 안전재고 관리</h2>
+    </div>
+
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">지점×상품별 안전재고 수량을 관리합니다. 발주서 자동생성 시 "현재고 &lt; 안전재고"인 상품이 발주 대상이 되며, 발주수량은 안전재고 수량 그대로 산정됩니다.</p>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-bottom:8px;">새 안전재고 등록</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <select id="ssBranch" style="flex:1;min-width:120px;" onchange="ssBranchChanged()">{branch_select_options}</select>
+        <select id="ssItemSelect" style="flex:2;min-width:180px;" disabled onchange="ssItemSelectChanged()">
+          <option value="">지점을 먼저 선택하세요</option>
+        </select>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#555;white-space:nowrap;">
+          <input type="checkbox" id="ssManualMode" onchange="ssToggleManualMode()"> 새 상품 직접입력
+        </label>
+        <input type="text" id="ssItemNameManual" placeholder="상품명 직접입력" style="flex:2;min-width:160px;display:none;">
+        <input type="number" id="ssQty" placeholder="안전재고 수량" style="flex:1;min-width:120px;">
+        <button class="btn" type="button" onclick="addSsItem()">추가</button>
+      </div>
+      <div id="ssAddResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+
+    <div class="card ss-upload-box">
+      <h3 style="margin-bottom:8px;">엑셀 업로드 (안전재고 일괄 등록/갱신)</h3>
+      <p style="font-size:12px;color:#1E40AF;margin-bottom:8px;">
+        헤더 2행 형식(1행 제목, 2행 컬럼명, 3행부터 데이터). 컬럼 위치: <b>B=지점 / D=상품명 / E=품번 / J=지점설정재고(발주 기준)</b><br>
+        (지점+상품명 기준으로 이미 있으면 덮어씁니다.)
+      </p>
+      <input type="file" id="ssExcelFile" accept=".xlsx,.xls">
+      <button class="btn" type="button" onclick="uploadSsExcel()">업로드</button>
+      <div id="ssUploadResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+
+    <div class="card">
+      <form method="get" action="/master/purchase-order/safety-stock" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+        <input name="search_item" value="{search_item}" placeholder="상품명/품번 검색" style="flex:2;min-width:180px;">
+        <select name="filter_branch" style="flex:1;min-width:120px;">{branch_filter_options}</select>
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/purchase-order/safety-stock" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+      </form>
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
+      <table class="ss-table">
+        <thead><tr>
+          <th style="cursor:pointer;" onclick="sortSs('branch_name')">지점 {'▲' if sort_by=='branch_name' and sort_dir=='asc' else ('▼' if sort_by=='branch_name' else '')}</th>
+          <th style="cursor:pointer;" onclick="sortSs('item_name')">상품명 {'▲' if sort_by=='item_name' and sort_dir=='asc' else ('▼' if sort_by=='item_name' else '')}</th>
+          <th>품번</th>
+          <th style="cursor:pointer;" onclick="sortSs('qty')">안전재고수량 {'▲' if sort_by=='qty' and sort_dir=='asc' else ('▼' if sort_by=='qty' else '')}</th>
+          <th style="cursor:pointer;" onclick="sortSs('updated_at')">수정일시 {'▲' if sort_by=='updated_at' and sort_dir=='asc' else ('▼' if sort_by=='updated_at' else '')}</th>
+          <th></th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+
+    <script>
+      const EXISTING_BY_BRANCH = {existing_by_branch_json};
+      let ssSelectedItem = null;
+
+      function sortSs(col) {{
+        const params = new URLSearchParams(window.location.search);
+        const curSort = params.get('sort_by') || 'item_name';
+        const curDir = params.get('sort_dir') || 'asc';
+        const newDir = (curSort === col && curDir === 'asc') ? 'desc' : 'asc';
+        params.set('sort_by', col);
+        params.set('sort_dir', newDir);
+        window.location.search = params.toString();
+      }}
+
+      function ssBranchChanged() {{
+        const branch = document.getElementById('ssBranch').value;
+        const selectEl = document.getElementById('ssItemSelect');
+        ssSelectedItem = null;
+        if (!branch) {{
+          selectEl.disabled = true;
+          selectEl.innerHTML = '<option value="">지점을 먼저 선택하세요</option>';
+          return;
+        }}
+        const items = EXISTING_BY_BRANCH[branch] || [];
+        selectEl.disabled = false;
+        if (items.length === 0) {{
+          selectEl.innerHTML = '<option value="">이 지점에 등록된 상품 없음 (직접입력 사용)</option>';
+        }} else {{
+          selectEl.innerHTML = '<option value="">상품 선택</option>' +
+            items.map((p, idx) => '<option value="' + idx + '">' + p.name + (p.code ? ' (' + p.code + ')' : '') + '</option>').join('');
+        }}
+      }}
+
+      function ssItemSelectChanged() {{
+        const branch = document.getElementById('ssBranch').value;
+        const idx = document.getElementById('ssItemSelect').value;
+        if (idx === '') {{ ssSelectedItem = null; return; }}
+        const items = EXISTING_BY_BRANCH[branch] || [];
+        ssSelectedItem = items[parseInt(idx)] || null;
+      }}
+
+      function ssToggleManualMode() {{
+        const manual = document.getElementById('ssManualMode').checked;
+        document.getElementById('ssItemSelect').style.display = manual ? 'none' : '';
+        document.getElementById('ssItemNameManual').style.display = manual ? '' : 'none';
+        ssSelectedItem = null;
+      }}
+
+      async function addSsItem() {{
+        const branch = document.getElementById('ssBranch').value;
+        const qty = parseInt(document.getElementById('ssQty').value);
+        const manual = document.getElementById('ssManualMode').checked;
+
+        let itemName = '';
+        let itemCode = '';
+        if (manual) {{
+          itemName = document.getElementById('ssItemNameManual').value.trim();
+        }} else if (ssSelectedItem) {{
+          itemName = ssSelectedItem.name;
+          itemCode = ssSelectedItem.code;
+        }}
+
+        if (!branch || !itemName || isNaN(qty)) {{
+          alert('지점, 상품(선택 또는 직접입력), 안전재고수량을 입력하세요.');
+          return;
+        }}
+        const res = await fetch('/master/purchase-order/safety-stock/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_name: branch, item_name: itemName, item_code: itemCode, qty: qty }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('ssAddResult').innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+
+      async function saveSsRow(id) {{
+        const qtyEl = document.querySelector('.ss-qty[data-id="' + id + '"]');
+        const res = await fetch('/master/purchase-order/safety-stock/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ id: id, qty: parseInt(qtyEl.value) || 0 }})
+        }});
+        if (res.ok) {{ alert('저장되었습니다.'); }} else {{ alert('저장 실패'); }}
+      }}
+
+      async function uploadSsExcel() {{
+        const fileEl = document.getElementById('ssExcelFile');
+        if (!fileEl.files.length) {{ alert('파일을 선택하세요.'); return; }}
+        const formData = new FormData();
+        formData.append('file', fileEl.files[0]);
+        document.getElementById('ssUploadResult').innerText = '업로드 중...';
+        const res = await fetch('/master/purchase-order/safety-stock/upload', {{
+          method: 'POST', body: formData
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          document.getElementById('ssUploadResult').innerText = '완료: ' + data.inserted + '건 등록/갱신 (건너뜀: ' + data.skipped + '건)';
+          setTimeout(() => location.reload(), 1200);
+        }} else {{
+          document.getElementById('ssUploadResult').innerText = '오류: ' + (data.detail || '업로드 실패');
+        }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/purchase-order/safety-stock/save")
+async def safety_stock_save(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    row_id = data.get("id")
+    branch_name = (data.get("branch_name") or "").strip()
+    item_name = (data.get("item_name") or "").strip()
+    item_code = (data.get("item_code") or "").strip()
+    qty = data.get("qty", 0)
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    if row_id:
+        conn.execute(
+            "UPDATE safety_stock SET qty=?, updated_at=? WHERE id=?",
+            (qty, now, row_id)
+        )
+    else:
+        if not branch_name or not item_name:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "지점과 상품명을 입력하세요."})
+        conn.execute("""
+            INSERT INTO safety_stock (branch_name, item_name, item_code, qty, safety_qty, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (branch_name, item_name) DO UPDATE SET
+                item_code=excluded.item_code, qty=excluded.qty,
+                safety_qty=excluded.safety_qty, updated_at=excluded.updated_at
+        """, (branch_name, item_name, item_code, qty, qty, now))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/purchase-order/safety-stock/upload")
+async def safety_stock_upload(request: Request, session_token: str = Cookie(default=None)):
+    """고정 컬럼 위치 기반 파싱: B=지점(idx1) D=상품명(idx3) E=품번(idx4) J=지점설정재고(idx9)
+    1행=제목, 2행=헤더, 3행부터 데이터."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse(status_code=400, content={"detail": "파일이 없습니다."})
+
+    import openpyxl
+    from io import BytesIO
+    raw = await file.read()
+    wb = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+    ws = wb.active
+
+    COL_BRANCH = 1   # B
+    COL_ITEM_NAME = 3   # D
+    COL_ITEM_CODE = 4   # E
+    COL_QTY = 9   # J
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    inserted = 0
+    skipped = 0
+
+    for row in ws.iter_rows(min_row=3, values_only=True):
+        if not row or len(row) <= COL_QTY:
+            skipped += 1
+            continue
+
+        branch_name = str(row[COL_BRANCH] or "").strip()
+        item_name = str(row[COL_ITEM_NAME] or "").strip()
+        if not branch_name or not item_name:
+            skipped += 1
+            continue
+
+        item_code = str(row[COL_ITEM_CODE] or "").strip()
+        qty_raw = row[COL_QTY]
+        try:
+            qty = int(float(qty_raw)) if qty_raw not in (None, "") else 0
+        except (ValueError, TypeError):
+            skipped += 1
+            continue
+
+        conn.execute("""
+            INSERT INTO safety_stock (branch_name, item_name, item_code, qty, safety_qty, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (branch_name, item_name) DO UPDATE SET
+                item_code=excluded.item_code, qty=excluded.qty,
+                safety_qty=excluded.safety_qty, updated_at=excluded.updated_at
+        """, (branch_name, item_name, item_code, qty, qty, now))
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok", "inserted": inserted, "skipped": skipped})
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
