@@ -9693,7 +9693,7 @@ async def safety_stock_page(
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
 
-    allowed_sort_cols = {"item_name", "branch_code", "qty", "updated_at"}
+    allowed_sort_cols = {"item_name", "branch_name", "qty", "updated_at"}
     if sort_by not in allowed_sort_cols:
         sort_by = "item_name"
     sort_dir_sql = "DESC" if sort_dir == "desc" else "ASC"
@@ -9706,34 +9706,32 @@ async def safety_stock_page(
         params.append(f"%{search_item}%")
         params.append(f"%{search_item}%")
     if filter_branch:
-        query += " AND branch_code = ?"
+        query += " AND branch_name = ?"
         params.append(filter_branch)
     query += f" ORDER BY {sort_by} {sort_dir_sql} LIMIT 300"
     rows = conn.execute(query, params).fetchall()
     conn.close()
 
     branches = get_branches(branch_type='branch')
-    branch_name_map = {b["branch_code"]: b["branch_name"] for b in branches}
 
     branch_filter_options = '<option value="">전체 지점</option>'
     for b in branches:
-        sel = "selected" if filter_branch == b["branch_code"] else ""
-        branch_filter_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
+        sel = "selected" if filter_branch == b["branch_name"] else ""
+        branch_filter_options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
 
     branch_select_options = '<option value="">지점 선택</option>'
     for b in branches:
-        branch_select_options += f'<option value="{b["branch_code"]}">{b["branch_name"]}</option>'
+        branch_select_options += f'<option value="{b["branch_name"]}">{b["branch_name"]}</option>'
 
     rows_html = ""
     if not rows:
         rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">등록된 안전재고가 없습니다.</td></tr>'
     else:
         for r in rows:
-            branch_display = branch_name_map.get(r["branch_code"], r["branch_code"])
             updated_display = (r["updated_at"] or "-")[:16] if r["updated_at"] else "-"
             rows_html += f"""
             <tr>
-              <td>{branch_display}</td>
+              <td>{r['branch_name'] or ''}</td>
               <td>{r['item_name'] or ''}</td>
               <td>{r['item_code'] or ''}</td>
               <td><input type="number" class="ss-qty" data-id="{r['id']}" value="{r['qty'] or 0}"></td>
@@ -9786,7 +9784,7 @@ async def safety_stock_page(
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
       <table class="ss-table">
         <thead><tr>
-          <th>지점</th>
+          <th style="cursor:pointer;" onclick="sortSs('branch_name')">지점 {'▲' if sort_by=='branch_name' and sort_dir=='asc' else ('▼' if sort_by=='branch_name' else '')}</th>
           <th style="cursor:pointer;" onclick="sortSs('item_name')">상품명 {'▲' if sort_by=='item_name' and sort_dir=='asc' else ('▼' if sort_by=='item_name' else '')}</th>
           <th>품번</th>
           <th style="cursor:pointer;" onclick="sortSs('qty')">안전재고수량 {'▲' if sort_by=='qty' and sort_dir=='asc' else ('▼' if sort_by=='qty' else '')}</th>
@@ -9816,7 +9814,7 @@ async def safety_stock_page(
         if (!branch || !name || isNaN(qty)) {{ alert('지점, 상품명, 안전재고수량을 입력하세요.'); return; }}
         const res = await fetch('/master/purchase-order/safety-stock/save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_code: branch, item_name: name, item_code: code, qty: qty }})
+          body: JSON.stringify({{ branch_name: branch, item_name: name, item_code: code, qty: qty }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
@@ -9863,7 +9861,7 @@ async def safety_stock_save(request: Request, session_token: str = Cookie(defaul
 
     data = await request.json()
     row_id = data.get("id")
-    branch_code = (data.get("branch_code") or "").strip()
+    branch_name = (data.get("branch_name") or "").strip()
     item_name = (data.get("item_name") or "").strip()
     item_code = (data.get("item_code") or "").strip()
     qty = data.get("qty", 0)
@@ -9876,15 +9874,15 @@ async def safety_stock_save(request: Request, session_token: str = Cookie(defaul
             (qty, now, row_id)
         )
     else:
-        if not branch_code or not item_name:
+        if not branch_name or not item_name:
             conn.close()
             return JSONResponse(status_code=400, content={"detail": "지점과 상품명을 입력하세요."})
         conn.execute("""
-            INSERT INTO safety_stock (branch_code, item_name, item_code, qty, updated_at)
+            INSERT INTO safety_stock (branch_name, item_name, item_code, qty, updated_at)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (branch_code, item_name) DO UPDATE SET
+            ON CONFLICT (branch_name, item_name) DO UPDATE SET
                 item_code=excluded.item_code, qty=excluded.qty, updated_at=excluded.updated_at
-        """, (branch_code, item_name, item_code, qty, now))
+        """, (branch_name, item_name, item_code, qty, now))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
@@ -9925,9 +9923,6 @@ async def safety_stock_upload(request: Request, session_token: str = Cookie(defa
         if col not in header_map:
             return JSONResponse(status_code=400, content={"detail": f"필수 컬럼 누락: {col}"})
 
-    branches = get_branches(branch_type='branch')
-    branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
-
     now = datetime.now().isoformat()
     conn = get_conn()
     inserted = 0
@@ -9949,7 +9944,6 @@ async def safety_stock_upload(request: Request, session_token: str = Cookie(defa
             skipped += 1
             continue
 
-        branch_code = branch_name_to_code.get(branch_name, branch_name)
         item_code = str(get_col("품번", "") or "").strip()
         qty_raw = get_col("안전재고수량", 0)
         try:
@@ -9959,11 +9953,11 @@ async def safety_stock_upload(request: Request, session_token: str = Cookie(defa
             continue
 
         conn.execute("""
-            INSERT INTO safety_stock (branch_code, item_name, item_code, qty, updated_at)
+            INSERT INTO safety_stock (branch_name, item_name, item_code, qty, updated_at)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (branch_code, item_name) DO UPDATE SET
+            ON CONFLICT (branch_name, item_name) DO UPDATE SET
                 item_code=excluded.item_code, qty=excluded.qty, updated_at=excluded.updated_at
-        """, (branch_code, item_name, item_code, qty, now))
+        """, (branch_name, item_name, item_code, qty, now))
         inserted += 1
 
     conn.commit()
