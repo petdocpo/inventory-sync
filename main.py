@@ -2673,8 +2673,6 @@ async def scan_log_page(
         branches = get_branches()
         for b in branches:
             sel = "selected" if filter_branch == b["branch_code"] else ""
-        for b in branches:
-            sel = "selected" if effective_branch == b["branch_code"] else ""
             branch_options += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
         branch_filter_html = f"""
         <div style="flex:1;min-width:140px;">
@@ -2700,7 +2698,7 @@ async def scan_log_page(
     table_open = '<form method="post" action="/scan-log/delete">' if user["role"] == "master" else '<div>'
     table_close = '</form>' if user["role"] == "master" else '</div>'
 
-    content = f"""
+    content = f"""Select-String -Path main.py -Pattern "effective_branch" -AllMatches
     <h2 style="margin-bottom:16px;">📜 스캔 이력</h2>
     <div class="card">
       <form method="get" action="/scan-log" style="display:flex;gap:8px;flex-wrap:wrap;">
