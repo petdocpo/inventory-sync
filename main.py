@@ -9711,7 +9711,6 @@ async def safety_stock_page(
     query += f" ORDER BY {sort_by} {sort_dir_sql} LIMIT 300"
     rows = conn.execute(query, params).fetchall()
 
-    # 드롭다운용: safety_stock에 이미 등록된 지점×상품 전체 목록 (검색 실패 없이 바로 선택 가능)
     existing_rows = conn.execute(
         "SELECT DISTINCT branch_name, item_name, item_code FROM safety_stock ORDER BY branch_name, item_name LIMIT 5000"
     ).fetchall()
@@ -9728,7 +9727,6 @@ async def safety_stock_page(
     for b in branches:
         branch_select_options += f'<option value="{b["branch_name"]}">{b["branch_name"]}</option>'
 
-    # branch -> [{name, code}] 매핑을 JS로 내려서, 지점 선택 시 그 지점 상품만 드롭다운에 표시
     existing_by_branch: Dict[str, list] = {}
     for r in existing_rows:
         existing_by_branch.setdefault(r["branch_name"], []).append(
@@ -9738,12 +9736,13 @@ async def safety_stock_page(
 
     rows_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">등록된 안전재고가 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="7" style="text-align:center;padding:20px;color:#888;">등록된 안전재고가 없습니다.</td></tr>'
     else:
         for r in rows:
             updated_display = (r["updated_at"] or "-")[:16] if r["updated_at"] else "-"
             rows_html += f"""
             <tr>
+              <td style="text-align:center;"><input type="checkbox" name="ss_ids" value="{r['id']}" class="ss-check" style="width:16px;height:16px;"></td>
               <td>{r['branch_name'] or ''}</td>
               <td>{r['item_name'] or ''}</td>
               <td>{r['item_code'] or ''}</td>
@@ -9799,9 +9798,17 @@ async def safety_stock_page(
         <button class="btn" type="submit">검색</button>
         <a href="/master/purchase-order/safety-stock" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
       </form>
-      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+        <p style="font-size:13px;color:#888;margin:0;">{len(rows)}건 (최대 300건까지 표시)</p>
+        <div style="display:flex;gap:8px;">
+          <button type="button" class="btn" id="ssSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+          <button type="button" class="btn btn-red" id="ssDeleteSelectedBtn" style="font-size:12px;padding:6px 12px;">선택 삭제</button>
+          <button type="button" class="btn btn-red" id="ssDeleteAllBtn" style="font-size:12px;padding:6px 12px;">전체 삭제</button>
+        </div>
+      </div>
       <table class="ss-table">
         <thead><tr>
+          <th style="width:36px;text-align:center;"><input type="checkbox" id="ssAllCheck" style="width:16px;height:16px;"></th>
           <th style="cursor:pointer;" onclick="sortSs('branch_name')">지점 {'▲' if sort_by=='branch_name' and sort_dir=='asc' else ('▼' if sort_by=='branch_name' else '')}</th>
           <th style="cursor:pointer;" onclick="sortSs('item_name')">상품명 {'▲' if sort_by=='item_name' and sort_dir=='asc' else ('▼' if sort_by=='item_name' else '')}</th>
           <th>품번</th>
@@ -9915,6 +9922,50 @@ async def safety_stock_page(
           document.getElementById('ssUploadResult').innerText = '오류: ' + (data.detail || '업로드 실패');
         }}
       }}
+
+      (function() {{
+        const allCheck = document.getElementById('ssAllCheck');
+        const selectBtn = document.getElementById('ssSelectAllBtn');
+        const deleteSelectedBtn = document.getElementById('ssDeleteSelectedBtn');
+        const deleteAllBtn = document.getElementById('ssDeleteAllBtn');
+
+        function applyAll(checked) {{
+          document.querySelectorAll('.ss-check').forEach(function(c) {{ c.checked = checked; }});
+          if (allCheck) allCheck.checked = checked;
+        }}
+
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ applyAll(allCheck.checked); }}); }}
+        if (selectBtn) {{
+          selectBtn.addEventListener('click', function() {{
+            const next = !(allCheck && allCheck.checked);
+            applyAll(next);
+          }});
+        }}
+
+        if (deleteSelectedBtn) {{
+          deleteSelectedBtn.addEventListener('click', async function() {{
+            const checked = Array.from(document.querySelectorAll('.ss-check:checked')).map(c => parseInt(c.value));
+            if (checked.length === 0) {{ alert('삭제할 항목을 선택하세요.'); return; }}
+            if (!confirm(checked.length + '건을 삭제합니다. 되돌릴 수 없습니다. 계속할까요?')) return;
+            const res = await fetch('/master/purchase-order/safety-stock/delete', {{
+              method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ ids: checked }})
+            }});
+            if (res.ok) {{ location.reload(); }} else {{
+              const err = await res.json();
+              alert('오류: ' + (err.detail || '삭제 실패'));
+            }}
+          }});
+        }}
+
+        if (deleteAllBtn) {{
+          deleteAllBtn.addEventListener('click', async function() {{
+            if (!confirm('현재 검색/필터 결과와 무관하게 전체 안전재고 데이터를 삭제합니다. 되돌릴 수 없습니다. 계속할까요?')) return;
+            const res = await fetch('/master/purchase-order/safety-stock/delete-all', {{ method: 'POST' }});
+            if (res.ok) {{ location.reload(); }} else {{ alert('전체 삭제 실패'); }}
+          }});
+        }}
+      }})();
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -10017,6 +10068,39 @@ async def safety_stock_upload(request: Request, session_token: str = Cookie(defa
     conn.close()
     return JSONResponse(content={"status": "ok", "inserted": inserted, "skipped": skipped})
 
+
+@app.post("/master/purchase-order/safety-stock/delete")
+async def safety_stock_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    ids = data.get("ids", [])
+    if not ids:
+        return JSONResponse(status_code=400, content={"detail": "삭제할 항목이 없습니다."})
+
+    conn = get_conn()
+    conn.execute(
+        f"DELETE FROM safety_stock WHERE id IN ({','.join('?' for _ in ids)})",
+        [int(i) for i in ids]
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok", "deleted_count": len(ids)})
+
+
+@app.post("/master/purchase-order/safety-stock/delete-all")
+async def safety_stock_delete_all(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    conn.execute("DELETE FROM safety_stock")
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
 
 if __name__ == "__main__":
     import uvicorn
