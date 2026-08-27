@@ -4052,13 +4052,78 @@ async def survey_list_page(session_token: str = Cookie(default=None)):
 
     cards_html = ""
     for s in surveys:
+@app.get("/survey", response_class=HTMLResponse)
+async def survey_list_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if user["role"] == "master":
+        return RedirectResponse(url="/master/survey", status_code=303)
+
+    branch_code = user["branch_code"]
+
+    conn = get_conn()
+    surveys = conn.execute(
+        "SELECT * FROM survey WHERE active = TRUE ORDER BY created_at DESC"
+    ).fetchall()
+
+    my_responses = conn.execute(
+        "SELECT id, survey_id, writer_name, status FROM survey_response WHERE branch_code=?",
+        (branch_code,)
+    ).fetchall()
+    conn.close()
+
+    my_map: Dict[int, list] = {}
+    for r in my_responses:
+        my_map.setdefault(r["survey_id"], []).append(
+            {"id": r["id"], "writer_name": r["writer_name"], "status": r["status"]}
+        )
+
+    if not surveys:
+        content = """
+        <div class="card" style="text-align:center;padding:40px;">
+          <div style="font-size:32px;">📋</div>
+          <p style="color:#888;margin-top:12px;">진행 중인 설문이 없습니다.</p>
+        </div>
+        """
+        return HTMLResponse(content=render_page(content, user, "survey"))
+
+    cards_html = ""
+    for s in surveys:
         my_writers = my_map.get(s["id"], [])
-        status_html = ""
         if my_writers:
-            names_str = ", ".join(my_writers)
-            status_html = f'<p style="font-size:12px;color:#22C55E;margin-top:6px;">✅ 제출됨: {names_str}</p>'
+            writer_rows_html = ""
+            for w in my_writers:
+                if w["status"] == "resubmit_requested":
+                    badge = '<span class="badge-red">⚠️ 재제출요청</span>'
+                else:
+                    badge = '<span class="badge-green">✅ 완료</span>'
+                writer_rows_html += f"""
+                <a href="/survey/{s['id']}/edit/{w['id']}" style="text-decoration:none;color:inherit;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;">
+                    <span style="font-size:13px;">{w['writer_name']}</span>
+                    {badge}
+                  </div>
+                </a>
+                """
+            status_html = f'<div style="margin-top:8px;border-top:1px solid #eee;padding-top:8px;">{writer_rows_html}</div>'
         else:
             status_html = '<p style="font-size:12px;color:#888;margin-top:6px;">미제출</p>'
+
+        cards_html += f"""
+        <div class="card">
+          <a href="/survey/{s['id']}" style="text-decoration:none;color:inherit;">
+            <div style="font-weight:bold;color:#1E2761;">{s['title']}</div>
+          </a>
+          {status_html}
+        </div>
+        """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📋 설문</h2>
+    {cards_html}
+    """
+    return HTMLResponse(content=render_page(content, user, "survey"))
         cards_html += f"""
         <a href="/survey/{s['id']}" style="text-decoration:none;">
           <div class="card" style="cursor:pointer;">
@@ -4545,7 +4610,7 @@ async def survey_edit_submit(response_id: int, request: Request, session_token: 
             "INSERT INTO survey_answer (response_id, question_id, selected_option, answer_text) VALUES (?, ?, ?, ?)",
             (response_id, a.get("question_id"), a.get("selected_option"), a.get("answer_text"))
         )
-    conn.execute("UPDATE survey_response SET updated_at=NOW() WHERE id=?", (response_id,))
+    conn.execute("UPDATE survey_response SET status='completed', updated_at=NOW() WHERE id=?", (response_id,))
     conn.commit()
     conn.close()
 
@@ -5082,7 +5147,7 @@ async def master_survey_question_delete(survey_id: int, question_id: int, sessio
     conn.close()
     return JSONResponse(content={"status": "ok"})
 
-    @app.get("/master/survey/{survey_id}/responses", response_class=HTMLResponse)
+@app.get("/master/survey/{survey_id}/responses", response_class=HTMLResponse)
 async def master_survey_responses_page(
     survey_id: int, session_token: str = Cookie(default=None), filter_branch: str = ""
 ):
@@ -5115,7 +5180,7 @@ async def master_survey_responses_page(
 
     rows_html = ""
     if not responses:
-        rows_html = '<tr><td colspan="4" style="text-align:center;padding:20px;color:#888;">제출된 응답이 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">제출된 응답이 없습니다.</td></tr>'
     for r in responses:
         answers = conn.execute(
             "SELECT * FROM survey_answer WHERE response_id=? ORDER BY question_id", (r["id"],)
@@ -5138,11 +5203,17 @@ async def master_survey_responses_page(
             answer_lines.append(f"<b>{qlabel}</b>: {' / '.join(parts) if parts else '-'}")
         answers_html = "<br>".join(answer_lines)
 
+        status_badge = '<span class="badge-red">⚠️ 재제출요청</span>' if r["status"] == "resubmit_requested" else '<span class="badge-green">✅ 완료</span>'
+
         rows_html += f"""
         <tr>
+            <td style="text-align:center;">
+              <input type="checkbox" name="selected_ids" value="{r['id']}" class="sv-resp-check" style="width:16px;height:16px;">
+            </td>
             <td>{r['branch_name']}</td>
             <td>{r['writer_name']}</td>
             <td style="font-size:12px;">{answers_html}</td>
+            <td>{status_badge}</td>
             <td style="font-size:11px;color:#888;">{str(r['created_at'])[:16]}</td>
         </tr>
         """
@@ -5174,14 +5245,73 @@ async def master_survey_responses_page(
     </div>
 
     <div class="card">
-      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(responses)}건 제출됨</p>
-      <table>
-        <thead><tr><th>지점</th><th>작성자</th><th>답변 내역</th><th>제출/수정일시</th></tr></thead>
-        <tbody>{rows_html}</tbody>
-      </table>
+      <form method="post" action="/master/survey/{survey_id}/responses/request-resubmit" id="svResponseForm">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <span style="font-size:13px;color:#888;">{len(responses)}건 제출됨</span>
+          <div style="display:flex;gap:8px;">
+            <button type="button" class="btn" id="svRespSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
+            <button type="button" class="btn" id="svRespResubmitBtn" style="background:#F59E0B;font-size:12px;padding:6px 12px;">재제출 요청</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr>
+            <th style="width:36px;text-align:center;"><input type="checkbox" id="svRespAllCheck" style="width:16px;height:16px;"></th>
+            <th>지점</th><th>작성자</th><th>답변 내역</th><th>상태</th><th>제출/수정일시</th>
+          </tr></thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      </form>
     </div>
+
+    <script>
+      (function() {{
+        var allCheck = document.getElementById('svRespAllCheck');
+        var selectBtn = document.getElementById('svRespSelectAllBtn');
+        function applyAll(checked) {{
+          document.querySelectorAll('.sv-resp-check').forEach(function(c) {{ c.checked = checked; }});
+          if (allCheck) allCheck.checked = checked;
+        }}
+        if (allCheck) {{ allCheck.addEventListener('click', function() {{ applyAll(allCheck.checked); }}); }}
+        if (selectBtn) {{
+          selectBtn.addEventListener('click', function() {{
+            var next = !(allCheck && allCheck.checked);
+            applyAll(next);
+          }});
+        }}
+        var resubmitBtn = document.getElementById('svRespResubmitBtn');
+        if (resubmitBtn) {{
+          resubmitBtn.addEventListener('click', function() {{
+            var checked = document.querySelectorAll('.sv-resp-check:checked');
+            if (checked.length === 0) {{ alert('재제출을 요청할 항목을 선택하세요.'); return; }}
+            if (confirm(checked.length + '건에 대해 재제출을 요청합니다. 작성자에게 재제출 알림이 표시됩니다. 계속할까요?')) {{
+              document.getElementById('svResponseForm').submit();
+            }}
+          }});
+        }}
+      }})();
+    </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/survey/{survey_id}/responses/request-resubmit")
+async def master_survey_responses_request_resubmit(
+    survey_id: int, request: Request, session_token: str = Cookie(default=None)
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    form = await request.form()
+    ids = form.getlist("selected_ids")
+    if ids:
+        conn = get_conn()
+        conn.execute(
+            f"UPDATE survey_response SET status='resubmit_requested' WHERE id IN ({','.join('?' for _ in ids)}) AND survey_id=?",
+            [int(i) for i in ids] + [survey_id]
+        )
+        conn.commit()
+        conn.close()
+    return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
 
 
 @app.get("/master/survey/{survey_id}/responses/export")
