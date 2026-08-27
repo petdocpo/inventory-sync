@@ -4813,7 +4813,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
       <textarea id="qDesc" placeholder="문항 설명 (선택)" style="width:100%;min-height:50px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:12px;"></textarea>
 
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
-        <input type="checkbox" id="qHasOptions" onchange="toggleOptionsSection()"> 객관식 선택지 포함
+        <input type="checkbox" id="qHasOptions" onchange="toggleOptionsSection()" style="width:18px;height:18px;flex-shrink:0;"> 객관식 선택지 포함
       </label>
       <div id="optionsSection" style="display:none;margin-bottom:12px;padding:12px;background:#f8fafc;border-radius:8px;">
         <div style="display:flex;gap:6px;margin-bottom:8px;">
@@ -4825,12 +4825,12 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
       </div>
 
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
-        <input type="checkbox" id="qHasText" checked onchange="toggleTextSection()"> 서술형 입력 포함
+        <input type="checkbox" id="qHasText" checked onchange="toggleTextSection()" style="width:18px;height:18px;flex-shrink:0;"> 서술형 입력 포함
       </label>
       <div id="textSection" style="margin-bottom:12px;">
         <input type="text" id="qTextLabel" placeholder="서술 입력란 라벨 (예: 기타(서술 필요한 내용 기재))" style="margin-bottom:8px;">
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
-          <input type="checkbox" id="qTextRequired"> 서술 입력 필수
+          <input type="checkbox" id="qTextRequired" style="width:18px;height:18px;flex-shrink:0;"> 서술 입력 필수
         </label>
       </div>
 
@@ -5081,6 +5081,183 @@ async def master_survey_question_delete(survey_id: int, question_id: int, sessio
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
+
+    @app.get("/master/survey/{survey_id}/responses", response_class=HTMLResponse)
+async def master_survey_responses_page(
+    survey_id: int, session_token: str = Cookie(default=None), filter_branch: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    survey = conn.execute("SELECT * FROM survey WHERE id=?", (survey_id,)).fetchone()
+    if not survey:
+        conn.close()
+        return RedirectResponse(url="/master/survey", status_code=303)
+
+    question_rows = conn.execute(
+        "SELECT * FROM survey_question WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+    question_map = {q["id"]: q for q in question_rows}
+
+    query = "SELECT * FROM survey_response WHERE survey_id=?"
+    params: list = [survey_id]
+    if filter_branch:
+        query += " AND branch_code=?"
+        params.append(filter_branch)
+    query += " ORDER BY created_at DESC"
+    responses = conn.execute(query, params).fetchall()
+
+    all_branches = conn.execute(
+        "SELECT DISTINCT branch_code, branch_name FROM survey_response WHERE survey_id=? ORDER BY branch_name", (survey_id,)
+    ).fetchall()
+
+    rows_html = ""
+    if not responses:
+        rows_html = '<tr><td colspan="4" style="text-align:center;padding:20px;color:#888;">제출된 응답이 없습니다.</td></tr>'
+    for r in responses:
+        answers = conn.execute(
+            "SELECT * FROM survey_answer WHERE response_id=? ORDER BY question_id", (r["id"],)
+        ).fetchall()
+        answer_lines = []
+        for a in answers:
+            q = question_map.get(a["question_id"])
+            if not q:
+                continue
+            qlabel = q["question_text"]
+            parts = []
+            if a["selected_option"]:
+                opt_row = conn.execute(
+                    "SELECT option_label FROM survey_question_option WHERE question_id=? AND option_value=?",
+                    (a["question_id"], a["selected_option"])
+                ).fetchone()
+                parts.append(opt_row["option_label"] if opt_row else a["selected_option"])
+            if a["answer_text"]:
+                parts.append(f'"{a["answer_text"]}"')
+            answer_lines.append(f"<b>{qlabel}</b>: {' / '.join(parts) if parts else '-'}")
+        answers_html = "<br>".join(answer_lines)
+
+        rows_html += f"""
+        <tr>
+            <td>{r['branch_name']}</td>
+            <td>{r['writer_name']}</td>
+            <td style="font-size:12px;">{answers_html}</td>
+            <td style="font-size:11px;color:#888;">{str(r['created_at'])[:16]}</td>
+        </tr>
+        """
+    conn.close()
+
+    branch_options_html = '<option value="">전체 지점</option>'
+    for b in all_branches:
+        sel = "selected" if filter_branch == b["branch_code"] else ""
+        branch_options_html += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/survey" style="color:#1E2761;">← 설문 관리</a>
+      <h2>📊 {survey['title']} — 제출현황</h2>
+    </div>
+
+    <div class="card">
+      <form method="get" action="/master/survey/{survey_id}/responses" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div style="flex:1;min-width:150px;">
+          <label style="font-size:12px;color:#888;">지점 필터</label>
+          <select name="filter_branch" style="margin-top:4px;">{branch_options_html}</select>
+        </div>
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/survey/{survey_id}/responses" style="padding:10px 14px;background:#eee;
+           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+        <a href="/master/survey/{survey_id}/responses/export?filter_branch={filter_branch}"
+           class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
+      </form>
+    </div>
+
+    <div class="card">
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(responses)}건 제출됨</p>
+      <table>
+        <thead><tr><th>지점</th><th>작성자</th><th>답변 내역</th><th>제출/수정일시</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.get("/master/survey/{survey_id}/responses/export")
+async def master_survey_responses_export(
+    survey_id: int, session_token: str = Cookie(default=None), filter_branch: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    survey = conn.execute("SELECT * FROM survey WHERE id=?", (survey_id,)).fetchone()
+    if not survey:
+        conn.close()
+        return RedirectResponse(url="/master/survey", status_code=303)
+
+    question_rows = conn.execute(
+        "SELECT * FROM survey_question WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+    question_map = {q["id"]: q for q in question_rows}
+
+    query = "SELECT * FROM survey_response WHERE survey_id=?"
+    params: list = [survey_id]
+    if filter_branch:
+        query += " AND branch_code=?"
+        params.append(filter_branch)
+    query += " ORDER BY created_at DESC"
+    responses = conn.execute(query, params).fetchall()
+
+    import io
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "설문응답"
+    headers = ["지점", "작성자", "문항", "객관식 답변", "서술형 답변", "제출일시"]
+    ws.append(headers)
+
+    for r in responses:
+        answers = conn.execute(
+            "SELECT * FROM survey_answer WHERE response_id=? ORDER BY question_id", (r["id"],)
+        ).fetchall()
+        if not answers:
+            ws.append([r["branch_name"], r["writer_name"], "-", "-", "-", str(r["created_at"]) if r["created_at"] else ""])
+        for a in answers:
+            q = question_map.get(a["question_id"])
+            qlabel = q["question_text"] if q else "-"
+            opt_label = ""
+            if a["selected_option"]:
+                opt_row = conn.execute(
+                    "SELECT option_label FROM survey_question_option WHERE question_id=? AND option_value=?",
+                    (a["question_id"], a["selected_option"])
+                ).fetchone()
+                opt_label = opt_row["option_label"] if opt_row else a["selected_option"]
+            ws.append([
+                r["branch_name"], r["writer_name"], qlabel, opt_label, a["answer_text"] or "",
+                str(r["created_at"]) if r["created_at"] else ""
+            ])
+    conn.close()
+
+    for col_idx in range(1, len(headers) + 1):
+        ws.column_dimensions[chr(64 + col_idx)].width = 22
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"설문응답_{survey['title']}_{filter_branch or '전체'}.xlsx"
+    from urllib.parse import quote
+    encoded_filename = quote(filename)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"}
+    )
 
 @app.get("/master/webhook-send-log", response_class=HTMLResponse)
 async def master_webhook_send_log_page(
