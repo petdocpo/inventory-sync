@@ -4017,6 +4017,541 @@ async def vendor_master_delete(request: Request, session_token: str = Cookie(def
         conn.close()
     return RedirectResponse(url="/master/vendor-master", status_code=303)
 
+@app.get("/survey", response_class=HTMLResponse)
+async def survey_list_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if user["role"] == "master":
+        return RedirectResponse(url="/master/survey", status_code=303)
+
+    branch_code = user["branch_code"]
+
+    conn = get_conn()
+    surveys = conn.execute(
+        "SELECT * FROM survey WHERE active = TRUE ORDER BY created_at DESC"
+    ).fetchall()
+
+    my_responses = conn.execute(
+        "SELECT survey_id, writer_name FROM survey_response WHERE branch_code=?",
+        (branch_code,)
+    ).fetchall()
+    conn.close()
+
+    my_map: Dict[int, list] = {}
+    for r in my_responses:
+        my_map.setdefault(r["survey_id"], []).append(r["writer_name"])
+
+    if not surveys:
+        content = """
+        <div class="card" style="text-align:center;padding:40px;">
+          <div style="font-size:32px;">📋</div>
+          <p style="color:#888;margin-top:12px;">진행 중인 설문이 없습니다.</p>
+        </div>
+        """
+        return HTMLResponse(content=render_page(content, user, "survey"))
+
+    cards_html = ""
+    for s in surveys:
+        my_writers = my_map.get(s["id"], [])
+        status_html = ""
+        if my_writers:
+            names_str = ", ".join(my_writers)
+            status_html = f'<p style="font-size:12px;color:#22C55E;margin-top:6px;">✅ 제출됨: {names_str}</p>'
+        else:
+            status_html = '<p style="font-size:12px;color:#888;margin-top:6px;">미제출</p>'
+        cards_html += f"""
+        <a href="/survey/{s['id']}" style="text-decoration:none;">
+          <div class="card" style="cursor:pointer;">
+            <div style="font-weight:bold;color:#1E2761;">{s['title']}</div>
+            {status_html}
+          </div>
+        </a>
+        """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📋 설문</h2>
+    {cards_html}
+    """
+    return HTMLResponse(content=render_page(content, user, "survey"))
+
+
+@app.get("/survey/{survey_id}", response_class=HTMLResponse)
+async def survey_write_page(survey_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if user["role"] == "master":
+        return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
+
+    branch_code = user["branch_code"]
+    branch_name = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_code)
+
+    conn = get_conn()
+    survey = conn.execute("SELECT * FROM survey WHERE id=?", (survey_id,)).fetchone()
+    if not survey:
+        conn.close()
+        return RedirectResponse(url="/survey", status_code=303)
+
+    legend_rows = conn.execute(
+        "SELECT * FROM survey_score_legend WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+
+    question_rows = conn.execute(
+        "SELECT * FROM survey_question WHERE survey_id=? AND active=TRUE ORDER BY display_order", (survey_id,)
+    ).fetchall()
+
+    questions_data = []
+    for q in question_rows:
+        options = conn.execute(
+            "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
+        ).fetchall()
+        questions_data.append({
+            "id": q["id"],
+            "question_text": q["question_text"],
+            "description": q["description"] or "",
+            "has_options": bool(q["has_options"]),
+            "has_text_answer": bool(q["has_text_answer"]),
+            "text_answer_label": q["text_answer_label"] or "기타 (서술)",
+            "text_answer_required": bool(q["text_answer_required"]),
+            "options": [{"value": o["option_value"], "label": o["option_label"]} for o in options]
+        })
+    conn.close()
+
+    if not questions_data:
+        content = """
+        <div class="card" style="text-align:center;padding:40px;">
+          <div style="font-size:32px;">📝</div>
+          <p style="color:#888;margin-top:12px;">등록된 문항이 없습니다. 마스터에게 문항 등록을 요청해주세요.</p>
+        </div>
+        """
+        return HTMLResponse(content=render_page(content, user, "survey"))
+
+    legend_html = ""
+    if legend_rows:
+        legend_items = "".join(
+            f'<tr><td style="text-align:center;font-weight:bold;">{lg["score_value"]}</td><td>{lg["score_meaning"]}</td></tr>'
+            for lg in legend_rows
+        )
+        legend_html = f"""
+        <div class="card">
+          <table>
+            <thead><tr><th style="width:60px;text-align:center;">점수</th><th>의미</th></tr></thead>
+            <tbody>{legend_items}</tbody>
+          </table>
+        </div>
+        """
+
+    intro_html = ""
+    if survey["purpose"] or survey["method"]:
+        purpose_block = f'<p style="margin-bottom:8px;"><b>진단목적</b><br>{survey["purpose"]}</p>' if survey["purpose"] else ""
+        method_block = f'<p><b>진단방법</b><br>{survey["method"]}</p>' if survey["method"] else ""
+        intro_html = f"""
+        <div class="card">
+          {purpose_block}
+          {method_block}
+        </div>
+        """
+
+    questions_js = json.dumps(questions_data, ensure_ascii=False)
+
+    question_blocks = ""
+    for idx, q in enumerate(questions_data):
+        num = idx + 1
+        desc_html = f'<p style="color:#888;font-size:12px;margin-bottom:8px;">{q["description"]}</p>' if q["description"] else ""
+        question_blocks += f"""
+        <div class="sv-field">
+          <label>{num}. {q['question_text']}</label>
+          {desc_html}
+          <div id="options_{q['id']}"></div>
+          <div id="textwrap_{q['id']}" style="display:{'block' if q['has_text_answer'] else 'none'};">
+            <textarea id="text_{q['id']}" placeholder="{q['text_answer_label']}{' (필수)' if q['text_answer_required'] else ' (선택)'}"></textarea>
+          </div>
+        </div>
+        """
+
+    content = f"""
+    {intro_html}
+    {legend_html}
+    <style>
+      .sv-card {{ background:#fff; border-radius:12px; padding:20px; max-width:560px; margin:0 auto; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
+      .sv-card h2 {{ font-size:18px; margin-bottom:16px; }}
+      .sv-field {{ margin-bottom:20px; padding-bottom:16px; border-bottom:1px solid #eee; }}
+      .sv-field label {{ display:block; font-weight:bold; margin-bottom:6px; font-size:14px; }}
+      .sv-option {{ display:inline-block; border:1px solid #ddd; border-radius:8px; padding:8px 14px; margin:0 6px 6px 0; cursor:pointer; font-size:13px; }}
+      .sv-option.selected {{ border-color:#2563eb; background:#eff6ff; color:#2563eb; font-weight:bold; }}
+      .sv-card textarea {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; min-height:60px; margin-top:8px; }}
+      .sv-card input[type="text"] {{ width:100%; padding:10px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; margin-bottom:16px; }}
+      .sv-card button {{ padding:12px 20px; border:none; border-radius:6px; font-size:15px; cursor:pointer; width:100%; }}
+      .sv-btn-submit {{ background:#2563eb; color:#fff; }}
+      .sv-btn-submit:disabled {{ background:#ccc; cursor:not-allowed; }}
+    </style>
+    <div class="sv-card">
+      <h2>{survey['title']}</h2>
+      <label style="font-size:13px;color:#555;">작성자 이름 (필수)</label>
+      <input type="text" id="writerName" placeholder="이름을 입력하세요" oninput="checkAllValid()">
+      {question_blocks}
+      <button class="sv-btn-submit" id="submitBtn" onclick="submitSurvey()" disabled>제출</button>
+    </div>
+
+    <script>
+      const questionsData = {questions_js};
+      const surveyId = {survey_id};
+
+      let selected = {{}};
+      questionsData.forEach(q => selected[q.id] = null);
+
+      function renderOptions(q) {{
+        if (!q.has_options) return;
+        const container = document.getElementById('options_' + q.id);
+        q.options.forEach(opt => {{
+          const div = document.createElement('div');
+          div.className = 'sv-option';
+          div.innerText = opt.label;
+          div.onclick = () => {{
+            selected[q.id] = opt.value;
+            document.querySelectorAll('#options_' + q.id + ' .sv-option').forEach(o => o.classList.remove('selected'));
+            div.classList.add('selected');
+            checkAllValid();
+          }};
+          container.appendChild(div);
+        }});
+      }}
+
+      function checkAllValid() {{
+        const writerOk = document.getElementById('writerName').value.trim().length > 0;
+        const questionsOk = questionsData.every(q => {{
+          const optOk = !q.has_options || selected[q.id] !== null;
+          let textOk = true;
+          if (q.has_text_answer && q.text_answer_required) {{
+            const el = document.getElementById('text_' + q.id);
+            textOk = el && el.value.trim().length > 0;
+          }}
+          return optOk && textOk;
+        }});
+        document.getElementById('submitBtn').disabled = !(writerOk && questionsOk);
+      }}
+
+      questionsData.forEach(q => {{
+        renderOptions(q);
+        const textEl = document.getElementById('text_' + q.id);
+        if (textEl) textEl.addEventListener('input', checkAllValid);
+      }});
+
+      async function submitSurvey() {{
+        const writerName = document.getElementById('writerName').value.trim();
+        const answers = questionsData.map(q => ({{
+          question_id: q.id,
+          selected_option: selected[q.id],
+          answer_text: q.has_text_answer ? (document.getElementById('text_' + q.id).value.trim() || null) : null
+        }}));
+        const payload = {{ writer_name: writerName, answers: answers }};
+        const res = await fetch('/survey/' + surveyId + '/submit', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload)
+        }});
+        if (res.ok) {{
+          const result = await res.json();
+          window.location.href = '/survey/' + surveyId + '/edit/' + result.response_id;
+        }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '제출 실패'));
+        }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "survey"))
+
+
+@app.post("/survey/{survey_id}/submit")
+async def survey_submit(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return JSONResponse(status_code=403, content={"detail": "지점 계정만 제출 가능합니다."})
+
+    branch_code = user["branch_code"]
+    branch_name = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_code)
+
+    data = await request.json()
+    writer_name = data.get("writer_name", "").strip()
+    answers = data.get("answers", [])
+
+    if not writer_name:
+        return JSONResponse(status_code=400, content={"detail": "작성자 이름을 입력하세요."})
+    if not answers:
+        return JSONResponse(status_code=400, content={"detail": "답변이 없습니다."})
+
+    conn = get_conn()
+
+    survey = conn.execute("SELECT id FROM survey WHERE id=?", (survey_id,)).fetchone()
+    if not survey:
+        conn.close()
+        return JSONResponse(status_code=404, content={"detail": "설문을 찾을 수 없습니다."})
+
+    question_map = {
+        q["id"]: q for q in conn.execute(
+            "SELECT * FROM survey_question WHERE survey_id=?", (survey_id,)
+        ).fetchall()
+    }
+
+    for a in answers:
+        qid = a.get("question_id")
+        q = question_map.get(qid)
+        if not q:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "잘못된 문항이 포함되어 있습니다."})
+        if q["has_options"] and not a.get("selected_option"):
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": f'"{q["question_text"]}" 문항에 응답하지 않았습니다.'})
+        if q["has_text_answer"] and q["text_answer_required"] and not (a.get("answer_text") or "").strip():
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": f'"{q["question_text"]}" 문항의 서술 입력이 필요합니다.'})
+
+    existing = conn.execute(
+        "SELECT id FROM survey_response WHERE survey_id=? AND branch_code=? AND writer_name=?",
+        (survey_id, branch_code, writer_name)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return JSONResponse(status_code=400, content={
+            "detail": "이미 같은 이름으로 제출된 기록이 있습니다. 수정 화면을 이용해주세요.",
+            "existing_response_id": existing["id"]
+        })
+
+    conn.execute("""
+        INSERT INTO survey_response (survey_id, writer_name, branch_code, branch_name, status)
+        VALUES (?, ?, ?, ?, 'completed')
+    """, (survey_id, writer_name, branch_code, branch_name))
+
+    new_row = conn.execute(
+        "SELECT id FROM survey_response WHERE survey_id=? AND branch_code=? AND writer_name=?",
+        (survey_id, branch_code, writer_name)
+    ).fetchone()
+    response_id = new_row["id"]
+
+    for a in answers:
+        conn.execute(
+            "INSERT INTO survey_answer (response_id, question_id, selected_option, answer_text) VALUES (?, ?, ?, ?)",
+            (response_id, a.get("question_id"), a.get("selected_option"), a.get("answer_text"))
+        )
+
+    conn.commit()
+    conn.close()
+
+    return JSONResponse(content={"status": "ok", "response_id": response_id})
+
+
+@app.get("/survey/{survey_id}/edit/{response_id}", response_class=HTMLResponse)
+async def survey_edit_page(survey_id: int, response_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    survey = conn.execute("SELECT * FROM survey WHERE id=?", (survey_id,)).fetchone()
+    response = conn.execute("SELECT * FROM survey_response WHERE id=?", (response_id,)).fetchone()
+    if not survey or not response or response["branch_code"] != user["branch_code"] or response["survey_id"] != survey_id:
+        conn.close()
+        return RedirectResponse(url="/survey", status_code=303)
+
+    legend_rows = conn.execute(
+        "SELECT * FROM survey_score_legend WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+
+    question_rows = conn.execute(
+        "SELECT * FROM survey_question WHERE survey_id=? AND active=TRUE ORDER BY display_order", (survey_id,)
+    ).fetchall()
+
+    questions_data = []
+    for q in question_rows:
+        options = conn.execute(
+            "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
+        ).fetchall()
+        existing_answer = conn.execute(
+            "SELECT selected_option, answer_text FROM survey_answer WHERE response_id=? AND question_id=?",
+            (response_id, q["id"])
+        ).fetchone()
+        questions_data.append({
+            "id": q["id"],
+            "question_text": q["question_text"],
+            "description": q["description"] or "",
+            "has_options": bool(q["has_options"]),
+            "has_text_answer": bool(q["has_text_answer"]),
+            "text_answer_label": q["text_answer_label"] or "기타 (서술)",
+            "text_answer_required": bool(q["text_answer_required"]),
+            "options": [{"value": o["option_value"], "label": o["option_label"]} for o in options],
+            "existing_option": existing_answer["selected_option"] if existing_answer else None,
+            "existing_text": existing_answer["answer_text"] if existing_answer else ""
+        })
+    conn.close()
+
+    legend_html = ""
+    if legend_rows:
+        legend_items = "".join(
+            f'<tr><td style="text-align:center;font-weight:bold;">{lg["score_value"]}</td><td>{lg["score_meaning"]}</td></tr>'
+            for lg in legend_rows
+        )
+        legend_html = f"""
+        <div class="card">
+          <table>
+            <thead><tr><th style="width:60px;text-align:center;">점수</th><th>의미</th></tr></thead>
+            <tbody>{legend_items}</tbody>
+          </table>
+        </div>
+        """
+
+    intro_html = ""
+    if survey["purpose"] or survey["method"]:
+        purpose_block = f'<p style="margin-bottom:8px;"><b>진단목적</b><br>{survey["purpose"]}</p>' if survey["purpose"] else ""
+        method_block = f'<p><b>진단방법</b><br>{survey["method"]}</p>' if survey["method"] else ""
+        intro_html = f"""
+        <div class="card">
+          {purpose_block}
+          {method_block}
+        </div>
+        """
+
+    questions_js = json.dumps(questions_data, ensure_ascii=False)
+    writer_name_js = json.dumps(response["writer_name"], ensure_ascii=False)
+
+    question_blocks = ""
+    for idx, q in enumerate(questions_data):
+        num = idx + 1
+        desc_html = f'<p style="color:#888;font-size:12px;margin-bottom:8px;">{q["description"]}</p>' if q["description"] else ""
+        question_blocks += f"""
+        <div class="sv-field">
+          <label>{num}. {q['question_text']}</label>
+          {desc_html}
+          <div id="options_{q['id']}"></div>
+          <div id="textwrap_{q['id']}" style="display:{'block' if q['has_text_answer'] else 'none'};">
+            <textarea id="text_{q['id']}" placeholder="{q['text_answer_label']}{' (필수)' if q['text_answer_required'] else ' (선택)'}"></textarea>
+          </div>
+        </div>
+        """
+
+    content = f"""
+    {intro_html}
+    {legend_html}
+    <style>
+      .sv-card {{ background:#fff; border-radius:12px; padding:20px; max-width:560px; margin:0 auto; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
+      .sv-card h2 {{ font-size:18px; margin-bottom:16px; }}
+      .sv-field {{ margin-bottom:20px; padding-bottom:16px; border-bottom:1px solid #eee; }}
+      .sv-field label {{ display:block; font-weight:bold; margin-bottom:6px; font-size:14px; }}
+      .sv-option {{ display:inline-block; border:1px solid #ddd; border-radius:8px; padding:8px 14px; margin:0 6px 6px 0; cursor:pointer; font-size:13px; }}
+      .sv-option.selected {{ border-color:#2563eb; background:#eff6ff; color:#2563eb; font-weight:bold; }}
+      .sv-card textarea {{ width:100%; padding:8px; border:1px solid #ccc; border-radius:6px; box-sizing:border-box; font-size:14px; min-height:60px; margin-top:8px; }}
+      .sv-card button {{ padding:12px 20px; border:none; border-radius:6px; font-size:15px; cursor:pointer; width:100%; }}
+      .sv-btn-submit {{ background:#2563eb; color:#fff; }}
+    </style>
+    <div class="sv-card">
+      <h2>{survey['title']} — 수정</h2>
+      <p style="color:#888;font-size:12px;margin-bottom:16px;">작성자: {response['writer_name']}</p>
+      {question_blocks}
+      <button class="sv-btn-submit" id="submitBtn" onclick="submitEdit()">저장</button>
+    </div>
+
+    <script>
+      const questionsData = {questions_js};
+      const writerName = {writer_name_js};
+      const responseId = {response_id};
+
+      let selected = {{}};
+      questionsData.forEach(q => selected[q.id] = q.existing_option);
+
+      function renderOptions(q) {{
+        if (!q.has_options) return;
+        const container = document.getElementById('options_' + q.id);
+        q.options.forEach(opt => {{
+          const div = document.createElement('div');
+          div.className = 'sv-option' + (opt.value === q.existing_option ? ' selected' : '');
+          div.innerText = opt.label;
+          div.onclick = () => {{
+            selected[q.id] = opt.value;
+            document.querySelectorAll('#options_' + q.id + ' .sv-option').forEach(o => o.classList.remove('selected'));
+            div.classList.add('selected');
+          }};
+          container.appendChild(div);
+        }});
+      }}
+
+      questionsData.forEach(q => {{
+        renderOptions(q);
+        const textEl = document.getElementById('text_' + q.id);
+        if (textEl) textEl.value = q.existing_text || '';
+      }});
+
+      async function submitEdit() {{
+        const answers = questionsData.map(q => ({{
+          question_id: q.id,
+          selected_option: selected[q.id],
+          answer_text: q.has_text_answer ? (document.getElementById('text_' + q.id).value.trim() || null) : null
+        }}));
+        const payload = {{ answers: answers }};
+        const res = await fetch('/survey/edit/' + responseId + '/submit', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload)
+        }});
+        if (res.ok) {{
+          alert('수정되었습니다.');
+          window.location.href = '/survey';
+        }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '수정 실패'));
+        }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "survey"))
+
+
+@app.post("/survey/edit/{response_id}/submit")
+async def survey_edit_submit(response_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    response = conn.execute("SELECT * FROM survey_response WHERE id=?", (response_id,)).fetchone()
+    if not response or response["branch_code"] != user["branch_code"]:
+        conn.close()
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    answers = data.get("answers", [])
+
+    question_map = {
+        q["id"]: q for q in conn.execute(
+            "SELECT * FROM survey_question WHERE survey_id=?", (response["survey_id"],)
+        ).fetchall()
+    }
+
+    for a in answers:
+        qid = a.get("question_id")
+        q = question_map.get(qid)
+        if not q:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "잘못된 문항이 포함되어 있습니다."})
+        if q["has_options"] and not a.get("selected_option"):
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": f'"{q["question_text"]}" 문항에 응답하지 않았습니다.'})
+        if q["has_text_answer"] and q["text_answer_required"] and not (a.get("answer_text") or "").strip():
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": f'"{q["question_text"]}" 문항의 서술 입력이 필요합니다.'})
+
+    conn.execute("DELETE FROM survey_answer WHERE response_id=?", (response_id,))
+    for a in answers:
+        conn.execute(
+            "INSERT INTO survey_answer (response_id, question_id, selected_option, answer_text) VALUES (?, ?, ?, ?)",
+            (response_id, a.get("question_id"), a.get("selected_option"), a.get("answer_text"))
+        )
+    conn.execute("UPDATE survey_response SET updated_at=NOW() WHERE id=?", (response_id,))
+    conn.commit()
+    conn.close()
+
+    return JSONResponse(content={"status": "ok"})
+
 @app.get("/master/webhook-send-log", response_class=HTMLResponse)
 async def master_webhook_send_log_page(
     session_token: str = Cookie(default=None),
@@ -6627,7 +7162,7 @@ async def master_page(session_token: str = Cookie(default=None)):
       <a href="/master/eval-criteria" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📝</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">평가 문항 관리</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 평가 문항 관리</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">문항 추가/삭제/수정</div>
         </div>
       </a>
