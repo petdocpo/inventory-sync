@@ -4032,42 +4032,6 @@ async def survey_list_page(session_token: str = Cookie(default=None)):
     ).fetchall()
 
     my_responses = conn.execute(
-        "SELECT survey_id, writer_name FROM survey_response WHERE branch_code=?",
-        (branch_code,)
-    ).fetchall()
-    conn.close()
-
-    my_map: Dict[int, list] = {}
-    for r in my_responses:
-        my_map.setdefault(r["survey_id"], []).append(r["writer_name"])
-
-    if not surveys:
-        content = """
-        <div class="card" style="text-align:center;padding:40px;">
-          <div style="font-size:32px;">📋</div>
-          <p style="color:#888;margin-top:12px;">진행 중인 설문이 없습니다.</p>
-        </div>
-        """
-        return HTMLResponse(content=render_page(content, user, "survey"))
-
-    cards_html = ""
-    for s in surveys:
-@app.get("/survey", response_class=HTMLResponse)
-async def survey_list_page(session_token: str = Cookie(default=None)):
-    user = get_session(session_token)
-    if not user:
-        return RedirectResponse(url="/login", status_code=303)
-    if user["role"] == "master":
-        return RedirectResponse(url="/master/survey", status_code=303)
-
-    branch_code = user["branch_code"]
-
-    conn = get_conn()
-    surveys = conn.execute(
-        "SELECT * FROM survey WHERE active = TRUE ORDER BY created_at DESC"
-    ).fetchall()
-
-    my_responses = conn.execute(
         "SELECT id, survey_id, writer_name, status FROM survey_response WHERE branch_code=?",
         (branch_code,)
     ).fetchall()
@@ -4124,21 +4088,6 @@ async def survey_list_page(session_token: str = Cookie(default=None)):
     {cards_html}
     """
     return HTMLResponse(content=render_page(content, user, "survey"))
-        cards_html += f"""
-        <a href="/survey/{s['id']}" style="text-decoration:none;">
-          <div class="card" style="cursor:pointer;">
-            <div style="font-weight:bold;color:#1E2761;">{s['title']}</div>
-            {status_html}
-          </div>
-        </a>
-        """
-
-    content = f"""
-    <h2 style="margin-bottom:16px;">📋 설문</h2>
-    {cards_html}
-    """
-    return HTMLResponse(content=render_page(content, user, "survey"))
-
 
 @app.get("/survey/{survey_id}", response_class=HTMLResponse)
 async def survey_write_page(survey_id: int, session_token: str = Cookie(default=None)):
