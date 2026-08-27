@@ -4596,6 +4596,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
                 <td style="display:flex;gap:4px;flex-wrap:wrap;">
                   <a href="/master/survey/{s['id']}/questions" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;">문항관리</a>
                   <a href="/master/survey/{s['id']}/responses" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;background:#64748B;">제출현황</a>
+                  <button class="btn" style="font-size:11px;padding:4px 8px;background:#0EA5E9;" onclick="copySurveyLink({s['id']}, this)">🔗 링크복사</button>
                   <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="toggleSurvey({s['id']}, {str(not s['active']).lower()})">{'비활성화' if s['active'] else '활성화'}</button>
                   <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteSurvey({s['id']}, '{safe_title}', {response_count})">삭제</button>
                 </td>
@@ -4664,6 +4665,18 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
           document.getElementById('svCreateResult').innerText = '오류: ' + (err.detail || '생성 실패');
+        }}
+      }}
+
+      async function copySurveyLink(id, btnEl) {{
+        const url = window.location.origin + '/survey/' + id;
+        try {{
+          await navigator.clipboard.writeText(url);
+          const original = btnEl.innerText;
+          btnEl.innerText = '✅ 복사됨';
+          setTimeout(() => {{ btnEl.innerText = original; }}, 1500);
+        }} catch (e) {{
+          prompt('아래 링크를 복사하세요:', url);
         }}
       }}
 
