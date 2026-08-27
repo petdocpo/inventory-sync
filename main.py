@@ -843,7 +843,6 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("inventory", "/inventory", "📦", "재고현황"),
         ("qr", "/qr", "📷", "QR생성"),
         ("adjust", "/adjust", "✏️", "수기조정"),
-        ("raw-branch", raw_menu_href, "📤", "유비플러스 재고"),
         ("scanlog", "/scan-log", "📜", "스캔이력"),
         ("vendor-eval", vendor_eval_href, "🤝", "거래처평가"),
         ("purchase-history", "/purchase-history", "📦", "발주내역"),
@@ -4550,6 +4549,537 @@ async def survey_edit_submit(response_id: int, request: Request, session_token: 
     conn.commit()
     conn.close()
 
+    return JSONResponse(content={"status": "ok"})
+
+@app.get("/master/survey", response_class=HTMLResponse)
+async def master_survey_list_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    surveys = conn.execute("SELECT * FROM survey ORDER BY created_at DESC").fetchall()
+
+    rows_html = ""
+    if not surveys:
+        rows_html = '<tr><td colspan="5" style="text-align:center;padding:20px;color:#888;">등록된 설문이 없습니다.</td></tr>'
+    else:
+        for s in surveys:
+            question_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM survey_question WHERE survey_id=?", (s["id"],)
+            ).fetchone()["cnt"]
+            response_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM survey_response WHERE survey_id=?", (s["id"],)
+            ).fetchone()["cnt"]
+            active_badge = '<span class="badge-green">활성</span>' if s["active"] else '<span class="badge-red">비활성</span>'
+            safe_title = s["title"].replace("'", "")
+            rows_html += f"""
+            <tr>
+                <td><b>{s['title']}</b> {active_badge}</td>
+                <td style="text-align:center;">{question_count}개</td>
+                <td style="text-align:center;">{response_count}건</td>
+                <td style="font-size:11px;color:#888;">{str(s['created_at'])[:16]}</td>
+                <td style="display:flex;gap:4px;flex-wrap:wrap;">
+                  <a href="/master/survey/{s['id']}/questions" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;">문항관리</a>
+                  <a href="/master/survey/{s['id']}/responses" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;background:#64748B;">제출현황</a>
+                  <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="toggleSurvey({s['id']}, {str(not s['active']).lower()})">{'비활성화' if s['active'] else '활성화'}</button>
+                  <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteSurvey({s['id']}, '{safe_title}', {response_count})">삭제</button>
+                </td>
+            </tr>
+            """
+    conn.close()
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>📋 설문 관리</h2>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-bottom:8px;">새 설문 만들기</h3>
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <input type="text" id="svTitle" placeholder="설문 제목 (예: 포포즈 직책자 인재상 자가진단)">
+        <textarea id="svPurpose" placeholder="진단목적 (선택, 자유서술)" style="width:100%;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
+        <textarea id="svMethod" placeholder="진단방법 (선택, 자유서술)" style="width:100%;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
+        <div>
+          <label style="font-size:12px;color:#888;">점수 의미표 (선택 — 표로 보여줄 점수/의미 쌍, 필요 없으면 비워두세요)</label>
+          <div id="legendRows" style="display:flex;flex-direction:column;gap:6px;margin-top:6px;"></div>
+          <button type="button" class="btn" style="font-size:12px;padding:6px 10px;margin-top:6px;background:#64748B;" onclick="addLegendRow()">+ 점수 행 추가</button>
+        </div>
+        <button class="btn" type="button" onclick="createSurvey()">설문 생성</button>
+      </div>
+      <div id="svCreateResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+
+    <div class="card">
+      <table>
+        <thead><tr><th>설문명</th><th>문항수</th><th>제출수</th><th>생성일</th><th></th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+
+    <script>
+      function addLegendRow(value, meaning) {{
+        const container = document.getElementById('legendRows');
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.gap = '6px';
+        row.innerHTML = '<input type="text" class="legend-value" placeholder="점수(예: 1)" style="width:80px;" value="' + (value || '') + '">' +
+          '<input type="text" class="legend-meaning" placeholder="의미(예: 전혀 그렇지 않다)" style="flex:1;" value="' + (meaning || '') + '">' +
+          '<button type="button" class="btn btn-red" style="font-size:11px;padding:6px 10px;" onclick="this.parentElement.remove()">삭제</button>';
+        container.appendChild(row);
+      }}
+
+      async function createSurvey() {{
+        const title = document.getElementById('svTitle').value.trim();
+        const purpose = document.getElementById('svPurpose').value.trim();
+        const method = document.getElementById('svMethod').value.trim();
+        if (!title) {{ alert('설문 제목을 입력하세요.'); return; }}
+
+        const legends = [];
+        document.querySelectorAll('#legendRows > div').forEach(row => {{
+          const val = row.querySelector('.legend-value').value.trim();
+          const meaning = row.querySelector('.legend-meaning').value.trim();
+          if (val && meaning) legends.push({{ score_value: val, score_meaning: meaning }});
+        }});
+
+        const res = await fetch('/master/survey/create', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ title: title, purpose: purpose, method: method, legends: legends }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('svCreateResult').innerText = '오류: ' + (err.detail || '생성 실패');
+        }}
+      }}
+
+      async function toggleSurvey(id, newActive) {{
+        const res = await fetch('/master/survey/' + id + '/toggle', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ active: newActive }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('변경 실패'); }}
+      }}
+
+      async function deleteSurvey(id, title, responseCount) {{
+        const msg = responseCount > 0
+          ? title + ' 설문을 삭제합니다. 이미 제출된 응답 ' + responseCount + '건도 함께 완전히 삭제되며 되돌릴 수 없습니다. 계속할까요?'
+          : title + ' 설문을 삭제할까요?';
+        if (!confirm(msg)) return;
+        const res = await fetch('/master/survey/' + id + '/delete', {{ method: 'POST' }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('삭제 실패'); }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/survey/create")
+async def master_survey_create(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    title = data.get("title", "").strip()
+    purpose = data.get("purpose", "").strip()
+    method = data.get("method", "").strip()
+    legends = data.get("legends", [])
+
+    if not title:
+        return JSONResponse(status_code=400, content={"detail": "설문 제목을 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO survey (title, purpose, method, active) VALUES (?, ?, ?, TRUE)",
+        (title, purpose or None, method or None)
+    )
+    new_survey = conn.execute(
+        "SELECT id FROM survey ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    survey_id = new_survey["id"]
+
+    for idx, lg in enumerate(legends):
+        conn.execute(
+            "INSERT INTO survey_score_legend (survey_id, score_value, score_meaning, display_order) VALUES (?, ?, ?, ?)",
+            (survey_id, lg.get("score_value", ""), lg.get("score_meaning", ""), idx)
+        )
+
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok", "survey_id": survey_id})
+
+
+@app.post("/master/survey/{survey_id}/toggle")
+async def master_survey_toggle(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    active = data.get("active", True)
+    conn = get_conn()
+    conn.execute("UPDATE survey SET active=? WHERE id=?", (active, survey_id))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/survey/{survey_id}/delete")
+async def master_survey_delete(survey_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    conn = get_conn()
+    conn.execute("DELETE FROM survey WHERE id=?", (survey_id,))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/master/survey/{survey_id}/questions", response_class=HTMLResponse)
+async def master_survey_questions_page(survey_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    survey = conn.execute("SELECT * FROM survey WHERE id=?", (survey_id,)).fetchone()
+    if not survey:
+        conn.close()
+        return RedirectResponse(url="/master/survey", status_code=303)
+
+    question_rows = conn.execute(
+        "SELECT * FROM survey_question WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+
+    questions_html = ""
+    for idx, q in enumerate(question_rows):
+        options = conn.execute(
+            "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
+        ).fetchall()
+        usage_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM survey_answer WHERE question_id=?", (q["id"],)
+        ).fetchone()["cnt"]
+        opt_summary = ", ".join(f"{o['option_value']}={o['option_label']}" for o in options) if options else "(없음)"
+        active_badge = '<span class="badge-green">사용중</span>' if q["active"] else '<span class="badge-red">비활성</span>'
+        text_badge = f'📝 서술형{"(필수)" if q["text_answer_required"] else "(선택)"}' if q["has_text_answer"] else ""
+        opt_badge = f'☑️ 객관식[{opt_summary}]' if q["has_options"] else ""
+        safe_qtext = q["question_text"].replace("'", "")
+        questions_html += f"""
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+            <div>
+              <b>{idx+1}. {q['question_text']}</b> {active_badge}
+              <p style="color:#888;font-size:12px;margin-top:4px;">{opt_badge} {text_badge}</p>
+              {'<p style="font-size:11px;color:#F59E0B;margin-top:2px;">⚠️ 이미 ' + str(usage_count) + '건의 응답에 사용됨</p>' if usage_count > 0 else ''}
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0;">
+              <button class="btn" style="font-size:11px;padding:4px 8px;" onclick="openEditQuestion({q['id']})">수정</button>
+              <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="toggleQuestion({q['id']}, {str(not q['active']).lower()})">{'비활성화' if q['active'] else '활성화'}</button>
+              <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteQuestion({q['id']}, '{safe_qtext}', {usage_count})">삭제</button>
+            </div>
+          </div>
+        </div>
+        """
+
+    if not question_rows:
+        questions_html = '<div class="card" style="text-align:center;padding:24px;color:#888;">등록된 문항이 없습니다.</div>'
+
+    existing_questions_json = json.dumps([{
+        "id": q["id"],
+        "question_text": q["question_text"],
+        "description": q["description"] or "",
+        "has_options": bool(q["has_options"]),
+        "has_text_answer": bool(q["has_text_answer"]),
+        "text_answer_label": q["text_answer_label"] or "",
+        "text_answer_required": bool(q["text_answer_required"]),
+        "options": [{"value": o["option_value"], "label": o["option_label"]} for o in conn.execute(
+            "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
+        ).fetchall()]
+    } for q in question_rows], ensure_ascii=False)
+
+    conn.close()
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/survey" style="color:#1E2761;">← 설문 관리</a>
+      <h2>📝 {survey['title']} — 문항 관리</h2>
+    </div>
+
+    <div class="card">
+      <h3 id="formTitle" style="margin-bottom:12px;">새 문항 추가</h3>
+      <input type="hidden" id="editQuestionId" value="">
+      <input type="text" id="qText" placeholder="문항 내용" style="margin-bottom:8px;">
+      <textarea id="qDesc" placeholder="문항 설명 (선택)" style="width:100%;min-height:50px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:12px;"></textarea>
+
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
+        <input type="checkbox" id="qHasOptions" onchange="toggleOptionsSection()"> 객관식 선택지 포함
+      </label>
+      <div id="optionsSection" style="display:none;margin-bottom:12px;padding:12px;background:#f8fafc;border-radius:8px;">
+        <div style="display:flex;gap:6px;margin-bottom:8px;">
+          <button type="button" class="btn" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="applyTemplate('ox')">O/X 템플릿</button>
+          <button type="button" class="btn" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="applyTemplate('scale5')">1~5점 템플릿</button>
+          <button type="button" class="btn" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="addOptionRow()">+ 직접 추가</button>
+        </div>
+        <div id="optionRows" style="display:flex;flex-direction:column;gap:6px;"></div>
+      </div>
+
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
+        <input type="checkbox" id="qHasText" checked onchange="toggleTextSection()"> 서술형 입력 포함
+      </label>
+      <div id="textSection" style="margin-bottom:12px;">
+        <input type="text" id="qTextLabel" placeholder="서술 입력란 라벨 (예: 기타(서술 필요한 내용 기재))" style="margin-bottom:8px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+          <input type="checkbox" id="qTextRequired"> 서술 입력 필수
+        </label>
+      </div>
+
+      <div style="display:flex;gap:8px;">
+        <button class="btn" type="button" onclick="saveQuestion()" id="saveQBtn" style="flex:1;">문항 추가</button>
+        <button class="btn" type="button" onclick="resetForm()" style="flex:1;background:#eee;color:#333;display:none;" id="cancelEditBtn">취소</button>
+      </div>
+      <div id="qSaveResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+
+    {questions_html}
+
+    <script>
+      const surveyId = {survey_id};
+      const existingQuestions = {existing_questions_json};
+
+      function toggleOptionsSection() {{
+        document.getElementById('optionsSection').style.display = document.getElementById('qHasOptions').checked ? 'block' : 'none';
+      }}
+      function toggleTextSection() {{
+        document.getElementById('textSection').style.display = document.getElementById('qHasText').checked ? 'block' : 'none';
+      }}
+
+      function addOptionRow(value, label) {{
+        const container = document.getElementById('optionRows');
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.gap = '6px';
+        row.innerHTML = '<input type="text" class="opt-value" placeholder="값(예: O)" style="width:80px;" value="' + (value || '') + '">' +
+          '<input type="text" class="opt-label" placeholder="라벨(예: 그렇다)" style="flex:1;" value="' + (label || '') + '">' +
+          '<button type="button" class="btn btn-red" style="font-size:11px;padding:6px 10px;" onclick="this.parentElement.remove()">삭제</button>';
+        container.appendChild(row);
+      }}
+
+      function applyTemplate(type) {{
+        document.getElementById('optionRows').innerHTML = '';
+        if (type === 'ox') {{
+          addOptionRow('O', '그렇다');
+          addOptionRow('X', '아니다');
+        }} else if (type === 'scale5') {{
+          addOptionRow('1', '전혀 그렇지 않다');
+          addOptionRow('2', '그렇지 않은 편이다');
+          addOptionRow('3', '보통이다');
+          addOptionRow('4', '대체로 그렇다');
+          addOptionRow('5', '항상 그렇다');
+        }}
+      }}
+
+      function resetForm() {{
+        document.getElementById('editQuestionId').value = '';
+        document.getElementById('qText').value = '';
+        document.getElementById('qDesc').value = '';
+        document.getElementById('qHasOptions').checked = false;
+        document.getElementById('qHasText').checked = true;
+        document.getElementById('qTextLabel').value = '';
+        document.getElementById('qTextRequired').checked = false;
+        document.getElementById('optionRows').innerHTML = '';
+        toggleOptionsSection();
+        toggleTextSection();
+        document.getElementById('formTitle').innerText = '새 문항 추가';
+        document.getElementById('saveQBtn').innerText = '문항 추가';
+        document.getElementById('cancelEditBtn').style.display = 'none';
+      }}
+
+      function openEditQuestion(id) {{
+        const q = existingQuestions.find(x => x.id === id);
+        if (!q) return;
+        document.getElementById('editQuestionId').value = id;
+        document.getElementById('qText').value = q.question_text;
+        document.getElementById('qDesc').value = q.description;
+        document.getElementById('qHasOptions').checked = q.has_options;
+        document.getElementById('qHasText').checked = q.has_text_answer;
+        document.getElementById('qTextLabel').value = q.text_answer_label;
+        document.getElementById('qTextRequired').checked = q.text_answer_required;
+        document.getElementById('optionRows').innerHTML = '';
+        q.options.forEach(o => addOptionRow(o.value, o.label));
+        toggleOptionsSection();
+        toggleTextSection();
+        document.getElementById('formTitle').innerText = '문항 수정';
+        document.getElementById('saveQBtn').innerText = '수정 저장';
+        document.getElementById('cancelEditBtn').style.display = 'block';
+        window.scrollTo({{ top: 0, behavior: 'smooth' }});
+      }}
+
+      async function saveQuestion() {{
+        const editId = document.getElementById('editQuestionId').value;
+        const questionText = document.getElementById('qText').value.trim();
+        const description = document.getElementById('qDesc').value.trim();
+        const hasOptions = document.getElementById('qHasOptions').checked;
+        const hasText = document.getElementById('qHasText').checked;
+        const textLabel = document.getElementById('qTextLabel').value.trim();
+        const textRequired = document.getElementById('qTextRequired').checked;
+
+        if (!questionText) {{ alert('문항 내용을 입력하세요.'); return; }}
+        if (!hasOptions && !hasText) {{ alert('객관식 또는 서술형 중 최소 하나는 선택해야 합니다.'); return; }}
+
+        const options = [];
+        if (hasOptions) {{
+          document.querySelectorAll('#optionRows > div').forEach(row => {{
+            const val = row.querySelector('.opt-value').value.trim();
+            const label = row.querySelector('.opt-label').value.trim();
+            if (val && label) options.push({{ value: val, label: label }});
+          }});
+          if (options.length === 0) {{ alert('객관식 선택지를 최소 1개 이상 입력하세요.'); return; }}
+        }}
+
+        const payload = {{
+          question_id: editId ? parseInt(editId) : null,
+          question_text: questionText, description: description,
+          has_options: hasOptions, has_text_answer: hasText,
+          text_answer_label: textLabel, text_answer_required: textRequired,
+          options: options
+        }};
+
+        const res = await fetch('/master/survey/' + surveyId + '/question/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload)
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('qSaveResult').innerText = '오류: ' + (err.detail || '저장 실패');
+        }}
+      }}
+
+      async function toggleQuestion(id, newActive) {{
+        const res = await fetch('/master/survey/' + surveyId + '/question/' + id + '/toggle', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ active: newActive }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('변경 실패'); }}
+      }}
+
+      async function deleteQuestion(id, qtext, usageCount) {{
+        if (usageCount > 0) {{
+          alert('이미 ' + usageCount + '건의 응답에 사용된 문항이라 삭제할 수 없습니다. 대신 "비활성화"를 사용해주세요.');
+          return;
+        }}
+        if (!confirm('"' + qtext + '" 문항을 삭제할까요?')) return;
+        const res = await fetch('/master/survey/' + surveyId + '/question/' + id + '/delete', {{ method: 'POST' }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '삭제 실패'));
+        }}
+      }}
+
+      toggleOptionsSection();
+      toggleTextSection();
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/survey/{survey_id}/question/save")
+async def master_survey_question_save(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    question_id = data.get("question_id")
+    question_text = data.get("question_text", "").strip()
+    description = data.get("description", "").strip()
+    has_options = bool(data.get("has_options", False))
+    has_text_answer = bool(data.get("has_text_answer", False))
+    text_answer_label = data.get("text_answer_label", "").strip()
+    text_answer_required = bool(data.get("text_answer_required", False))
+    options = data.get("options", [])
+
+    if not question_text:
+        return JSONResponse(status_code=400, content={"detail": "문항 내용을 입력하세요."})
+    if not has_options and not has_text_answer:
+        return JSONResponse(status_code=400, content={"detail": "객관식 또는 서술형 중 최소 하나는 선택해야 합니다."})
+    if has_options and not options:
+        return JSONResponse(status_code=400, content={"detail": "객관식 선택지를 최소 1개 이상 입력하세요."})
+
+    conn = get_conn()
+
+    if question_id:
+        conn.execute("""
+            UPDATE survey_question
+            SET question_text=?, description=?, has_options=?, has_text_answer=?,
+                text_answer_label=?, text_answer_required=?
+            WHERE id=? AND survey_id=?
+        """, (question_text, description or None, has_options, has_text_answer,
+              text_answer_label or None, text_answer_required, question_id, survey_id))
+        conn.execute("DELETE FROM survey_question_option WHERE question_id=?", (question_id,))
+        target_qid = question_id
+    else:
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(display_order), -1) as m FROM survey_question WHERE survey_id=?", (survey_id,)
+        ).fetchone()["m"]
+        conn.execute("""
+            INSERT INTO survey_question
+                (survey_id, question_text, description, has_options, has_text_answer,
+                 text_answer_label, text_answer_required, display_order, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+        """, (survey_id, question_text, description or None, has_options, has_text_answer,
+              text_answer_label or None, text_answer_required, max_order + 1))
+        new_q = conn.execute(
+            "SELECT id FROM survey_question WHERE survey_id=? ORDER BY id DESC LIMIT 1", (survey_id,)
+        ).fetchone()
+        target_qid = new_q["id"]
+
+    if has_options:
+        for idx, opt in enumerate(options):
+            conn.execute(
+                "INSERT INTO survey_question_option (question_id, option_value, option_label, display_order) VALUES (?, ?, ?, ?)",
+                (target_qid, opt.get("value", ""), opt.get("label", ""), idx)
+            )
+
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/survey/{survey_id}/question/{question_id}/toggle")
+async def master_survey_question_toggle(survey_id: int, question_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    active = data.get("active", True)
+    conn = get_conn()
+    conn.execute("UPDATE survey_question SET active=? WHERE id=? AND survey_id=?", (active, question_id, survey_id))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/survey/{survey_id}/question/{question_id}/delete")
+async def master_survey_question_delete(survey_id: int, question_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    usage_count = conn.execute(
+        "SELECT COUNT(*) as cnt FROM survey_answer WHERE question_id=?", (question_id,)
+    ).fetchone()["cnt"]
+
+    if usage_count > 0:
+        conn.close()
+        return JSONResponse(status_code=400, content={
+            "detail": f"이미 {usage_count}건의 응답에 사용된 문항이라 삭제할 수 없습니다. 대신 '비활성화'를 사용해주세요."
+        })
+
+    conn.execute("DELETE FROM survey_question WHERE id=? AND survey_id=?", (question_id, survey_id))
+    conn.commit()
+    conn.close()
     return JSONResponse(content={"status": "ok"})
 
 @app.get("/master/webhook-send-log", response_class=HTMLResponse)
