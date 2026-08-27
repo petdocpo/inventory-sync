@@ -844,6 +844,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("qr", "/qr", "📷", "QR생성"),
         ("adjust", "/adjust", "✏️", "수기조정"),
         ("scanlog", "/scan-log", "📜", "스캔이력"),
+        ("survey", survey_menu_href, "📋", "설문"),
         ("vendor-eval", vendor_eval_href, "🤝", "거래처평가"),
         ("purchase-history", "/purchase-history", "📦", "발주내역"),
     ]
@@ -4160,7 +4161,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
         purpose_block = f'<p style="margin-bottom:8px;"><b>진단목적</b><br>{survey["purpose"]}</p>' if survey["purpose"] else ""
         method_block = f'<p><b>진단방법</b><br>{survey["method"]}</p>' if survey["method"] else ""
         intro_html = f"""
-        <div class="card">
+        <div class="card" style="max-width:560px;margin:0 auto 16px;">
           {purpose_block}
           {method_block}
         </div>
@@ -4185,8 +4186,8 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
 
     content = f"""
     {intro_html}
-    {legend_html}
     <style>
+      .sv-legend-card {{ max-width:560px; margin:0 auto 16px; }}
       .sv-card {{ background:#fff; border-radius:12px; padding:20px; max-width:560px; margin:0 auto; box-shadow:0 2px 8px rgba(0,0,0,0.08); }}
       .sv-card h2 {{ font-size:18px; margin-bottom:16px; }}
       .sv-field {{ margin-bottom:20px; padding-bottom:16px; border-bottom:1px solid #eee; }}
@@ -4199,6 +4200,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
       .sv-btn-submit {{ background:#2563eb; color:#fff; }}
       .sv-btn-submit:disabled {{ background:#ccc; cursor:not-allowed; }}
     </style>
+    <div class="sv-legend-card">{legend_html}</div>
     <div class="sv-card">
       <h2>{survey['title']}</h2>
       <label style="font-size:13px;color:#555;">작성자 이름 (필수)</label>
@@ -7958,11 +7960,18 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">거래처 {vendor_count}개 등록됨</div>
         </div>
       </a>
-      <a href="/master/eval-criteria" style="text-decoration:none;">
+            <a href="/master/eval-criteria" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📝</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 평가 문항 관리</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">문항 추가/삭제/수정</div>
+        </div>
+      </a>
+      <a href="/master/survey" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📋</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">설문 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">설문 생성/문항관리/제출현황</div>
         </div>
       </a>
       <a href="/master/vendor-eval/status" style="text-decoration:none;">
