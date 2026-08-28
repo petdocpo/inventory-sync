@@ -4066,12 +4066,14 @@ async def survey_list_page(session_token: str = Cookie(default=None)):
                     badge = '<span class="badge-red">⚠️ 재제출요청</span>'
                 else:
                     badge = '<span class="badge-green">✅ 완료</span>'
+                safe_writer_name = w['writer_name'].replace("'", "")
                 writer_rows_html += f"""
                 <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0;">
                   <span style="font-size:13px;">{w['writer_name']}</span>
                   <div style="display:flex;gap:8px;align-items:center;">
                     {badge}
                     <a href="/survey/{s['id']}/edit/{w['id']}" class="btn" style="font-size:11px;padding:5px 10px;text-decoration:none;">수정</a>
+                    <button class="btn btn-red" style="font-size:11px;padding:5px 10px;" onclick="deleteMyResponse({w['id']}, '{safe_writer_name}')">삭제</button>
                   </div>
                 </div>
                 """
@@ -4115,6 +4117,15 @@ async def survey_list_page(session_token: str = Cookie(default=None)):
         var isOpen = body.style.display !== 'none';
         body.style.display = isOpen ? 'none' : 'block';
         if (toggle) toggle.innerText = isOpen ? '펼치기 ▾' : '접기 ▴';
+      }}
+
+      async function deleteMyResponse(responseId, writerName) {{
+        if (!confirm(writerName + ' 님이 제출한 응답을 삭제합니다. 되돌릴 수 없습니다. 계속할까요?')) return;
+        const res = await fetch('/survey/response/' + responseId + '/delete', {{ method: 'POST' }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '삭제 실패'));
+        }}
       }}
     </script>
     """
@@ -4595,6 +4606,23 @@ async def survey_edit_submit(response_id: int, request: Request, session_token: 
     conn.commit()
     conn.close()
 
+    return JSONResponse(content={"status": "ok"})
+
+@app.post("/survey/response/{response_id}/delete")
+async def survey_response_delete(response_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] == "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    response = conn.execute("SELECT * FROM survey_response WHERE id=?", (response_id,)).fetchone()
+    if not response or response["branch_code"] != user["branch_code"]:
+        conn.close()
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn.execute("DELETE FROM survey_response WHERE id=?", (response_id,))
+    conn.commit()
+    conn.close()
     return JSONResponse(content={"status": "ok"})
 
 @app.get("/master/survey", response_class=HTMLResponse)
@@ -5245,6 +5273,7 @@ async def master_survey_responses_page(
           <div style="display:flex;gap:8px;">
             <button type="button" class="btn" id="svRespSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
             <button type="button" class="btn" id="svRespResubmitBtn" style="background:#F59E0B;font-size:12px;padding:6px 12px;">재제출 요청</button>
+            <button type="button" class="btn btn-red" id="svRespDeleteBtn" style="font-size:12px;padding:6px 12px;">완전삭제</button>
           </div>
         </div>
         <table>
@@ -5256,6 +5285,7 @@ async def master_survey_responses_page(
         </table>
       </form>
     </div>
+    <form method="post" action="/master/survey/{survey_id}/responses/delete" id="svResponseDeleteForm"></form>
 
     <script>
       (function() {{
@@ -5279,6 +5309,24 @@ async def master_survey_responses_page(
             if (checked.length === 0) {{ alert('재제출을 요청할 항목을 선택하세요.'); return; }}
             if (confirm(checked.length + '건에 대해 재제출을 요청합니다. 작성자에게 재제출 알림이 표시됩니다. 계속할까요?')) {{
               document.getElementById('svResponseForm').submit();
+            }}
+          }});
+        }}
+        var deleteBtn = document.getElementById('svRespDeleteBtn');
+        if (deleteBtn) {{
+          deleteBtn.addEventListener('click', function() {{
+            var checked = document.querySelectorAll('.sv-resp-check:checked');
+            if (checked.length === 0) {{ alert('삭제할 항목을 선택하세요.'); return; }}
+            if (confirm(checked.length + '건을 완전 삭제합니다. 되돌릴 수 없습니다. 계속할까요?')) {{
+              var deleteForm = document.getElementById('svResponseDeleteForm');
+              checked.forEach(function(c) {{
+                var hidden = document.createElement('input');
+                hidden.type = 'hidden';
+                hidden.name = 'selected_ids';
+                hidden.value = c.value;
+                deleteForm.appendChild(hidden);
+              }});
+              deleteForm.submit();
             }}
           }});
         }}
@@ -5307,6 +5355,24 @@ async def master_survey_responses_request_resubmit(
         conn.close()
     return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
 
+@app.post("/master/survey/{survey_id}/responses/delete")
+async def master_survey_responses_delete(
+    survey_id: int, request: Request, session_token: str = Cookie(default=None)
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    form = await request.form()
+    ids = form.getlist("selected_ids")
+    if ids:
+        conn = get_conn()
+        conn.execute(
+            f"DELETE FROM survey_response WHERE id IN ({','.join('?' for _ in ids)}) AND survey_id=?",
+            [int(i) for i in ids] + [survey_id]
+        )
+        conn.commit()
+        conn.close()
+    return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
 
 @app.get("/master/survey/{survey_id}/responses/export")
 async def master_survey_responses_export(
