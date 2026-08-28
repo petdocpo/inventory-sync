@@ -4968,41 +4968,9 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
     for sec in section_rows:
         section_options_html += f'<option value="{sec["id"]}">{sec["section_name"]}</option>'
 
-    questions_html = ""
-    for idx, q in enumerate(question_rows):
-        options = conn.execute(
-            "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
-        ).fetchall()
-        usage_count = conn.execute(
-            "SELECT COUNT(*) as cnt FROM survey_answer WHERE question_id=?", (q["id"],)
-        ).fetchone()["cnt"]
-        opt_summary = ", ".join(f"{o['option_value']}={o['option_label']}" for o in options) if options else "(없음)"
-        active_badge = '<span class="badge-green">사용중</span>' if q["active"] else '<span class="badge-red">비활성</span>'
-        text_badge = f'📝 서술형{"(필수)" if q["text_answer_required"] else "(선택)"}' if q["has_text_answer"] else ""
-        multi_badge = ' 🔲 다중선택' if q["is_multi_select"] else ''
-        opt_badge = f'☑️ 객관식[{opt_summary}]{multi_badge}' if q["has_options"] else ""
-        section_label = section_name_map.get(q["section_id"], "")
-        section_badge = f'<span style="background:#EFF6FF;color:#1E40AF;padding:2px 8px;border-radius:8px;font-size:11px;margin-right:6px;">📂 {section_label}</span>' if section_label else ""
-        safe_qtext = q["question_text"].replace("'", "")
-        questions_html += f"""
-        <div class="card">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-            <div>
-              <div style="margin-bottom:4px;">{section_badge}<b>{idx+1}. {q['question_text']}</b> {active_badge}</div>
-              <p style="color:#888;font-size:12px;margin-top:4px;">{opt_badge} {text_badge}</p>
-              {'<p style="font-size:11px;color:#F59E0B;margin-top:2px;">⚠️ 이미 ' + str(usage_count) + '건의 응답에 사용됨</p>' if usage_count > 0 else ''}
-            </div>
-            <div style="display:flex;gap:6px;flex-shrink:0;">
-              <button class="btn" style="font-size:11px;padding:4px 8px;" onclick="openEditQuestion({q['id']})">수정</button>
-              <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="toggleQuestion({q['id']}, {str(not q['active']).lower()})">{'비활성화' if q['active'] else '활성화'}</button>
-              <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteQuestion({q['id']}, '{safe_qtext}', {usage_count})">삭제</button>
-            </div>
-          </div>
-        </div>
-        """
-
-    if not question_rows:
-        questions_html = '<div class="card" style="text-align:center;padding:24px;color:#888;">등록된 문항이 없습니다.</div>'
+    # 분야별 그룹핑 (섹션 순서대로, "분야 없음"은 마지막)
+    section_order = [(sec["id"], sec["section_name"]) for sec in section_rows]
+    section_order.append((None, "분야 없음"))
 
     existing_questions_json = json.dumps([{
         "id": q["id"],
@@ -5019,9 +4987,70 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         ).fetchall()]
     } for q in question_rows], ensure_ascii=False)
 
+    global_idx = 0
+    section_blocks_html = ""
+    for sec_id, sec_name in section_order:
+        sec_questions = [q for q in question_rows if q["section_id"] == sec_id]
+        if not sec_questions:
+            continue
+
+        section_key = f"sec_{sec_id if sec_id is not None else 'none'}"
+        cards_html = ""
+        for q in sec_questions:
+            global_idx += 1
+            options = conn.execute(
+                "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
+            ).fetchall()
+            usage_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM survey_answer WHERE question_id=?", (q["id"],)
+            ).fetchone()["cnt"]
+            opt_summary = ", ".join(f"{o['option_value']}={o['option_label']}" for o in options) if options else "(없음)"
+            active_badge = '<span class="badge-green">사용중</span>' if q["active"] else '<span class="badge-red">비활성</span>'
+            text_badge = f'📝 서술형{"(필수)" if q["text_answer_required"] else "(선택)"}' if q["has_text_answer"] else ""
+            multi_badge = ' 🔲 다중선택' if q["is_multi_select"] else ''
+            opt_badge = f'☑️ 객관식[{opt_summary}]{multi_badge}' if q["has_options"] else ""
+            safe_qtext = q["question_text"].replace("'", "")
+            cards_html += f"""
+            <div class="card sv-q-card" draggable="true" data-qid="{q['id']}" data-section="{section_key}"
+                 ondragstart="onQDragStart(event)" ondragover="onQDragOver(event)" ondrop="onQDrop(event)" ondragend="onQDragEnd(event)">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                <div style="display:flex;gap:8px;">
+                  <span style="cursor:grab;color:#ccc;font-size:18px;line-height:1;padding-top:2px;">⠿</span>
+                  <div>
+                    <div style="margin-bottom:4px;"><b>{global_idx}. {q['question_text']}</b> {active_badge}</div>
+                    <p style="color:#888;font-size:12px;margin-top:4px;">{opt_badge} {text_badge}</p>
+                    {'<p style="font-size:11px;color:#F59E0B;margin-top:2px;">⚠️ 이미 ' + str(usage_count) + '건의 응답에 사용됨</p>' if usage_count > 0 else ''}
+                  </div>
+                </div>
+                <div style="display:flex;gap:6px;flex-shrink:0;">
+                  <button class="btn" style="font-size:11px;padding:4px 8px;" onclick="openEditQuestion({q['id']})">수정</button>
+                  <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="toggleQuestion({q['id']}, {str(not q['active']).lower()})">{'비활성화' if q['active'] else '활성화'}</button>
+                  <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteQuestion({q['id']}, '{safe_qtext}', {usage_count})">삭제</button>
+                </div>
+              </div>
+            </div>
+            """
+
+        section_title_html = f'<div class="sv-mgmt-section-title">📂 {sec_name}</div>' if sec_id is not None else '<div class="sv-mgmt-section-title" style="color:#888;">📄 분야 없음</div>'
+        section_blocks_html += f"""
+        {section_title_html}
+        <div class="sv-q-dropzone" data-section="{section_key}" ondragover="onQDragOver(event)" ondrop="onQDrop(event)">
+          {cards_html}
+        </div>
+        """
+
     conn.close()
 
+    if not question_rows:
+        section_blocks_html = '<div class="card" style="text-align:center;padding:24px;color:#888;">등록된 문항이 없습니다.</div>'
+
     content = f"""
+    <style>
+      .sv-mgmt-section-title {{ font-weight:bold; font-size:15px; color:#1E2761; margin:20px 0 10px; padding-bottom:6px; border-bottom:2px solid #1E2761; }}
+      .sv-q-card {{ cursor:default; }}
+      .sv-q-card.dragging {{ opacity:0.4; }}
+      .sv-q-dropzone {{ min-height:8px; }}
+    </style>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
       <a href="/master/survey" style="color:#1E2761;">← 설문 관리</a>
       <h2>📝 {survey['title']} — 문항 관리</h2>
@@ -5079,12 +5108,14 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
       <div id="qSaveResult" style="margin-top:8px;font-size:13px;"></div>
     </div>
 
-    {questions_html}
+    <p style="font-size:12px;color:#888;margin:12px 0 4px;">💡 문항 카드의 ⠿ 아이콘을 드래그하면 같은 분야 안에서 순서를 바꿀 수 있습니다.</p>
+    {section_blocks_html}
 
     <script>
       const surveyId = {survey_id};
       const existingQuestions = {existing_questions_json};
 
+      // ── 분야 관리 ──
       async function addSection() {{
         const name = document.getElementById('newSectionName').value.trim();
         if (!name) {{ alert('분야명을 입력하세요.'); return; }}
@@ -5117,6 +5148,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         if (res.ok) {{ location.reload(); }} else {{ alert('삭제 실패'); }}
       }}
 
+      // ── 문항 폼 ──
       function toggleOptionsSection() {{
         document.getElementById('optionsSection').style.display = document.getElementById('qHasOptions').checked ? 'block' : 'none';
       }}
@@ -5254,6 +5286,71 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         }}
       }}
 
+      // ── 드래그 정렬 (같은 분야 섹션 내에서만) ──
+      let draggedEl = null;
+
+      function onQDragStart(e) {{
+        draggedEl = e.currentTarget;
+        e.currentTarget.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+      }}
+
+      function onQDragEnd(e) {{
+        e.currentTarget.classList.remove('dragging');
+      }}
+
+      function onQDragOver(e) {{
+        e.preventDefault();
+        if (!draggedEl) return;
+        const targetSection = e.currentTarget.dataset.section;
+        const draggedSection = draggedEl.dataset.section;
+        if (targetSection !== draggedSection) return;
+
+        const dropzone = e.currentTarget.classList.contains('sv-q-dropzone')
+          ? e.currentTarget
+          : e.currentTarget.parentElement;
+        if (!dropzone || dropzone.dataset.section !== draggedSection) return;
+
+        const afterEl = getDragAfterElement(dropzone, e.clientY);
+        if (afterEl == null) {{
+          dropzone.appendChild(draggedEl);
+        }} else {{
+          dropzone.insertBefore(draggedEl, afterEl);
+        }}
+      }}
+
+      function getDragAfterElement(container, y) {{
+        const cards = [...container.querySelectorAll('.sv-q-card:not(.dragging)')];
+        return cards.reduce((closest, child) => {{
+          const box = child.getBoundingClientRect();
+          const offset = y - box.top - box.height / 2;
+          if (offset < 0 && offset > closest.offset) {{
+            return {{ offset: offset, element: child }};
+          }} else {{
+            return closest;
+          }}
+        }}, {{ offset: -Infinity }}).element;
+      }}
+
+      async function onQDrop(e) {{
+        e.preventDefault();
+        if (!draggedEl) return;
+        const section = draggedEl.dataset.section;
+        const dropzone = document.querySelector('.sv-q-dropzone[data-section="' + section + '"]');
+        if (!dropzone) return;
+        const orderedIds = [...dropzone.querySelectorAll('.sv-q-card')].map(el => parseInt(el.dataset.qid));
+        draggedEl = null;
+
+        const res = await fetch('/master/survey/' + surveyId + '/question/reorder', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ ordered_ids: orderedIds }})
+        }});
+        if (!res.ok) {{
+          alert('순서 저장에 실패했습니다. 새로고침 후 다시 시도해주세요.');
+          location.reload();
+        }}
+      }}
+
       toggleOptionsSection();
       toggleTextSection();
     </script>
@@ -5322,6 +5419,27 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
                 (target_qid, opt.get("value", ""), opt.get("label", ""), idx)
             )
 
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+@app.post("/master/survey/{survey_id}/question/reorder")
+async def master_survey_question_reorder(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    ordered_ids = data.get("ordered_ids", [])
+    if not ordered_ids:
+        return JSONResponse(status_code=400, content={"detail": "순서 정보가 없습니다."})
+
+    conn = get_conn()
+    for idx, qid in enumerate(ordered_ids):
+        conn.execute(
+            "UPDATE survey_question SET display_order=? WHERE id=? AND survey_id=?",
+            (idx, qid, survey_id)
+        )
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
