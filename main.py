@@ -838,6 +838,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     is_master = user and user.get("role") == "master"
     raw_menu_href = "/master/raw-upload" if is_master else "/raw-branch"
     vendor_eval_href = "/master/vendor-eval" if is_master else "/vendor-eval"
+    survey_menu_href = "/master/survey" if is_master else "/survey"
     menus = [
         ("dashboard", "/", "⚠️", "대시보드"),
         ("inventory", "/inventory", "📦", "재고현황"),
