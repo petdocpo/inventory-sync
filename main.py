@@ -4835,9 +4835,35 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         conn.close()
         return RedirectResponse(url="/master/survey", status_code=303)
 
+    section_rows = conn.execute(
+        "SELECT * FROM survey_section WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+
     question_rows = conn.execute(
         "SELECT * FROM survey_question WHERE survey_id=? ORDER BY display_order", (survey_id,)
     ).fetchall()
+
+    section_name_map = {sec["id"]: sec["section_name"] for sec in section_rows}
+
+    section_mgmt_rows_html = ""
+    for sec in section_rows:
+        q_count = sum(1 for q in question_rows if q["section_id"] == sec["id"])
+        safe_sec_name = sec["section_name"].replace("'", "")
+        section_mgmt_rows_html += f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f0f0f0;">
+          <span style="font-size:13px;"><b>{sec['section_name']}</b> <span style="color:#888;font-size:11px;">({q_count}개 문항)</span></span>
+          <div style="display:flex;gap:4px;">
+            <button class="btn" style="font-size:11px;padding:4px 8px;" onclick="editSection({sec['id']}, '{safe_sec_name}')">수정</button>
+            <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteSection({sec['id']}, '{safe_sec_name}', {q_count})">삭제</button>
+          </div>
+        </div>
+        """
+    if not section_rows:
+        section_mgmt_rows_html = '<p style="font-size:12px;color:#888;padding:8px 0;">등록된 분야가 없습니다. 분야 없이도 문항 등록 가능합니다.</p>'
+
+    section_options_html = '<option value="">분야 없음</option>'
+    for sec in section_rows:
+        section_options_html += f'<option value="{sec["id"]}">{sec["section_name"]}</option>'
 
     questions_html = ""
     for idx, q in enumerate(question_rows):
@@ -4850,13 +4876,16 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         opt_summary = ", ".join(f"{o['option_value']}={o['option_label']}" for o in options) if options else "(없음)"
         active_badge = '<span class="badge-green">사용중</span>' if q["active"] else '<span class="badge-red">비활성</span>'
         text_badge = f'📝 서술형{"(필수)" if q["text_answer_required"] else "(선택)"}' if q["has_text_answer"] else ""
-        opt_badge = f'☑️ 객관식[{opt_summary}]' if q["has_options"] else ""
+        multi_badge = ' 🔲 다중선택' if q["is_multi_select"] else ''
+        opt_badge = f'☑️ 객관식[{opt_summary}]{multi_badge}' if q["has_options"] else ""
+        section_label = section_name_map.get(q["section_id"], "")
+        section_badge = f'<span style="background:#EFF6FF;color:#1E40AF;padding:2px 8px;border-radius:8px;font-size:11px;margin-right:6px;">📂 {section_label}</span>' if section_label else ""
         safe_qtext = q["question_text"].replace("'", "")
         questions_html += f"""
         <div class="card">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;">
             <div>
-              <b>{idx+1}. {q['question_text']}</b> {active_badge}
+              <div style="margin-bottom:4px;">{section_badge}<b>{idx+1}. {q['question_text']}</b> {active_badge}</div>
               <p style="color:#888;font-size:12px;margin-top:4px;">{opt_badge} {text_badge}</p>
               {'<p style="font-size:11px;color:#F59E0B;margin-top:2px;">⚠️ 이미 ' + str(usage_count) + '건의 응답에 사용됨</p>' if usage_count > 0 else ''}
             </div>
@@ -4880,6 +4909,8 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         "has_text_answer": bool(q["has_text_answer"]),
         "text_answer_label": q["text_answer_label"] or "",
         "text_answer_required": bool(q["text_answer_required"]),
+        "is_multi_select": bool(q["is_multi_select"]),
+        "section_id": q["section_id"],
         "options": [{"value": o["option_value"], "label": o["option_label"]} for o in conn.execute(
             "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
         ).fetchall()]
@@ -4894,8 +4925,22 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
     </div>
 
     <div class="card">
+      <h3 style="margin-bottom:8px;">📂 분야 관리</h3>
+      <div style="display:flex;gap:8px;margin-bottom:8px;">
+        <input type="text" id="newSectionName" placeholder="분야명 (예: IT분야, 인사분야)" style="flex:1;">
+        <button class="btn" type="button" onclick="addSection()">분야 추가</button>
+      </div>
+      <div id="sectionResult" style="font-size:13px;margin-bottom:8px;"></div>
+      {section_mgmt_rows_html}
+    </div>
+
+    <div class="card">
       <h3 id="formTitle" style="margin-bottom:12px;">새 문항 추가</h3>
       <input type="hidden" id="editQuestionId" value="">
+
+      <label style="font-size:12px;color:#888;">분야 (선택)</label>
+      <select id="qSection" style="margin-bottom:12px;">{section_options_html}</select>
+
       <input type="text" id="qText" placeholder="문항 내용" style="margin-bottom:8px;">
       <textarea id="qDesc" placeholder="문항 설명 (선택)" style="width:100%;min-height:50px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:12px;"></textarea>
 
@@ -4908,7 +4953,10 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
           <button type="button" class="btn" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="applyTemplate('scale5')">1~5점 템플릿</button>
           <button type="button" class="btn" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="addOptionRow()">+ 직접 추가</button>
         </div>
-        <div id="optionRows" style="display:flex;flex-direction:column;gap:6px;"></div>
+        <div id="optionRows" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px;"></div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+          <input type="checkbox" id="qMultiSelect" style="width:18px;height:18px;flex-shrink:0;"> 다중선택 허용 (여러 선택지 동시 체크 가능)
+        </label>
       </div>
 
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
@@ -4933,6 +4981,38 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
     <script>
       const surveyId = {survey_id};
       const existingQuestions = {existing_questions_json};
+
+      async function addSection() {{
+        const name = document.getElementById('newSectionName').value.trim();
+        if (!name) {{ alert('분야명을 입력하세요.'); return; }}
+        const res = await fetch('/master/survey/' + surveyId + '/section/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ section_name: name }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('sectionResult').innerText = '오류: ' + (err.detail || '추가 실패');
+        }}
+      }}
+
+      async function editSection(id, currentName) {{
+        const name = prompt('분야명 수정:', currentName);
+        if (name === null || !name.trim()) return;
+        const res = await fetch('/master/survey/' + surveyId + '/section/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ section_id: id, section_name: name.trim() }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('수정 실패'); }}
+      }}
+
+      async function deleteSection(id, name, qCount) {{
+        const msg = qCount > 0
+          ? name + ' 분야를 삭제합니다. 이 분야에 속한 문항 ' + qCount + '개는 "분야 없음"으로 남습니다. 계속할까요?'
+          : name + ' 분야를 삭제할까요?';
+        if (!confirm(msg)) return;
+        const res = await fetch('/master/survey/' + surveyId + '/section/' + id + '/delete', {{ method: 'POST' }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('삭제 실패'); }}
+      }}
 
       function toggleOptionsSection() {{
         document.getElementById('optionsSection').style.display = document.getElementById('qHasOptions').checked ? 'block' : 'none';
@@ -4968,12 +5048,14 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
 
       function resetForm() {{
         document.getElementById('editQuestionId').value = '';
+        document.getElementById('qSection').value = '';
         document.getElementById('qText').value = '';
         document.getElementById('qDesc').value = '';
         document.getElementById('qHasOptions').checked = false;
         document.getElementById('qHasText').checked = true;
         document.getElementById('qTextLabel').value = '';
         document.getElementById('qTextRequired').checked = false;
+        document.getElementById('qMultiSelect').checked = false;
         document.getElementById('optionRows').innerHTML = '';
         toggleOptionsSection();
         toggleTextSection();
@@ -4986,12 +5068,14 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         const q = existingQuestions.find(x => x.id === id);
         if (!q) return;
         document.getElementById('editQuestionId').value = id;
+        document.getElementById('qSection').value = q.section_id || '';
         document.getElementById('qText').value = q.question_text;
         document.getElementById('qDesc').value = q.description;
         document.getElementById('qHasOptions').checked = q.has_options;
         document.getElementById('qHasText').checked = q.has_text_answer;
         document.getElementById('qTextLabel').value = q.text_answer_label;
         document.getElementById('qTextRequired').checked = q.text_answer_required;
+        document.getElementById('qMultiSelect').checked = q.is_multi_select;
         document.getElementById('optionRows').innerHTML = '';
         q.options.forEach(o => addOptionRow(o.value, o.label));
         toggleOptionsSection();
@@ -5004,12 +5088,14 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
 
       async function saveQuestion() {{
         const editId = document.getElementById('editQuestionId').value;
+        const sectionId = document.getElementById('qSection').value;
         const questionText = document.getElementById('qText').value.trim();
         const description = document.getElementById('qDesc').value.trim();
         const hasOptions = document.getElementById('qHasOptions').checked;
         const hasText = document.getElementById('qHasText').checked;
         const textLabel = document.getElementById('qTextLabel').value.trim();
         const textRequired = document.getElementById('qTextRequired').checked;
+        const multiSelect = document.getElementById('qMultiSelect').checked;
 
         if (!questionText) {{ alert('문항 내용을 입력하세요.'); return; }}
         if (!hasOptions && !hasText) {{ alert('객관식 또는 서술형 중 최소 하나는 선택해야 합니다.'); return; }}
@@ -5026,9 +5112,11 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
 
         const payload = {{
           question_id: editId ? parseInt(editId) : null,
+          section_id: sectionId ? parseInt(sectionId) : null,
           question_text: questionText, description: description,
           has_options: hasOptions, has_text_answer: hasText,
           text_answer_label: textLabel, text_answer_required: textRequired,
+          is_multi_select: multiSelect,
           options: options
         }};
 
@@ -5078,12 +5166,14 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
 
     data = await request.json()
     question_id = data.get("question_id")
+    section_id = data.get("section_id")
     question_text = data.get("question_text", "").strip()
     description = data.get("description", "").strip()
     has_options = bool(data.get("has_options", False))
     has_text_answer = bool(data.get("has_text_answer", False))
     text_answer_label = data.get("text_answer_label", "").strip()
     text_answer_required = bool(data.get("text_answer_required", False))
+    is_multi_select = bool(data.get("is_multi_select", False))
     options = data.get("options", [])
 
     if not question_text:
@@ -5099,10 +5189,11 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
         conn.execute("""
             UPDATE survey_question
             SET question_text=?, description=?, has_options=?, has_text_answer=?,
-                text_answer_label=?, text_answer_required=?
+                text_answer_label=?, text_answer_required=?, is_multi_select=?, section_id=?
             WHERE id=? AND survey_id=?
         """, (question_text, description or None, has_options, has_text_answer,
-              text_answer_label or None, text_answer_required, question_id, survey_id))
+              text_answer_label or None, text_answer_required, is_multi_select, section_id,
+              question_id, survey_id))
         conn.execute("DELETE FROM survey_question_option WHERE question_id=?", (question_id,))
         target_qid = question_id
     else:
@@ -5112,10 +5203,10 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
         conn.execute("""
             INSERT INTO survey_question
                 (survey_id, question_text, description, has_options, has_text_answer,
-                 text_answer_label, text_answer_required, display_order, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+                 text_answer_label, text_answer_required, is_multi_select, section_id, display_order, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
         """, (survey_id, question_text, description or None, has_options, has_text_answer,
-              text_answer_label or None, text_answer_required, max_order + 1))
+              text_answer_label or None, text_answer_required, is_multi_select, section_id, max_order + 1))
         new_q = conn.execute(
             "SELECT id FROM survey_question WHERE survey_id=? ORDER BY id DESC LIMIT 1", (survey_id,)
         ).fetchone()
@@ -5128,6 +5219,50 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
                 (target_qid, opt.get("value", ""), opt.get("label", ""), idx)
             )
 
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+@app.post("/master/survey/{survey_id}/section/save")
+async def master_survey_section_save(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    section_id = data.get("section_id")
+    section_name = data.get("section_name", "").strip()
+
+    if not section_name:
+        return JSONResponse(status_code=400, content={"detail": "분야명을 입력하세요."})
+
+    conn = get_conn()
+    if section_id:
+        conn.execute(
+            "UPDATE survey_section SET section_name=? WHERE id=? AND survey_id=?",
+            (section_name, section_id, survey_id)
+        )
+    else:
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(display_order), -1) as m FROM survey_section WHERE survey_id=?", (survey_id,)
+        ).fetchone()["m"]
+        conn.execute(
+            "INSERT INTO survey_section (survey_id, section_name, display_order) VALUES (?, ?, ?)",
+            (survey_id, section_name, max_order + 1)
+        )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/survey/{survey_id}/section/{section_id}/delete")
+async def master_survey_section_delete(survey_id: int, section_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    conn.execute("DELETE FROM survey_section WHERE id=? AND survey_id=?", (section_id, survey_id))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
