@@ -8067,6 +8067,13 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">발주서 생성 기준값</div>
         </div>
       </a>
+            <a href="/master/cron-failure-log" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🚨</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">크론 실패 이력</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">자동화 작업 오류 확인</div>
+        </div>
+      </a>
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -11474,6 +11481,168 @@ async def safety_stock_delete_all(session_token: str = Cookie(default=None)):
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
+
+# ============================================================
+# 크론/기능 실패 알림 대상 채널 (테스트 채널, admin_hs)
+# ============================================================
+CRON_FAILURE_TEAMS_CHANNEL = "admin_hs"
+CRON_FAILURE_EMAIL_TO = "hs.yu@petdoc.co.kr"
+
+
+def send_email(to_addr: str, subject: str, body: str,
+               attachment_bytes: bytes = None, attachment_filename: str = None) -> tuple:
+    """Gmail SMTP로 이메일 발송. 성공 시 (True, ''), 실패 시 (False, 에러메시지) 반환.
+    첨부파일이 있으면 attachment_bytes(bytes)와 attachment_filename을 함께 전달."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+
+    sender = os.environ.get("GMAIL_SENDER_ADDRESS", "")
+    app_password = os.environ.get("GMAIL_APP_PASSWORD", "")
+
+    if not sender or not app_password:
+        return False, "GMAIL_SENDER_ADDRESS 또는 GMAIL_APP_PASSWORD 환경변수가 설정되지 않았습니다."
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = sender
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        if attachment_bytes and attachment_filename:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(attachment_bytes)
+            encoders.encode_base64(part)
+            from email.header import Header
+            encoded_filename = Header(attachment_filename, "utf-8").encode()
+            part.add_header("Content-Disposition", f'attachment; filename="{encoded_filename}"')
+            msg.attach(part)
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(sender, app_password)
+            server.sendmail(sender, [to_addr], msg.as_string())
+
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:300]
+
+
+def report_cron_failure(cron_name: str, error_detail: str):
+    """크론/주요기능 실패 시 공통 처리: DB 기록 + Teams(admin_hs) 발송 + 이메일 발송.
+    이 함수 자체는 예외를 던지지 않음 (알림 발송 실패가 원본 크론의 실패 처리를 방해하지 않도록 방어)."""
+    now = datetime.now().isoformat()
+
+    try:
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO cron_failure_log (cron_name, error_detail, occurred_at) VALUES (?, ?, ?)",
+            (cron_name, error_detail, now)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[report_cron_failure] DB 기록 실패: {str(e)[:200]}")
+
+    try:
+        title = f"⚠️ 크론/기능 실패: {cron_name}"
+        body = f"발생 시각: {now}\n\n오류 내용:\n{error_detail[:1000]}"
+        send_teams_notification(
+            CRON_FAILURE_TEAMS_CHANNEL, title, body,
+            sent_by="system_cron_failure"
+        )
+    except Exception as e:
+        print(f"[report_cron_failure] Teams 발송 실패: {str(e)[:200]}")
+
+    try:
+        subject = f"[재고관리시스템] 크론/기능 실패 알림 - {cron_name}"
+        body = f"발생 시각: {now}\n\n실패한 작업: {cron_name}\n\n오류 상세:\n{error_detail[:2000]}"
+        send_email(CRON_FAILURE_EMAIL_TO, subject, body)
+    except Exception as e:
+        print(f"[report_cron_failure] 이메일 발송 실패: {str(e)[:200]}")
+
+
+@app.get("/master/cron-failure-log", response_class=HTMLResponse)
+async def cron_failure_log_page(
+    session_token: str = Cookie(default=None),
+    filter_cron: str = "",
+    date_filter: str = ""
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    query = "SELECT * FROM cron_failure_log WHERE 1=1"
+    params: list = []
+    if filter_cron:
+        query += " AND cron_name = ?"
+        params.append(filter_cron)
+    if date_filter:
+        query += " AND occurred_at LIKE ?"
+        params.append(f"{date_filter}%")
+    query += " ORDER BY occurred_at DESC LIMIT 300"
+    logs = conn.execute(query, params).fetchall()
+
+    all_cron_names = conn.execute(
+        "SELECT DISTINCT cron_name FROM cron_failure_log ORDER BY cron_name"
+    ).fetchall()
+    conn.close()
+
+    cron_options = '<option value="">전체</option>'
+    for c in all_cron_names:
+        sel = "selected" if filter_cron == c["cron_name"] else ""
+        cron_options += f'<option value="{c["cron_name"]}" {sel}>{c["cron_name"]}</option>'
+
+    rows_html = ""
+    if not logs:
+        rows_html = '<tr><td colspan="3" style="text-align:center;padding:20px;color:#888;">기록된 실패 이력이 없습니다. (정상)</td></tr>'
+    else:
+        for lg in logs:
+            occurred_display = (lg["occurred_at"] or "-")[:19] if lg["occurred_at"] else "-"
+            error_preview = (lg["error_detail"] or "")[:150]
+            rows_html += f"""
+            <tr>
+              <td style="font-size:12px;">{occurred_display}</td>
+              <td><b>{lg['cron_name']}</b></td>
+              <td style="font-size:12px;color:#EF4444;">{error_preview}</td>
+            </tr>
+            """
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>🚨 크론/기능 실패 이력</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">모든 cron 작업 및 주요 기능 실패 시 이 목록에 기록되며, 동시에 Teams(테스트채널)와 이메일로 알림이 발송됩니다.</p>
+    </div>
+    <div class="card">
+      <form method="get" action="/master/cron-failure-log" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div style="flex:1;min-width:160px;">
+          <label style="font-size:12px;color:#888;">작업 종류</label>
+          <select name="filter_cron" style="margin-top:4px;">{cron_options}</select>
+        </div>
+        <div style="flex:1;min-width:140px;">
+          <label style="font-size:12px;color:#888;">날짜</label>
+          <input name="date_filter" type="date" value="{date_filter}" style="margin-top:4px;">
+        </div>
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/cron-failure-log" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+      </form>
+    </div>
+    <div class="card">
+      <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(logs)}건 (최근 300건까지 표시)</p>
+      <table>
+        <thead><tr><th>발생시각</th><th>작업</th><th>오류 내용</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
 
 if __name__ == "__main__":
     import uvicorn
