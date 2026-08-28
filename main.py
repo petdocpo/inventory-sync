@@ -4057,37 +4057,66 @@ async def survey_list_page(session_token: str = Cookie(default=None)):
     cards_html = ""
     for s in surveys:
         my_writers = my_map.get(s["id"], [])
+        writer_count = len(my_writers)
+
+        writer_rows_html = ""
         if my_writers:
-            writer_rows_html = ""
             for w in my_writers:
                 if w["status"] == "resubmit_requested":
                     badge = '<span class="badge-red">⚠️ 재제출요청</span>'
                 else:
                     badge = '<span class="badge-green">✅ 완료</span>'
                 writer_rows_html += f"""
-                <a href="/survey/{s['id']}/edit/{w['id']}" style="text-decoration:none;color:inherit;">
-                  <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;">
-                    <span style="font-size:13px;">{w['writer_name']}</span>
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0;">
+                  <span style="font-size:13px;">{w['writer_name']}</span>
+                  <div style="display:flex;gap:8px;align-items:center;">
                     {badge}
+                    <a href="/survey/{s['id']}/edit/{w['id']}" class="btn" style="font-size:11px;padding:5px 10px;text-decoration:none;">수정</a>
                   </div>
-                </a>
+                </div>
                 """
-            status_html = f'<div style="margin-top:8px;border-top:1px solid #eee;padding-top:8px;">{writer_rows_html}</div>'
         else:
-            status_html = '<p style="font-size:12px;color:#888;margin-top:6px;">미제출</p>'
+            writer_rows_html = '<p style="font-size:12px;color:#888;padding:10px 0;">제출된 응답이 없습니다.</p>'
+
+        new_submit_html = f"""
+        <a href="/survey/{s['id']}" class="btn" style="text-decoration:none;font-size:12px;padding:8px 14px;display:inline-block;margin-top:8px;">➕ 새로 작성</a>
+        """
+
+        accordion_id = f"sv_acc_{s['id']}"
+        summary_badge = f'<span style="font-size:12px;color:#888;margin-left:8px;">제출 {writer_count}건</span>' if writer_count > 0 else '<span style="font-size:12px;color:#888;margin-left:8px;">미제출</span>'
 
         cards_html += f"""
-        <div class="card">
-          <a href="/survey/{s['id']}" style="text-decoration:none;color:inherit;">
-            <div style="font-weight:bold;color:#1E2761;">{s['title']}</div>
-          </a>
-          {status_html}
+        <div class="card" style="padding:0;overflow:hidden;">
+          <div onclick="toggleSurveyAccordion('{accordion_id}')" style="cursor:pointer;padding:16px;display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <span style="font-weight:bold;color:#1E2761;">{s['title']}</span>
+              {summary_badge}
+            </div>
+            <span id="{accordion_id}_toggle" style="font-size:12px;color:#2563eb;white-space:nowrap;">펼치기 ▾</span>
+          </div>
+          <div id="{accordion_id}" style="display:none;padding:0 16px 16px;border-top:1px solid #eee;">
+            <div style="margin-top:8px;">
+              {writer_rows_html}
+            </div>
+            {new_submit_html}
+          </div>
         </div>
         """
 
     content = f"""
     <h2 style="margin-bottom:16px;">📋 설문</h2>
     {cards_html}
+
+    <script>
+      function toggleSurveyAccordion(id) {{
+        var body = document.getElementById(id);
+        var toggle = document.getElementById(id + '_toggle');
+        if (!body) return;
+        var isOpen = body.style.display !== 'none';
+        body.style.display = isOpen ? 'none' : 'block';
+        if (toggle) toggle.innerText = isOpen ? '펼치기 ▾' : '접기 ▴';
+      }}
+    </script>
     """
     return HTMLResponse(content=render_page(content, user, "survey"))
 
