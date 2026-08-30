@@ -4761,6 +4761,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
                   <a href="/master/survey/{s['id']}/questions" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;">문항관리</a>
                   <a href="/master/survey/{s['id']}/responses" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;background:#64748B;">제출현황</a>
                   <button class="btn" style="font-size:11px;padding:4px 8px;background:#0EA5E9;" onclick="copySurveyLink({s['id']}, this)">🔗 링크복사</button>
+                  <button class="btn" style="font-size:11px;padding:4px 8px;background:#22C55E;" onclick="duplicateSurvey({s['id']}, '{safe_title}', this)">📋 설문복사</button>
                   <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="toggleSurvey({s['id']}, {str(not s['active']).lower()})">{'비활성화' if s['active'] else '활성화'}</button>
                   <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteSurvey({s['id']}, '{safe_title}', {response_count})">삭제</button>
                 </td>
@@ -4848,6 +4849,28 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         }}
       }}
 
+      async function duplicateSurvey(id, title, btnEl) {{
+        if (!confirm('"' + title + '" 설문을 복사합니다. 문항/분야/점수표가 그대로 복제되고, 제출된 응답은 복사되지 않습니다. 계속할까요?')) return;
+        const original = btnEl.innerText;
+        btnEl.innerText = '복사 중...';
+        btnEl.disabled = true;
+        try {{
+          const res = await fetch('/master/survey/' + id + '/duplicate', {{ method: 'POST' }});
+          if (res.ok) {{
+            location.reload();
+          }} else {{
+            const err = await res.json();
+            alert('오류: ' + (err.detail || '복사 실패'));
+            btnEl.innerText = original;
+            btnEl.disabled = false;
+          }}
+        }} catch (e) {{
+          alert('복사 중 오류가 발생했습니다.');
+          btnEl.innerText = original;
+          btnEl.disabled = false;
+        }}
+      }}
+
       async function toggleSurvey(id, newActive) {{
         const res = await fetch('/master/survey/' + id + '/toggle', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
@@ -4931,6 +4954,86 @@ async def master_survey_delete(survey_id: int, session_token: str = Cookie(defau
     conn.close()
     return JSONResponse(content={"status": "ok"})
 
+@app.post("/master/survey/{survey_id}/duplicate")
+async def master_survey_duplicate(survey_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    original = conn.execute("SELECT * FROM survey WHERE id=?", (survey_id,)).fetchone()
+    if not original:
+        conn.close()
+        return JSONResponse(status_code=404, content={"detail": "설문을 찾을 수 없습니다."})
+
+    new_title = f"{original['title']} (복사본)"
+    conn.execute(
+        "INSERT INTO survey (title, purpose, method, allow_edit_after_submit, active) VALUES (?, ?, ?, ?, TRUE)",
+        (new_title, original["purpose"], original["method"], original["allow_edit_after_submit"])
+    )
+    new_survey = conn.execute(
+        "SELECT id FROM survey ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    new_survey_id = new_survey["id"]
+
+    legend_rows = conn.execute(
+        "SELECT * FROM survey_score_legend WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+    for lg in legend_rows:
+        conn.execute(
+            "INSERT INTO survey_score_legend (survey_id, score_value, score_meaning, display_order) VALUES (?, ?, ?, ?)",
+            (new_survey_id, lg["score_value"], lg["score_meaning"], lg["display_order"])
+        )
+
+    section_rows = conn.execute(
+        "SELECT * FROM survey_section WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+    section_id_map = {}
+    for sec in section_rows:
+        conn.execute(
+            "INSERT INTO survey_section (survey_id, section_name, display_order) VALUES (?, ?, ?)",
+            (new_survey_id, sec["section_name"], sec["display_order"])
+        )
+        new_sec = conn.execute(
+            "SELECT id FROM survey_section WHERE survey_id=? ORDER BY id DESC LIMIT 1", (new_survey_id,)
+        ).fetchone()
+        section_id_map[sec["id"]] = new_sec["id"]
+
+    question_rows = conn.execute(
+        "SELECT * FROM survey_question WHERE survey_id=? ORDER BY display_order", (survey_id,)
+    ).fetchall()
+    for q in question_rows:
+        new_section_id = section_id_map.get(q["section_id"]) if q["section_id"] else None
+        conn.execute("""
+            INSERT INTO survey_question
+                (survey_id, question_text, description, has_options, has_text_answer,
+                 text_answer_label, text_answer_required, is_multi_select, section_id,
+                 has_answer_key, display_order, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+        """, (
+            new_survey_id, q["question_text"], q["description"], q["has_options"], q["has_text_answer"],
+            q["text_answer_label"], q["text_answer_required"], q["is_multi_select"], new_section_id,
+            q["has_answer_key"], q["display_order"]
+        ))
+        new_q = conn.execute(
+            "SELECT id FROM survey_question WHERE survey_id=? ORDER BY id DESC LIMIT 1", (new_survey_id,)
+        ).fetchone()
+        new_qid = new_q["id"]
+
+        options = conn.execute(
+            "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
+        ).fetchall()
+        for opt in options:
+            conn.execute("""
+                INSERT INTO survey_question_option
+                    (question_id, option_value, option_label, display_order, is_correct, explanation)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (new_qid, opt["option_value"], opt["option_label"], opt["display_order"],
+                  opt["is_correct"], opt["explanation"]))
+
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok", "new_survey_id": new_survey_id})
 
 @app.get("/master/survey/{survey_id}/questions", response_class=HTMLResponse)
 async def master_survey_questions_page(survey_id: int, session_token: str = Cookie(default=None)):
