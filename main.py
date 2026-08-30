@@ -4231,10 +4231,11 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
         for q in sec_questions:
             global_idx += 1
             num = global_idx
-            desc_html = f'<p style="color:#888;font-size:12px;margin-bottom:8px;">{q["description"]}</p>' if q["description"] else ""
+            question_text_html = q['question_text'].replace(chr(10), '<br>')
+            desc_html = f'<p style="color:#888;font-size:12px;margin-bottom:8px;">{q["description"].replace(chr(10), "<br>")}</p>' if q["description"] else ""
             question_blocks += f"""
             <div class="sv-field">
-              <label>{num}. {q['question_text']}</label>
+              <label>{num}. {question_text_html}</label>
               {desc_html}
               <div id="options_{q['id']}"></div>
               <div id="textwrap_{q['id']}" style="display:{'block' if q['has_text_answer'] else 'none'};">
@@ -4779,6 +4780,9 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         <input type="text" id="svTitle" placeholder="설문 제목 (예: 포포즈 직책자 인재상 자가진단)">
         <textarea id="svPurpose" placeholder="진단목적 (선택, 자유서술)" style="width:100%;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
         <textarea id="svMethod" placeholder="진단방법 (선택, 자유서술)" style="width:100%;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+          <input type="checkbox" id="svAllowEdit" checked style="width:18px;height:18px;flex-shrink:0;"> 제출 후 수정 허용 (해제 시 제출 즉시 결과 확정, 재수정 불가 — 퀴즈/시험용)
+        </label>
         <div>
           <label style="font-size:12px;color:#888;">점수 의미표 (선택 — 표로 보여줄 점수/의미 쌍, 필요 없으면 비워두세요)</label>
           <div id="legendRows" style="display:flex;flex-direction:column;gap:6px;margin-top:6px;"></div>
@@ -4812,6 +4816,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         const title = document.getElementById('svTitle').value.trim();
         const purpose = document.getElementById('svPurpose').value.trim();
         const method = document.getElementById('svMethod').value.trim();
+        const allowEdit = document.getElementById('svAllowEdit').checked;
         if (!title) {{ alert('설문 제목을 입력하세요.'); return; }}
 
         const legends = [];
@@ -4823,7 +4828,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
 
         const res = await fetch('/master/survey/create', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ title: title, purpose: purpose, method: method, legends: legends }})
+          body: JSON.stringify({{ title: title, purpose: purpose, method: method, allow_edit_after_submit: allowEdit, legends: legends }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
@@ -4874,6 +4879,7 @@ async def master_survey_create(request: Request, session_token: str = Cookie(def
     title = data.get("title", "").strip()
     purpose = data.get("purpose", "").strip()
     method = data.get("method", "").strip()
+    allow_edit_after_submit = bool(data.get("allow_edit_after_submit", True))
     legends = data.get("legends", [])
 
     if not title:
@@ -4881,8 +4887,9 @@ async def master_survey_create(request: Request, session_token: str = Cookie(def
 
     conn = get_conn()
     conn.execute(
-        "INSERT INTO survey (title, purpose, method, active) VALUES (?, ?, ?, TRUE)",
-        (title, purpose or None, method or None)
+        "INSERT INTO survey (title, purpose, method, allow_edit_after_submit, active) VALUES (?, ?, ?, ?, TRUE)",
+        (title, purpose or None, method or None, allow_edit_after_submit)
+    )
     )
     new_survey = conn.execute(
         "SELECT id FROM survey ORDER BY created_at DESC LIMIT 1"
