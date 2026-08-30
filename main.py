@@ -4890,7 +4890,6 @@ async def master_survey_create(request: Request, session_token: str = Cookie(def
         "INSERT INTO survey (title, purpose, method, allow_edit_after_submit, active) VALUES (?, ?, ?, ?, TRUE)",
         (title, purpose or None, method or None, allow_edit_after_submit)
     )
-    )
     new_survey = conn.execute(
         "SELECT id FROM survey ORDER BY created_at DESC LIMIT 1"
     ).fetchone()
