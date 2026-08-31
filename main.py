@@ -5928,6 +5928,49 @@ async def master_survey_responses_page(
         "SELECT DISTINCT branch_code, branch_name FROM survey_response WHERE survey_id=? ORDER BY branch_name", (survey_id,)
     ).fetchall()
 
+    # ── 제출/미제출 현황 계산 ──
+    target_rows = conn.execute(
+        "SELECT * FROM survey_target_list WHERE survey_id=? ORDER BY branch_name, writer_name", (survey_id,)
+    ).fetchall()
+
+    submitted_keys = {(r["branch_code"], r["writer_name"]) for r in conn.execute(
+        "SELECT DISTINCT branch_code, writer_name FROM survey_response WHERE survey_id=?", (survey_id,)
+    ).fetchall()}
+
+    target_status_rows_html = ""
+    submitted_count = 0
+    if target_rows:
+        for t in target_rows:
+            is_submitted = (t["branch_code"], t["writer_name"]) in submitted_keys
+            if is_submitted:
+                submitted_count += 1
+            status_badge = '<span class="badge-green">✅ 제출완료</span>' if is_submitted else '<span class="badge-red">❌ 미제출</span>'
+            target_status_rows_html += f"""
+            <tr>
+              <td>{t['branch_name']}</td>
+              <td>{t['writer_name']}</td>
+              <td>{t['contact'] or '-'}</td>
+              <td>{status_badge}</td>
+            </tr>
+            """
+    conn.close()
+
+    target_section_html = ""
+    if target_rows:
+        target_section_html = f"""
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <h3 style="font-size:15px;">📋 제출 대상자 현황</h3>
+            <span style="font-size:13px;color:#888;">{submitted_count} / {len(target_rows)}명 제출</span>
+          </div>
+          <table>
+            <thead><tr><th>지점</th><th>이름</th><th>연락처</th><th>상태</th></tr></thead>
+            <tbody>{target_status_rows_html}</tbody>
+          </table>
+        </div>
+        """
+
+    conn = get_conn()
     rows_html = ""
     if not responses:
         rows_html = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">제출된 응답이 없습니다.</td></tr>'
@@ -5981,6 +6024,21 @@ async def master_survey_responses_page(
     </div>
 
     <div class="card">
+      <h3 style="font-size:15px;margin-bottom:8px;">📤 제출 대상자 명단 업로드</h3>
+      <p style="font-size:12px;color:#888;margin-bottom:8px;">
+        엑셀 컬럼: <b>A=지점명 / B=이름 / C=연락처(선택)</b> (1행 헤더). 업로드하면 기존 명단은 전체 교체됩니다.
+      </p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="file" id="targetListFile" accept=".xlsx,.xls" style="flex:1;">
+        <button class="btn" type="button" onclick="uploadTargetList()">업로드</button>
+        {'<button class="btn btn-red" type="button" onclick="clearTargetList()">명단 초기화</button>' if target_rows else ''}
+      </div>
+      <div id="targetUploadResult" style="margin-top:8px;font-size:13px;"></div>
+    </div>
+
+    {target_section_html}
+
+    <div class="card">
       <form method="get" action="/master/survey/{survey_id}/responses" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
         <div style="flex:1;min-width:150px;">
           <label style="font-size:12px;color:#888;">지점 필터</label>
@@ -6014,6 +6072,7 @@ async def master_survey_responses_page(
       </form>
     </div>
     <form method="post" action="/master/survey/{survey_id}/responses/delete" id="svResponseDeleteForm"></form>
+    <form method="post" action="/master/survey/{survey_id}/target-list/clear" id="targetListClearForm"></form>
 
     <script>
       (function() {{
@@ -6059,6 +6118,29 @@ async def master_survey_responses_page(
           }});
         }}
       }})();
+
+      async function uploadTargetList() {{
+        const fileEl = document.getElementById('targetListFile');
+        if (!fileEl.files.length) {{ alert('파일을 선택하세요.'); return; }}
+        const formData = new FormData();
+        formData.append('file', fileEl.files[0]);
+        document.getElementById('targetUploadResult').innerText = '업로드 중...';
+        const res = await fetch('/master/survey/{survey_id}/target-list/upload', {{
+          method: 'POST', body: formData
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          document.getElementById('targetUploadResult').innerText = '완료: ' + data.inserted + '명 등록';
+          setTimeout(() => location.reload(), 1000);
+        }} else {{
+          document.getElementById('targetUploadResult').innerText = '오류: ' + (data.detail || '업로드 실패');
+        }}
+      }}
+
+      function clearTargetList() {{
+        if (!confirm('제출 대상자 명단을 전체 삭제합니다. 계속할까요?')) return;
+        document.getElementById('targetListClearForm').submit();
+      }}
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -6081,6 +6163,76 @@ async def master_survey_responses_request_resubmit(
         )
         conn.commit()
         conn.close()
+    return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
+
+@app.post("/master/survey/{survey_id}/target-list/upload")
+async def master_survey_target_list_upload(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse(status_code=400, content={"detail": "파일이 없습니다."})
+
+    import openpyxl
+    from io import BytesIO
+    raw = await file.read()
+    wb = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+    ws = wb.active
+    if ws is None:
+        return JSONResponse(status_code=400, content={"detail": "시트를 찾을 수 없습니다."})
+
+    branch_map = {}
+    for b in get_branches():
+        branch_map[b["branch_name"]] = b["branch_code"]
+        branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
+        branch_map[b["branch_code"]] = b["branch_code"]
+
+    conn = get_conn()
+    conn.execute("DELETE FROM survey_target_list WHERE survey_id=?", (survey_id,))
+
+    inserted = 0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or not row[0]:
+            continue
+        branch_name_raw = str(row[0]).strip()
+        writer_name = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+        contact = str(row[2]).strip() if len(row) > 2 and row[2] else None
+
+        if not writer_name:
+            continue
+
+        branch_code = (branch_map.get(branch_name_raw)
+                       or branch_map.get(branch_name_raw.replace(" ", ""))
+                       or branch_name_raw)
+        branch_name = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_name_raw)
+
+        try:
+            conn.execute("""
+                INSERT INTO survey_target_list (survey_id, branch_code, branch_name, writer_name, contact)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (survey_id, branch_code, writer_name) DO UPDATE SET contact=excluded.contact
+            """, (survey_id, branch_code, branch_name, writer_name, contact))
+            inserted += 1
+        except Exception:
+            continue
+
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok", "inserted": inserted})
+
+
+@app.post("/master/survey/{survey_id}/target-list/clear")
+async def master_survey_target_list_clear(survey_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    conn = get_conn()
+    conn.execute("DELETE FROM survey_target_list WHERE survey_id=?", (survey_id,))
+    conn.commit()
+    conn.close()
     return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
 
 @app.post("/master/survey/{survey_id}/responses/delete")
@@ -6236,6 +6388,25 @@ async def master_survey_responses_export(
 
     for col_idx in range(1, 6):
         ws2.column_dimensions[chr(64 + col_idx)].width = 24
+
+    # ── 미제출자 시트 ──
+    conn2 = get_conn()
+    target_rows = conn2.execute(
+        "SELECT * FROM survey_target_list WHERE survey_id=? ORDER BY branch_name, writer_name", (survey_id,)
+    ).fetchall()
+    submitted_keys = {(r["branch_code"], r["writer_name"]) for r in conn2.execute(
+        "SELECT DISTINCT branch_code, writer_name FROM survey_response WHERE survey_id=?", (survey_id,)
+    ).fetchall()}
+    conn2.close()
+
+    if target_rows:
+        ws3 = wb.create_sheet("제출현황")
+        ws3.append(["지점", "이름", "연락처", "제출여부"])
+        for t in target_rows:
+            is_submitted = (t["branch_code"], t["writer_name"]) in submitted_keys
+            ws3.append([t["branch_name"], t["writer_name"], t["contact"] or "", "제출완료" if is_submitted else "미제출"])
+        for col_idx in range(1, 5):
+            ws3.column_dimensions[chr(64 + col_idx)].width = 20
 
     buf = io.BytesIO()
     wb.save(buf)
