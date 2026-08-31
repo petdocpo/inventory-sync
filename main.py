@@ -5179,7 +5179,8 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         "text_answer_required": bool(q["text_answer_required"]),
         "is_multi_select": bool(q["is_multi_select"]),
         "section_id": q["section_id"],
-        "options": [{"value": o["option_value"], "label": o["option_label"]} for o in conn.execute(
+        "options": [{"value": o["option_value"], "label": o["option_label"],
+                     "is_correct": bool(o["is_correct"]), "explanation": o["explanation"] or ""} for o in conn.execute(
             "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
         ).fetchall()]
     } for q in question_rows], ensure_ascii=False)
