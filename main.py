@@ -4351,6 +4351,9 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
           }}
         }});
         const payload = {{ writer_name: writerName, answers: answers }};
+        const btn = document.getElementById('submitBtn');
+        btn.disabled = true;
+        btn.innerText = '제출 중...';
         const res = await fetch('/survey/' + surveyId + '/submit', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
@@ -4358,11 +4361,51 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
         }});
         if (res.ok) {{
           const result = await res.json();
-          window.location.href = '/survey/' + surveyId + '/edit/' + result.response_id;
+          showResultScreen(writerName, result.results);
         }} else {{
           const err = await res.json();
           alert('오류: ' + (err.detail || '제출 실패'));
+          btn.disabled = false;
+          btn.innerText = '제출';
         }}
+      }}
+
+      function showResultScreen(writerName, results) {{
+        const container = document.querySelector('.sv-card').parentElement;
+        let resultsHtml = '';
+
+        if (results.length === 0) {{
+          resultsHtml = '<p style="color:#888;font-size:14px;text-align:center;padding:20px 0;">이 설문에는 정답이 있는 문항이 없습니다.</p>';
+        }} else {{
+          const correctCount = results.filter(r => r.is_correct).length;
+          resultsHtml += '<div style="text-align:center;padding:16px;background:#EFF6FF;border-radius:10px;margin-bottom:16px;">' +
+            '<div style="font-size:13px;color:#888;">정답 결과</div>' +
+            '<div style="font-size:24px;font-weight:bold;color:#1E2761;">' + correctCount + ' / ' + results.length + '</div>' +
+            '</div>';
+          results.forEach((r, idx) => {{
+            const badge = r.is_correct
+              ? '<span style="background:#D1FAE5;color:#065F46;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:bold;">✅ 정답</span>'
+              : '<span style="background:#FEE2E2;color:#991B1B;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:bold;">❌ 오답</span>';
+            const myAnswer = r.selected_labels.length ? r.selected_labels.join(', ') : '(응답 없음)';
+            const correctAnswer = !r.is_correct ? '<p style="font-size:13px;color:#22C55E;margin-top:4px;">정답: ' + r.correct_labels.join(', ') + '</p>' : '';
+            const explanationHtml = r.explanation ? '<p style="font-size:12px;color:#666;margin-top:6px;background:#f8fafc;padding:8px;border-radius:6px;">💡 ' + r.explanation + '</p>' : '';
+            resultsHtml += '<div style="padding:14px 0;border-bottom:1px solid #eee;">' +
+              '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">' +
+              '<span style="font-size:14px;font-weight:bold;">' + (idx + 1) + '. ' + r.question_text + '</span>' + badge +
+              '</div>' +
+              '<p style="font-size:13px;color:#555;margin-top:6px;">내 답변: ' + myAnswer + '</p>' +
+              correctAnswer + explanationHtml +
+              '</div>';
+          }});
+        }}
+
+        container.innerHTML = '<div class="sv-card">' +
+          '<h2>제출 완료</h2>' +
+          '<p style="color:#888;font-size:13px;margin-bottom:16px;">작성자: ' + writerName + '</p>' +
+          resultsHtml +
+          '<a href="/survey" class="btn sv-btn-submit" style="display:block;text-align:center;text-decoration:none;margin-top:16px;">설문 목록으로</a>' +
+          '</div>';
+        window.scrollTo({{ top: 0, behavior: 'smooth' }});
       }}
     </script>
     """
@@ -4400,7 +4443,6 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
         ).fetchall()
     }
 
-    # 문항별로 답변 묶어서 검증 (다중선택은 같은 question_id로 여러 행이 올 수 있음)
     answers_by_qid: Dict[int, list] = {}
     for a in answers:
         qid = a.get("question_id")
@@ -4429,7 +4471,7 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
     if existing:
         conn.close()
         return JSONResponse(status_code=400, content={
-            "detail": "이미 같은 이름으로 제출된 기록이 있습니다. 수정 화면을 이용해주세요.",
+            "detail": "이미 같은 이름으로 제출된 기록이 있습니다.",
             "existing_response_id": existing["id"]
         })
 
@@ -4454,10 +4496,38 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
             (response_id, a.get("question_id"), sel, text)
         )
 
+    # 채점 결과 생성 — 정답이 있는 문항만 대상
+    results = []
+    for qid, a_list in answers_by_qid.items():
+        q = question_map.get(qid)
+        if not q or not q["has_answer_key"]:
+            continue
+        option_rows = conn.execute(
+            "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (qid,)
+        ).fetchall()
+        correct_values = {o["option_value"] for o in option_rows if o["is_correct"]}
+        selected_values = {a.get("selected_option") for a in a_list if a.get("selected_option")}
+        is_correct = selected_values == correct_values
+
+        selected_labels = [o["option_label"] for o in option_rows if o["option_value"] in selected_values]
+        correct_labels = [o["option_label"] for o in option_rows if o["option_value"] in correct_values]
+        explanations = [o["explanation"] for o in option_rows if o["option_value"] in selected_values and o["explanation"]]
+        if not explanations:
+            explanations = [o["explanation"] for o in option_rows if o["option_value"] in correct_values and o["explanation"]]
+
+        results.append({
+            "question_id": qid,
+            "question_text": q["question_text"],
+            "is_correct": is_correct,
+            "selected_labels": selected_labels,
+            "correct_labels": correct_labels,
+            "explanation": explanations[0] if explanations else None
+        })
+
     conn.commit()
     conn.close()
 
-    return JSONResponse(content={"status": "ok", "response_id": response_id})
+    return JSONResponse(content={"status": "ok", "response_id": response_id, "results": results})
 
 
 @app.get("/survey/{survey_id}/edit/{response_id}", response_class=HTMLResponse)
