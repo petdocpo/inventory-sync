@@ -2699,7 +2699,7 @@ async def scan_log_page(
     table_open = '<form method="post" action="/scan-log/delete">' if user["role"] == "master" else '<div>'
     table_close = '</form>' if user["role"] == "master" else '</div>'
 
-    content = f"""WLS
+    content = f"""
     <h2 style="margin-bottom:16px;">📜 스캔 이력</h2>
     <div class="card">
       <form method="get" action="/scan-log" style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -4740,6 +4740,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
     surveys = conn.execute("SELECT * FROM survey ORDER BY created_at DESC").fetchall()
 
     rows_html = ""
+    all_surveys_data = []
     if not surveys:
         rows_html = '<tr><td colspan="5" style="text-align:center;padding:20px;color:#888;">등록된 설문이 없습니다.</td></tr>'
     else:
@@ -4752,6 +4753,10 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
             ).fetchone()["cnt"]
             active_badge = '<span class="badge-green">활성</span>' if s["active"] else '<span class="badge-red">비활성</span>'
             safe_title = s["title"].replace("'", "")
+            all_surveys_data.append({
+                "id": s["id"], "title": s["title"], "purpose": s["purpose"] or "",
+                "method": s["method"] or "", "allow_edit_after_submit": bool(s["allow_edit_after_submit"])
+            })
             rows_html += f"""
             <tr>
                 <td><b>{s['title']}</b> {active_badge}</td>
@@ -4759,6 +4764,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
                 <td style="text-align:center;">{response_count}건</td>
                 <td style="font-size:11px;color:#888;">{str(s['created_at'])[:16]}</td>
                 <td style="display:flex;gap:4px;flex-wrap:wrap;">
+                  <button class="btn" style="font-size:11px;padding:4px 8px;background:#F59E0B;" onclick="openEditSurveyInfo({s['id']})">⚙️ 설정수정</button>                  
                   <a href="/master/survey/{s['id']}/questions" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;">문항관리</a>
                   <a href="/master/survey/{s['id']}/responses" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;background:#64748B;">제출현황</a>
                   <button class="btn" style="font-size:11px;padding:4px 8px;background:#0EA5E9;" onclick="copySurveyLink({s['id']}, this)">🔗 링크복사</button>
@@ -4769,6 +4775,8 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
             </tr>
             """
     conn.close()
+
+    all_surveys_json = json.dumps(all_surveys_data, ensure_ascii=False)
 
     content = f"""
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
@@ -4802,7 +4810,63 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
       </table>
     </div>
 
+    <div id="editSurveyModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:480px;width:90%;max-height:85vh;overflow-y:auto;">
+        <h3 style="margin-bottom:12px;">설문 설정 수정</h3>
+        <input type="hidden" id="editSvId">
+        <label style="font-size:12px;color:#888;">설문 제목</label>
+        <input type="text" id="editSvTitle" style="margin-bottom:8px;">
+        <label style="font-size:12px;color:#888;">진단목적</label>
+        <textarea id="editSvPurpose" style="width:100%;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:8px;"></textarea>
+        <label style="font-size:12px;color:#888;">진단방법</label>
+        <textarea id="editSvMethod" style="width:100%;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:8px;"></textarea>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;">
+          <input type="checkbox" id="editSvAllowEdit" style="width:18px;height:18px;flex-shrink:0;"> 제출 후 수정 허용
+        </label>
+        <div style="display:flex;gap:8px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeEditSurveyInfo()">취소</button>
+          <button class="btn" style="flex:1;" onclick="saveEditSurveyInfo()">저장</button>
+        </div>
+        <div id="editSvResult" style="margin-top:8px;font-size:13px;"></div>
+      </div>
+    </div>
+
     <script>
+      const allSurveysData = {all_surveys_json};
+
+      function openEditSurveyInfo(id) {{
+        const s = allSurveysData.find(x => x.id === id);
+        if (!s) return;
+        document.getElementById('editSvId').value = s.id;
+        document.getElementById('editSvTitle').value = s.title;
+        document.getElementById('editSvPurpose').value = s.purpose;
+        document.getElementById('editSvMethod').value = s.method;
+        document.getElementById('editSvAllowEdit').checked = s.allow_edit_after_submit;
+        document.getElementById('editSurveyModal').style.display = 'flex';
+      }}
+
+      function closeEditSurveyInfo() {{
+        document.getElementById('editSurveyModal').style.display = 'none';
+      }}
+
+      async function saveEditSurveyInfo() {{
+        const id = document.getElementById('editSvId').value;
+        const title = document.getElementById('editSvTitle').value.trim();
+        const purpose = document.getElementById('editSvPurpose').value.trim();
+        const method = document.getElementById('editSvMethod').value.trim();
+        const allowEdit = document.getElementById('editSvAllowEdit').checked;
+        if (!title) {{ alert('설문 제목을 입력하세요.'); return; }}
+
+        const res = await fetch('/master/survey/' + id + '/update-info', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ title: title, purpose: purpose, method: method, allow_edit_after_submit: allowEdit }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          document.getElementById('editSvResult').innerText = '오류: ' + (err.detail || '저장 실패');
+        }}
+      }}
+
       function addLegendRow(value, meaning) {{
         const container = document.getElementById('legendRows');
         const row = document.createElement('div');
@@ -4943,6 +5007,29 @@ async def master_survey_toggle(survey_id: int, request: Request, session_token: 
     conn.close()
     return JSONResponse(content={"status": "ok"})
 
+@app.post("/master/survey/{survey_id}/update-info")
+async def master_survey_update_info(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    title = data.get("title", "").strip()
+    purpose = data.get("purpose", "").strip()
+    method = data.get("method", "").strip()
+    allow_edit_after_submit = bool(data.get("allow_edit_after_submit", True))
+
+    if not title:
+        return JSONResponse(status_code=400, content={"detail": "설문 제목을 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "UPDATE survey SET title=?, purpose=?, method=?, allow_edit_after_submit=? WHERE id=?",
+        (title, purpose or None, method or None, allow_edit_after_submit, survey_id)
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
 
 @app.post("/master/survey/{survey_id}/delete")
 async def master_survey_delete(survey_id: int, session_token: str = Cookie(default=None)):
