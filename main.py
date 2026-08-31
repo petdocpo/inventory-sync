@@ -6054,6 +6054,16 @@ async def master_survey_responses_export(
     ).fetchall()
     question_map = {q["id"]: q for q in question_rows}
 
+    # 문항별 정답 선택지 미리 조회
+    correct_options_map: Dict[int, set] = {}
+    option_label_map: Dict[int, Dict[str, str]] = {}
+    for q in question_rows:
+        opts = conn.execute(
+            "SELECT * FROM survey_question_option WHERE question_id=?", (q["id"],)
+        ).fetchall()
+        correct_options_map[q["id"]] = {o["option_value"] for o in opts if o["is_correct"]}
+        option_label_map[q["id"]] = {o["option_value"]: o["option_label"] for o in opts}
+
     query = "SELECT * FROM survey_response WHERE survey_id=?"
     params: list = [survey_id]
     if filter_branch:
@@ -6068,33 +6078,97 @@ async def master_survey_responses_export(
     ws = wb.active
     assert ws is not None
     ws.title = "설문응답"
-    headers = ["지점", "작성자", "문항", "객관식 답변", "서술형 답변", "제출일시"]
+    headers = ["지점", "작성자", "문항", "객관식 답변", "서술형 답변", "정답여부", "제출일시"]
     ws.append(headers)
+
+    # 응답자별 정답률 집계용
+    writer_stats: Dict[int, Dict] = {}
+    # 문항별 정답률 집계용
+    question_stats: Dict[int, Dict] = {}
+    for q in question_rows:
+        if q["has_answer_key"]:
+            question_stats[q["id"]] = {"question_text": q["question_text"], "correct": 0, "total": 0}
 
     for r in responses:
         answers = conn.execute(
             "SELECT * FROM survey_answer WHERE response_id=? ORDER BY question_id", (r["id"],)
         ).fetchall()
-        if not answers:
-            ws.append([r["branch_name"], r["writer_name"], "-", "-", "-", str(r["created_at"]) if r["created_at"] else ""])
+
+        answers_by_qid: Dict[int, list] = {}
         for a in answers:
-            q = question_map.get(a["question_id"])
+            answers_by_qid.setdefault(a["question_id"], []).append(a)
+
+        writer_correct = 0
+        writer_total = 0
+
+        if not answers:
+            ws.append([r["branch_name"], r["writer_name"], "-", "-", "-", "-", str(r["created_at"]) if r["created_at"] else ""])
+
+        for qid, a_list in answers_by_qid.items():
+            q = question_map.get(qid)
             qlabel = q["question_text"] if q else "-"
-            opt_label = ""
-            if a["selected_option"]:
-                opt_row = conn.execute(
-                    "SELECT option_label FROM survey_question_option WHERE question_id=? AND option_value=?",
-                    (a["question_id"], a["selected_option"])
-                ).fetchone()
-                opt_label = opt_row["option_label"] if opt_row else a["selected_option"]
-            ws.append([
-                r["branch_name"], r["writer_name"], qlabel, opt_label, a["answer_text"] or "",
-                str(r["created_at"]) if r["created_at"] else ""
-            ])
+
+            opt_labels = []
+            selected_values = set()
+            answer_texts = []
+            for a in a_list:
+                if a["selected_option"]:
+                    selected_values.add(a["selected_option"])
+                    opt_labels.append(option_label_map.get(qid, {}).get(a["selected_option"], a["selected_option"]))
+                if a["answer_text"]:
+                    answer_texts.append(a["answer_text"])
+
+            opt_label_str = ", ".join(opt_labels) if opt_labels else ""
+            answer_text_str = ", ".join(answer_texts) if answer_texts else ""
+
+            correctness = "-"
+            if q and q["has_answer_key"]:
+                is_correct = selected_values == correct_options_map.get(qid, set())
+                correctness = "O" if is_correct else "X"
+                writer_total += 1
+                if is_correct:
+                    writer_correct += 1
+                if qid in question_stats:
+                    question_stats[qid]["total"] += 1
+                    if is_correct:
+                        question_stats[qid]["correct"] += 1
+
+            created_display = str(r["created_at"]) if r["created_at"] else ""
+            ws.append([r["branch_name"], r["writer_name"], qlabel, opt_label_str, answer_text_str, correctness, created_display])
+
+        if writer_total > 0:
+            writer_stats[r["id"]] = {
+                "branch_name": r["branch_name"], "writer_name": r["writer_name"],
+                "correct": writer_correct, "total": writer_total
+            }
+
     conn.close()
 
     for col_idx in range(1, len(headers) + 1):
         ws.column_dimensions[chr(64 + col_idx)].width = 22
+
+    # ── 정답률 시트 ──
+    ws2 = wb.create_sheet("정답률")
+    ws2.append(["구분", "이름", "정답수", "전체문항수", "정답률(%)"])
+
+    if writer_stats:
+        ws2.append(["── 작성자별 정답률 ──", "", "", "", ""])
+        for stat in writer_stats.values():
+            rate = round(stat["correct"] / stat["total"] * 100, 1) if stat["total"] > 0 else 0
+            ws2.append([stat["branch_name"], stat["writer_name"], stat["correct"], stat["total"], rate])
+
+    if question_stats:
+        ws2.append(["", "", "", "", ""])
+        ws2.append(["── 문항별 정답률 ──", "", "", "", ""])
+        for stat in question_stats.values():
+            rate = round(stat["correct"] / stat["total"] * 100, 1) if stat["total"] > 0 else 0
+            ws2.append(["문항", stat["question_text"], stat["correct"], stat["total"], rate])
+
+    if not writer_stats and not question_stats:
+        ws2.append(["이 설문에는 정답이 있는 문항이 없습니다.", "", "", "", ""])
+
+    for col_idx in range(1, 6):
+        ws2.column_dimensions[chr(64 + col_idx)].width = 24
 
     buf = io.BytesIO()
     wb.save(buf)
