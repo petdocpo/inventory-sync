@@ -4134,19 +4134,22 @@ async def survey_list_page(session_token: str = Cookie(default=None)):
 @app.get("/survey/{survey_id}", response_class=HTMLResponse)
 async def survey_write_page(survey_id: int, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
-    if not user:
-        return RedirectResponse(url="/login", status_code=303)
-    if user["role"] == "master":
-        return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
-
-    branch_code = user["branch_code"]
-    branch_name = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_code)
 
     conn = get_conn()
     survey = conn.execute("SELECT * FROM survey WHERE id=?", (survey_id,)).fetchone()
     if not survey:
         conn.close()
         return RedirectResponse(url="/survey", status_code=303)
+
+    is_public_mode = False
+    if not user:
+        if not survey["is_public_access"]:
+            conn.close()
+            return RedirectResponse(url="/login", status_code=303)
+        is_public_mode = True
+    elif user["role"] == "master":
+        conn.close()
+        return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
 
     legend_rows = conn.execute(
         "SELECT * FROM survey_score_legend WHERE survey_id=? ORDER BY display_order", (survey_id,)
@@ -4177,6 +4180,14 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
             "is_multi_select": bool(q["is_multi_select"]),
             "options": [{"value": o["option_value"], "label": o["option_label"]} for o in options]
         })
+
+    branch_options_html = ""
+    if is_public_mode:
+        branches = get_branches(branch_type='branch')
+        branch_options_html = '<option value="">지점을 선택하세요</option>'
+        for b in branches:
+            branch_options_html += f'<option value="{b["branch_code"]}">{b["branch_name"]}</option>'
+
     conn.close()
 
     if not questions_data:
@@ -4186,7 +4197,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
           <p style="color:#888;margin-top:12px;">등록된 문항이 없습니다. 마스터에게 문항 등록을 요청해주세요.</p>
         </div>
         """
-        return HTMLResponse(content=render_page(content, user, "survey"))
+        return HTMLResponse(content=render_page(content, user, "survey") if user else content)
 
     legend_html = ""
     if legend_rows:
@@ -4216,7 +4227,6 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
 
     questions_js = json.dumps(questions_data, ensure_ascii=False)
 
-    # 섹션별 그룹화: (섹션id, 섹션명) 순서대로 문항 배치, 섹션 없는 문항은 마지막에 별도 그룹
     section_order = [(sec["id"], sec["section_name"]) for sec in section_rows]
     section_order.append((None, None))
 
@@ -4244,7 +4254,16 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
             </div>
             """
 
-    content = f"""
+    branch_select_html = ""
+    if is_public_mode:
+        branch_select_html = f"""
+        <label style="font-size:13px;color:#555;">지점 선택 (필수)</label>
+        <select id="publicBranchCode" onchange="checkAllValid()" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:16px;">
+          {branch_options_html}
+        </select>
+        """
+
+    inner_content = f"""
     {intro_html}
     <style>
       .sv-legend-card {{ max-width:560px; margin:0 auto 16px; }}
@@ -4264,6 +4283,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
     <div class="sv-legend-card">{legend_html}</div>
     <div class="sv-card">
       <h2>{survey['title']}</h2>
+      {branch_select_html}
       <label style="font-size:13px;color:#555;">작성자 이름 (필수)</label>
       <input type="text" id="writerName" placeholder="이름을 입력하세요" oninput="checkAllValid()">
       {question_blocks}
@@ -4273,8 +4293,8 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
     <script>
       const questionsData = {questions_js};
       const surveyId = {survey_id};
+      const isPublicMode = {json.dumps(is_public_mode)};
 
-      // 단일선택: selected[qid] = value (string) / 다중선택: selected[qid] = [values...] (array)
       let selected = {{}};
       questionsData.forEach(q => selected[q.id] = q.is_multi_select ? [] : null);
 
@@ -4311,6 +4331,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
 
       function checkAllValid() {{
         const writerOk = document.getElementById('writerName').value.trim().length > 0;
+        const branchOk = isPublicMode ? document.getElementById('publicBranchCode').value !== '' : true;
         const questionsOk = questionsData.every(q => {{
           let optOk = true;
           if (q.has_options) {{
@@ -4323,7 +4344,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
           }}
           return optOk && textOk;
         }});
-        document.getElementById('submitBtn').disabled = !(writerOk && questionsOk);
+        document.getElementById('submitBtn').disabled = !(writerOk && branchOk && questionsOk);
       }}
 
       questionsData.forEach(q => {{
@@ -4351,6 +4372,9 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
           }}
         }});
         const payload = {{ writer_name: writerName, answers: answers }};
+        if (isPublicMode) {{
+          payload.branch_code = document.getElementById('publicBranchCode').value;
+        }}
         const btn = document.getElementById('submitBtn');
         btn.disabled = true;
         btn.innerText = '제출 중...';
@@ -4399,43 +4423,79 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
           }});
         }}
 
+        const listLink = isPublicMode ? '' : '<a href="/survey" class="btn sv-btn-submit" style="display:block;text-align:center;text-decoration:none;margin-top:16px;">설문 목록으로</a>';
+
         container.innerHTML = '<div class="sv-card">' +
           '<h2>제출 완료</h2>' +
           '<p style="color:#888;font-size:13px;margin-bottom:16px;">작성자: ' + writerName + '</p>' +
           resultsHtml +
-          '<a href="/survey" class="btn sv-btn-submit" style="display:block;text-align:center;text-decoration:none;margin-top:16px;">설문 목록으로</a>' +
+          listLink +
           '</div>';
         window.scrollTo({{ top: 0, behavior: 'smooth' }});
       }}
     </script>
     """
-    return HTMLResponse(content=render_page(content, user, "survey"))
+
+    if is_public_mode:
+        page_html = f"""
+        <html><head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>{survey['title']}</title>
+          <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7fa; padding: 20px 14px; }}
+            .card {{ background: white; border-radius: 12px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }}
+          </style>
+        </head>
+        <body>{inner_content}</body></html>
+        """
+        return HTMLResponse(content=page_html)
+
+    return HTMLResponse(content=render_page(inner_content, user, "survey"))
 
 
 @app.post("/survey/{survey_id}/submit")
 async def survey_submit(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
-    if not user or user["role"] == "master":
+    data = await request.json()
+
+    conn = get_conn()
+    survey = conn.execute("SELECT * FROM survey WHERE id=?", (survey_id,)).fetchone()
+    if not survey:
+        conn.close()
+        return JSONResponse(status_code=404, content={"detail": "설문을 찾을 수 없습니다."})
+
+    if user and user["role"] == "master":
+        conn.close()
         return JSONResponse(status_code=403, content={"detail": "지점 계정만 제출 가능합니다."})
 
-    branch_code = user["branch_code"]
-    branch_name = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_code)
+    if user:
+        branch_code = user["branch_code"]
+        branch_name = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_code)
+    else:
+        if not survey["is_public_access"]:
+            conn.close()
+            return JSONResponse(status_code=403, content={"detail": "로그인이 필요합니다."})
+        branch_code = (data.get("branch_code") or "").strip()
+        if not branch_code:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "지점을 선택하세요."})
+        matched_branch = next((b for b in get_branches(branch_type='branch') if b["branch_code"] == branch_code), None)
+        if not matched_branch:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "올바르지 않은 지점입니다."})
+        branch_name = matched_branch["branch_name"]
 
-    data = await request.json()
     writer_name = data.get("writer_name", "").strip()
     answers = data.get("answers", [])
 
     if not writer_name:
+        conn.close()
         return JSONResponse(status_code=400, content={"detail": "작성자 이름을 입력하세요."})
     if not answers:
-        return JSONResponse(status_code=400, content={"detail": "답변이 없습니다."})
-
-    conn = get_conn()
-
-    survey = conn.execute("SELECT id FROM survey WHERE id=?", (survey_id,)).fetchone()
-    if not survey:
         conn.close()
-        return JSONResponse(status_code=404, content={"detail": "설문을 찾을 수 없습니다."})
+        return JSONResponse(status_code=400, content={"detail": "답변이 없습니다."})
 
     question_map = {
         q["id"]: q for q in conn.execute(
@@ -4825,7 +4885,8 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
             safe_title = s["title"].replace("'", "")
             all_surveys_data.append({
                 "id": s["id"], "title": s["title"], "purpose": s["purpose"] or "",
-                "method": s["method"] or "", "allow_edit_after_submit": bool(s["allow_edit_after_submit"])
+                "method": s["method"] or "", "allow_edit_after_submit": bool(s["allow_edit_after_submit"]),
+                "is_public_access": bool(s["is_public_access"])
             })
             rows_html += f"""
             <tr>
@@ -4890,8 +4951,11 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         <textarea id="editSvPurpose" style="width:100%;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:8px;"></textarea>
         <label style="font-size:12px;color:#888;">진단방법</label>
         <textarea id="editSvMethod" style="width:100%;min-height:60px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:8px;"></textarea>
-        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
           <input type="checkbox" id="editSvAllowEdit" style="width:18px;height:18px;flex-shrink:0;"> 제출 후 수정 허용
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;">
+          <input type="checkbox" id="editSvPublicAccess" style="width:18px;height:18px;flex-shrink:0;"> 로그인 없이 링크로 제출 허용 (공개링크, 제출 후 수정 불가)
         </label>
         <div style="display:flex;gap:8px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeEditSurveyInfo()">취소</button>
@@ -4912,6 +4976,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         document.getElementById('editSvPurpose').value = s.purpose;
         document.getElementById('editSvMethod').value = s.method;
         document.getElementById('editSvAllowEdit').checked = s.allow_edit_after_submit;
+        document.getElementById('editSvPublicAccess').checked = s.is_public_access;
         document.getElementById('editSurveyModal').style.display = 'flex';
       }}
 
@@ -4925,11 +4990,12 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         const purpose = document.getElementById('editSvPurpose').value.trim();
         const method = document.getElementById('editSvMethod').value.trim();
         const allowEdit = document.getElementById('editSvAllowEdit').checked;
+        const publicAccess = document.getElementById('editSvPublicAccess').checked;
         if (!title) {{ alert('설문 제목을 입력하세요.'); return; }}
 
         const res = await fetch('/master/survey/' + id + '/update-info', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ title: title, purpose: purpose, method: method, allow_edit_after_submit: allowEdit }})
+          body: JSON.stringify({{ title: title, purpose: purpose, method: method, allow_edit_after_submit: allowEdit, is_public_access: publicAccess }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
@@ -5088,14 +5154,15 @@ async def master_survey_update_info(survey_id: int, request: Request, session_to
     purpose = data.get("purpose", "").strip()
     method = data.get("method", "").strip()
     allow_edit_after_submit = bool(data.get("allow_edit_after_submit", True))
+    is_public_access = bool(data.get("is_public_access", False))
 
     if not title:
         return JSONResponse(status_code=400, content={"detail": "설문 제목을 입력하세요."})
 
     conn = get_conn()
     conn.execute(
-        "UPDATE survey SET title=?, purpose=?, method=?, allow_edit_after_submit=? WHERE id=?",
-        (title, purpose or None, method or None, allow_edit_after_submit, survey_id)
+        "UPDATE survey SET title=?, purpose=?, method=?, allow_edit_after_submit=?, is_public_access=? WHERE id=?",
+        (title, purpose or None, method or None, allow_edit_after_submit, is_public_access, survey_id)
     )
     conn.commit()
     conn.close()
