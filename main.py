@@ -4555,10 +4555,11 @@ async def survey_edit_page(survey_id: int, response_id: int, session_token: str 
         for q in sec_questions:
             global_idx += 1
             num = global_idx
-            desc_html = f'<p style="color:#888;font-size:12px;margin-bottom:8px;">{q["description"]}</p>' if q["description"] else ""
+            question_text_html = q['question_text'].replace(chr(10), '<br>')
+            desc_html = f'<p style="color:#888;font-size:12px;margin-bottom:8px;">{q["description"].replace(chr(10), "<br>")}</p>' if q["description"] else ""
             question_blocks += f"""
             <div class="sv-field">
-              <label>{num}. {q['question_text']}</label>
+              <label>{num}. {question_text_html}</label>
               {desc_html}
               <div id="options_{q['id']}"></div>
               <div id="textwrap_{q['id']}" style="display:{'block' if q['has_text_answer'] else 'none'};">
@@ -5117,7 +5118,8 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
             active_badge = '<span class="badge-green">사용중</span>' if q["active"] else '<span class="badge-red">비활성</span>'
             text_badge = f'📝 서술형{"(필수)" if q["text_answer_required"] else "(선택)"}' if q["has_text_answer"] else ""
             multi_badge = ' 🔲 다중선택' if q["is_multi_select"] else ''
-            opt_badge = f'☑️ 객관식[{opt_summary}]{multi_badge}' if q["has_options"] else ""
+            answer_key_badge = ' 🎯 정답있음' if q["has_answer_key"] else ''
+            opt_badge = f'☑️ 객관식[{opt_summary}]{multi_badge}{answer_key_badge}' if q["has_options"] else ""
             safe_qtext = q["question_text"].replace("'", "")
             cards_html += f"""
             <div class="card sv-q-card" draggable="true" data-qid="{q['id']}" data-section="{section_key}"
@@ -5270,7 +5272,37 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         const row = document.createElement('div');
         row.style.display = 'flex';
         row.style.gap = '6px';
+        row.inner      function addOptionRow(value, label, isCorrect, explanation) {{
+        const container = document.getElementById('optionRows');
+        const wrap = document.createElement('div');
+        wrap.style.border = '1px solid #e5e7eb';
+        wrap.style.borderRadius = '8px';
+        wrap.style.padding = '8px';
+
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.gap = '6px';
+        row.style.alignItems = 'center';
         row.innerHTML = '<input type="text" class="opt-value" placeholder="값(예: O)" style="width:80px;" value="' + (value || '') + '">' +
+          '<input type="text" class="opt-label" placeholder="라벨(예: 그렇다)" style="flex:1;" value="' + (label || '') + '">' +
+          '<label style="display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap;">' +
+          '<input type="checkbox" class="opt-correct" style="width:18px;height:18px;flex-shrink:0;" ' + (isCorrect ? 'checked' : '') + '> 정답</label>' +
+          '<button type="button" class="btn btn-red" style="font-size:11px;padding:6px 10px;" onclick="this.closest(\\'div\\').parentElement.remove()">삭제</button>';
+
+        const explWrap = document.createElement('div');
+        explWrap.style.marginTop = '6px';
+        explWrap.style.display = isCorrect || explanation ? 'block' : 'none';
+        explWrap.className = 'opt-expl-wrap';
+        explWrap.innerHTML = '<input type="text" class="opt-explanation" placeholder="이 선택지를 골랐을 때 보여줄 설명 (선택)" style="width:100%;font-size:12px;" value="' + (explanation || '').replace(/"/g, '&quot;') + '">';
+
+        row.querySelector('.opt-correct').addEventListener('change', function() {{
+          explWrap.style.display = this.checked ? 'block' : 'none';
+        }});
+
+        wrap.appendChild(row);
+        wrap.appendChild(explWrap);
+        container.appendChild(wrap);
+      }}HTML = '<input type="text" class="opt-value" placeholder="값(예: O)" style="width:80px;" value="' + (value || '') + '">' +
           '<input type="text" class="opt-label" placeholder="라벨(예: 그렇다)" style="flex:1;" value="' + (label || '') + '">' +
           '<button type="button" class="btn btn-red" style="font-size:11px;padding:6px 10px;" onclick="this.parentElement.remove()">삭제</button>';
         container.appendChild(row);
@@ -5288,6 +5320,18 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
           addOptionRow('4', '대체로 그렇다');
           addOptionRow('5', '항상 그렇다');
         }}
+      }}
+
+      function collectOptions() {{
+        const options = [];
+        document.querySelectorAll('#optionRows > div').forEach(wrap => {{
+          const val = wrap.querySelector('.opt-value').value.trim();
+          const label = wrap.querySelector('.opt-label').value.trim();
+          const isCorrect = wrap.querySelector('.opt-correct').checked;
+          const explanation = wrap.querySelector('.opt-explanation').value.trim();
+          if (val && label) options.push({{ value: val, label: label, is_correct: isCorrect, explanation: explanation || null }});
+        }});
+        return options;
       }}
 
       function resetForm() {{
@@ -5321,7 +5365,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         document.getElementById('qTextRequired').checked = q.text_answer_required;
         document.getElementById('qMultiSelect').checked = q.is_multi_select;
         document.getElementById('optionRows').innerHTML = '';
-        q.options.forEach(o => addOptionRow(o.value, o.label));
+        q.options.forEach(o => addOptionRow(o.value, o.label, o.is_correct, o.explanation));
         toggleOptionsSection();
         toggleTextSection();
         document.getElementById('formTitle').innerText = '문항 수정';
@@ -5344,15 +5388,10 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         if (!questionText) {{ alert('문항 내용을 입력하세요.'); return; }}
         if (!hasOptions && !hasText) {{ alert('객관식 또는 서술형 중 최소 하나는 선택해야 합니다.'); return; }}
 
-        const options = [];
-        if (hasOptions) {{
-          document.querySelectorAll('#optionRows > div').forEach(row => {{
-            const val = row.querySelector('.opt-value').value.trim();
-            const label = row.querySelector('.opt-label').value.trim();
-            if (val && label) options.push({{ value: val, label: label }});
-          }});
-          if (options.length === 0) {{ alert('객관식 선택지를 최소 1개 이상 입력하세요.'); return; }}
-        }}
+        const options = hasOptions ? collectOptions() : [];
+        if (hasOptions && options.length === 0) {{ alert('객관식 선택지를 최소 1개 이상 입력하세요.'); return; }}
+
+        const hasAnswerKey = hasOptions && options.some(o => o.is_correct);
 
         const payload = {{
           question_id: editId ? parseInt(editId) : null,
@@ -5361,6 +5400,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
           has_options: hasOptions, has_text_answer: hasText,
           text_answer_label: textLabel, text_answer_required: textRequired,
           is_multi_select: multiSelect,
+          has_answer_key: hasAnswerKey,
           options: options
         }};
 
@@ -5483,6 +5523,7 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
     text_answer_label = data.get("text_answer_label", "").strip()
     text_answer_required = bool(data.get("text_answer_required", False))
     is_multi_select = bool(data.get("is_multi_select", False))
+    has_answer_key = bool(data.get("has_answer_key", False))
     options = data.get("options", [])
 
     if not question_text:
@@ -5498,10 +5539,10 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
         conn.execute("""
             UPDATE survey_question
             SET question_text=?, description=?, has_options=?, has_text_answer=?,
-                text_answer_label=?, text_answer_required=?, is_multi_select=?, section_id=?
+                text_answer_label=?, text_answer_required=?, is_multi_select=?, section_id=?, has_answer_key=?
             WHERE id=? AND survey_id=?
         """, (question_text, description or None, has_options, has_text_answer,
-              text_answer_label or None, text_answer_required, is_multi_select, section_id,
+              text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key,
               question_id, survey_id))
         conn.execute("DELETE FROM survey_question_option WHERE question_id=?", (question_id,))
         target_qid = question_id
@@ -5512,10 +5553,10 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
         conn.execute("""
             INSERT INTO survey_question
                 (survey_id, question_text, description, has_options, has_text_answer,
-                 text_answer_label, text_answer_required, is_multi_select, section_id, display_order, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+                 text_answer_label, text_answer_required, is_multi_select, section_id, has_answer_key, display_order, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
         """, (survey_id, question_text, description or None, has_options, has_text_answer,
-              text_answer_label or None, text_answer_required, is_multi_select, section_id, max_order + 1))
+              text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key, max_order + 1))
         new_q = conn.execute(
             "SELECT id FROM survey_question WHERE survey_id=? ORDER BY id DESC LIMIT 1", (survey_id,)
         ).fetchone()
@@ -5523,10 +5564,12 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
 
     if has_options:
         for idx, opt in enumerate(options):
-            conn.execute(
-                "INSERT INTO survey_question_option (question_id, option_value, option_label, display_order) VALUES (?, ?, ?, ?)",
-                (target_qid, opt.get("value", ""), opt.get("label", ""), idx)
-            )
+            conn.execute("""
+                INSERT INTO survey_question_option
+                    (question_id, option_value, option_label, display_order, is_correct, explanation)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (target_qid, opt.get("value", ""), opt.get("label", ""), idx,
+                  bool(opt.get("is_correct", False)), opt.get("explanation")))
 
     conn.commit()
     conn.close()
