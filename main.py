@@ -5267,12 +5267,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         document.getElementById('textSection').style.display = document.getElementById('qHasText').checked ? 'block' : 'none';
       }}
 
-      function addOptionRow(value, label) {{
-        const container = document.getElementById('optionRows');
-        const row = document.createElement('div');
-        row.style.display = 'flex';
-        row.style.gap = '6px';
-        row.inner      function addOptionRow(value, label, isCorrect, explanation) {{
+      function addOptionRow(value, label, isCorrect, explanation) {{
         const container = document.getElementById('optionRows');
         const wrap = document.createElement('div');
         wrap.style.border = '1px solid #e5e7eb';
@@ -5287,7 +5282,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
           '<input type="text" class="opt-label" placeholder="라벨(예: 그렇다)" style="flex:1;" value="' + (label || '') + '">' +
           '<label style="display:flex;align-items:center;gap:4px;font-size:12px;white-space:nowrap;">' +
           '<input type="checkbox" class="opt-correct" style="width:18px;height:18px;flex-shrink:0;" ' + (isCorrect ? 'checked' : '') + '> 정답</label>' +
-          '<button type="button" class="btn btn-red" style="font-size:11px;padding:6px 10px;" onclick="this.closest(\\'div\\').parentElement.remove()">삭제</button>';
+          '<button type="button" class="btn btn-red" style="font-size:11px;padding:6px 10px;" onclick="removeOptionRow(this)">삭제</button>';
 
         const explWrap = document.createElement('div');
         explWrap.style.marginTop = '6px';
@@ -5302,10 +5297,10 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         wrap.appendChild(row);
         wrap.appendChild(explWrap);
         container.appendChild(wrap);
-      }}HTML = '<input type="text" class="opt-value" placeholder="값(예: O)" style="width:80px;" value="' + (value || '') + '">' +
-          '<input type="text" class="opt-label" placeholder="라벨(예: 그렇다)" style="flex:1;" value="' + (label || '') + '">' +
-          '<button type="button" class="btn btn-red" style="font-size:11px;padding:6px 10px;" onclick="this.parentElement.remove()">삭제</button>';
-        container.appendChild(row);
+      }}
+
+      function removeOptionRow(btnEl) {{
+        btnEl.closest('div[style*="border"]').remove();
       }}
 
       function applyTemplate(type) {{
