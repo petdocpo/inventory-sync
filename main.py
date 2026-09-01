@@ -4890,7 +4890,10 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
                 "id": s["id"], "title": s["title"], "purpose": s["purpose"] or "",
                 "method": s["method"] or "", "allow_edit_after_submit": bool(s["allow_edit_after_submit"]),
                 "is_public_access": bool(s["is_public_access"]),
-                "reminder_interval_days": s["reminder_interval_days"]
+                "reminder_interval_days": s["reminder_interval_days"],
+                "show_score_result": bool(s["show_score_result"]),
+                "pass_criteria_type": s["pass_criteria_type"],
+                "pass_criteria_value": float(s["pass_criteria_value"]) if s["pass_criteria_value"] is not None else None
             })
             rows_html += f"""
             <tr>
@@ -4964,6 +4967,17 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         <label style="font-size:12px;color:#888;">미제출 알림 주기 (일 단위, 비워두면 알림 사용 안함)</label>
         <p style="font-size:11px;color:#888;margin-bottom:4px;">제출 대상자 명단이 등록된 설문만 작동합니다. 예: 3 입력 시 3일마다 미제출 지점에 팀즈 알림 발송</p>
         <input type="number" id="editSvReminderDays" placeholder="예: 3" min="1" style="margin-bottom:12px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
+          <input type="checkbox" id="editSvShowScore" onchange="toggleScoreCriteriaSection()" style="width:18px;height:18px;flex-shrink:0;"> 제출 결과에 점수/합격여부 표시
+        </label>
+        <div id="scoreCriteriaSection" style="display:none;margin-bottom:12px;padding:10px;background:#f8fafc;border-radius:8px;">
+          <label style="font-size:12px;color:#888;">합격 기준</label>
+          <select id="editSvPassType" style="margin-bottom:8px;">
+            <option value="percent">퍼센트 기준 (%)</option>
+            <option value="score">점수 기준</option>
+          </select>
+          <input type="number" id="editSvPassValue" placeholder="예: 퍼센트면 70, 점수면 8" min="0" step="0.5">
+        </div>
         <div style="display:flex;gap:8px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeEditSurveyInfo()">취소</button>
           <button class="btn" style="flex:1;" onclick="saveEditSurveyInfo()">저장</button>
@@ -4975,6 +4989,10 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
     <script>
       const allSurveysData = {all_surveys_json};
 
+      function toggleScoreCriteriaSection() {{
+        document.getElementById('scoreCriteriaSection').style.display = document.getElementById('editSvShowScore').checked ? 'block' : 'none';
+      }}
+
       function openEditSurveyInfo(id) {{
         const s = allSurveysData.find(x => x.id === id);
         if (!s) return;
@@ -4985,6 +5003,10 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         document.getElementById('editSvAllowEdit').checked = s.allow_edit_after_submit;
         document.getElementById('editSvPublicAccess').checked = s.is_public_access;
         document.getElementById('editSvReminderDays').value = s.reminder_interval_days || '';
+        document.getElementById('editSvShowScore').checked = s.show_score_result;
+        document.getElementById('editSvPassType').value = s.pass_criteria_type || 'percent';
+        document.getElementById('editSvPassValue').value = s.pass_criteria_value || '';
+        toggleScoreCriteriaSection();
         document.getElementById('editSurveyModal').style.display = 'flex';
       }}
 
@@ -5001,14 +5023,20 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         const publicAccess = document.getElementById('editSvPublicAccess').checked;
         const reminderDaysRaw = document.getElementById('editSvReminderDays').value.trim();
         const reminderDays = reminderDaysRaw ? parseInt(reminderDaysRaw) : null;
+        const showScore = document.getElementById('editSvShowScore').checked;
+        const passType = document.getElementById('editSvPassType').value;
+        const passValueRaw = document.getElementById('editSvPassValue').value.trim();
+        const passValue = passValueRaw ? parseFloat(passValueRaw) : null;
         if (!title) {{ alert('설문 제목을 입력하세요.'); return; }}
+        if (showScore && passValue === null) {{ alert('합격 기준값을 입력하세요.'); return; }}
 
         const res = await fetch('/master/survey/' + id + '/update-info', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{
             title: title, purpose: purpose, method: method,
             allow_edit_after_submit: allowEdit, is_public_access: publicAccess,
-            reminder_interval_days: reminderDays
+            reminder_interval_days: reminderDays,
+            show_score_result: showScore, pass_criteria_type: passType, pass_criteria_value: passValue
           }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
@@ -5170,15 +5198,20 @@ async def master_survey_update_info(survey_id: int, request: Request, session_to
     allow_edit_after_submit = bool(data.get("allow_edit_after_submit", True))
     is_public_access = bool(data.get("is_public_access", False))
     reminder_interval_days = data.get("reminder_interval_days")
+    show_score_result = bool(data.get("show_score_result", False))
+    pass_criteria_type = data.get("pass_criteria_type", "percent")
+    pass_criteria_value = data.get("pass_criteria_value")
 
     if not title:
         return JSONResponse(status_code=400, content={"detail": "설문 제목을 입력하세요."})
 
     conn = get_conn()
-    conn.execute(
-        "UPDATE survey SET title=?, purpose=?, method=?, allow_edit_after_submit=?, is_public_access=?, reminder_interval_days=? WHERE id=?",
-        (title, purpose or None, method or None, allow_edit_after_submit, is_public_access, reminder_interval_days, survey_id)
-    )
+    conn.execute("""
+        UPDATE survey SET title=?, purpose=?, method=?, allow_edit_after_submit=?, is_public_access=?,
+            reminder_interval_days=?, show_score_result=?, pass_criteria_type=?, pass_criteria_value=?
+        WHERE id=?
+    """, (title, purpose or None, method or None, allow_edit_after_submit, is_public_access,
+          reminder_interval_days, show_score_result, pass_criteria_type, pass_criteria_value, survey_id))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
@@ -5331,6 +5364,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         "text_answer_required": bool(q["text_answer_required"]),
         "is_multi_select": bool(q["is_multi_select"]),
         "section_id": q["section_id"],
+        "score_points": float(q["score_points"]) if q["score_points"] is not None else 1,
         "options": [{"value": o["option_value"], "label": o["option_label"],
                      "is_correct": bool(o["is_correct"]), "explanation": o["explanation"] or ""} for o in conn.execute(
             "SELECT * FROM survey_question_option WHERE question_id=? ORDER BY display_order", (q["id"],)
@@ -5437,9 +5471,11 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
           <button type="button" class="btn" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="addOptionRow()">+ 직접 추가</button>
         </div>
         <div id="optionRows" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px;"></div>
-        <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:10px;">
           <input type="checkbox" id="qMultiSelect" style="width:18px;height:18px;flex-shrink:0;"> 다중선택 허용 (여러 선택지 동시 체크 가능)
         </label>
+        <label style="font-size:12px;color:#888;">이 문항 배점 (정답 지정 시에만 사용)</label>
+        <input type="number" id="qScorePoints" placeholder="예: 1" value="1" min="0" step="0.5">
       </div>
 
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
@@ -5579,6 +5615,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         document.getElementById('qTextLabel').value = '';
         document.getElementById('qTextRequired').checked = false;
         document.getElementById('qMultiSelect').checked = false;
+        document.getElementById('qScorePoints').value = '1';
         document.getElementById('optionRows').innerHTML = '';
         toggleOptionsSection();
         toggleTextSection();
@@ -5599,6 +5636,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         document.getElementById('qTextLabel').value = q.text_answer_label;
         document.getElementById('qTextRequired').checked = q.text_answer_required;
         document.getElementById('qMultiSelect').checked = q.is_multi_select;
+        document.getElementById('qScorePoints').value = q.score_points || 1;
         document.getElementById('optionRows').innerHTML = '';
         q.options.forEach(o => addOptionRow(o.value, o.label, o.is_correct, o.explanation));
         toggleOptionsSection();
@@ -5627,6 +5665,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         if (hasOptions && options.length === 0) {{ alert('객관식 선택지를 최소 1개 이상 입력하세요.'); return; }}
 
         const hasAnswerKey = hasOptions && options.some(o => o.is_correct);
+        const scorePoints = parseFloat(document.getElementById('qScorePoints').value) || 1;
 
         const payload = {{
           question_id: editId ? parseInt(editId) : null,
@@ -5636,6 +5675,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
           text_answer_label: textLabel, text_answer_required: textRequired,
           is_multi_select: multiSelect,
           has_answer_key: hasAnswerKey,
+          score_points: scorePoints,
           options: options
         }};
 
@@ -5759,6 +5799,7 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
     text_answer_required = bool(data.get("text_answer_required", False))
     is_multi_select = bool(data.get("is_multi_select", False))
     has_answer_key = bool(data.get("has_answer_key", False))
+    score_points = data.get("score_points", 1)
     options = data.get("options", [])
 
     if not question_text:
@@ -5774,10 +5815,10 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
         conn.execute("""
             UPDATE survey_question
             SET question_text=?, description=?, has_options=?, has_text_answer=?,
-                text_answer_label=?, text_answer_required=?, is_multi_select=?, section_id=?, has_answer_key=?
+                text_answer_label=?, text_answer_required=?, is_multi_select=?, section_id=?, has_answer_key=?, score_points=?
             WHERE id=? AND survey_id=?
         """, (question_text, description or None, has_options, has_text_answer,
-              text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key,
+              text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key, score_points,
               question_id, survey_id))
         conn.execute("DELETE FROM survey_question_option WHERE question_id=?", (question_id,))
         target_qid = question_id
@@ -5788,10 +5829,10 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
         conn.execute("""
             INSERT INTO survey_question
                 (survey_id, question_text, description, has_options, has_text_answer,
-                 text_answer_label, text_answer_required, is_multi_select, section_id, has_answer_key, display_order, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+                 text_answer_label, text_answer_required, is_multi_select, section_id, has_answer_key, score_points, display_order, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
         """, (survey_id, question_text, description or None, has_options, has_text_answer,
-              text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key, max_order + 1))
+              text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key, score_points, max_order + 1))
         new_q = conn.execute(
             "SELECT id FROM survey_question WHERE survey_id=? ORDER BY id DESC LIMIT 1", (survey_id,)
         ).fetchone()
