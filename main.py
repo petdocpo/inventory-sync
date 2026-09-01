@@ -4446,6 +4446,9 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7fa; padding: 20px 14px; }}
             .card {{ background: white; border-radius: 12px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th {{ background: #1E2761; color: white; padding: 8px 6px; text-align: left; font-size: 13px; }}
+            td {{ padding: 8px 6px; border-bottom: 1px solid #eee; font-size: 13px; }}
           </style>
         </head>
         <body>{inner_content}</body></html>
