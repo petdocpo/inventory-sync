@@ -4889,7 +4889,8 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
             all_surveys_data.append({
                 "id": s["id"], "title": s["title"], "purpose": s["purpose"] or "",
                 "method": s["method"] or "", "allow_edit_after_submit": bool(s["allow_edit_after_submit"]),
-                "is_public_access": bool(s["is_public_access"])
+                "is_public_access": bool(s["is_public_access"]),
+                "reminder_interval_days": s["reminder_interval_days"]
             })
             rows_html += f"""
             <tr>
@@ -4960,6 +4961,9 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;">
           <input type="checkbox" id="editSvPublicAccess" style="width:18px;height:18px;flex-shrink:0;"> 로그인 없이 링크로 제출 허용 (공개링크, 제출 후 수정 불가)
         </label>
+        <label style="font-size:12px;color:#888;">미제출 알림 주기 (일 단위, 비워두면 알림 사용 안함)</label>
+        <p style="font-size:11px;color:#888;margin-bottom:4px;">제출 대상자 명단이 등록된 설문만 작동합니다. 예: 3 입력 시 3일마다 미제출 지점에 팀즈 알림 발송</p>
+        <input type="number" id="editSvReminderDays" placeholder="예: 3" min="1" style="margin-bottom:12px;">
         <div style="display:flex;gap:8px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeEditSurveyInfo()">취소</button>
           <button class="btn" style="flex:1;" onclick="saveEditSurveyInfo()">저장</button>
@@ -4980,6 +4984,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         document.getElementById('editSvMethod').value = s.method;
         document.getElementById('editSvAllowEdit').checked = s.allow_edit_after_submit;
         document.getElementById('editSvPublicAccess').checked = s.is_public_access;
+        document.getElementById('editSvReminderDays').value = s.reminder_interval_days || '';
         document.getElementById('editSurveyModal').style.display = 'flex';
       }}
 
@@ -4994,11 +4999,17 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         const method = document.getElementById('editSvMethod').value.trim();
         const allowEdit = document.getElementById('editSvAllowEdit').checked;
         const publicAccess = document.getElementById('editSvPublicAccess').checked;
+        const reminderDaysRaw = document.getElementById('editSvReminderDays').value.trim();
+        const reminderDays = reminderDaysRaw ? parseInt(reminderDaysRaw) : null;
         if (!title) {{ alert('설문 제목을 입력하세요.'); return; }}
 
         const res = await fetch('/master/survey/' + id + '/update-info', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ title: title, purpose: purpose, method: method, allow_edit_after_submit: allowEdit, is_public_access: publicAccess }})
+          body: JSON.stringify({{
+            title: title, purpose: purpose, method: method,
+            allow_edit_after_submit: allowEdit, is_public_access: publicAccess,
+            reminder_interval_days: reminderDays
+          }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
@@ -5158,14 +5169,15 @@ async def master_survey_update_info(survey_id: int, request: Request, session_to
     method = data.get("method", "").strip()
     allow_edit_after_submit = bool(data.get("allow_edit_after_submit", True))
     is_public_access = bool(data.get("is_public_access", False))
+    reminder_interval_days = data.get("reminder_interval_days")
 
     if not title:
         return JSONResponse(status_code=400, content={"detail": "설문 제목을 입력하세요."})
 
     conn = get_conn()
     conn.execute(
-        "UPDATE survey SET title=?, purpose=?, method=?, allow_edit_after_submit=?, is_public_access=? WHERE id=?",
-        (title, purpose or None, method or None, allow_edit_after_submit, is_public_access, survey_id)
+        "UPDATE survey SET title=?, purpose=?, method=?, allow_edit_after_submit=?, is_public_access=?, reminder_interval_days=? WHERE id=?",
+        (title, purpose or None, method or None, allow_edit_after_submit, is_public_access, reminder_interval_days, survey_id)
     )
     conn.commit()
     conn.close()
@@ -7299,6 +7311,83 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
         "month": month,
         "date": today.isoformat(),
         "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
+    })
+
+@app.get("/api/cron/send-survey-unsubmitted-reminder")
+async def cron_send_survey_unsubmitted_reminder(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    from datetime import date
+    today = date.today()
+
+    conn = get_conn()
+    surveys = conn.execute(
+        "SELECT * FROM survey WHERE reminder_interval_days IS NOT NULL AND active = TRUE"
+    ).fetchall()
+
+    public_base_url = os.getenv("PUBLIC_SERVER_URL", "https://inventory-sync-teal.vercel.app")
+
+    total_processed = 0
+    total_sent = 0
+
+    for s in surveys:
+        last_sent = s["reminder_last_sent_date"]
+        if last_sent:
+            days_since = (today - last_sent).days
+            if days_since < s["reminder_interval_days"]:
+                continue
+        # last_sent가 없으면 최초 1회는 즉시 발송 대상
+
+        target_rows = conn.execute(
+            "SELECT * FROM survey_target_list WHERE survey_id=?", (s["id"],)
+        ).fetchall()
+        if not target_rows:
+            continue
+
+        submitted_keys = {(r["branch_code"], r["writer_name"]) for r in conn.execute(
+            "SELECT DISTINCT branch_code, writer_name FROM survey_response WHERE survey_id=?", (s["id"],)
+        ).fetchall()}
+
+        unsubmitted_branch_codes = set()
+        for t in target_rows:
+            if (t["branch_code"], t["writer_name"]) not in submitted_keys:
+                unsubmitted_branch_codes.add(t["branch_code"])
+
+        if not unsubmitted_branch_codes:
+            conn.execute(
+                "UPDATE survey SET reminder_last_sent_date=? WHERE id=?", (today.isoformat(), s["id"])
+            )
+            total_processed += 1
+            continue
+
+        survey_link = f"{public_base_url}/survey/{s['id']}"
+        message = f"{s['title']} 설문이 미제출됐습니다. 제출해주시기 바랍니다."
+
+        for branch_code in unsubmitted_branch_codes:
+            send_teams_notification(
+                branch_code,
+                f"{s['title']} 미제출 알림",
+                message,
+                link_url=survey_link,
+                link_text="설문 작성하러 가기",
+                sent_by="system_cron_survey_reminder"
+            )
+            total_sent += 1
+
+        conn.execute(
+            "UPDATE survey SET reminder_last_sent_date=? WHERE id=?", (today.isoformat(), s["id"])
+        )
+        total_processed += 1
+
+    conn.commit()
+    conn.close()
+
+    return JSONResponse(content={
+        "processed_surveys": total_processed,
+        "sent_count": total_sent,
+        "date": today.isoformat()
     })
 
 @app.get("/api/cron/check-qr-raw-mismatch")
