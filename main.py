@@ -19,6 +19,8 @@ import openpyxl
 load_dotenv("config/settings.env.example")
 load_dotenv(".env")
 
+app = FastAPI()
+
 from db import get_conn, pk_column  # noqa: E402
 
 SERVER_PORT = int(os.getenv("SERVER_PORT", "28000"))
@@ -6112,6 +6114,7 @@ async def master_survey_responses_page(
 
     anonymous_notice_html = '<div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;"><p style="font-size:13px;color:#1E40AF;">🔒 무기명 설문입니다. 응답은 완전 익명으로 저장되며, 제출자 식별·재제출요청·명단관리·팀즈알림 기능은 사용할 수 없습니다.</p></div>' if is_anonymous_survey else ""
 
+    # 1. 상단 타이틀 및 안내 영역
     content = f"""
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
       <a href="/master/survey" style="color:#1E2761;">← 설문 관리</a>
@@ -6130,14 +6133,16 @@ async def master_survey_responses_page(
         </div>
         <button class="btn" type="submit">검색</button>
         <a href="/master/survey/{survey_id}/responses" style="padding:10px 14px;background:#eee;
-           border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+            border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
         <a href="/master/survey/{survey_id}/responses/export?filter_branch={filter_branch}"
-           class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
+            class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
       </form>
     </div>
+    """
 
     resubmit_btn_html = '' if is_anonymous_survey else '<button type="button" class="btn" id="svRespResubmitBtn" style="background:#F59E0B;font-size:12px;padding:6px 12px;">재제출 요청</button>'
 
+    # 2. 응답 테이블 및 폼 영역
     content += f"""
     <div class="card">
       <form method="post" action="/master/survey/{survey_id}/responses/request-resubmit" id="svResponseForm">
@@ -6160,7 +6165,10 @@ async def master_survey_responses_page(
     </div>
     <form method="post" action="/master/survey/{survey_id}/responses/delete" id="svResponseDeleteForm"></form>
     <form method="post" action="/master/survey/{survey_id}/target-list/clear" id="targetListClearForm"></form>
+    """
 
+    # 3. 자바스크립트 영역 (f를 빼고 안전하게 연결)
+    content += """
     <script>
       (function() {{
         var allCheck = document.getElementById('svRespAllCheck');
