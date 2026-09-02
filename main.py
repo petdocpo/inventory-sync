@@ -4141,9 +4141,10 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
         conn.close()
         return RedirectResponse(url="/survey", status_code=303)
 
+    is_anonymous = bool(survey["is_anonymous"])
     is_public_mode = False
     if not user:
-        if not survey["is_public_access"]:
+        if not (survey["is_public_access"] or is_anonymous):
             conn.close()
             return RedirectResponse(url="/login", status_code=303)
         is_public_mode = True
@@ -4182,7 +4183,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
         })
 
     branch_options_html = ""
-    if is_public_mode:
+    if is_public_mode and not is_anonymous:
         branches = get_branches(branch_type='branch')
         branch_options_html = '<option value="">지점을 선택하세요</option>'
         for b in branches:
@@ -4255,13 +4256,15 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
             """
 
     branch_select_html = ""
-    if is_public_mode:
+    if is_public_mode and not is_anonymous:
         branch_select_html = f"""
         <label style="font-size:13px;color:#555;">지점 선택 (필수)</label>
         <select id="publicBranchCode" onchange="checkAllValid()" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:16px;">
           {branch_options_html}
         </select>
         """
+
+    writer_field_html = "" if is_anonymous else '<label style="font-size:13px;color:#555;">작성자 이름 (필수)</label><input type="text" id="writerName" placeholder="이름을 입력하세요" oninput="checkAllValid()">'
 
     inner_content = f"""
     {intro_html}
@@ -4284,8 +4287,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
     <div class="sv-card">
       <h2>{survey['title']}</h2>
       {branch_select_html}
-      <label style="font-size:13px;color:#555;">작성자 이름 (필수)</label>
-      <input type="text" id="writerName" placeholder="이름을 입력하세요" oninput="checkAllValid()">
+      {writer_field_html}
       {question_blocks}
       <button class="sv-btn-submit" id="submitBtn" onclick="submitSurvey()" disabled>제출</button>
     </div>
@@ -4294,6 +4296,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
       const questionsData = {questions_js};
       const surveyId = {survey_id};
       const isPublicMode = {json.dumps(is_public_mode)};
+      const isAnonymous = {json.dumps(is_anonymous)};
 
       let selected = {{}};
       questionsData.forEach(q => selected[q.id] = q.is_multi_select ? [] : null);
@@ -4330,8 +4333,8 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
       }}
 
       function checkAllValid() {{
-        const writerOk = document.getElementById('writerName').value.trim().length > 0;
-        const branchOk = isPublicMode ? document.getElementById('publicBranchCode').value !== '' : true;
+        const writerOk = isAnonymous ? true : document.getElementById('writerName').value.trim().length > 0;
+        const branchOk = (isPublicMode && !isAnonymous) ? document.getElementById('publicBranchCode').value !== '' : true;
         const questionsOk = questionsData.every(q => {{
           let optOk = true;
           if (q.has_options) {{
@@ -4354,7 +4357,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
       }});
 
       async function submitSurvey() {{
-        const writerName = document.getElementById('writerName').value.trim();
+        const writerName = isAnonymous ? '' : document.getElementById('writerName').value.trim();
         const answers = [];
         questionsData.forEach(q => {{
           const textVal = q.has_text_answer ? (document.getElementById('text_' + q.id).value.trim() || null) : null;
@@ -4372,7 +4375,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
           }}
         }});
         const payload = {{ writer_name: writerName, answers: answers }};
-        if (isPublicMode) {{
+        if (isPublicMode && !isAnonymous) {{
           payload.branch_code = document.getElementById('publicBranchCode').value;
         }}
         const btn = document.getElementById('submitBtn');
@@ -4473,7 +4476,14 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
         conn.close()
         return JSONResponse(status_code=403, content={"detail": "지점 계정만 제출 가능합니다."})
 
-    if user:
+    is_anonymous = bool(survey["is_anonymous"])
+
+    if is_anonymous:
+        import uuid
+        branch_code = "ANONYMOUS"
+        branch_name = "무기명"
+        writer_name = f"익명_{uuid.uuid4().hex[:12]}"
+    elif user:
         branch_code = user["branch_code"]
         branch_name = next((b["branch_name"] for b in get_branches() if b["branch_code"] == branch_code), branch_code)
     else:
@@ -4490,12 +4500,15 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
             return JSONResponse(status_code=400, content={"detail": "올바르지 않은 지점입니다."})
         branch_name = matched_branch["branch_name"]
 
-    writer_name = data.get("writer_name", "").strip()
     answers = data.get("answers", [])
 
-    if not writer_name:
-        conn.close()
-        return JSONResponse(status_code=400, content={"detail": "작성자 이름을 입력하세요."})
+    if not is_anonymous:
+        writer_name_input = data.get("writer_name", "").strip()
+        if not writer_name_input:
+            conn.close()
+            return JSONResponse(status_code=400, content={"detail": "작성자 이름을 입력하세요."})
+        writer_name = writer_name_input
+
     if not answers:
         conn.close()
         return JSONResponse(status_code=400, content={"detail": "답변이 없습니다."})
@@ -4890,6 +4903,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
                 "id": s["id"], "title": s["title"], "purpose": s["purpose"] or "",
                 "method": s["method"] or "", "allow_edit_after_submit": bool(s["allow_edit_after_submit"]),
                 "is_public_access": bool(s["is_public_access"]),
+                "is_anonymous": bool(s["is_anonymous"]),
                 "reminder_interval_days": s["reminder_interval_days"],
                 "show_score_result": bool(s["show_score_result"]),
                 "pass_criteria_type": s["pass_criteria_type"],
@@ -4961,8 +4975,11 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
           <input type="checkbox" id="editSvAllowEdit" style="width:18px;height:18px;flex-shrink:0;"> 제출 후 수정 허용
         </label>
-        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;">
           <input type="checkbox" id="editSvPublicAccess" style="width:18px;height:18px;flex-shrink:0;"> 로그인 없이 링크로 제출 허용 (공개링크, 제출 후 수정 불가)
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:12px;">
+          <input type="checkbox" id="editSvAnonymous" style="width:18px;height:18px;flex-shrink:0;"> 무기명 설문 (지점/작성자 정보 완전 익명, 제출·미제출 관리·재제출요청·수정·팀즈알림 자동 비활성)
         </label>
         <label style="font-size:12px;color:#888;">미제출 알림 주기 (일 단위, 비워두면 알림 사용 안함)</label>
         <p style="font-size:11px;color:#888;margin-bottom:4px;">제출 대상자 명단이 등록된 설문만 작동합니다. 예: 3 입력 시 3일마다 미제출 지점에 팀즈 알림 발송</p>
@@ -5002,6 +5019,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         document.getElementById('editSvMethod').value = s.method;
         document.getElementById('editSvAllowEdit').checked = s.allow_edit_after_submit;
         document.getElementById('editSvPublicAccess').checked = s.is_public_access;
+        document.getElementById('editSvAnonymous').checked = s.is_anonymous;
         document.getElementById('editSvReminderDays').value = s.reminder_interval_days || '';
         document.getElementById('editSvShowScore').checked = s.show_score_result;
         document.getElementById('editSvPassType').value = s.pass_criteria_type || 'percent';
@@ -5021,6 +5039,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         const method = document.getElementById('editSvMethod').value.trim();
         const allowEdit = document.getElementById('editSvAllowEdit').checked;
         const publicAccess = document.getElementById('editSvPublicAccess').checked;
+        const isAnonymous = document.getElementById('editSvAnonymous').checked;
         const reminderDaysRaw = document.getElementById('editSvReminderDays').value.trim();
         const reminderDays = reminderDaysRaw ? parseInt(reminderDaysRaw) : null;
         const showScore = document.getElementById('editSvShowScore').checked;
@@ -5035,6 +5054,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
           body: JSON.stringify({{
             title: title, purpose: purpose, method: method,
             allow_edit_after_submit: allowEdit, is_public_access: publicAccess,
+            is_anonymous: isAnonymous,
             reminder_interval_days: reminderDays,
             show_score_result: showScore, pass_criteria_type: passType, pass_criteria_value: passValue
           }})
@@ -5197,6 +5217,7 @@ async def master_survey_update_info(survey_id: int, request: Request, session_to
     method = data.get("method", "").strip()
     allow_edit_after_submit = bool(data.get("allow_edit_after_submit", True))
     is_public_access = bool(data.get("is_public_access", False))
+    is_anonymous = bool(data.get("is_anonymous", False))
     reminder_interval_days = data.get("reminder_interval_days")
     show_score_result = bool(data.get("show_score_result", False))
     pass_criteria_type = data.get("pass_criteria_type", "percent")
@@ -5208,10 +5229,10 @@ async def master_survey_update_info(survey_id: int, request: Request, session_to
     conn = get_conn()
     conn.execute("""
         UPDATE survey SET title=?, purpose=?, method=?, allow_edit_after_submit=?, is_public_access=?,
-            reminder_interval_days=?, show_score_result=?, pass_criteria_type=?, pass_criteria_value=?
+            is_anonymous=?, reminder_interval_days=?, show_score_result=?, pass_criteria_type=?, pass_criteria_value=?
         WHERE id=?
     """, (title, purpose or None, method or None, allow_edit_after_submit, is_public_access,
-          reminder_interval_days, show_score_result, pass_criteria_type, pass_criteria_value, survey_id))
+          is_anonymous, reminder_interval_days, show_score_result, pass_criteria_type, pass_criteria_value, survey_id))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
@@ -6010,9 +6031,10 @@ async def master_survey_responses_page(
             </tr>
             """
     conn.close()
+    is_anonymous_survey = bool(survey["is_anonymous"])
 
     target_section_html = ""
-    if target_rows:
+    if target_rows and not is_anonymous_survey:
         target_section_html = f"""
         <div class="card">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
@@ -6073,12 +6095,7 @@ async def master_survey_responses_page(
         sel = "selected" if filter_branch == b["branch_code"] else ""
         branch_options_html += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
 
-    content = f"""
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
-      <a href="/master/survey" style="color:#1E2761;">← 설문 관리</a>
-      <h2>📊 {survey['title']} — 제출현황</h2>
-    </div>
-
+    upload_section_html = "" if is_anonymous_survey else f"""
     <div class="card">
       <h3 style="font-size:15px;margin-bottom:8px;">📤 제출 대상자 명단 업로드</h3>
       <p style="font-size:12px;color:#888;margin-bottom:8px;">
@@ -6091,7 +6108,18 @@ async def master_survey_responses_page(
       </div>
       <div id="targetUploadResult" style="margin-top:8px;font-size:13px;"></div>
     </div>
+    """
 
+    anonymous_notice_html = '<div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;"><p style="font-size:13px;color:#1E40AF;">🔒 무기명 설문입니다. 응답은 완전 익명으로 저장되며, 제출자 식별·재제출요청·명단관리·팀즈알림 기능은 사용할 수 없습니다.</p></div>' if is_anonymous_survey else ""
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/survey" style="color:#1E2761;">← 설문 관리</a>
+      <h2>📊 {survey['title']} — 제출현황</h2>
+    </div>
+
+    {anonymous_notice_html}
+    {upload_section_html}
     {target_section_html}
 
     <div class="card">
@@ -6108,13 +6136,16 @@ async def master_survey_responses_page(
       </form>
     </div>
 
+    resubmit_btn_html = '' if is_anonymous_survey else '<button type="button" class="btn" id="svRespResubmitBtn" style="background:#F59E0B;font-size:12px;padding:6px 12px;">재제출 요청</button>'
+
+    content += f"""
     <div class="card">
       <form method="post" action="/master/survey/{survey_id}/responses/request-resubmit" id="svResponseForm">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
           <span style="font-size:13px;color:#888;">{len(responses)}건 제출됨</span>
           <div style="display:flex;gap:8px;">
             <button type="button" class="btn" id="svRespSelectAllBtn" style="background:#64748B;font-size:12px;padding:6px 12px;">전체선택</button>
-            <button type="button" class="btn" id="svRespResubmitBtn" style="background:#F59E0B;font-size:12px;padding:6px 12px;">재제출 요청</button>
+            {resubmit_btn_html}
             <button type="button" class="btn btn-red" id="svRespDeleteBtn" style="font-size:12px;padding:6px 12px;">완전삭제</button>
           </div>
         </div>
