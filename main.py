@@ -4391,44 +4391,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
         if (res.ok) {{
           const result = await res.json();
           showResultScreen(writerName, result.results);
-        }} else {{        if (res.ok) {{
-          const result = await res.json();
-          showResultScreen(writerName, result.results, result.show_score_result, result.score_summary);
         }} else {{
-          const err = await res.json();
-          alert('오류: ' + (err.detail || '제출 실패'));
-          btn.disabled = false;
-          btn.innerText = '제출';
-        }}
-      }}
-
-      function showResultScreen(writerName, results, showScoreResult, scoreSummary) {{
-        const container = document.querySelector('.sv-card').parentElement;
-        let resultsHtml = '';
-
-        if (results.length === 0) {{
-          resultsHtml = '<p style="color:#888;font-size:14px;text-align:center;padding:20px 0;">이 설문에는 정답이 있는 문항이 없습니다.</p>';
-        }} else {{
-          const correctCount = results.filter(r => r.is_correct).length;
-          let summaryHtml = '<div style="font-size:13px;color:#888;">정답 결과</div>' +
-            '<div style="font-size:24px;font-weight:bold;color:#1E2761;">' + correctCount + ' / ' + results.length + '</div>';
-
-          if (showScoreResult && scoreSummary) {{
-            summaryHtml += '<div style="font-size:13px;color:#888;margin-top:10px;">획득 점수</div>' +
-              '<div style="font-size:20px;font-weight:bold;color:#1E2761;">' + scoreSummary.total_score + ' / ' + scoreSummary.max_score + '점</div>';
-            if (scoreSummary.is_pass !== null) {{
-              const passBadge = scoreSummary.is_pass
-                ? '<span style="background:#D1FAE5;color:#065F46;padding:5px 14px;border-radius:12px;font-size:14px;font-weight:bold;display:inline-block;margin-top:10px;">✅ 합격</span>'
-                : '<span style="background:#FEE2E2;color:#991B1B;padding:5px 14px;border-radius:12px;font-size:14px;font-weight:bold;display:inline-block;margin-top:10px;">❌ 불합격</span>';
-              summaryHtml += passBadge;
-            }}
-          }}
-
-          resultsHtml += '<div style="text-align:center;padding:16px;background:#EFF6FF;border-radius:10px;margin-bottom:16px;">' +
-            summaryHtml +
-            '</div>';
-          results.forEach((r, idx) => {{
-          
           const err = await res.json();
           alert('오류: ' + (err.detail || '제출 실패'));
           btn.disabled = false;
@@ -4613,8 +4576,6 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
 
     # 채점 결과 생성 — 정답이 있는 문항만 대상
     results = []
-    total_score = 0.0
-    max_score = 0.0
     for qid, a_list in answers_by_qid.items():
         q = question_map.get(qid)
         if not q or not q["has_answer_key"]:
@@ -4632,48 +4593,19 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
         if not explanations:
             explanations = [o["explanation"] for o in option_rows if o["option_value"] in correct_values and o["explanation"]]
 
-        points = float(q["score_points"]) if q["score_points"] is not None else 1
-        max_score += points
-        if is_correct:
-            total_score += points
-
         results.append({
             "question_id": qid,
             "question_text": q["question_text"],
             "is_correct": is_correct,
             "selected_labels": selected_labels,
             "correct_labels": correct_labels,
-            "explanation": explanations[0] if explanations else None,
-            "points": points
+            "explanation": explanations[0] if explanations else None
         })
-
-    show_score_result = bool(survey["show_score_result"])
-    is_pass = None
-    score_summary = None
-    if show_score_result and results:
-        pass_type = survey["pass_criteria_type"] or "percent"
-        pass_value = float(survey["pass_criteria_value"]) if survey["pass_criteria_value"] is not None else None
-        if pass_value is not None:
-            if pass_type == "percent":
-                achieved_percent = round((total_score / max_score) * 100, 1) if max_score > 0 else 0
-                is_pass = achieved_percent >= pass_value
-            else:
-                is_pass = total_score >= pass_value
-        score_summary = {
-            "total_score": total_score,
-            "max_score": max_score,
-            "pass_type": pass_type,
-            "pass_value": pass_value,
-            "is_pass": is_pass
-        }
 
     conn.commit()
     conn.close()
 
-    return JSONResponse(content={
-        "status": "ok", "response_id": response_id, "results": results,
-        "show_score_result": show_score_result, "score_summary": score_summary
-    })
+    return JSONResponse(content={"status": "ok", "response_id": response_id, "results": results})
 
 
 @app.get("/survey/{survey_id}/edit/{response_id}", response_class=HTMLResponse)
@@ -6184,28 +6116,28 @@ async def master_survey_responses_page(
 
     # 1. 상단 타이틀 및 안내 영역
     content = f"""
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
-        <a href="/master/survey" style="color:#1E2761;">← 설문 관리</a>
-        <h2>📊 {survey['title']} — 제출현황</h2>
-      </div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/survey" style="color:#1E2761;">← 설문 관리</a>
+      <h2>📊 {survey['title']} — 제출현황</h2>
+    </div>
 
-      {anonymous_notice_html}
-      {upload_section_html}
-      {target_section_html}
+    {anonymous_notice_html}
+    {upload_section_html}
+    {target_section_html}
 
-      <div class="card">
-        <form method="get" action="/master/survey/{survey_id}/responses" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
-          <div style="flex:1;min-width:150px;">
-            <label style="font-size:12px;color:#888;">지점 필터</label>
-            <select name="filter_branch" style="margin-top:4px;">{branch_options_html}</select>
-          </div>
-          <button class="btn" type="submit">검색</button>
-          <a href="/master/survey/{survey_id}/responses" style="padding:10px 14px;background:#eee;
-              border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
-          <a href="/master/survey/{survey_id}/responses/export?filter_branch={filter_branch}"
-              class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
-        </form>
-      </div>
+    <div class="card">
+      <form method="get" action="/master/survey/{survey_id}/responses" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div style="flex:1;min-width:150px;">
+          <label style="font-size:12px;color:#888;">지점 필터</label>
+          <select name="filter_branch" style="margin-top:4px;">{branch_options_html}</select>
+        </div>
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/survey/{survey_id}/responses" style="padding:10px 14px;background:#eee;
+            border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+        <a href="/master/survey/{survey_id}/responses/export?filter_branch={filter_branch}"
+            class="btn" style="text-decoration:none;background:#22C55E;">⬇️ 엑셀 다운로드</a>
+      </form>
+    </div>
     """
 
     resubmit_btn_html = '' if is_anonymous_survey else '<button type="button" class="btn" id="svRespResubmitBtn" style="background:#F59E0B;font-size:12px;padding:6px 12px;">재제출 요청</button>'
@@ -6463,17 +6395,13 @@ async def master_survey_responses_export(
     headers = ["지점", "작성자", "문항", "객관식 답변", "서술형 답변", "정답여부", "제출일시"]
     ws.append(headers)
 
-    # 응답자별 정답률/점수 집계용
+    # 응답자별 정답률 집계용
     writer_stats: Dict[int, Dict] = {}
     # 문항별 정답률 집계용
     question_stats: Dict[int, Dict] = {}
     for q in question_rows:
         if q["has_answer_key"]:
             question_stats[q["id"]] = {"question_text": q["question_text"], "correct": 0, "total": 0}
-
-    show_score_result = bool(survey["show_score_result"])
-    pass_type = survey["pass_criteria_type"] or "percent"
-    pass_value = float(survey["pass_criteria_value"]) if survey["pass_criteria_value"] is not None else None
 
     for r in responses:
         answers = conn.execute(
@@ -6486,8 +6414,6 @@ async def master_survey_responses_export(
 
         writer_correct = 0
         writer_total = 0
-        writer_score = 0.0
-        writer_max_score = 0.0
 
         if not answers:
             ws.append([r["branch_name"], r["writer_name"], "-", "-", "-", "-", str(r["created_at"]) if r["created_at"] else ""])
@@ -6513,12 +6439,9 @@ async def master_survey_responses_export(
             if q and q["has_answer_key"]:
                 is_correct = selected_values == correct_options_map.get(qid, set())
                 correctness = "O" if is_correct else "X"
-                points = float(q["score_points"]) if q["score_points"] is not None else 1
                 writer_total += 1
-                writer_max_score += points
                 if is_correct:
                     writer_correct += 1
-                    writer_score += points
                 if qid in question_stats:
                     question_stats[qid]["total"] += 1
                     if is_correct:
@@ -6528,17 +6451,9 @@ async def master_survey_responses_export(
             ws.append([r["branch_name"], r["writer_name"], qlabel, opt_label_str, answer_text_str, correctness, created_display])
 
         if writer_total > 0:
-            writer_is_pass = None
-            if show_score_result and pass_value is not None:
-                if pass_type == "percent":
-                    achieved = round((writer_score / writer_max_score) * 100, 1) if writer_max_score > 0 else 0
-                    writer_is_pass = achieved >= pass_value
-                else:
-                    writer_is_pass = writer_score >= pass_value
             writer_stats[r["id"]] = {
                 "branch_name": r["branch_name"], "writer_name": r["writer_name"],
-                "correct": writer_correct, "total": writer_total,
-                "score": writer_score, "max_score": writer_max_score, "is_pass": writer_is_pass
+                "correct": writer_correct, "total": writer_total
             }
 
     conn.close()
@@ -6548,36 +6463,25 @@ async def master_survey_responses_export(
 
     # ── 정답률 시트 ──
     ws2 = wb.create_sheet("정답률")
-    if show_score_result:
-        ws2.append(["구분", "이름", "정답수", "전체문항수", "정답률(%)", "획득점수", "만점", "합격여부"])
-    else:
-        ws2.append(["구분", "이름", "정답수", "전체문항수", "정답률(%)"])
+    ws2.append(["구분", "이름", "정답수", "전체문항수", "정답률(%)"])
 
     if writer_stats:
-        ws2.append(["── 작성자별 정답률 ──"] + [""] * (7 if show_score_result else 4))
+        ws2.append(["── 작성자별 정답률 ──", "", "", "", ""])
         for stat in writer_stats.values():
             rate = round(stat["correct"] / stat["total"] * 100, 1) if stat["total"] > 0 else 0
-            if show_score_result:
-                pass_label = "-" if stat["is_pass"] is None else ("합격" if stat["is_pass"] else "불합격")
-                ws2.append([stat["branch_name"], stat["writer_name"], stat["correct"], stat["total"], rate,
-                            stat["score"], stat["max_score"], pass_label])
-            else:
-                ws2.append([stat["branch_name"], stat["writer_name"], stat["correct"], stat["total"], rate])
+            ws2.append([stat["branch_name"], stat["writer_name"], stat["correct"], stat["total"], rate])
 
     if question_stats:
-        ws2.append([""] * (8 if show_score_result else 5))
-        ws2.append(["── 문항별 정답률 ──"] + [""] * (7 if show_score_result else 4))
+        ws2.append(["", "", "", "", ""])
+        ws2.append(["── 문항별 정답률 ──", "", "", "", ""])
         for stat in question_stats.values():
             rate = round(stat["correct"] / stat["total"] * 100, 1) if stat["total"] > 0 else 0
-            if show_score_result:
-                ws2.append(["문항", stat["question_text"], stat["correct"], stat["total"], rate, "-", "-", "-"])
-            else:
-                ws2.append(["문항", stat["question_text"], stat["correct"], stat["total"], rate])
+            ws2.append(["문항", stat["question_text"], stat["correct"], stat["total"], rate])
 
     if not writer_stats and not question_stats:
-        ws2.append(["이 설문에는 정답이 있는 문항이 없습니다."] + [""] * (7 if show_score_result else 4))
+        ws2.append(["이 설문에는 정답이 있는 문항이 없습니다.", "", "", "", ""])
 
-    for col_idx in range(1, (9 if show_score_result else 6)):
+    for col_idx in range(1, 6):
         ws2.column_dimensions[chr(64 + col_idx)].width = 24
 
     # ── 미제출자 시트 ──
