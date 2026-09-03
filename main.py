@@ -5853,7 +5853,7 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
             INSERT INTO survey_question
                 (survey_id, question_text, description, has_options, has_text_answer,
                  text_answer_label, text_answer_required, is_multi_select, section_id, has_answer_key, score_points, display_order, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
         """, (survey_id, question_text, description or None, has_options, has_text_answer,
               text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key, score_points, max_order + 1))
         new_q = conn.execute(
