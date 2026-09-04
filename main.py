@@ -4390,7 +4390,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
         }});
         if (res.ok) {{
           const result = await res.json();
-          showResultScreen(writerName, result.results);
+          showResultScreen(writerName, result.results, result.show_score_result, result.total_score, result.max_score, result.is_pass);
         }} else {{
           const err = await res.json();
           alert('오류: ' + (err.detail || '제출 실패'));
@@ -4399,45 +4399,59 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
         }}
       }}
 
-      function showResultScreen(writerName, results) {{
-        const container = document.querySelector('.sv-card').parentElement;
-        let resultsHtml = '';
+          function showResultScreen(writerName, results, showScoreResult, totalScore, maxScore, isPass) {{
+            const container = document.querySelector('.sv-card').parentElement;
+            let resultsHtml = '';
+            let scoreHtml = '';
 
-        if (results.length === 0) {{
-          resultsHtml = '<p style="color:#888;font-size:14px;text-align:center;padding:20px 0;">이 설문에는 정답이 있는 문항이 없습니다.</p>';
-        }} else {{
-          const correctCount = results.filter(r => r.is_correct).length;
-          resultsHtml += '<div style="text-align:center;padding:16px;background:#EFF6FF;border-radius:10px;margin-bottom:16px;">' +
-            '<div style="font-size:13px;color:#888;">정답 결과</div>' +
-            '<div style="font-size:24px;font-weight:bold;color:#1E2761;">' + correctCount + ' / ' + results.length + '</div>' +
-            '</div>';
-          results.forEach((r, idx) => {{
-            const badge = r.is_correct
-              ? '<span style="background:#D1FAE5;color:#065F46;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:bold;">✅ 정답</span>'
-              : '<span style="background:#FEE2E2;color:#991B1B;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:bold;">❌ 오답</span>';
-            const myAnswer = r.selected_labels.length ? r.selected_labels.join(', ') : '(응답 없음)';
-            const correctAnswer = !r.is_correct ? '<p style="font-size:13px;color:#22C55E;margin-top:4px;">정답: ' + r.correct_labels.join(', ') + '</p>' : '';
-            const explanationHtml = r.explanation ? '<p style="font-size:12px;color:#666;margin-top:6px;background:#f8fafc;padding:8px;border-radius:6px;">💡 ' + r.explanation + '</p>' : '';
-            resultsHtml += '<div style="padding:14px 0;border-bottom:1px solid #eee;">' +
-              '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">' +
-              '<span style="font-size:14px;font-weight:bold;">' + (idx + 1) + '. ' + r.question_text + '</span>' + badge +
-              '</div>' +
-              '<p style="font-size:13px;color:#555;margin-top:6px;">내 답변: ' + myAnswer + '</p>' +
-              correctAnswer + explanationHtml +
+            if (showScoreResult && maxScore !== null && maxScore !== undefined && maxScore > 0) {{
+              const passBadge = isPass === true
+                ? '<span style="background:#D1FAE5;color:#065F46;padding:4px 12px;border-radius:12px;font-size:13px;font-weight:bold;margin-left:8px;">✅ 합격</span>'
+                : (isPass === false
+                    ? '<span style="background:#FEE2E2;color:#991B1B;padding:4px 12px;border-radius:12px;font-size:13px;font-weight:bold;margin-left:8px;">❌ 불합격</span>'
+                    : '');
+              scoreHtml = '<div style="text-align:center;padding:16px;background:#F0FDF4;border-radius:10px;margin-bottom:12px;">' +
+                '<div style="font-size:13px;color:#888;">획득 점수</div>' +
+                '<div style="font-size:26px;font-weight:bold;color:#166534;">' + totalScore + ' / ' + maxScore + passBadge + '</div>' +
+                '</div>';
+            }}
+
+            if (results.length === 0) {{
+              resultsHtml = '<p style="color:#888;font-size:14px;text-align:center;padding:20px 0;">이 설문에는 정답이 있는 문항이 없습니다.</p>';
+            }} else {{
+              const correctCount = results.filter(r => r.is_correct).length;
+              resultsHtml += '<div style="text-align:center;padding:16px;background:#EFF6FF;border-radius:10px;margin-bottom:16px;">' +
+                '<div style="font-size:13px;color:#888;">정답 결과</div>' +
+                '<div style="font-size:24px;font-weight:bold;color:#1E2761;">' + correctCount + ' / ' + results.length + '</div>' +
+                '</div>';
+              results.forEach((r, idx) => {{
+                const badge = r.is_correct
+                  ? '<span style="background:#D1FAE5;color:#065F46;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:bold;">✅ 정답</span>'
+                  : '<span style="background:#FEE2E2;color:#991B1B;padding:3px 10px;border-radius:10px;font-size:12px;font-weight:bold;">❌ 오답</span>';
+                const myAnswer = r.selected_labels.length ? r.selected_labels.join(', ') : '(응답 없음)';
+                const correctAnswer = !r.is_correct ? '<p style="font-size:13px;color:#22C55E;margin-top:4px;">정답: ' + r.correct_labels.join(', ') + '</p>' : '';
+                const explanationHtml = r.explanation ? '<p style="font-size:12px;color:#666;margin-top:6px;background:#f8fafc;padding:8px;border-radius:6px;">💡 ' + r.explanation + '</p>' : '';
+                resultsHtml += '<div style="padding:14px 0;border-bottom:1px solid #eee;">' +
+                  '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">' +
+                  '<span style="font-size:14px;font-weight:bold;">' + (idx + 1) + '. ' + r.question_text + '</span>' + badge +
+                  '</div>' +
+                  '<p style="font-size:13px;color:#555;margin-top:6px;">내 답변: ' + myAnswer + '</p>' +
+                  correctAnswer + explanationHtml +
+                  '</div>';
+              }});
+            }}
+
+            const listLink = isPublicMode ? '' : '<a href="/survey" class="btn sv-btn-submit" style="display:block;text-align:center;text-decoration:none;margin-top:16px;">설문 목록으로</a>';
+
+            container.innerHTML = '<div class="sv-card">' +
+              '<h2>제출 완료</h2>' +
+              '<p style="color:#888;font-size:13px;margin-bottom:16px;">작성자: ' + writerName + '</p>' +
+              scoreHtml +
+              resultsHtml +
+              listLink +
               '</div>';
-          }});
-        }}
-
-        const listLink = isPublicMode ? '' : '<a href="/survey" class="btn sv-btn-submit" style="display:block;text-align:center;text-decoration:none;margin-top:16px;">설문 목록으로</a>';
-
-        container.innerHTML = '<div class="sv-card">' +
-          '<h2>제출 완료</h2>' +
-          '<p style="color:#888;font-size:13px;margin-bottom:16px;">작성자: ' + writerName + '</p>' +
-          resultsHtml +
-          listLink +
-          '</div>';
-        window.scrollTo({{ top: 0, behavior: 'smooth' }});
-      }}
+            window.scrollTo({{ top: 0, behavior: 'smooth' }});
+          }}
     </script>
     """
 
@@ -4553,29 +4567,10 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
             "existing_response_id": existing["id"]
         })
 
-    conn.execute("""
-        INSERT INTO survey_response (survey_id, writer_name, branch_code, branch_name, status)
-        VALUES (?, ?, ?, ?, 'completed')
-    """, (survey_id, writer_name, branch_code, branch_name))
-
-    new_row = conn.execute(
-        "SELECT id FROM survey_response WHERE survey_id=? AND branch_code=? AND writer_name=?",
-        (survey_id, branch_code, writer_name)
-    ).fetchone()
-    response_id = new_row["id"]
-
-    for a in answers:
-        sel = a.get("selected_option")
-        text = a.get("answer_text")
-        if sel is None and not text:
-            continue
-        conn.execute(
-            "INSERT INTO survey_answer (response_id, question_id, selected_option, answer_text) VALUES (?, ?, ?, ?)",
-            (response_id, a.get("question_id"), sel, text)
-        )
-
-    # 채점 결과 생성 — 정답이 있는 문항만 대상
+    # 채점 결과 생성 — 정답이 있는 문항만 대상으로 정오답 판정 + 배점 합산
     results = []
+    total_score = 0
+    max_score = 0
     for qid, a_list in answers_by_qid.items():
         q = question_map.get(qid)
         if not q or not q["has_answer_key"]:
@@ -4593,19 +4588,67 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
         if not explanations:
             explanations = [o["explanation"] for o in option_rows if o["option_value"] in correct_values and o["explanation"]]
 
+        q_points = q["score_points"] if q["score_points"] is not None else 0
+        max_score += q_points
+        if is_correct:
+            total_score += q_points
+
         results.append({
             "question_id": qid,
             "question_text": q["question_text"],
             "is_correct": is_correct,
+            "score_points": q_points,
             "selected_labels": selected_labels,
             "correct_labels": correct_labels,
             "explanation": explanations[0] if explanations else None
         })
 
+    # 합격여부 계산 — pass_criteria_type/value가 설정된 경우에만 계산, 그 외엔 None
+    is_pass = None
+    pass_type = survey["pass_criteria_type"]
+    pass_value = survey["pass_criteria_value"]
+    if pass_type and pass_value is not None and max_score > 0:
+        if pass_type == "score":
+            is_pass = total_score >= pass_value
+        elif pass_type == "percent":
+            achieved_percent = (total_score / max_score) * 100
+            is_pass = achieved_percent >= pass_value
+
+    conn.execute("""
+        INSERT INTO survey_response (survey_id, writer_name, branch_code, branch_name, status, total_score, max_score, is_pass)
+        VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
+    """, (survey_id, writer_name, branch_code, branch_name, total_score, max_score, is_pass))
+
+    new_row = conn.execute(
+        "SELECT id FROM survey_response WHERE survey_id=? AND branch_code=? AND writer_name=?",
+        (survey_id, branch_code, writer_name)
+    ).fetchone()
+    response_id = new_row["id"]
+
+    for a in answers:
+        sel = a.get("selected_option")
+        text = a.get("answer_text")
+        if sel is None and not text:
+            continue
+        conn.execute(
+            "INSERT INTO survey_answer (response_id, question_id, selected_option, answer_text) VALUES (?, ?, ?, ?)",
+            (response_id, a.get("question_id"), sel, text)
+        )
+
     conn.commit()
     conn.close()
 
-    return JSONResponse(content={"status": "ok", "response_id": response_id, "results": results})
+    show_score = bool(survey["show_score_result"])
+
+    return JSONResponse(content={
+        "status": "ok",
+        "response_id": response_id,
+        "results": results,
+        "show_score_result": show_score,
+        "total_score": total_score if show_score else None,
+        "max_score": max_score if show_score else None,
+        "is_pass": is_pass if show_score else None
+    })
 
 
 @app.get("/survey/{survey_id}/edit/{response_id}", response_class=HTMLResponse)
