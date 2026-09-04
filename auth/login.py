@@ -137,10 +137,19 @@ def add_branch(branch_code: str, branch_name: str, login_id: str, password: str,
 
 def update_branch_account(branch_code: str, branch_name: str, login_id: str, password: str, branch_type: str, team: Optional[str] = None) -> Optional[str]:
     """기존 지점 계정 정보 수정 (지점명/로그인ID/비밀번호/역할/팀). 성공 시 None, 실패 시 에러 메시지 반환."""
+    branch_name = (branch_name or "").strip()
+    login_id = (login_id or "").strip()
+
     if branch_type == "hq":
-        branch_name = (branch_name or login_id).strip()
-    if not branch_name:
-        return "지점명(또는 본사 계정명)을 입력하세요."
+        # 본사 계정: 지점명이 비어있으면 로그인ID로 자동 대체 (사용자가 실수로 이전 값이 남는 것 방지 위해 매번 재확인)
+        if not branch_name:
+            branch_name = login_id
+    else:
+        if not branch_name:
+            return "지점명을 입력하세요."
+
+    if not login_id:
+        return "로그인 ID를 입력하세요."
 
     conn = get_conn()
     existing = conn.execute("SELECT id FROM accounts WHERE branch_code=? AND role='branch'", (branch_code,)).fetchone()

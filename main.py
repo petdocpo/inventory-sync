@@ -1058,7 +1058,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
 async def login_page():
     branches = get_branches()
     branch_options = "".join(
-        f'<option value="{b["login_id"]}">{b["branch_name"]}</option>' for b in branches
+        f'<option value="{b["login_id"]}">{b["login_id"]}</option>' for b in branches
     )
     return HTMLResponse(content=f"""
     <html><head>
@@ -6995,7 +6995,8 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
         const password = document.getElementById('editPassword').value.trim();
         const branchType = document.querySelector('input[name="editBranchType"]:checked').value;
         const team = document.getElementById('editBranchTeam').value;
-        if (!branchName || !loginId || !password) {{ alert('모든 항목을 입력하세요.'); return; }}
+        if (!loginId || !password) {{ alert('로그인 ID와 비밀번호를 입력하세요.'); return; }}
+        if (branchType !== 'hq' && !branchName) {{ alert('지점명을 입력하세요.'); return; }}
         const res = await fetch('/master/branch-manage/update', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{ branch_code: branchCode, branch_name: branchName, login_id: loginId, password: password, branch_type: branchType, team: team || null }})
