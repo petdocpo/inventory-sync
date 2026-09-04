@@ -858,7 +858,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")    
     role_badge = f'<span style="background:#4FC3F7;color:white;padding:2px 10px;border-radius:12px;font-size:12px;margin-left:8px;">{branch_name}</span>' if user else ""
 
-    is_master = user and user.get("role") == "master"
+    is_master = user and (user.get("role") == "master" or user.get("branch_type") == "hq")
     raw_menu_href = "/master/raw-upload" if is_master else "/raw-branch"
     vendor_eval_href = "/master/vendor-eval" if is_master else "/vendor-eval"
     survey_menu_href = "/master/survey" if is_master else "/survey"
@@ -6866,7 +6866,7 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
     <div class="card">
       <h3 style="margin-bottom:8px;">새 지점 추가</h3>
       <div style="display:flex;flex-direction:column;gap:8px;max-width:400px;">
-        <input type="text" id="newBranchName" placeholder="지점명 (예: 경기 파주점)">
+        <input type="text" id="newBranchName" placeholder="지점명 (예: 경기 파주점) — 본사는 비워도 됨">
         <input type="text" id="newBranchCode" placeholder="지점코드/로그인ID (예: 경기파주점, 공백없이)">
         <input type="password" id="newBranchPassword" placeholder="초기 비밀번호 (미입력시 1234)">
         <div style="display:flex;gap:16px;font-size:14px;">
@@ -6947,14 +6947,15 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
     </div>
 
     <script>
-      async function addBranch() {{
+        async function addBranch() {{
         const name = document.getElementById('newBranchName').value.trim();
         const code = document.getElementById('newBranchCode').value.trim();
         const pw = document.getElementById('newBranchPassword').value.trim() || '1234';
         const type = document.querySelector('input[name="newBranchType"]:checked').value;
         const team = document.getElementById('newBranchTeam').value;
-        if (!name || !code) {{ alert('지점명과 지점코드를 입력하세요.'); return; }}
+        if (!code) {{ alert('로그인 ID(지점코드)를 입력하세요.'); return; }}
         if (code.includes(' ')) {{ alert('지점코드에는 공백을 사용할 수 없습니다.'); return; }}
+        if (type !== 'hq' && !name) {{ alert('지점명을 입력하세요.'); return; }}
         const res = await fetch('/master/branch-manage/add', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{ branch_name: name, branch_code: code, login_id: code, password: pw, branch_type: type, team: team || null }})
@@ -7096,8 +7097,15 @@ async def master_branch_manage_add(request: Request, session_token: str = Cookie
     team = data.get("team")
     team = team.strip() if team else None
 
-    if not branch_name or not branch_code:
-        return JSONResponse(status_code=400, content={"detail": "지점명과 지점코드를 입력하세요."})
+    if branch_type == "hq":
+        if not login_id:
+            return JSONResponse(status_code=400, content={"detail": "로그인 ID를 입력하세요."})
+        # 본사 계정은 지점명/지점코드 미입력 시 로그인ID로 자동 채움
+        branch_code = branch_code or login_id
+        branch_name = branch_name or login_id
+    else:
+        if not branch_name or not branch_code:
+            return JSONResponse(status_code=400, content={"detail": "지점명과 지점코드를 입력하세요."})
 
     err = add_branch(branch_code, branch_name, login_id, password, branch_type, team)
     if err:

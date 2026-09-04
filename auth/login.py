@@ -63,6 +63,17 @@ def init_auth_db():
     """)
     conn.commit()
 
+    # ── 마이그레이션: sessions.branch_type 컬럼이 없으면 추가 ──
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS branch_type TEXT")
+        conn.commit()
+    except Exception:
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN branch_type TEXT")
+            conn.commit()
+        except Exception:
+            pass
+
     existing = conn.execute("SELECT id FROM accounts WHERE login_id=?", (MASTER_ID,)).fetchone()
     if not existing:
         conn.execute(
@@ -82,26 +93,34 @@ def init_auth_db():
     conn.close()
 
 
-def get_branches(branch_type: Optional[str] = None) -> List[Dict]:
+def get_branches(branch_type: Optional[str] = None, team: Optional[str] = None) -> List[Dict]:
     """현재 등록된 모든 지점 계정 목록을 DB에서 동적으로 조회 (BRANCHES 하드코딩 대체).
     branch_type을 지정하면 'branch'(일반 지점) 또는 'hq'(본사 소속 팀)만 필터링.
-    지정하지 않으면 기존과 동일하게 전체 반환 (하위 호환)."""
+    team을 지정하면 해당 팀 소속만 필터링. 지정하지 않으면 기존과 동일하게 전체 반환 (하위 호환)."""
     conn = get_conn()
+    query = "SELECT branch_code, branch_name, login_id, password, branch_type, team FROM accounts WHERE role='branch'"
+    params = []
     if branch_type:
-        rows = conn.execute(
-            "SELECT branch_code, branch_name, login_id, password, branch_type, team FROM accounts WHERE role='branch' AND branch_type=? ORDER BY branch_name",
-            (branch_type,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT branch_code, branch_name, login_id, password, branch_type, team FROM accounts WHERE role='branch' ORDER BY branch_name"
-        ).fetchall()
+        query += " AND branch_type=?"
+        params.append(branch_type)
+    if team:
+        query += " AND team=?"
+        params.append(team)
+    query += " ORDER BY branch_name"
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def add_branch(branch_code: str, branch_name: str, login_id: str, password: str, branch_type: str = "branch", team: Optional[str] = None) -> Optional[str]:
     """새 지점 계정 추가. branch_type: 'branch'(일반지점) 또는 'hq'(본사팀). team: '1팀'/'2팀'/'3팀'/None. 성공 시 None, 실패 시 에러 메시지 반환."""
+    if branch_type == "hq":
+        # 본사 계정은 지점코드/지점명을 생략할 수 있음 — login_id로 대체
+        branch_code = (branch_code or login_id).strip()
+        branch_name = (branch_name or login_id).strip()
+    if not branch_code or not login_id:
+        return "로그인 ID가 필요합니다."
+
     conn = get_conn()
     existing = conn.execute("SELECT id FROM accounts WHERE login_id=?", (login_id,)).fetchone()
     if existing:
@@ -118,6 +137,11 @@ def add_branch(branch_code: str, branch_name: str, login_id: str, password: str,
 
 def update_branch_account(branch_code: str, branch_name: str, login_id: str, password: str, branch_type: str, team: Optional[str] = None) -> Optional[str]:
     """기존 지점 계정 정보 수정 (지점명/로그인ID/비밀번호/역할/팀). 성공 시 None, 실패 시 에러 메시지 반환."""
+    if branch_type == "hq":
+        branch_name = (branch_name or login_id).strip()
+    if not branch_name:
+        return "지점명(또는 본사 계정명)을 입력하세요."
+
     conn = get_conn()
     existing = conn.execute("SELECT id FROM accounts WHERE branch_code=? AND role='branch'", (branch_code,)).fetchone()
     if not existing:

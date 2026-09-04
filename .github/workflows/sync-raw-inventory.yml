@@ -1,8 +1,9 @@
 name: Sync Raw Inventory from S3 CSV
 
 on:
-  schedule:
-    # - cron: '15 */2 * * *'  # 백업용: 2시간마다 → cron-job.org와 중복 실행으로 레이스컨디션 발생, 비활성화 (2026-08-07)
+  # 스케줄 비활성화: cron-job.org와 중복 실행으로 레이스컨디션 발생 (2026-08-07)
+  # schedule:
+  #   - cron: '15 */2 * * *'
   workflow_dispatch: {}
 
 jobs:
