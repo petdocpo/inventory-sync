@@ -89,50 +89,35 @@ def get_branches(branch_type: Optional[str] = None) -> List[Dict]:
     conn = get_conn()
     if branch_type:
         rows = conn.execute(
-            "SELECT branch_code, branch_name, login_id, password, branch_type FROM accounts WHERE role='branch' AND branch_type=? ORDER BY branch_name",
+            "SELECT branch_code, branch_name, login_id, password, branch_type, team FROM accounts WHERE role='branch' AND branch_type=? ORDER BY branch_name",
             (branch_type,)
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT branch_code, branch_name, login_id, password, branch_type FROM accounts WHERE role='branch' ORDER BY branch_name"
+            "SELECT branch_code, branch_name, login_id, password, branch_type, team FROM accounts WHERE role='branch' ORDER BY branch_name"
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def add_branch(branch_code: str, branch_name: str, login_id: str, password: str) -> Optional[str]:
-    """새 지점 계정 추가. 성공 시 None, 실패 시 에러 메시지 반환."""
+def add_branch(branch_code: str, branch_name: str, login_id: str, password: str, branch_type: str = "branch", team: Optional[str] = None) -> Optional[str]:
+    """새 지점 계정 추가. branch_type: 'branch'(일반지점) 또는 'hq'(본사팀). team: '1팀'/'2팀'/'3팀'/None. 성공 시 None, 실패 시 에러 메시지 반환."""
     conn = get_conn()
     existing = conn.execute("SELECT id FROM accounts WHERE login_id=?", (login_id,)).fetchone()
     if existing:
         conn.close()
         return "이미 존재하는 로그인 ID입니다."
     conn.execute(
-        "INSERT INTO accounts (login_id, password, role, branch_code, branch_name) VALUES (?, ?, 'branch', ?, ?)",
-        (login_id, password, branch_code, branch_name)
-    )
-    conn.commit()
-    conn.close()
-    return None
-
-def add_branch(branch_code: str, branch_name: str, login_id: str, password: str, branch_type: str = "branch") -> Optional[str]:
-    """새 지점 계정 추가. branch_type: 'branch'(일반지점) 또는 'hq'(본사팀). 성공 시 None, 실패 시 에러 메시지 반환."""
-    conn = get_conn()
-    existing = conn.execute("SELECT id FROM accounts WHERE login_id=?", (login_id,)).fetchone()
-    if existing:
-        conn.close()
-        return "이미 존재하는 로그인 ID입니다."
-    conn.execute(
-        "INSERT INTO accounts (login_id, password, role, branch_code, branch_name, branch_type) VALUES (?, ?, 'branch', ?, ?, ?)",
-        (login_id, password, branch_code, branch_name, branch_type)
+        "INSERT INTO accounts (login_id, password, role, branch_code, branch_name, branch_type, team) VALUES (?, ?, 'branch', ?, ?, ?, ?)",
+        (login_id, password, branch_code, branch_name, branch_type, team)
     )
     conn.commit()
     conn.close()
     return None
 
 
-def update_branch_account(branch_code: str, branch_name: str, login_id: str, password: str, branch_type: str) -> Optional[str]:
-    """기존 지점 계정 정보 수정 (지점명/로그인ID/비밀번호/역할). 성공 시 None, 실패 시 에러 메시지 반환."""
+def update_branch_account(branch_code: str, branch_name: str, login_id: str, password: str, branch_type: str, team: Optional[str] = None) -> Optional[str]:
+    """기존 지점 계정 정보 수정 (지점명/로그인ID/비밀번호/역할/팀). 성공 시 None, 실패 시 에러 메시지 반환."""
     conn = get_conn()
     existing = conn.execute("SELECT id FROM accounts WHERE branch_code=? AND role='branch'", (branch_code,)).fetchone()
     if not existing:
@@ -147,8 +132,8 @@ def update_branch_account(branch_code: str, branch_name: str, login_id: str, pas
         return "이미 사용 중인 로그인 ID입니다."
 
     conn.execute(
-        "UPDATE accounts SET branch_name=?, login_id=?, password=?, branch_type=? WHERE branch_code=? AND role='branch'",
-        (branch_name, login_id, password, branch_type, branch_code)
+        "UPDATE accounts SET branch_name=?, login_id=?, password=?, branch_type=?, team=? WHERE branch_code=? AND role='branch'",
+        (branch_name, login_id, password, branch_type, team, branch_code)
     )
     conn.commit()
     conn.close()
