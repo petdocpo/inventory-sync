@@ -252,3 +252,49 @@ def set_menu_permission(login_id: str, menu_key: str, enabled: bool):
     """, (login_id, menu_key, enabled))
     conn.commit()
     conn.close()
+
+def get_permission_templates() -> List[Dict]:
+    """저장된 모든 권한 템플릿 목록 반환."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, template_name FROM permission_template ORDER BY template_name"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_template_items(template_id: int) -> Dict[str, bool]:
+    """특정 템플릿의 메뉴별 on/off 값을 dict로 반환."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT menu_key, enabled FROM permission_template_item WHERE template_id=?",
+        (template_id,)
+    ).fetchall()
+    conn.close()
+    return {r["menu_key"]: bool(r["enabled"]) for r in rows}
+
+
+def save_permission_template(template_name: str, permissions: Dict[str, bool]) -> Optional[str]:
+    """현재 권한 세트를 새 템플릿으로 저장 (이름 중복 시 덮어쓰기). 성공 시 None, 실패 시 에러 메시지."""
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT id FROM permission_template WHERE template_name=?", (template_name,)
+    ).fetchone()
+    if existing:
+        template_id = existing["id"]
+        conn.execute("DELETE FROM permission_template_item WHERE template_id=?", (template_id,))
+    else:
+        conn.execute("INSERT INTO permission_template (template_name) VALUES (?)", (template_name,))
+        new_row = conn.execute(
+            "SELECT id FROM permission_template WHERE template_name=?", (template_name,)
+        ).fetchone()
+        template_id = new_row["id"]
+
+    for menu_key, enabled in permissions.items():
+        conn.execute(
+            "INSERT INTO permission_template_item (template_id, menu_key, enabled) VALUES (?, ?, ?)",
+            (template_id, menu_key, enabled)
+        )
+    conn.commit()
+    conn.close()
+    return None

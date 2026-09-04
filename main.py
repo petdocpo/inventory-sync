@@ -69,11 +69,30 @@ TEAMS_ALERT_TYPES = {
     },
 }
 
+MENU_DEFINITIONS = {
+    "data": "데이터 관리",
+    "qr-init": "QR 재고 업로드",
+    "vendor-master": "거래처 관리",
+    "eval-criteria": "거래처 평가 문항 관리",
+    "survey": "설문 관리",
+    "vendor-eval-status": "거래처평가 제출현황",
+    "branch-manage": "지점 관리",
+    "notification-settings": "알림 설정",
+    "webhook-send-log": "웹훅 발송 이력",
+    "login-history": "접속 이력",
+    "purchase-tracking": "발주 주기 트래킹",
+    "product-settings": "상품 설정",
+    "branch-exceptions": "발주서 지점 예외",
+    "safety-stock": "안전재고 관리",
+    "cron-failure-log": "크론 실패 이력",
+}
+
 from auth.login import (  # noqa: E402
     init_auth_db, authenticate, create_session, get_session,
     delete_session, create_auto_login_token, get_auto_login_info,
     get_branches, add_branch, delete_branch, update_branch_account,
-    has_menu_permission, get_menu_permissions, set_menu_permission
+    has_menu_permission, get_menu_permissions, set_menu_permission,
+    get_permission_templates, get_template_items, save_permission_template
 )
 init_auth_db()
 
@@ -6821,6 +6840,7 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
       team_display = b_team if b_team else '-'
       safe_name = b["branch_name"].replace("'", "")
       safe_login = b["login_id"].replace("'", "")
+      permission_btn = f'<button class="btn" style="font-size:12px;padding:6px 10px;background:#8B5CF6;" onclick="openPermissionModal(\'{b["login_id"]}\', \'{safe_name}\')">권한</button>' if b_type == "hq" else ""
       rows_html += f"""
       <tr>
           <td>{b['branch_name']}</td>
@@ -6831,6 +6851,7 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
           <td>{team_display}</td>
           <td style="display:flex;gap:4px;flex-wrap:wrap;">
             <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editBranch('{b['branch_code']}', '{safe_name}', '{safe_login}', '{b.get('password','')}', '{b_type}', '{b_team}')">수 정</button>
+            {permission_btn}
             <button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteBranch('{b['branch_code']}', '{safe_name}')">삭제</button>
           </td>
       </tr>
@@ -6897,6 +6918,33 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
       </div>
     </div>
 
+    <div id="permissionModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:440px;width:90%;max-height:85vh;overflow-y:auto;">
+        <h3 style="margin-bottom:4px;">메뉴 권한 설정</h3>
+        <p id="permissionTargetName" style="font-size:13px;color:#888;margin-bottom:12px;"></p>
+        <input type="hidden" id="permissionLoginId">
+
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;padding:10px;background:#f8fafc;border-radius:8px;">
+          <select id="templateSelect" style="flex:1;">
+            <option value="">템플릿 선택 (미리보기)</option>
+          </select>
+          <button class="btn" type="button" style="font-size:12px;padding:6px 10px;background:#64748B;" onclick="applyTemplateToToggles()">적용</button>
+        </div>
+
+        <div id="permissionTogglesList" style="display:flex;flex-direction:column;gap:2px;margin-bottom:16px;"></div>
+
+        <div style="margin-bottom:12px;padding:10px;background:#FFF7ED;border-radius:8px;">
+          <label style="font-size:12px;color:#888;">현재 설정을 템플릿으로 저장 (선택)</label>
+          <input type="text" id="saveAsTemplateName" placeholder="템플릿 이름 (예: 운영팀 기본권한)" style="margin-top:4px;">
+        </div>
+
+        <div style="display:flex;gap:8px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closePermissionModal()">취소</button>
+          <button class="btn" style="flex:1;" onclick="savePermissions()">저장</button>
+        </div>
+      </div>
+    </div>
+
     <script>
       async function addBranch() {{
         const name = document.getElementById('newBranchName').value.trim();
@@ -6950,9 +6998,82 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{ branch_code: branchCode, branch_name: branchName, login_id: loginId, password: password, branch_type: branchType, team: team || null }})
         }});
-        if (res.ok) {{ location.reload(); }} else {{
+                if (res.ok) {{ location.reload(); }} else {{
           const err = await res.json();
           alert('오류: ' + (err.detail || '수정 실패'));
+        }}
+      }}
+
+      let currentTemplates = [];
+
+      async function openPermissionModal(loginId, branchName) {{
+        document.getElementById('permissionLoginId').value = loginId;
+        document.getElementById('permissionTargetName').innerText = branchName + ' (' + loginId + ')';
+        document.getElementById('saveAsTemplateName').value = '';
+
+        const res = await fetch('/master/branch-manage/permissions/' + loginId);
+        if (!res.ok) {{ alert('권한 정보를 불러오지 못했습니다.'); return; }}
+        const data = await res.json();
+
+        renderToggles(data.menus);
+
+        currentTemplates = data.templates;
+        const templateSelect = document.getElementById('templateSelect');
+        templateSelect.innerHTML = '<option value="">템플릿 선택 (미리보기)</option>';
+        currentTemplates.forEach(t => {{
+          const opt = document.createElement('option');
+          opt.value = t.id;
+          opt.innerText = t.template_name;
+          templateSelect.appendChild(opt);
+        }});
+
+        document.getElementById('permissionModal').style.display = 'flex';
+      }}
+
+      function renderToggles(menus) {{
+        const container = document.getElementById('permissionTogglesList');
+        container.innerHTML = '';
+        menus.forEach(m => {{
+          const row = document.createElement('label');
+          row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:8px 4px;border-bottom:1px solid #f0f0f0;font-size:13px;cursor:pointer;';
+          row.innerHTML = '<span>' + m.label + '</span>' +
+            '<input type="checkbox" data-menu-key="' + m.key + '" ' + (m.enabled ? 'checked' : '') + ' style="width:20px;height:20px;flex-shrink:0;">';
+          container.appendChild(row);
+        }});
+      }}
+
+      async function applyTemplateToToggles() {{
+        const templateId = document.getElementById('templateSelect').value;
+        if (!templateId) {{ alert('템플릿을 선택하세요.'); return; }}
+        const res = await fetch('/master/branch-manage/permissions/template/' + templateId);
+        if (!res.ok) {{ alert('템플릿 정보를 불러오지 못했습니다.'); return; }}
+        const data = await res.json();
+        renderToggles(data.menus);
+      }}
+
+      function closePermissionModal() {{
+        document.getElementById('permissionModal').style.display = 'none';
+      }}
+
+      async function savePermissions() {{
+        const loginId = document.getElementById('permissionLoginId').value;
+        const checkboxes = document.querySelectorAll('#permissionTogglesList input[type="checkbox"]');
+        const permissions = {{}};
+        checkboxes.forEach(cb => {{
+          permissions[cb.getAttribute('data-menu-key')] = cb.checked;
+        }});
+        const saveAsTemplate = document.getElementById('saveAsTemplateName').value.trim();
+
+        const res = await fetch('/master/branch-manage/permissions/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ login_id: loginId, permissions: permissions, save_as_template: saveAsTemplate || null }})
+        }});
+        if (res.ok) {{
+          alert('권한이 저장되었습니다.');
+          closePermissionModal();
+        }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '저장 실패'));
         }}
       }}
     </script>
@@ -7018,6 +7139,57 @@ async def master_branch_manage_update(request: Request, session_token: str = Coo
     err = update_branch_account(branch_code, branch_name, login_id, password, branch_type, team)
     if err:
         return JSONResponse(status_code=400, content={"detail": err})
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/master/branch-manage/permissions/{login_id}")
+async def master_branch_manage_permissions_get(login_id: str, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    current_perms = get_menu_permissions(login_id)
+    menus = [{"key": k, "label": v, "enabled": current_perms.get(k, True)} for k, v in MENU_DEFINITIONS.items()]
+    templates = get_permission_templates()
+
+    return JSONResponse(content={"menus": menus, "templates": templates})
+
+
+@app.get("/master/branch-manage/permissions/template/{template_id}")
+async def master_branch_manage_permission_template_get(template_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    items = get_template_items(template_id)
+    menus = [{"key": k, "label": v, "enabled": items.get(k, True)} for k, v in MENU_DEFINITIONS.items()]
+    return JSONResponse(content={"menus": menus})
+
+
+@app.post("/master/branch-manage/permissions/save")
+async def master_branch_manage_permissions_save(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    target_login_id = data.get("login_id", "").strip()
+    permissions = data.get("permissions", {})
+
+    if not target_login_id:
+        return JSONResponse(status_code=400, content={"detail": "계정이 지정되지 않았습니다."})
+
+    for menu_key in MENU_DEFINITIONS.keys():
+        enabled = bool(permissions.get(menu_key, True))
+        set_menu_permission(target_login_id, menu_key, enabled)
+
+    save_as_template = (data.get("save_as_template") or "").strip()
+    if save_as_template:
+        full_permissions = {k: bool(permissions.get(k, True)) for k in MENU_DEFINITIONS.keys()}
+        err = save_permission_template(save_as_template, full_permissions)
+        if err:
+            return JSONResponse(status_code=400, content={"detail": err})
+
     return JSONResponse(content={"status": "ok"})
 
 @app.get("/master/custom-channel", response_class=HTMLResponse)
