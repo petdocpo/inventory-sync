@@ -72,7 +72,8 @@ TEAMS_ALERT_TYPES = {
 from auth.login import (  # noqa: E402
     init_auth_db, authenticate, create_session, get_session,
     delete_session, create_auto_login_token, get_auto_login_info,
-    get_branches, add_branch, delete_branch, update_branch_account
+    get_branches, add_branch, delete_branch, update_branch_account,
+    has_menu_permission, get_menu_permissions, set_menu_permission
 )
 init_auth_db()
 
@@ -1109,7 +1110,7 @@ async def login_submit(request: Request, login_id: str = Form(...), password: st
         </body></html>""", status_code=401)
     device_info = request.headers.get("user-agent", "")[:255]
     client_ip = request.client.host if request.client else ""
-    token = create_session(account["login_id"], account["role"], account["branch_code"], device_info, client_ip)
+    token = create_session(account["login_id"], account["role"], account["branch_code"], device_info, client_ip, account.get("branch_type"))
     resp = RedirectResponse(url="/", status_code=303)
     resp.set_cookie(key="session_token", value=token, max_age=7 * 24 * 3600, httponly=True)
     return resp
@@ -3384,6 +3385,8 @@ async def master_vendor_eval_status(session_token: str = Cookie(default=None), m
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "vendor-eval-status"):
+        return RedirectResponse(url="/master", status_code=303)
 
     from datetime import date
     today = date.today()
@@ -3890,6 +3893,8 @@ async def vendor_master_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "vendor-master"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     vendors = conn.execute("SELECT * FROM vendor_master ORDER BY vendor_name").fetchall()
@@ -4931,6 +4936,8 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "survey"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     surveys = conn.execute("SELECT * FROM survey ORDER BY created_at DESC").fetchall()
@@ -6603,6 +6610,8 @@ async def master_webhook_send_log_page(
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "webhook-send-log"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     query = "SELECT * FROM teams_send_log WHERE (sent_by IS NULL OR sent_by NOT LIKE ?)"
@@ -6706,6 +6715,8 @@ async def master_login_history_page(
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "login-history"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     query = "SELECT * FROM login_history WHERE 1=1"
@@ -6798,6 +6809,8 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "branch-manage"):
+        return RedirectResponse(url="/master", status_code=303)
 
     branches = get_branches()
     rows_html = ""
@@ -7956,6 +7969,8 @@ async def master_notification_settings_page(session_token: str = Cookie(default=
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "notification-settings"):
+        return RedirectResponse(url="/master", status_code=303)
 
     toggle_cards_html = ""
     for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
@@ -8804,6 +8819,8 @@ async def eval_criteria_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "eval-criteria"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     criteria_list = conn.execute("SELECT * FROM eval_criteria ORDER BY display_order").fetchall()
@@ -9268,8 +9285,15 @@ async def health_check():
 @app.get("/master", response_class=HTMLResponse)
 async def master_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
-    if not user or user["role"] != "master":
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
         return RedirectResponse(url="/login", status_code=303)
+
+    perms = get_menu_permissions(user["login_id"])
+
+    def menu_allowed(key: str) -> bool:
+        if user["role"] == "master":
+            return True
+        return perms.get(key, True)
 
     conn = get_conn()
     raw_count = conn.execute("SELECT COUNT(*) AS cnt FROM raw_inventory").fetchone()["cnt"]
@@ -9277,9 +9301,9 @@ async def master_page(session_token: str = Cookie(default=None)):
     vendor_count = conn.execute("SELECT COUNT(*) AS cnt FROM vendor_master").fetchone()["cnt"]
     conn.close()
 
-    content = f"""
-    <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+    cards = []
+    if menu_allowed("data"):
+        cards.append(f"""
       <a href="/master/data" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📋</div>
@@ -9287,6 +9311,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">품목 {item_count}개 등록됨</div>
         </div>
       </a>
+        """)
+    if menu_allowed("qr-init"):
+        cards.append("""
       <a href="/master/qr-init" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🔄</div>
@@ -9294,6 +9321,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">엑셀로 초기 수량 업로드</div>
         </div>
       </a>
+        """)
+    if menu_allowed("vendor-master"):
+        cards.append(f"""
       <a href="/master/vendor-master" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🏢</div>
@@ -9301,13 +9331,19 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">거래처 {vendor_count}개 등록됨</div>
         </div>
       </a>
-            <a href="/master/eval-criteria" style="text-decoration:none;">
+        """)
+    if menu_allowed("eval-criteria"):
+        cards.append("""
+      <a href="/master/eval-criteria" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📝</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 평가 문항 관리</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">문항 추가/삭제/수정</div>
         </div>
       </a>
+        """)
+    if menu_allowed("survey"):
+        cards.append("""
       <a href="/master/survey" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📋</div>
@@ -9315,6 +9351,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">설문 생성/문항관리/제출현황</div>
         </div>
       </a>
+        """)
+    if menu_allowed("vendor-eval-status"):
+        cards.append("""
       <a href="/master/vendor-eval/status" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📊</div>
@@ -9322,6 +9361,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">지점별 제출/미제출 확인</div>
         </div>
       </a>
+        """)
+    if menu_allowed("branch-manage"):
+        cards.append("""
       <a href="/master/branch-manage" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🏬</div>
@@ -9329,13 +9371,19 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">지점 추가/삭제</div>
         </div>
       </a>
-            <a href="/master/notification-settings" style="text-decoration:none;">
+        """)
+    if menu_allowed("notification-settings"):
+        cards.append("""
+      <a href="/master/notification-settings" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">⏰</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">알림 설정</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">자동 알림 켜기/끄기</div>
         </div>
       </a>
+        """)
+    if menu_allowed("webhook-send-log"):
+        cards.append("""
       <a href="/master/webhook-send-log" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📨</div>
@@ -9343,6 +9391,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">수동 발송 내역 조회</div>
         </div>
       </a>
+        """)
+    if menu_allowed("login-history"):
+        cards.append("""
       <a href="/master/login-history" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🔐</div>
@@ -9350,6 +9401,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">계정별 로그인 기록</div>
         </div>
       </a>
+        """)
+    if menu_allowed("purchase-tracking"):
+        cards.append("""
       <a href="/master/purchase-tracking" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📈</div>
@@ -9357,6 +9411,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">구매 패턴 분석/추천</div>
         </div>
       </a>
+        """)
+    if menu_allowed("product-settings"):
+        cards.append("""
       <a href="/master/purchase-order/product-settings" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📝</div>
@@ -9364,6 +9421,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">리드타임/MOQ/소모품/예외</div>
         </div>
       </a>
+        """)
+    if menu_allowed("branch-exceptions"):
+        cards.append("""
       <a href="/master/purchase-order/branch-exceptions" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🏬</div>
@@ -9371,6 +9431,9 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">소모품 포함 지점 설정</div>
         </div>
       </a>
+        """)
+    if menu_allowed("safety-stock"):
+        cards.append("""
       <a href="/master/purchase-order/safety-stock" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🎯</div>
@@ -9378,17 +9441,27 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="color:#888;font-size:12px;margin-top:4px;">발주서 생성 기준값</div>
         </div>
       </a>
-            <a href="/master/cron-failure-log" style="text-decoration:none;">
+        """)
+    if menu_allowed("cron-failure-log"):
+        cards.append("""
+      <a href="/master/cron-failure-log" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🚨</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">크론 실패 이력</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">자동화 작업 오류 확인</div>
         </div>
       </a>
+        """)
+
+    cards_html = "".join(cards)
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      {cards_html}
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
-
 
 # ── 마스터 > 데이터 관리 ────────────────────────────────
 
@@ -9401,6 +9474,8 @@ async def master_data_page(
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "data"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     query = "SELECT * FROM items WHERE 1=1"
@@ -9709,6 +9784,8 @@ async def purchase_tracking_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "purchase-tracking"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     record_count = conn.execute("SELECT COUNT(*) as cnt FROM purchase_records").fetchone()["cnt"]
@@ -9969,6 +10046,8 @@ async def purchase_order_product_settings_page(
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "product-settings"):
+        return RedirectResponse(url="/master", status_code=303)
 
     allowed_sort_cols = {"item_name", "branch_name", "lead_time_days", "moq", "is_consumable", "purchase_price"}
     if sort_by not in allowed_sort_cols:
@@ -10932,6 +11011,8 @@ async def purchase_order_branch_exceptions_page(session_token: str = Cookie(defa
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "branch-exceptions"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     exception_rows = conn.execute(
@@ -12109,6 +12190,8 @@ async def qr_init_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "qr-init"):
+        return RedirectResponse(url="/master", status_code=303)
 
     content = """
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
@@ -12383,6 +12466,8 @@ async def safety_stock_page(
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "safety-stock"):
+        return RedirectResponse(url="/master", status_code=303)
 
     allowed_sort_cols = {"item_name", "branch_name", "qty", "updated_at"}
     if sort_by not in allowed_sort_cols:
@@ -12885,6 +12970,8 @@ async def cron_failure_log_page(
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "cron-failure-log"):
+        return RedirectResponse(url="/master", status_code=303)
 
     conn = get_conn()
     query = "SELECT * FROM cron_failure_log WHERE 1=1"

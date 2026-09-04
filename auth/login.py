@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
-from db import get_conn, pk_column
+from db import get_conn, pk_column, upsert_suffix
 
 # 초기 시딩용 지점 목록 (최초 1회만 사용, 이후로는 accounts 테이블이 정본)
 _INITIAL_BRANCHES = [
@@ -163,13 +163,13 @@ def authenticate(login_id: str, password: str) -> Optional[Dict]:
     return dict(row) if row else None
 
 
-def create_session(login_id: str, role: str, branch_code: Optional[str], device_info: str = "", client_ip: str = "") -> str:
+def create_session(login_id: str, role: str, branch_code: Optional[str], device_info: str = "", client_ip: str = "", branch_type: Optional[str] = None) -> str:
     token = secrets.token_urlsafe(32)
     expires = (datetime.now() + timedelta(days=7)).isoformat()
     conn = get_conn()
     conn.execute(
-        "INSERT INTO sessions (session_token, login_id, role, branch_code, expires_at) VALUES (?, ?, ?, ?, ?)",
-        (token, login_id, role, branch_code, expires)
+        "INSERT INTO sessions (session_token, login_id, role, branch_code, expires_at, branch_type) VALUES (?, ?, ?, ?, ?, ?)",
+        (token, login_id, role, branch_code, expires, branch_type)
     )
     conn.execute(
         "INSERT INTO login_history (login_id, role, branch_code, device_info, client_ip, logged_in_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -217,3 +217,38 @@ def get_auto_login_info(token: str) -> Optional[Dict]:
     row = conn.execute("SELECT * FROM auto_login_tokens WHERE token=?", (token,)).fetchone()
     conn.close()
     return dict(row) if row else None
+
+def has_menu_permission(login_id: str, menu_key: str) -> bool:
+    """계정의 특정 메뉴 접근 권한 확인. row가 없으면 기본 허용(True)."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT enabled FROM menu_permission WHERE login_id=? AND menu_key=?",
+        (login_id, menu_key)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return True
+    return bool(row["enabled"])
+
+
+def get_menu_permissions(login_id: str) -> Dict[str, bool]:
+    """계정의 모든 메뉴 권한을 dict로 반환 (꺼진 것만 실제 row가 있고, 나머지는 True로 채움)."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT menu_key, enabled FROM menu_permission WHERE login_id=?",
+        (login_id,)
+    ).fetchall()
+    conn.close()
+    return {r["menu_key"]: bool(r["enabled"]) for r in rows}
+
+
+def set_menu_permission(login_id: str, menu_key: str, enabled: bool):
+    """계정의 특정 메뉴 권한을 설정 (upsert)."""
+    conn = get_conn()
+    conn.execute(f"""
+        INSERT INTO menu_permission (login_id, menu_key, enabled)
+        VALUES (?, ?, ?)
+        {upsert_suffix('login_id, menu_key', 'enabled=EXCLUDED.enabled, updated_at=NOW()')}
+    """, (login_id, menu_key, enabled))
+    conn.commit()
+    conn.close()
