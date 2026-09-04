@@ -85,6 +85,7 @@ MENU_DEFINITIONS = {
     "branch-exceptions": "발주서 지점 예외",
     "safety-stock": "안전재고 관리",
     "cron-failure-log": "크론 실패 이력",
+    "stocktake": "지점 월 재고실사(운영팀장)",
 }
 
 from auth.login import (  # noqa: E402
@@ -11487,6 +11488,80 @@ async def cron_compute_purchase_tracking_snapshot(authorization: str = Header(de
 
     result = await _compute_purchase_tracking_snapshot()
     return JSONResponse(content=result)
+
+@app.get("/api/cron/select-stocktake-items")
+async def cron_select_stocktake_items(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    result = await _select_stocktake_items()
+    return JSONResponse(content=result)
+
+
+async def _select_stocktake_items():
+    import random
+    from datetime import date
+
+    today = date.today()
+    year_month = f"{today.year}-{today.month:02d}"
+
+    conn = get_conn()
+
+    already_selected = conn.execute(
+        "SELECT id FROM stocktake_selection WHERE year_month=?", (year_month,)
+    ).fetchall()
+    if already_selected:
+        conn.close()
+        return {"status": "skipped", "reason": f"{year_month}에 이미 선정된 품목이 있습니다.", "count": len(already_selected)}
+
+    prev_year = today.year if today.month > 1 else today.year - 1
+    prev_month = today.month - 1 if today.month > 1 else 12
+    prev_year_month = f"{prev_year}-{prev_month:02d}"
+
+    prev_items = conn.execute(
+        "SELECT item_code FROM stocktake_selection WHERE year_month=?", (prev_year_month,)
+    ).fetchall()
+    prev_item_codes = {r["item_code"] for r in prev_items}
+
+    EXCLUDED_STOCKTAKE_BRANCHES = ('남양주점', '본사')
+
+    placeholders = ','.join(['?'] * len(EXCLUDED_STOCKTAKE_BRANCHES))
+    all_rows = conn.execute(
+        f"SELECT item_code, item_name, branch_code, quantity FROM raw_inventory WHERE item_code IS NOT NULL AND item_code != '' AND branch_code NOT IN ({placeholders})",
+        EXCLUDED_STOCKTAKE_BRANCHES
+    ).fetchall()
+
+    by_item: Dict[str, Dict] = {}
+    for r in all_rows:
+        code = r["item_code"]
+        if code not in by_item:
+            by_item[code] = {"item_name": r["item_name"], "min_qty": r["quantity"], "branch_count": 1}
+        else:
+            by_item[code]["min_qty"] = min(by_item[code]["min_qty"], r["quantity"])
+            by_item[code]["branch_count"] += 1
+
+    candidates = [
+        {"item_code": code, "item_name": info["item_name"]}
+        for code, info in by_item.items()
+        if info["min_qty"] > 0 and code not in prev_item_codes
+    ]
+
+    if len(candidates) < 5:
+        conn.close()
+        return {"status": "error", "reason": f"조건에 맞는 후보 품목이 {len(candidates)}개뿐입니다 (5개 필요).", "candidates": len(candidates)}
+
+    selected = random.sample(candidates, 5)
+
+    for item in selected:
+        conn.execute(
+            "INSERT INTO stocktake_selection (year_month, item_code, item_name) VALUES (?, ?, ?)",
+            (year_month, item["item_code"], item["item_name"])
+        )
+    conn.commit()
+    conn.close()
+
+    return {"status": "ok", "year_month": year_month, "selected": selected}
 
 @app.get("/api/cron/sync-raw-inventory")
 async def cron_sync_raw_inventory(request: Request):
