@@ -21,7 +21,7 @@ load_dotenv(".env")
 
 app = FastAPI()
 
-from db import get_conn, pk_column  # noqa: E402
+from db import get_conn, pk_column, upsert_suffix  # noqa: E402
 
 SERVER_PORT = int(os.getenv("SERVER_PORT", "28000"))
 QR_DIR = "./qr_codes"
@@ -9625,6 +9625,16 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
+    if menu_allowed("stocktake"):
+        cards.append("""
+      <a href="/master/stocktake" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📦</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">재고실사(운영팀장)</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">매월 랜덤 5개 품목 실사</div>
+        </div>
+      </a>
+        """)
 
     cards_html = "".join(cards)
 
@@ -11562,6 +11572,269 @@ async def _select_stocktake_items():
     conn.close()
 
     return {"status": "ok", "year_month": year_month, "selected": selected}
+
+
+@app.get("/master/stocktake", response_class=HTMLResponse)
+async def master_stocktake_page(session_token: str = Cookie(default=None), team: str = ""):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "stocktake"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    from datetime import date
+    today = date.today()
+    year_month = f"{today.year}-{today.month:02d}"
+
+    conn = get_conn()
+    my_account = conn.execute("SELECT team FROM accounts WHERE login_id=?", (user["login_id"],)).fetchone()
+    my_team = my_account["team"] if my_account else None
+
+    is_team_locked = bool(my_team)
+    if is_team_locked:
+        selected_team = my_team
+    else:
+        selected_team = team or ""
+
+    all_teams_rows = conn.execute(
+        "SELECT DISTINCT team FROM accounts WHERE role='branch' AND team IS NOT NULL ORDER BY team"
+    ).fetchall()
+    all_teams = [r["team"] for r in all_teams_rows]
+
+    branch_rows = []
+    if selected_team:
+        branch_rows = get_branches(team=selected_team)
+
+    submitted_codes = set()
+    if selected_team and branch_rows:
+        codes = [b["branch_code"] for b in branch_rows]
+        placeholders = ','.join(['?'] * len(codes))
+        submitted_rows = conn.execute(
+            f"SELECT DISTINCT branch_code FROM stocktake_record WHERE year_month=? AND branch_code IN ({placeholders})",
+            [year_month] + codes
+        ).fetchall()
+        submitted_codes = {r["branch_code"] for r in submitted_rows}
+
+    selection_count = conn.execute(
+        "SELECT COUNT(*) as cnt FROM stocktake_selection WHERE year_month=?", (year_month,)
+    ).fetchone()["cnt"]
+
+    conn.close()
+
+    team_options_html = ""
+    if is_team_locked:
+        team_options_html = f'<option value="{selected_team}" selected>{selected_team}</option>'
+    else:
+        team_options_html = '<option value="">팀을 선택하세요</option>'
+        for t in all_teams:
+            sel = 'selected' if t == selected_team else ''
+            team_options_html += f'<option value="{t}" {sel}>{t}</option>'
+
+    branch_cards_html = ""
+    if selected_team:
+        if selection_count == 0:
+            branch_cards_html = '<div class="card" style="text-align:center;padding:24px;color:#888;">이번 달 실사 대상 품목이 아직 선정되지 않았습니다.</div>'
+        elif not branch_rows:
+            branch_cards_html = '<div class="card" style="text-align:center;padding:24px;color:#888;">해당 팀에 소속된 지점이 없습니다.</div>'
+        else:
+            for b in branch_rows:
+                is_submitted = b["branch_code"] in submitted_codes
+                status_badge = '<span class="badge-green">제출완료</span>' if is_submitted else '<span class="badge-red">미제출</span>'
+                branch_cards_html += f"""
+                <a href="/master/stocktake/{b['branch_code']}" style="text-decoration:none;">
+                  <div class="card" style="display:flex;justify-content:space-between;align-items:center;padding:16px;cursor:pointer;">
+                    <span style="font-weight:bold;">{b['branch_name']}</span>
+                    {status_badge}
+                  </div>
+                </a>
+                """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📦 재고실사 (운영팀장)</h2>
+    <div class="card">
+      <p style="font-size:13px;color:#888;margin-bottom:8px;">{year_month} 실사 대상 품목: {selection_count}개 선정됨</p>
+      <select id="teamSelect" onchange="location.href='/master/stocktake?team=' + this.value" {'disabled' if is_team_locked else ''}>
+        {team_options_html}
+      </select>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-top:12px;">
+      {branch_cards_html}
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.get("/master/stocktake/{branch_code}", response_class=HTMLResponse)
+async def master_stocktake_detail_page(branch_code: str, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "stocktake"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    from datetime import date
+    today = date.today()
+    year_month = f"{today.year}-{today.month:02d}"
+
+    conn = get_conn()
+    branch = conn.execute("SELECT branch_name FROM accounts WHERE branch_code=? AND role='branch'", (branch_code,)).fetchone()
+    if not branch:
+        conn.close()
+        return RedirectResponse(url="/master/stocktake", status_code=303)
+
+    selected_items = conn.execute(
+        "SELECT item_code, item_name FROM stocktake_selection WHERE year_month=?", (year_month,)
+    ).fetchall()
+
+    existing_records = conn.execute(
+        "SELECT item_code, counted_quantity, qr_diff, raw_diff FROM stocktake_record WHERE year_month=? AND branch_code=?",
+        (year_month, branch_code)
+    ).fetchall()
+    existing_map = {r["item_code"]: r["counted_quantity"] for r in existing_records}
+    existing_diff_map = {r["item_code"]: {"qr_diff": r["qr_diff"], "raw_diff": r["raw_diff"]} for r in existing_records}
+
+    item_rows_html = ""
+    for item in selected_items:
+        qr_row = conn.execute(
+            "SELECT quantity FROM inventory WHERE branch_code=? AND item_code=?",
+            (branch_code, item["item_code"])
+        ).fetchone()
+        raw_row = conn.execute(
+            "SELECT quantity FROM raw_inventory WHERE branch_code=? AND item_code=?",
+            (branch_code, item["item_code"])
+        ).fetchone()
+        qr_qty = qr_row["quantity"] if qr_row else 0
+        raw_qty = raw_row["quantity"] if raw_row else 0
+        existing_value = existing_map.get(item["item_code"], "")
+
+        existing_qr_diff = existing_diff_map.get(item["item_code"], {}).get("qr_diff")
+        existing_raw_diff = existing_diff_map.get(item["item_code"], {}).get("raw_diff")
+        diff_html = ""
+        if existing_value != "":
+            qr_diff_display = f"+{existing_qr_diff}" if existing_qr_diff and existing_qr_diff > 0 else str(existing_qr_diff)
+            raw_diff_display = f"+{existing_raw_diff}" if existing_raw_diff and existing_raw_diff > 0 else str(existing_raw_diff)
+            qr_diff_color = "#EF4444" if existing_qr_diff != 0 else "#22C55E"
+            raw_diff_color = "#EF4444" if existing_raw_diff != 0 else "#22C55E"
+            diff_html = f"""
+            <div style="display:flex;gap:16px;font-size:13px;margin-top:6px;padding-top:6px;border-top:1px dashed #eee;">
+              <span style="color:{qr_diff_color};font-weight:bold;">QR 오차: {qr_diff_display}</span>
+              <span style="color:{raw_diff_color};font-weight:bold;">RAW 오차: {raw_diff_display}</span>
+            </div>
+            """
+        item_rows_html += f"""
+        <div class="card" style="margin-bottom:8px;">
+          <div style="font-weight:bold;margin-bottom:8px;">{item['item_name']}</div>
+          <div style="display:flex;gap:16px;font-size:13px;color:#888;margin-bottom:8px;">
+            <span>QR재고: {qr_qty}</span>
+            <span>RAW재고: {raw_qty}</span>
+          </div>
+          <input type="number" class="stocktake-input" data-item-code="{item['item_code']}" data-item-name="{item['item_name']}" data-qr-qty="{qr_qty}" data-raw-qty="{raw_qty}" placeholder="실사 수량 입력" value="{existing_value}" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;" oninput="updateDiffPreview(this)">
+          <div class="diff-preview" data-item-code="{item['item_code']}">{diff_html}</div>
+        </div>
+        """
+
+    conn.close()
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/stocktake" style="color:#1E2761;">← 재고실사</a>
+      <h2>📦 {branch['branch_name']} 실사입력 ({year_month})</h2>
+    </div>
+    {item_rows_html if selected_items else '<div class="card" style="text-align:center;padding:24px;color:#888;">이번 달 실사 대상 품목이 없습니다.</div>'}
+    <button class="btn" style="width:100%;margin-top:12px;" onclick="saveStocktake()">실사 결과 저장</button>
+    <div id="stocktakeResult" style="margin-top:8px;font-size:13px;text-align:center;"></div>
+
+    <script>
+      function updateDiffPreview(input) {{
+        const val = input.value.trim();
+        const container = document.querySelector('.diff-preview[data-item-code="' + input.getAttribute('data-item-code') + '"]');
+        if (val === '') {{ container.innerHTML = ''; return; }}
+        const counted = parseInt(val);
+        const qrQty = parseInt(input.getAttribute('data-qr-qty'));
+        const rawQty = parseInt(input.getAttribute('data-raw-qty'));
+        const qrDiff = counted - qrQty;
+        const rawDiff = counted - rawQty;
+        const qrDiffDisplay = qrDiff > 0 ? '+' + qrDiff : qrDiff;
+        const rawDiffDisplay = rawDiff > 0 ? '+' + rawDiff : rawDiff;
+        const qrColor = qrDiff !== 0 ? '#EF4444' : '#22C55E';
+        const rawColor = rawDiff !== 0 ? '#EF4444' : '#22C55E';
+        container.innerHTML = '<div style="display:flex;gap:16px;font-size:13px;margin-top:6px;padding-top:6px;border-top:1px dashed #eee;">' +
+          '<span style="color:' + qrColor + ';font-weight:bold;">QR 오차: ' + qrDiffDisplay + '</span>' +
+          '<span style="color:' + rawColor + ';font-weight:bold;">RAW 오차: ' + rawDiffDisplay + '</span>' +
+          '</div>';
+      }}
+
+      async function saveStocktake() {{
+        const inputs = document.querySelectorAll('.stocktake-input');
+        const items = [];
+        for (const inp of inputs) {{
+          const val = inp.value.trim();
+          if (val === '') {{ alert('모든 품목의 실사 수량을 입력하세요.'); return; }}
+          items.push({{
+            item_code: inp.getAttribute('data-item-code'),
+            item_name: inp.getAttribute('data-item-name'),
+            qr_quantity: parseInt(inp.getAttribute('data-qr-qty')),
+            raw_quantity: parseInt(inp.getAttribute('data-raw-qty')),
+            counted_quantity: parseInt(val)
+          }});
+        }}
+        const res = await fetch('/master/stocktake/{branch_code}/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ items: items }})
+        }});
+        if (res.ok) {{
+          document.getElementById('stocktakeResult').innerText = '✅ 저장되었습니다.';
+          setTimeout(() => location.href = '/master/stocktake', 1000);
+        }} else {{
+          const err = await res.json();
+          document.getElementById('stocktakeResult').innerText = '오류: ' + (err.detail || '저장 실패');
+        }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/stocktake/{branch_code}/save")
+async def master_stocktake_save(branch_code: str, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    from datetime import date
+    today = date.today()
+    year_month = f"{today.year}-{today.month:02d}"
+
+    data = await request.json()
+    items = data.get("items", [])
+    if not items:
+        return JSONResponse(status_code=400, content={"detail": "입력된 품목이 없습니다."})
+
+    conn = get_conn()
+    branch = conn.execute("SELECT branch_name FROM accounts WHERE branch_code=? AND role='branch'", (branch_code,)).fetchone()
+    if not branch:
+        conn.close()
+        return JSONResponse(status_code=400, content={"detail": "올바르지 않은 지점입니다."})
+
+    for item in items:
+        qr_qty = item.get("qr_quantity", 0)
+        raw_qty = item.get("raw_quantity", 0)
+        counted = item.get("counted_quantity", 0)
+        qr_diff = counted - qr_qty
+        raw_diff = counted - raw_qty
+
+        conn.execute(f"""
+            INSERT INTO stocktake_record
+                (year_month, branch_code, branch_name, item_code, item_name, qr_quantity, raw_quantity, counted_quantity, qr_diff, raw_diff, recorded_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            {upsert_suffix('year_month, branch_code, item_code', 'counted_quantity=EXCLUDED.counted_quantity, qr_quantity=EXCLUDED.qr_quantity, raw_quantity=EXCLUDED.raw_quantity, qr_diff=EXCLUDED.qr_diff, raw_diff=EXCLUDED.raw_diff, recorded_by=EXCLUDED.recorded_by, recorded_at=NOW()')}
+        """, (year_month, branch_code, branch["branch_name"], item["item_code"], item["item_name"],
+              qr_qty, raw_qty, counted, qr_diff, raw_diff, user["login_id"]))
+
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
 
 @app.get("/api/cron/sync-raw-inventory")
 async def cron_sync_raw_inventory(request: Request):
