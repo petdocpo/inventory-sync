@@ -86,6 +86,7 @@ MENU_DEFINITIONS = {
     "safety-stock": "안전재고 관리",
     "cron-failure-log": "크론 실패 이력",
     "stocktake": "지점 월 재고실사(운영팀장)",
+    "stocktake-result": "재고실사(결과)",
 }
 
 from auth.login import (  # noqa: E402
@@ -9634,6 +9635,16 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
+    if menu_allowed("stocktake-result"):
+        cards.append("""
+      <a href="/master/stocktake-result" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📊</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">재고실사(결과)</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">지점별 실사 결과 조회/관리</div>
+        </div>
+      </a>
+        """)
 
     cards_html = "".join(cards)
 
@@ -11869,6 +11880,246 @@ async def master_stocktake_save(branch_code: str, request: Request, session_toke
     conn.close()
     return JSONResponse(content={"status": "ok"})
 
+
+@app.get("/master/stocktake-result", response_class=HTMLResponse)
+async def master_stocktake_result_page(session_token: str = Cookie(default=None), year_month: str = ""):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "stocktake-result"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    from datetime import date
+    today = date.today()
+    default_ym = f"{today.year}-{today.month:02d}"
+    selected_ym = year_month or default_ym
+
+    conn = get_conn()
+    month_rows = conn.execute(
+        "SELECT DISTINCT year_month FROM stocktake_selection ORDER BY year_month DESC"
+    ).fetchall()
+    all_months = [r["year_month"] for r in month_rows]
+    if not all_months:
+        all_months = [default_ym]
+    if selected_ym not in all_months:
+        selected_ym = all_months[0]
+
+    records = conn.execute(
+        "SELECT * FROM stocktake_record WHERE year_month=? ORDER BY branch_name, item_name",
+        (selected_ym,)
+    ).fetchall()
+
+    branches_with_data = sorted(set(r["branch_code"] for r in records))
+    all_target_branches = conn.execute(
+        "SELECT branch_code, branch_name FROM accounts WHERE role='branch' AND branch_code NOT IN ('남양주점', '본사') ORDER BY branch_name"
+    ).fetchall()
+    conn.close()
+
+    month_options_html = "".join(
+        f'<option value="{m}" {"selected" if m == selected_ym else ""}>{m}</option>' for m in all_months
+    )
+
+    records_by_branch: Dict[str, list] = {}
+    for r in records:
+        records_by_branch.setdefault(r["branch_code"], []).append(r)
+
+    branch_blocks_html = ""
+    for b in all_target_branches:
+        b_records = records_by_branch.get(b["branch_code"], [])
+        if not b_records:
+            branch_blocks_html += f"""
+            <div class="card" style="margin-bottom:8px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <b>{b['branch_name']}</b>
+                <span class="badge-red">미제출</span>
+              </div>
+            </div>
+            """
+            continue
+
+        is_finalized = any(bool(r["is_finalized"]) for r in b_records)
+        status_badge = '<span class="badge-green">제출완료</span>' if is_finalized else '<span class="badge-red">임시저장(미제출)</span>'
+        recorded_by = b_records[0]["recorded_by"]
+        recorded_at = str(b_records[0]["recorded_at"])[:16]
+
+        rows_html = ""
+        for r in b_records:
+            qr_diff_color = "#EF4444" if r["qr_diff"] != 0 else "#22C55E"
+            raw_diff_color = "#EF4444" if r["raw_diff"] != 0 else "#22C55E"
+            rows_html += f"""
+            <tr>
+              <td>{r['item_name']}</td>
+              <td style="text-align:center;">{r['qr_quantity']}</td>
+              <td style="text-align:center;">{r['raw_quantity']}</td>
+              <td style="text-align:center;">
+                <input type="number" class="result-edit-input" data-record-id="{r['id']}" value="{r['counted_quantity']}" style="width:70px;padding:4px;text-align:center;border:1px solid #ccc;border-radius:4px;">
+              </td>
+              <td style="text-align:center;color:{qr_diff_color};font-weight:bold;">{r['qr_diff']}</td>
+              <td style="text-align:center;color:{raw_diff_color};font-weight:bold;">{r['raw_diff']}</td>
+            </tr>
+            """
+
+        branch_blocks_html += f"""
+        <div class="card" style="margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <b>{b['branch_name']}</b>
+            <div style="display:flex;gap:6px;align-items:center;">
+              {status_badge}
+              <span style="font-size:11px;color:#888;">{recorded_by} · {recorded_at}</span>
+            </div>
+          </div>
+          <table style="width:100%;">
+            <thead><tr><th>품목</th><th>QR재고</th><th>RAW재고</th><th>실사값</th><th>QR오차</th><th>RAW오차</th></tr></thead>
+            <tbody>{rows_html}</tbody>
+          </table>
+          <div style="display:flex;gap:6px;margin-top:10px;">
+            <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="saveEditedRecords('{b['branch_code']}')">수정사항 저장</button>
+            {'<button class="btn" style="font-size:12px;padding:6px 10px;background:#F59E0B;" onclick="requestResubmit(\'' + b['branch_code'] + '\', \'' + b['branch_name'] + '\')">재제출 요청</button>' if is_finalized else ''}
+            <button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteStocktakeRecord('{b['branch_code']}', '{b['branch_name']}')">삭제</button>
+          </div>
+        </div>
+        """
+
+    content = f"""
+    <h2 style="margin-bottom:16px;">📊 재고실사 결과</h2>
+    <div class="card" style="display:flex;justify-content:space-between;align-items:center;">
+      <select id="yearMonthSelect" onchange="location.href='/master/stocktake-result?year_month=' + this.value">
+        {month_options_html}
+      </select>
+      <a href="/master/stocktake-result/export?year_month={selected_ym}" class="btn" style="text-decoration:none;">엑셀 다운로드</a>
+    </div>
+    <div style="margin-top:12px;">
+      {branch_blocks_html}
+    </div>
+
+    <script>
+      async function saveEditedRecords(branchCode) {{
+        const inputs = document.querySelectorAll('.result-edit-input');
+        const updates = [];
+        inputs.forEach(inp => {{
+          updates.push({{ record_id: parseInt(inp.getAttribute('data-record-id')), counted_quantity: parseInt(inp.value) }});
+        }});
+        const res = await fetch('/master/stocktake-result/update', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ updates: updates }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '수정 실패'));
+        }}
+      }}
+
+      async function requestResubmit(branchCode, branchName) {{
+        if (!confirm(branchName + '에 재제출을 요청합니다. 계속할까요?')) return;
+        const res = await fetch('/master/stocktake-result/resubmit-request', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: branchCode, year_month: '{selected_ym}' }})
+        }});
+        if (res.ok) {{ alert('재제출 요청이 발송되었습니다.'); location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '요청 실패'));
+        }}
+      }}
+
+      async function deleteStocktakeRecord(branchCode, branchName) {{
+        if (!confirm(branchName + '의 이번 달 실사 기록을 전부 삭제합니다. 되돌릴 수 없습니다. 계속할까요?')) return;
+        const res = await fetch('/master/stocktake-result/delete', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: branchCode, year_month: '{selected_ym}' }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json();
+          alert('오류: ' + (err.detail || '삭제 실패'));
+        }}
+      }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/stocktake-result/update")
+async def master_stocktake_result_update(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    updates = data.get("updates", [])
+    if not updates:
+        return JSONResponse(status_code=400, content={"detail": "수정할 항목이 없습니다."})
+
+    conn = get_conn()
+    for u in updates:
+        record = conn.execute("SELECT qr_quantity, raw_quantity FROM stocktake_record WHERE id=?", (u["record_id"],)).fetchone()
+        if not record:
+            continue
+        counted = u["counted_quantity"]
+        qr_diff = counted - record["qr_quantity"]
+        raw_diff = counted - record["raw_quantity"]
+        conn.execute(
+            "UPDATE stocktake_record SET counted_quantity=?, qr_diff=?, raw_diff=? WHERE id=?",
+            (counted, qr_diff, raw_diff, u["record_id"])
+        )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/stocktake-result/resubmit-request")
+async def master_stocktake_result_resubmit(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    year_month = data.get("year_month", "").strip()
+    if not branch_code or not year_month:
+        return JSONResponse(status_code=400, content={"detail": "지점 또는 연월이 지정되지 않았습니다."})
+
+    conn = get_conn()
+    branch = conn.execute("SELECT branch_name FROM accounts WHERE branch_code=?", (branch_code,)).fetchone()
+    branch_name = branch["branch_name"] if branch else branch_code
+
+    conn.execute(
+        "UPDATE stocktake_record SET is_finalized=FALSE WHERE branch_code=? AND year_month=?",
+        (branch_code, year_month)
+    )
+    conn.commit()
+    conn.close()
+
+    send_teams_notification(
+        branch_code="stocktake_alert",
+        title="📦 재고실사 재제출 요청",
+        message=f"{year_month} {branch_name}의 재고실사 결과에 대해 재제출이 요청되었습니다. 담당 팀장은 재고실사 메뉴에서 다시 입력해주세요.",
+        link_url="",
+        link_text="",
+        sent_by=user["login_id"]
+    )
+
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/stocktake-result/delete")
+async def master_stocktake_result_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    branch_code = data.get("branch_code", "").strip()
+    year_month = data.get("year_month", "").strip()
+    if not branch_code or not year_month:
+        return JSONResponse(status_code=400, content={"detail": "지점 또는 연월이 지정되지 않았습니다."})
+
+    conn = get_conn()
+    conn.execute(
+        "DELETE FROM stocktake_record WHERE branch_code=? AND year_month=?",
+        (branch_code, year_month)
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
 
 @app.get("/api/cron/sync-raw-inventory")
 async def cron_sync_raw_inventory(request: Request):
