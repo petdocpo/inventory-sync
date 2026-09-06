@@ -9524,16 +9524,6 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
-    if menu_allowed("survey"):
-        cards.append("""
-      <a href="/master/survey" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">📋</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">설문 관리</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">설문 생성/문항관리/제출현황</div>
-        </div>
-      </a>
-        """)
     if menu_allowed("vendor-eval-status"):
         cards.append("""
       <a href="/master/vendor-eval/status" style="text-decoration:none;">
@@ -11696,11 +11686,12 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
     ).fetchall()
 
     existing_records = conn.execute(
-        "SELECT item_code, counted_quantity, qr_diff, raw_diff FROM stocktake_record WHERE year_month=? AND branch_code=?",
+        "SELECT item_code, counted_quantity, qr_diff, raw_diff, is_finalized FROM stocktake_record WHERE year_month=? AND branch_code=?",
         (year_month, branch_code)
     ).fetchall()
     existing_map = {r["item_code"]: r["counted_quantity"] for r in existing_records}
     existing_diff_map = {r["item_code"]: {"qr_diff": r["qr_diff"], "raw_diff": r["raw_diff"]} for r in existing_records}
+    is_finalized = any(bool(r["is_finalized"]) for r in existing_records)
 
     item_rows_html = ""
     for item in selected_items:
@@ -11737,7 +11728,7 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
             <span>QR재고: {qr_qty}</span>
             <span>RAW재고: {raw_qty}</span>
           </div>
-          <input type="number" class="stocktake-input" data-item-code="{item['item_code']}" data-item-name="{item['item_name']}" data-qr-qty="{qr_qty}" data-raw-qty="{raw_qty}" placeholder="실사 수량 입력" value="{existing_value}" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;" oninput="updateDiffPreview(this)">
+          <input type="number" class="stocktake-input" data-item-code="{item['item_code']}" data-item-name="{item['item_name']}" data-qr-qty="{qr_qty}" data-raw-qty="{raw_qty}" placeholder="실사 수량 입력" value="{existing_value}" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;background:{'#f5f5f5' if is_finalized else 'white'};" oninput="updateDiffPreview(this)" {'readonly' if is_finalized else ''}>
           <div class="diff-preview" data-item-code="{item['item_code']}">{diff_html}</div>
         </div>
         """
@@ -11750,7 +11741,10 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
       <h2>📦 {branch['branch_name']} 실사입력 ({year_month})</h2>
     </div>
     {item_rows_html if selected_items else '<div class="card" style="text-align:center;padding:24px;color:#888;">이번 달 실사 대상 품목이 없습니다.</div>'}
-    <button class="btn" style="width:100%;margin-top:12px;" onclick="saveStocktake()">실사 결과 저장</button>
+    {'<div class="card" style="text-align:center;padding:16px;background:#EFF6FF;color:#1E40AF;font-weight:bold;margin-top:12px;">✅ 제출 완료되었습니다. 더 이상 수정할 수 없습니다.</div>' if is_finalized else '''
+    <button class="btn" style="width:100%;margin-top:12px;background:#64748B;" onclick="saveStocktake()">실사 결과 저장</button>
+    <button class="btn" style="width:100%;margin-top:8px;" onclick="submitStocktake()">제출하기 (제출 후 수정 불가)</button>
+    '''}
     <div id="stocktakeResult" style="margin-top:8px;font-size:13px;text-align:center;"></div>
 
     <script>
@@ -11773,12 +11767,12 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
           '</div>';
       }}
 
-      async function saveStocktake() {{
+      function collectStocktakeItems() {{
         const inputs = document.querySelectorAll('.stocktake-input');
         const items = [];
         for (const inp of inputs) {{
           const val = inp.value.trim();
-          if (val === '') {{ alert('모든 품목의 실사 수량을 입력하세요.'); return; }}
+          if (val === '') {{ alert('모든 품목의 실사 수량을 입력하세요.'); return null; }}
           items.push({{
             item_code: inp.getAttribute('data-item-code'),
             item_name: inp.getAttribute('data-item-name'),
@@ -11787,16 +11781,38 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
             counted_quantity: parseInt(val)
           }});
         }}
+        return items;
+      }}
+
+      async function saveStocktake() {{
+        const items = collectStocktakeItems();
+        if (!items) return;
         const res = await fetch('/master/stocktake/{branch_code}/save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ items: items }})
+          body: JSON.stringify({{ items: items, finalize: false }})
         }});
         if (res.ok) {{
-          document.getElementById('stocktakeResult').innerText = '✅ 저장되었습니다.';
-          setTimeout(() => location.href = '/master/stocktake', 1000);
+          document.getElementById('stocktakeResult').innerText = '✅ 저장되었습니다. (수정 가능한 임시저장 상태)';
         }} else {{
           const err = await res.json();
           document.getElementById('stocktakeResult').innerText = '오류: ' + (err.detail || '저장 실패');
+        }}
+      }}
+
+      async function submitStocktake() {{
+        if (!confirm('제출하면 더 이상 수정할 수 없습니다. 제출하시겠습니까?')) return;
+        const items = collectStocktakeItems();
+        if (!items) return;
+        const res = await fetch('/master/stocktake/{branch_code}/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ items: items, finalize: true }})
+        }});
+        if (res.ok) {{
+          document.getElementById('stocktakeResult').innerText = '✅ 제출 완료되었습니다.';
+          setTimeout(() => location.href = '/master/stocktake', 1000);
+        }} else {{
+          const err = await res.json();
+          document.getElementById('stocktakeResult').innerText = '오류: ' + (err.detail || '제출 실패');
         }}
       }}
     </script>
@@ -11816,6 +11832,7 @@ async def master_stocktake_save(branch_code: str, request: Request, session_toke
 
     data = await request.json()
     items = data.get("items", [])
+    finalize = bool(data.get("finalize", False))
     if not items:
         return JSONResponse(status_code=400, content={"detail": "입력된 품목이 없습니다."})
 
@@ -11824,6 +11841,14 @@ async def master_stocktake_save(branch_code: str, request: Request, session_toke
     if not branch:
         conn.close()
         return JSONResponse(status_code=400, content={"detail": "올바르지 않은 지점입니다."})
+
+    already_finalized = conn.execute(
+        "SELECT id FROM stocktake_record WHERE year_month=? AND branch_code=? AND is_finalized=TRUE LIMIT 1",
+        (year_month, branch_code)
+    ).fetchone()
+    if already_finalized:
+        conn.close()
+        return JSONResponse(status_code=400, content={"detail": "이미 제출 완료되어 수정할 수 없습니다."})
 
     for item in items:
         qr_qty = item.get("qr_quantity", 0)
@@ -11834,11 +11859,11 @@ async def master_stocktake_save(branch_code: str, request: Request, session_toke
 
         conn.execute(f"""
             INSERT INTO stocktake_record
-                (year_month, branch_code, branch_name, item_code, item_name, qr_quantity, raw_quantity, counted_quantity, qr_diff, raw_diff, recorded_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            {upsert_suffix('year_month, branch_code, item_code', 'counted_quantity=EXCLUDED.counted_quantity, qr_quantity=EXCLUDED.qr_quantity, raw_quantity=EXCLUDED.raw_quantity, qr_diff=EXCLUDED.qr_diff, raw_diff=EXCLUDED.raw_diff, recorded_by=EXCLUDED.recorded_by, recorded_at=NOW()')}
+                (year_month, branch_code, branch_name, item_code, item_name, qr_quantity, raw_quantity, counted_quantity, qr_diff, raw_diff, recorded_by, is_finalized)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            {upsert_suffix('year_month, branch_code, item_code', 'counted_quantity=EXCLUDED.counted_quantity, qr_quantity=EXCLUDED.qr_quantity, raw_quantity=EXCLUDED.raw_quantity, qr_diff=EXCLUDED.qr_diff, raw_diff=EXCLUDED.raw_diff, recorded_by=EXCLUDED.recorded_by, recorded_at=NOW(), is_finalized=EXCLUDED.is_finalized')}
         """, (year_month, branch_code, branch["branch_name"], item["item_code"], item["item_name"],
-              qr_qty, raw_qty, counted, qr_diff, raw_diff, user["login_id"]))
+              qr_qty, raw_qty, counted, qr_diff, raw_diff, user["login_id"], finalize))
 
     conn.commit()
     conn.close()
