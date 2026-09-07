@@ -5570,8 +5570,17 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
       <input type="text" id="qText" placeholder="문항 내용" style="margin-bottom:8px;">
       <textarea id="qDesc" placeholder="문항 설명 (선택)" style="width:100%;min-height:50px;padding:8px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;margin-bottom:12px;"></textarea>
 
-      <label style="font-size:12px;color:#888;">이미지 URL (선택)</label>
-      <input type="text" id="qImageUrl" placeholder="https://... (이미지 주소)" style="margin-bottom:12px;">
+      <label style="font-size:12px;color:#888;">이미지 (선택, 5MB 이하)</label>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+        <input type="file" id="qImageFile" accept="image/jpeg,image/png,image/gif,image/webp" style="flex:1;">
+        <button type="button" class="btn" style="font-size:12px;padding:8px 12px;white-space:nowrap;" onclick="uploadQuestionImage()">업로드</button>
+      </div>
+      <div id="qImagePreviewWrap" style="display:none;margin-bottom:12px;">
+        <img id="qImagePreview" src="" style="max-width:200px;max-height:120px;border-radius:6px;display:block;margin-bottom:4px;">
+        <button type="button" class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="clearQuestionImage()">이미지 제거</button>
+      </div>
+      <input type="hidden" id="qImageUrl" value="">
+      <div id="qImageUploadResult" style="font-size:12px;margin-bottom:8px;"></div>
 
       <div style="display:flex;gap:8px;margin-bottom:12px;">
         <div style="flex:1;">
@@ -5717,6 +5726,35 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         }}
       }}
 
+      async function uploadQuestionImage() {{
+        const fileEl = document.getElementById('qImageFile');
+        if (!fileEl.files.length) {{ alert('파일을 선택하세요.'); return; }}
+        const formData = new FormData();
+        formData.append('file', fileEl.files[0]);
+        document.getElementById('qImageUploadResult').innerText = '업로드 중...';
+        try {{
+          const res = await fetch('/master/survey/upload-image', {{ method: 'POST', body: formData }});
+          const data = await res.json();
+          if (res.ok) {{
+            document.getElementById('qImageUrl').value = data.url;
+            document.getElementById('qImagePreview').src = data.url;
+            document.getElementById('qImagePreviewWrap').style.display = 'block';
+            document.getElementById('qImageUploadResult').innerText = '✅ 업로드 완료';
+            fileEl.value = '';
+          }} else {{
+            document.getElementById('qImageUploadResult').innerText = '오류: ' + (data.detail || '업로드 실패');
+          }}
+        }} catch (e) {{
+          document.getElementById('qImageUploadResult').innerText = '업로드 중 오류가 발생했습니다.';
+        }}
+      }}
+
+      function clearQuestionImage() {{
+        document.getElementById('qImageUrl').value = '';
+        document.getElementById('qImagePreview').src = '';
+        document.getElementById('qImagePreviewWrap').style.display = 'none';
+      }}
+
       function collectOptions() {{
         const options = [];
         document.querySelectorAll('#optionRows > div').forEach(wrap => {{
@@ -5735,6 +5773,10 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         document.getElementById('qText').value = '';
         document.getElementById('qDesc').value = '';
         document.getElementById('qImageUrl').value = '';
+        document.getElementById('qImagePreview').src = '';
+        document.getElementById('qImagePreviewWrap').style.display = 'none';
+        document.getElementById('qImageFile').value = '';
+        document.getElementById('qImageUploadResult').innerText = '';
         document.getElementById('qLinkUrl').value = '';
         document.getElementById('qLinkLabel').value = '';
         document.getElementById('qHasOptions').checked = false;
@@ -5759,6 +5801,13 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         document.getElementById('qText').value = q.question_text;
         document.getElementById('qDesc').value = q.description;
         document.getElementById('qImageUrl').value = q.image_url || '';
+        if (q.image_url) {{
+          document.getElementById('qImagePreview').src = q.image_url;
+          document.getElementById('qImagePreviewWrap').style.display = 'block';
+        }} else {{
+          document.getElementById('qImagePreview').src = '';
+          document.getElementById('qImagePreviewWrap').style.display = 'none';
+        }}
         document.getElementById('qLinkUrl').value = q.link_url || '';
         document.getElementById('qLinkLabel').value = q.link_label || '';
         document.getElementById('qHasOptions').checked = q.has_options;
@@ -6378,6 +6427,7 @@ async def master_survey_responses_request_resubmit(
         conn.close()
     return RedirectResponse(url=f"/master/survey/{survey_id}/responses", status_code=303)
 
+
 @app.post("/master/survey/{survey_id}/target-list/upload")
 async def master_survey_target_list_upload(survey_id: int, request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -6436,6 +6486,65 @@ async def master_survey_target_list_upload(survey_id: int, request: Request, ses
     conn.close()
     return JSONResponse(content={"status": "ok", "inserted": inserted})
 
+@app.post("/master/survey/upload-image")
+async def master_survey_upload_image(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse(status_code=400, content={"detail": "파일이 없습니다."})
+
+    filename = getattr(file, "filename", "") or ""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    allowed_ext = {"jpg", "jpeg", "png", "gif", "webp"}
+    if ext not in allowed_ext:
+        return JSONResponse(status_code=400, content={"detail": "이미지 파일(jpg/jpeg/png/gif/webp)만 업로드 가능합니다."})
+
+    raw = await file.read()
+    max_size = 5 * 1024 * 1024  # 5MB
+    if len(raw) > max_size:
+        return JSONResponse(status_code=400, content={"detail": "파일 크기는 5MB 이하만 가능합니다."})
+
+    content_type_map = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+        "gif": "image/gif", "webp": "image/webp"
+    }
+    content_type = content_type_map.get(ext, "application/octet-stream")
+
+    import uuid
+    new_filename = f"{uuid.uuid4().hex}.{ext}"
+
+    supabase_url = "https://fjznuesrbrwcqbdghegn.supabase.co"
+    service_role_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
+    if not service_role_key:
+        return JSONResponse(status_code=500, content={"detail": "서버 설정 오류: service_role 키가 없습니다."})
+
+    upload_url = f"{supabase_url}/storage/v1/object/survey-images/{new_filename}"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(
+            upload_url,
+            content=raw,
+            headers={
+                "Authorization": f"Bearer {service_role_key}",
+                "apikey": service_role_key,
+                "Content-Type": content_type,
+                "x-upsert": "true"
+            },
+            timeout=30.0
+        )
+
+    if resp.status_code not in (200, 201):
+        return JSONResponse(status_code=500, content={
+            "detail": f"업로드 실패 (Supabase 응답 {resp.status_code}): {resp.text[:200]}"
+        })
+
+    public_url = f"{supabase_url}/storage/v1/object/public/survey-images/{new_filename}"
+
+    return JSONResponse(content={"status": "ok", "url": public_url})
 
 @app.post("/master/survey/{survey_id}/target-list/clear")
 async def master_survey_target_list_clear(survey_id: int, session_token: str = Cookie(default=None)):
