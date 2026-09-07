@@ -5731,6 +5731,7 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         document.getElementById('qSection').value = '';
         document.getElementById('qText').value = '';
         document.getElementById('qDesc').value = '';
+        document.getElementById('qImageUrl').value = '';
         document.getElementById('qLinkUrl').value = '';
         document.getElementById('qLinkLabel').value = '';
         document.getElementById('qHasOptions').checked = false;
@@ -5930,6 +5931,9 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
   is_multi_select = bool(data.get("is_multi_select", False))
   has_answer_key = bool(data.get("has_answer_key", False))
   score_points = data.get("score_points", 1)
+  image_url = data.get("image_url", "").strip()
+  link_url = data.get("link_url", "").strip()
+  link_label = data.get("link_label", "").strip()
   options = data.get("options", [])
 
   if not question_text:
@@ -5945,10 +5949,12 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
       conn.execute("""
           UPDATE survey_question
           SET question_text=?, description=?, has_options=?, has_text_answer=?,
-              text_answer_label=?, text_answer_required=?, is_multi_select=?, section_id=?, has_answer_key=?, score_points=?
+              text_answer_label=?, text_answer_required=?, is_multi_select=?, section_id=?, has_answer_key=?, score_points=?,
+              image_url=?, link_url=?, link_label=?
           WHERE id=? AND survey_id=?
       """, (question_text, description or None, has_options, has_text_answer,
             text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key, score_points,
+            image_url or None, link_url or None, link_label or None,
             question_id, survey_id))
       conn.execute("DELETE FROM survey_question_option WHERE question_id=?", (question_id,))
       target_qid = question_id
@@ -5959,10 +5965,12 @@ async def master_survey_question_save(survey_id: int, request: Request, session_
       conn.execute("""
           INSERT INTO survey_question
               (survey_id, question_text, description, has_options, has_text_answer,
-                text_answer_label, text_answer_required, is_multi_select, section_id, has_answer_key, score_points, display_order, active)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+                text_answer_label, text_answer_required, is_multi_select, section_id, has_answer_key, score_points,
+                image_url, link_url, link_label, display_order, active)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
       """, (survey_id, question_text, description or None, has_options, has_text_answer,
-            text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key, score_points, max_order + 1))
+            text_answer_label or None, text_answer_required, is_multi_select, section_id, has_answer_key, score_points,
+            image_url or None, link_url or None, link_label or None, max_order + 1))
       new_q = conn.execute(
           "SELECT id FROM survey_question WHERE survey_id=? ORDER BY id DESC LIMIT 1", (survey_id,)
       ).fetchone()
