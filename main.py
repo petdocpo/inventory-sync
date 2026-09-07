@@ -11982,11 +11982,11 @@ async def master_stocktake_result_page(session_token: str = Cookie(default=None)
 
     content = f"""
     <h2 style="margin-bottom:16px;">📊 재고실사 결과</h2>
-    <div class="card" style="display:flex;justify-content:space-between;align-items:center;">
-      <select id="yearMonthSelect" onchange="location.href='/master/stocktake-result?year_month=' + this.value">
+    <div class="card" style="display:flex;gap:8px;align-items:center;">
+      <select id="yearMonthSelect" onchange="location.href='/master/stocktake-result?year_month=' + this.value" style="width:110px;flex-shrink:0;">
         {month_options_html}
       </select>
-      <a href="/master/stocktake-result/export?year_month={selected_ym}" class="btn" style="text-decoration:none;">엑셀 다운로드</a>
+      <a href="/master/stocktake-result/export?year_month={selected_ym}" class="btn" style="text-decoration:none;flex:1;text-align:center;white-space:nowrap;">엑셀 다운로드</a>
     </div>
     <div style="margin-top:12px;">
       {branch_blocks_html}
@@ -12010,12 +12010,13 @@ async def master_stocktake_result_page(session_token: str = Cookie(default=None)
       }}
 
       async function requestResubmit(branchCode, branchName) {{
-        if (!confirm(branchName + '에 재제출을 요청합니다. 계속할까요?')) return;
+        if (!confirm(branchName + '의 제출 잠금을 해제하고 재제출을 요청합니다. 계속할까요?')) return;
+        const sendWebhook = confirm('Teams 웹훅을 발송하시겠습니까?\\n(취소를 누르면 웹훅 없이 잠금해제만 진행됩니다)');
         const res = await fetch('/master/stocktake-result/resubmit-request', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_code: branchCode, year_month: '{selected_ym}' }})
+          body: JSON.stringify({{ branch_code: branchCode, year_month: '{selected_ym}', send_webhook: sendWebhook }})
         }});
-        if (res.ok) {{ alert('재제출 요청이 발송되었습니다.'); location.reload(); }} else {{
+        if (res.ok) {{ alert(sendWebhook ? '재제출 요청 및 웹훅이 발송되었습니다.' : '웹훅 없이 잠금해제만 처리되었습니다.'); location.reload(); }} else {{
           const err = await res.json();
           alert('오류: ' + (err.detail || '요청 실패'));
         }}
@@ -12074,6 +12075,7 @@ async def master_stocktake_result_resubmit(request: Request, session_token: str 
     data = await request.json()
     branch_code = data.get("branch_code", "").strip()
     year_month = data.get("year_month", "").strip()
+    send_webhook = bool(data.get("send_webhook", False))
     if not branch_code or not year_month:
         return JSONResponse(status_code=400, content={"detail": "지점 또는 연월이 지정되지 않았습니다."})
 
@@ -12088,14 +12090,15 @@ async def master_stocktake_result_resubmit(request: Request, session_token: str 
     conn.commit()
     conn.close()
 
-    send_teams_notification(
-        branch_code="stocktake_alert",
-        title="📦 재고실사 재제출 요청",
-        message=f"{year_month} {branch_name}의 재고실사 결과에 대해 재제출이 요청되었습니다. 담당 팀장은 재고실사 메뉴에서 다시 입력해주세요.",
-        link_url="",
-        link_text="",
-        sent_by=user["login_id"]
-    )
+    if send_webhook:
+        send_teams_notification(
+            branch_code="stocktake_alert",
+            title="📦 재고실사 재제출 요청",
+            message=f"{year_month} {branch_name}의 재고실사 결과에 대해 재제출이 요청되었습니다. 담당 팀장은 재고실사 메뉴에서 다시 입력해주세요.",
+            link_url="",
+            link_text="",
+            sent_by=user["login_id"]
+        )
 
     return JSONResponse(content={"status": "ok"})
 
