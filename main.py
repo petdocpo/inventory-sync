@@ -4779,10 +4779,14 @@ async def survey_edit_page(survey_id: int, response_id: int, session_token: str 
             num = global_idx
             question_text_html = q['question_text'].replace(chr(10), '<br>')
             desc_html = f'<p style="color:#888;font-size:12px;margin-bottom:8px;">{q["description"].replace(chr(10), "<br>")}</p>' if q["description"] else ""
+            image_html = f'<img src="{q["image_url"]}" style="max-width:100%;border-radius:8px;margin-bottom:10px;display:block;">' if q.get("image_url") else ""
+            link_html = f'<a href="{q["link_url"]}" target="_blank" rel="noopener" style="display:inline-block;margin-bottom:10px;padding:6px 12px;background:#EFF6FF;color:#1E2761;border-radius:6px;font-size:13px;text-decoration:none;">🔗 {q["link_label"] or "링크 열기"}</a>' if q.get("link_url") else ""
             question_blocks += f"""
             <div class="sv-field">
               <label>{num}. {question_text_html}</label>
               {desc_html}
+              {image_html}
+              {link_html}
               <div id="options_{q['id']}"></div>
               <div id="textwrap_{q['id']}" style="display:{'block' if q['has_text_answer'] else 'none'};">
                 <textarea id="text_{q['id']}" placeholder="{q['text_answer_label']}{' (필수)' if q['text_answer_required'] else ' (선택)'}"></textarea>
@@ -5727,7 +5731,6 @@ async def master_survey_questions_page(survey_id: int, session_token: str = Cook
         document.getElementById('qSection').value = '';
         document.getElementById('qText').value = '';
         document.getElementById('qDesc').value = '';
-        document.getElementById('qImageUrl').value = '';
         document.getElementById('qLinkUrl').value = '';
         document.getElementById('qLinkLabel').value = '';
         document.getElementById('qHasOptions').checked = false;
@@ -12091,12 +12094,13 @@ async def master_stocktake_result_resubmit(request: Request, session_token: str 
     conn.close()
 
     if send_webhook:
+        server_url = os.environ.get("PUBLIC_SERVER_URL", "https://inventory-sync-teal.vercel.app")
         send_teams_notification(
             branch_code="stocktake_alert",
             title="📦 재고실사 재제출 요청",
             message=f"{year_month} {branch_name}의 재고실사 결과에 대해 재제출이 요청되었습니다. 담당 팀장은 재고실사 메뉴에서 다시 입력해주세요.",
-            link_url="",
-            link_text="",
+            link_url=f"{server_url}/master/stocktake/{branch_code}",
+            link_text="재고실사 입력 바로가기",
             sent_by=user["login_id"]
         )
 
