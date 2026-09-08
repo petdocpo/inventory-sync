@@ -4344,6 +4344,93 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
       let selected = {{}};
       questionsData.forEach(q => selected[q.id] = q.is_multi_select ? [] : null);
 
+      const draftKey = 'survey_draft_' + surveyId;
+      let saveDraftTimer = null;
+
+      function saveDraft() {{
+        clearTimeout(saveDraftTimer);
+        saveDraftTimer = setTimeout(() => {{
+          const draft = {{
+            selected: selected,
+            texts: {{}},
+            writerName: isAnonymous ? '' : (document.getElementById('writerName') ? document.getElementById('writerName').value : ''),
+            branchCode: (isPublicMode && !isAnonymous && document.getElementById('publicBranchCode')) ? document.getElementById('publicBranchCode').value : ''
+          }};
+          questionsData.forEach(q => {{
+            if (q.has_text_answer) {{
+              const el = document.getElementById('text_' + q.id);
+              if (el) draft.texts[q.id] = el.value;
+            }}
+          }});
+          try {{
+            localStorage.setItem(draftKey, JSON.stringify(draft));
+          }} catch (e) {{}}
+        }}, 400);
+      }}
+
+      function showDraftBanner() {{
+        const card = document.querySelector('.sv-card');
+        if (!card) return;
+        const banner = document.createElement('div');
+        banner.innerText = '📝 임시저장된 답변을 불러왔습니다';
+        banner.style.cssText = 'background:#EFF6FF;color:#1E2761;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px;text-align:center;';
+        card.insertBefore(banner, card.firstChild);
+      }}
+
+      function restoreDraft() {{
+        let raw;
+        try {{
+          raw = localStorage.getItem(draftKey);
+        }} catch (e) {{
+          return;
+        }}
+        if (!raw) return;
+        let draft;
+        try {{
+          draft = JSON.parse(raw);
+        }} catch (e) {{
+          return;
+        }}
+
+        if (draft.selected) {{
+          Object.keys(draft.selected).forEach(qid => {{
+            selected[qid] = draft.selected[qid];
+          }});
+        }}
+        questionsData.forEach(q => {{
+          if (!q.has_options) return;
+          const container = document.getElementById('options_' + q.id);
+          if (!container) return;
+          const val = selected[q.id];
+          const opts = container.querySelectorAll('.sv-option');
+          opts.forEach((div, i) => {{
+            const optVal = q.options[i].value;
+            if (q.is_multi_select) {{
+              const isSel = Array.isArray(val) && val.includes(optVal);
+              div.classList.toggle('selected', isSel);
+              div.innerText = (isSel ? '☑ ' : '☐ ') + q.options[i].label;
+            }} else {{
+              div.classList.toggle('selected', val === optVal);
+            }}
+          }});
+        }});
+
+        if (draft.texts) {{
+          Object.keys(draft.texts).forEach(qid => {{
+            const el = document.getElementById('text_' + qid);
+            if (el) el.value = draft.texts[qid];
+          }});
+        }}
+        if (!isAnonymous && draft.writerName && document.getElementById('writerName')) {{
+          document.getElementById('writerName').value = draft.writerName;
+        }}
+        if (isPublicMode && !isAnonymous && draft.branchCode && document.getElementById('publicBranchCode')) {{
+          document.getElementById('publicBranchCode').value = draft.branchCode;
+        }}
+
+        showDraftBanner();
+      }}
+
       function renderOptions(q) {{
         if (!q.has_options) return;
         const container = document.getElementById('options_' + q.id);
@@ -4370,6 +4457,7 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
               div.classList.add('selected');
             }}
             checkAllValid();
+            saveDraft();
           }};
           container.appendChild(div);
         }});
@@ -4396,8 +4484,16 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
       questionsData.forEach(q => {{
         renderOptions(q);
         const textEl = document.getElementById('text_' + q.id);
-        if (textEl) textEl.addEventListener('input', checkAllValid);
+        if (textEl) textEl.addEventListener('input', () => {{ checkAllValid(); saveDraft(); }});
       }});
+
+      const writerNameEl = document.getElementById('writerName');
+      if (writerNameEl) writerNameEl.addEventListener('input', saveDraft);
+      const branchSelectEl = document.getElementById('publicBranchCode');
+      if (branchSelectEl) branchSelectEl.addEventListener('change', saveDraft);
+
+      restoreDraft();
+      checkAllValid();
 
       async function submitSurvey() {{
         const writerName = isAnonymous ? '' : document.getElementById('writerName').value.trim();
@@ -4430,9 +4526,9 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
           body: JSON.stringify(payload)
         }});
         if (res.ok) {{
+          try {{ localStorage.removeItem(draftKey); }} catch (e) {{}}
           const result = await res.json();
-          showResultScreen(writerName, result.results, result.show_score_result, result.total_score, result.max_score, result.is_pass);
-        }} else {{
+          showResultScreen(writerName, result.results, result.show_score_result, result.total_score, result.max_score, result.is_pass);        }} else {{
           const err = await res.json();
           alert('오류: ' + (err.detail || '제출 실패'));
           btn.disabled = false;
@@ -4857,6 +4953,7 @@ async def survey_edit_page(survey_id: int, response_id: int, session_token: str 
                 div.classList.add('selected');
                 div.innerText = '☑ ' + opt.label;
               }}
+              saveDraft();
             }} else {{
               selected[q.id] = opt.value;
               document.querySelectorAll('#options_' + q.id + ' .sv-option').forEach(o => o.classList.remove('selected'));
