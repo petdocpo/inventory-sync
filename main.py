@@ -7068,21 +7068,25 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
       b_team = b.get("team") or ""
       type_badge = '<span class="badge-green">지점</span>' if b_type == "branch" else '<span class="badge-red">본사</span>'
       team_display = b_team if b_team else '-'
-      safe_name = b["branch_name"].replace("'", "")
-      safe_login = b["login_id"].replace("'", "")
-      permission_btn = f'<button class="btn" style="font-size:12px;padding:6px 10px;background:#8B5CF6;" onclick="openPermissionModal(\'{b["login_id"]}\', \'{safe_name}\')">권한</button>' if b_type == "hq" else ""
+      display_name = b.get("branch_name") or "-"
+      display_code = b.get("branch_code") or "-"
+      display_login = b.get("login_id") or ""
+      safe_name = display_name.replace("'", "")
+      safe_code = display_code.replace("'", "")
+      safe_login = display_login.replace("'", "")
+      permission_btn = f'<button class="btn" style="font-size:12px;padding:6px 10px;background:#8B5CF6;" onclick="openPermissionModal(\'{safe_login}\', \'{safe_name}\')">권한</button>' if b_type == "hq" else ""
       rows_html += f"""
       <tr>
-          <td>{b['branch_name']}</td>
-          <td>{b['branch_code']}</td>
-          <td>{b['login_id']}</td>
+          <td>{display_name}</td>
+          <td>{display_code}</td>
+          <td>{display_login}</td>
           <td>{b.get('password', '-')}</td>
           <td>{type_badge}</td>
           <td>{team_display}</td>
           <td style="display:flex;gap:4px;flex-wrap:wrap;">
-            <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editBranch('{b['branch_code']}', '{safe_name}', '{safe_login}', '{b.get('password','')}', '{b_type}', '{b_team}')">수 정</button>
+            <button class="btn" style="font-size:12px;padding:6px 10px;" onclick="editBranch('{safe_code}', '{safe_name}', '{safe_login}', '{b.get('password','')}', '{b_type}', '{b_team}')">수 정</button>
             {permission_btn}
-            <button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteBranch('{b['branch_code']}', '{safe_name}')">삭제</button>
+            <button class="btn btn-red" style="font-size:12px;padding:6px 10px;" onclick="deleteBranch('{safe_code}', '{safe_name}')">삭제</button>
           </td>
       </tr>
       """
