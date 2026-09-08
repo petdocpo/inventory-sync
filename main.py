@@ -11899,7 +11899,26 @@ async def _select_stocktake_items():
         conn.close()
         return {"status": "error", "reason": f"조건에 맞는 후보 품목이 {len(candidates)}개뿐입니다 (5개 필요).", "candidates": len(candidates)}
 
-    selected = random.sample(candidates, 5)
+    MAX_PER_CATEGORY = 2
+    shuffled_candidates = candidates.copy()
+    random.shuffle(shuffled_candidates)
+
+    selected = []
+    category_count: Dict[str, int] = {}
+    for item in shuffled_candidates:
+        if len(selected) >= 5:
+            break
+        category = item["item_name"].split("_")[0]
+        if category_count.get(category, 0) >= MAX_PER_CATEGORY:
+            continue
+        selected.append(item)
+        category_count[category] = category_count.get(category, 0) + 1
+
+    if len(selected) < 5:
+        remaining_needed = 5 - len(selected)
+        already_picked_codes = {s["item_code"] for s in selected}
+        fallback_pool = [c for c in shuffled_candidates if c["item_code"] not in already_picked_codes]
+        selected.extend(fallback_pool[:remaining_needed])
 
     for item in selected:
         conn.execute(
