@@ -12067,7 +12067,7 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
             <span>QR재고: {qr_qty}</span>
             <span>RAW재고: {raw_qty}</span>
           </div>
-          <input type="number" class="stocktake-input" data-item-code="{item['item_code']}" data-item-name="{item['item_name']}" data-qr-qty="{qr_qty}" data-raw-qty="{raw_qty}" placeholder="실사 수량 입력" value="{existing_value}" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;background:{'#f5f5f5' if is_finalized else 'white'};" oninput="updateDiffPreview(this)" {'readonly' if is_finalized else ''}>
+          <input type="number" class="stocktake-input" data-item-code="{item['item_code']}" data-item-name="{item['item_name']}" data-qr-qty="{qr_qty}" data-raw-qty="{raw_qty}" placeholder="실사 수량 입력" value="{existing_value}" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;background:{'#f5f5f5' if is_finalized else 'white'};" oninput="updateDiffPreview(this); saveDraft();" {'readonly' if is_finalized else ''}>
           <div class="diff-preview" data-item-code="{item['item_code']}">{diff_html}</div>
         </div>
         """
@@ -12087,6 +12087,63 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
     <div id="stocktakeResult" style="margin-top:8px;font-size:13px;text-align:center;"></div>
 
     <script>
+      const stocktakeDraftKey = 'stocktake_draft_{branch_code}_{year_month}';
+      const isFinalizedPage = {json.dumps(is_finalized)};
+      let stocktakeDraftTimer = null;
+
+      function saveDraft() {{
+        if (isFinalizedPage) return;
+        clearTimeout(stocktakeDraftTimer);
+        stocktakeDraftTimer = setTimeout(() => {{
+          const inputs = document.querySelectorAll('.stocktake-input');
+          const values = {{}};
+          inputs.forEach(inp => {{
+            values[inp.getAttribute('data-item-code')] = inp.value;
+          }});
+          try {{
+            localStorage.setItem(stocktakeDraftKey, JSON.stringify({{ values: values, savedAt: Date.now() }}));
+          }} catch (e) {{}}
+        }}, 300);
+      }}
+
+      function showStocktakeDraftBanner() {{
+        const heading = document.querySelector('h2');
+        if (!heading || !heading.parentElement) return;
+        const banner = document.createElement('div');
+        banner.innerText = '📝 임시저장된 입력값을 불러왔습니다';
+        banner.style.cssText = 'background:#EFF6FF;color:#1E2761;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px;text-align:center;';
+        heading.parentElement.insertAdjacentElement('afterend', banner);
+      }}
+
+      function restoreStocktakeDraft() {{
+        if (isFinalizedPage) return;
+        let raw;
+        try {{
+          raw = localStorage.getItem(stocktakeDraftKey);
+        }} catch (e) {{
+          return;
+        }}
+        if (!raw) return;
+        let draft;
+        try {{
+          draft = JSON.parse(raw);
+        }} catch (e) {{
+          return;
+        }}
+        if (!draft.values) return;
+
+        let restoredAny = false;
+        document.querySelectorAll('.stocktake-input').forEach(inp => {{
+          const code = inp.getAttribute('data-item-code');
+          if (draft.values.hasOwnProperty(code) && draft.values[code] !== '') {{
+            inp.value = draft.values[code];
+            updateDiffPreview(inp);
+            restoredAny = true;
+          }}
+        }});
+        if (restoredAny) showStocktakeDraftBanner();
+      }}
+
       function updateDiffPreview(input) {{
         const val = input.value.trim();
         const container = document.querySelector('.diff-preview[data-item-code="' + input.getAttribute('data-item-code') + '"]');
@@ -12131,7 +12188,8 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
           body: JSON.stringify({{ items: items, finalize: false }})
         }});
         if (res.ok) {{
-          document.getElementById('stocktakeResult').innerText = '✅ 저장되었습니다. (수정 가능한 임시저장 상태)';
+          try {{ localStorage.removeItem(stocktakeDraftKey); }} catch (e) {{}}
+          document.getElementById('stocktakeResult').innerText = '✅ 저장되었습니다. (수정 가능한 임시저장 상 태)';
         }} else {{
           const err = await res.json();
           document.getElementById('stocktakeResult').innerText = '오류: ' + (err.detail || '저장 실패');
@@ -12147,6 +12205,7 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
           body: JSON.stringify({{ items: items, finalize: true }})
         }});
         if (res.ok) {{
+          try {{ localStorage.removeItem(stocktakeDraftKey); }} catch (e) {{}}
           document.getElementById('stocktakeResult').innerText = '✅ 제출 완료되었습니다.';
           setTimeout(() => location.href = '/master/stocktake', 1000);
         }} else {{
@@ -12154,6 +12213,8 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
           document.getElementById('stocktakeResult').innerText = '오류: ' + (err.detail || '제출 실패');
         }}
       }}
+
+      restoreStocktakeDraft();
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
