@@ -9596,6 +9596,45 @@ async def health_check():
 
 # ── 마스터 전용 페이지 ──────────────────────────────────
 
+ACCORDION_CSS_JS = """
+<style>
+  .accordion-group { margin-bottom: 14px; border: 1px solid #E5E7EB; border-radius: 10px; overflow: hidden; }
+  .accordion-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px; background: #F8F9FB; cursor: pointer;
+    font-weight: bold; color: #1E2761; font-size: 15px;
+    user-select: none;
+  }
+  .accordion-header:hover { background: #EEF0F5; }
+  .accordion-arrow { transition: transform 0.2s ease; font-size: 13px; color: #888; }
+  .accordion-header.open .accordion-arrow { transform: rotate(90deg); }
+  .accordion-body {
+    max-height: 0; overflow: hidden; transition: max-height 0.25s ease;
+    padding: 0 16px; background: #fff;
+  }
+  .accordion-body.open { max-height: 2000px; padding: 16px; }
+  .accordion-cards-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 480px) {
+    .accordion-cards-grid { grid-template-columns: 1fr; }
+  }
+</style>
+<script>
+  function toggleAccordion(id) {
+    const header = document.getElementById('acc-header-' + id);
+    const body = document.getElementById('acc-body-' + id);
+    const isOpen = body.classList.contains('open');
+    if (isOpen) {
+      body.classList.remove('open');
+      header.classList.remove('open');
+    } else {
+      body.classList.add('open');
+      header.classList.add('open');
+    }
+  }
+</script>
+"""
+
+
 @app.get("/master", response_class=HTMLResponse)
 async def master_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -9615,9 +9654,23 @@ async def master_page(session_token: str = Cookie(default=None)):
     vendor_count = conn.execute("SELECT COUNT(*) AS cnt FROM vendor_master").fetchone()["cnt"]
     conn.close()
 
-    cards = []
+    # ---- 지점 관리 (단독 상단, 아코디언 아님) ----
+    branch_card_html = ""
+    if menu_allowed("branch-manage"):
+        branch_card_html = """
+      <a href="/master/branch-manage" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🏬</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">지점 추가/삭제</div>
+        </div>
+      </a>
+        """
+
+    # ---- 그룹 1: DB재고관리 ----
+    db_inventory_cards = []
     if menu_allowed("data"):
-        cards.append(f"""
+        db_inventory_cards.append(f"""
       <a href="/master/data" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📋</div>
@@ -9627,7 +9680,7 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """)
     if menu_allowed("qr-init"):
-        cards.append("""
+        db_inventory_cards.append("""
       <a href="/master/qr-init" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🔄</div>
@@ -9636,88 +9689,18 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
-    if menu_allowed("vendor-master"):
-        cards.append(f"""
-      <a href="/master/vendor-master" style="text-decoration:none;">
+    if menu_allowed("product-unified"):
+        db_inventory_cards.append("""
+      <a href="/master/product-unified" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">🏢</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 관리</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">거래처 {vendor_count}개 등록됨</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("eval-criteria"):
-        cards.append("""
-      <a href="/master/eval-criteria" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">📝</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 평가 문항 관리</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">문항 추가/삭제/수정</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("vendor-eval-status"):
-        cards.append("""
-      <a href="/master/vendor-eval/status" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">📊</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처평가 제출현황</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">지점별 제출/미제출 확인</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("branch-manage"):
-        cards.append("""
-      <a href="/master/branch-manage" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">🏬</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 관리</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">지점 추가/삭제</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("notification-settings"):
-        cards.append("""
-      <a href="/master/notification-settings" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">⏰</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">알림 설정</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">자동 알림 켜기/끄기</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("webhook-send-log"):
-        cards.append("""
-      <a href="/master/webhook-send-log" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">📨</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">웹훅 발송 이력</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">수동 발송 내역 조회</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("login-history"):
-        cards.append("""
-      <a href="/master/login-history" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">🔐</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">접속 이력</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">계정별 로그인 기록</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("purchase-tracking"):
-        cards.append("""
-      <a href="/master/purchase-tracking" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">📈</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주 주기 트래킹</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">구매 패턴 분석/추천</div>
+          <div style="font-size:32px;">🧩</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 무관 통합 상품관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">품번/상품명 통합 조회 (준비중)</div>
         </div>
       </a>
         """)
     if menu_allowed("product-settings"):
-        cards.append("""
+        db_inventory_cards.append("""
       <a href="/master/purchase-order/product-settings" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📝</div>
@@ -9727,7 +9710,7 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """)
     if menu_allowed("branch-exceptions"):
-        cards.append("""
+        db_inventory_cards.append("""
       <a href="/master/purchase-order/branch-exceptions" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🏬</div>
@@ -9737,7 +9720,7 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """)
     if menu_allowed("safety-stock"):
-        cards.append("""
+        db_inventory_cards.append("""
       <a href="/master/purchase-order/safety-stock" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🎯</div>
@@ -9746,18 +9729,21 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
-    if menu_allowed("cron-failure-log"):
-        cards.append("""
-      <a href="/master/cron-failure-log" style="text-decoration:none;">
+    if menu_allowed("purchase-tracking"):
+        db_inventory_cards.append("""
+      <a href="/master/purchase-tracking" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">🚨</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">크론 실패 이력</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">자동화 작업 오류 확인</div>
+          <div style="font-size:32px;">📈</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주 주기 트래킹</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">구매 패턴 분석/추천</div>
         </div>
       </a>
         """)
+
+    # ---- 그룹 2: 재고실사 ----
+    stocktake_cards = []
     if menu_allowed("stocktake"):
-        cards.append("""
+        stocktake_cards.append("""
       <a href="/master/stocktake" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📦</div>
@@ -9767,7 +9753,7 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """)
     if menu_allowed("stocktake-result"):
-        cards.append("""
+        stocktake_cards.append("""
       <a href="/master/stocktake-result" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">📊</div>
@@ -9777,12 +9763,126 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """)
 
-    cards_html = "".join(cards)
+    # ---- 그룹 3: 거래처관리 ----
+    vendor_cards = []
+    if menu_allowed("vendor-master"):
+        vendor_cards.append(f"""
+      <a href="/master/vendor-master" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🏢</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">거래처 {vendor_count}개 등록됨</div>
+        </div>
+      </a>
+        """)
+    if menu_allowed("eval-criteria"):
+        vendor_cards.append("""
+      <a href="/master/eval-criteria" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📝</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처 평가 문항 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">문항 추가/삭제/수정</div>
+        </div>
+      </a>
+        """)
+    if menu_allowed("vendor-eval-status"):
+        vendor_cards.append("""
+      <a href="/master/vendor-eval/status" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📊</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래처평가 제출현황</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">지점별 제출/미제출 확인</div>
+        </div>
+      </a>
+        """)
+
+    # ---- 그룹 4: 기타설정 ----
+    etc_cards = []
+    if menu_allowed("notification-settings"):
+        etc_cards.append("""
+      <a href="/master/notification-settings" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">⏰</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">알림 설정</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">자동 알림 켜기/끄기</div>
+        </div>
+      </a>
+        """)
+    if menu_allowed("webhook-send-log"):
+        etc_cards.append("""
+      <a href="/master/webhook-send-log" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📨</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">웹훅 발송 이력</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">수동 발송 내역 조회</div>
+        </div>
+      </a>
+        """)
+    if menu_allowed("login-history"):
+        etc_cards.append("""
+      <a href="/master/login-history" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🔐</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">접속 이력</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">계정별 로그인 기록</div>
+        </div>
+      </a>
+        """)
+    if menu_allowed("cron-failure-log"):
+        etc_cards.append("""
+      <a href="/master/cron-failure-log" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🚨</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">크론 실패 이력</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">자동화 작업 오류 확인</div>
+        </div>
+      </a>
+        """)
+
+    # ---- 아코디언 그룹 조립 (카드 0개인 그룹은 렌더링 생략) ----
+    def render_group(group_id: str, title: str, cards: list) -> str:
+        if not cards:
+            return ""
+        cards_html = "".join(cards)
+        return f"""
+    <div class="accordion-group">
+      <div class="accordion-header" id="acc-header-{group_id}" onclick="toggleAccordion('{group_id}')">
+        <span>{title}</span>
+        <span class="accordion-arrow">▶</span>
+      </div>
+      <div class="accordion-body" id="acc-body-{group_id}">
+        <div class="accordion-cards-grid">
+          {cards_html}
+        </div>
+      </div>
+    </div>
+        """
+
+    groups_html = "".join([
+        render_group("db-inventory", "📦 DB재고관리", db_inventory_cards),
+        render_group("stocktake", "🔍 재고실사", stocktake_cards),
+        render_group("vendor", "🏢 거래처관리", vendor_cards),
+        render_group("etc", "⚙️ 기타설정", etc_cards),
+    ])
 
     content = f"""
+    {ACCORDION_CSS_JS}
     <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-      {cards_html}
+    {f'<div style="margin-bottom:14px;">{branch_card_html}</div>' if branch_card_html else ""}
+    {groups_html}
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+@app.get("/master/product-unified", response_class=HTMLResponse)
+async def product_unified_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return RedirectResponse(url="/login", status_code=303)
+
+    content = """
+    <h2 style="margin-bottom:16px;">🧩 지점 무관 통합 상품관리</h2>
+    <div class="card" style="padding:32px;text-align:center;color:#888;">
+      준비중입니다. 다음 단계에서 items.is_consumable 토글 기능이 여기 추가될 예정입니다.
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
