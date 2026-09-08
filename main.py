@@ -23,6 +23,14 @@ app = FastAPI()
 
 from db import get_conn, pk_column, upsert_suffix  # noqa: E402
 
+def is_item_consumable(conn, branch_code: str, item_code: str) -> bool:
+    """items 테이블 기준 소모품 여부 확인 (RAW 자동반영 대상 판별용)"""
+    row = conn.execute(
+        "SELECT is_consumable FROM items WHERE branch_code=? AND item_code=?",
+        (branch_code, item_code)
+    ).fetchone()
+    return bool(row["is_consumable"]) if row else False
+
 SERVER_PORT = int(os.getenv("SERVER_PORT", "28000"))
 QR_DIR = "./qr_codes"
 
@@ -11581,7 +11589,7 @@ async def _fetch_and_process_s3_csv():
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
 
-            if item_code.startswith("미지정_"):
+            if item_code.startswith("미지정_") or is_item_consumable(conn, branch_code, item_code):
                 conn.execute("""
                     UPDATE inventory SET quantity=?, last_updated=?
                     WHERE branch_code=? AND item_code=?
@@ -12758,8 +12766,8 @@ async def _process_raw_upload_master(file: UploadFile):
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
 
-            # ⚠️ 품번 없는 상품(미지정_): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
-            if item_code.startswith("미지정_"):
+            # ⚠️ 품번 없는 상품(미지정_) 또는 소모품(is_consumable=TRUE): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
+            if item_code.startswith("미지정_") or is_item_consumable(conn, branch_code, item_code):
                 conn.execute("""
                     UPDATE inventory SET quantity=?, last_updated=?
                     WHERE branch_code=? AND item_code=?
@@ -12936,8 +12944,8 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
                     ON CONFLICT(branch_code, item_code) DO NOTHING
                 """, (branch_code, item_name, item_code, now))
 
-            # ⚠️ 품번 없는 상품(미지정_): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
-            if item_code.startswith("미지정_"):
+            # ⚠️ 품번 없는 상품(미지정_) 또는 소모품(is_consumable=TRUE): 업로드할 때마다 QR재고를 RAW재고와 항상 강제 동기화
+            if item_code.startswith("미지정_") or is_item_consumable(conn, branch_code, item_code):
                 conn.execute("""
                     UPDATE inventory SET quantity=?, last_updated=?
                     WHERE branch_code=? AND item_code=?
