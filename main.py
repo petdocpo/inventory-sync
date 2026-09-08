@@ -12542,21 +12542,78 @@ async def master_stocktake_result_export(session_token: str = Cookie(default=Non
     from io import BytesIO
 
     wb = Workbook()
-    ws = wb.active
-    ws.title = f"재고실사_{year_month}"
+
+    # ---- 시트 1: 요약 ----
+    ws_summary = wb.active
+    ws_summary.title = "요약"
+
+    header_font = Font(name="Arial", bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1E2761", end_color="1E2761", fill_type="solid")
+    body_font = Font(name="Arial")
+    bold_font = Font(name="Arial", bold=True)
+
+    branch_stats: Dict[str, Dict[str, int]] = {}
+    for r in records:
+        bname = r["branch_name"]
+        stat = branch_stats.setdefault(bname, {"total": 0, "qr_error": 0, "raw_error": 0})
+        stat["total"] += 1
+        if r["qr_diff"] != 0:
+            stat["qr_error"] += 1
+        if r["raw_diff"] != 0:
+            stat["raw_error"] += 1
+
+    total_items = len(records)
+    total_qr_error = sum(s["qr_error"] for s in branch_stats.values())
+    total_raw_error = sum(s["raw_error"] for s in branch_stats.values())
+    overall_qr_accuracy = round((total_items - total_qr_error) / total_items * 100, 1) if total_items else 0
+    overall_raw_accuracy = round((total_items - total_raw_error) / total_items * 100, 1) if total_items else 0
+
+    ws_summary.append([f"재고실사 요약 - {year_month}"])
+    ws_summary["A1"].font = Font(name="Arial", bold=True, size=14)
+    ws_summary.append([])
+    ws_summary.append(["전체 실사 품목수", total_items])
+    ws_summary.append(["전체 QR오차 건수", total_qr_error, "전체 QR정확도(%)", overall_qr_accuracy])
+    ws_summary.append(["전체 RAW오차 건수", total_raw_error, "전체 RAW정확도(%)", overall_raw_accuracy])
+    for row_idx in range(3, 6):
+        ws_summary.cell(row=row_idx, column=1).font = bold_font
+        ws_summary.cell(row=row_idx, column=3).font = bold_font
+    ws_summary.append([])
+
+    table_header_row = ws_summary.max_row + 1
+    summary_headers = ["지점명", "실사품목수", "QR오차건수", "QR정확도(%)", "RAW오차건수", "RAW정확도(%)"]
+    ws_summary.append(summary_headers)
+    for col_idx in range(1, len(summary_headers) + 1):
+        cell = ws_summary.cell(row=table_header_row, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for bname in sorted(branch_stats.keys()):
+        stat = branch_stats[bname]
+        qr_accuracy = round((stat["total"] - stat["qr_error"]) / stat["total"] * 100, 1) if stat["total"] else 0
+        raw_accuracy = round((stat["total"] - stat["raw_error"]) / stat["total"] * 100, 1) if stat["total"] else 0
+        ws_summary.append([bname, stat["total"], stat["qr_error"], qr_accuracy, stat["raw_error"], raw_accuracy])
+
+    for row_cells in ws_summary.iter_rows(min_row=table_header_row + 1):
+        for cell in row_cells:
+            cell.font = body_font
+
+    summary_col_widths = [20, 12, 12, 14, 12, 14]
+    for i, width in enumerate(summary_col_widths, start=1):
+        ws_summary.column_dimensions[ws_summary.cell(row=table_header_row, column=i).column_letter].width = width
+
+    # ---- 시트 2: 재고실사 원본 데이터 ----
+    ws = wb.create_sheet(title=f"재고실사_{year_month}")
 
     headers = ["지점명", "품목명", "QR재고", "RAW재고", "실사수량", "QR오차", "RAW오차", "실사자", "실사일시", "제출상태"]
     ws.append(headers)
 
-    header_font = Font(name="Arial", bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="1E2761", end_color="1E2761", fill_type="solid")
     for col_idx in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=col_idx)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
-    body_font = Font(name="Arial")
     for r in records:
         recorded_at = str(r["recorded_at"])[:16] if r["recorded_at"] else ""
         status = "제출완료" if r["is_finalized"] else "임시저장(미제출)"
