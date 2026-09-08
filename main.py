@@ -12514,6 +12514,80 @@ async def master_stocktake_result_delete(request: Request, session_token: str = 
     conn.close()
     return JSONResponse(content={"status": "ok"})
 
+@app.get("/master/stocktake-result/export")
+async def master_stocktake_result_export(session_token: str = Cookie(default=None), year_month: str = ""):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "stocktake-result"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    if not year_month:
+        from datetime import date
+        today = date.today()
+        year_month = f"{today.year}-{today.month:02d}"
+
+    conn = get_conn()
+    records = conn.execute(
+        "SELECT * FROM stocktake_record WHERE year_month=? ORDER BY branch_name, item_name",
+        (year_month,)
+    ).fetchall()
+    conn.close()
+
+    if not records:
+        return JSONResponse(status_code=404, content={"detail": f"{year_month}에 해당하는 재고실사 결과가 없습니다."})
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from io import BytesIO
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"재고실사_{year_month}"
+
+    headers = ["지점명", "품목명", "QR재고", "RAW재고", "실사수량", "QR오차", "RAW오차", "실사자", "실사일시", "제출상태"]
+    ws.append(headers)
+
+    header_font = Font(name="Arial", bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1E2761", end_color="1E2761", fill_type="solid")
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    body_font = Font(name="Arial")
+    for r in records:
+        recorded_at = str(r["recorded_at"])[:16] if r["recorded_at"] else ""
+        status = "제출완료" if r["is_finalized"] else "임시저장(미제출)"
+        row = [
+            r["branch_name"], r["item_name"], r["qr_quantity"], r["raw_quantity"],
+            r["counted_quantity"], r["qr_diff"], r["raw_diff"], r["recorded_by"],
+            recorded_at, status
+        ]
+        ws.append(row)
+
+    for row_cells in ws.iter_rows(min_row=2):
+        for cell in row_cells:
+            cell.font = body_font
+
+    col_widths = [14, 24, 10, 10, 10, 10, 10, 12, 16, 16]
+    for i, width in enumerate(col_widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
+
+    ws.freeze_panes = "A2"
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    filename = f"stocktake_result_{year_month}.xlsx"
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
 @app.get("/api/cron/sync-raw-inventory")
 async def cron_sync_raw_inventory(request: Request):
     # Vercel Cron 요청 검증 (Authorization 헤더로 비인가 접근 차단)
