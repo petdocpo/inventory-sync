@@ -113,11 +113,15 @@ def get_branches(branch_type: Optional[str] = None, team: Optional[str] = None) 
 
 
 def add_branch(branch_code: str, branch_name: str, login_id: str, password: str, branch_type: str = "branch", team: Optional[str] = None) -> Optional[str]:
-    """새 지점 계정 추가. branch_type: 'branch'(일반지점) 또는 'hq'(본사팀). team: '1팀'/'2팀'/'3팀'/None. 성공 시 None, 실패 시 에러 메시지 반환."""
+    """새 지점 계정 추가. branch_type: 'branch'(일반지점) 또는 'hq'(본사팀). team: '1팀'/'2팀'/'3팀'/None. 성공 시 None, 실패 시 에러 메시지 반환.
+    본사 계정은 지점 매칭이 필요 없으므로 branch_code/branch_name을 login_id로 대체해 저장하되(기존 조회 로직과의 호환을 위한 내부 식별자 역할),
+    화면 목록에서는 branch_type='hq'인 행을 렌더링 시 '-'로 표시하도록 처리한다 (main.py의 렌더링 로직 참고)."""
+    branch_code = (branch_code or "").strip()
+    branch_name = (branch_name or "").strip()
     if branch_type == "hq":
-        # 본사 계정은 지점코드/지점명을 생략할 수 있음 — login_id로 대체
-        branch_code = (branch_code or login_id).strip()
-        branch_name = (branch_name or login_id).strip()
+        # 본사 계정은 지점 매칭이 필요 없음 — 내부 식별자(고유키)로만 login_id를 재사용
+        branch_code = branch_code or login_id
+        branch_name = branch_name or login_id
     if not branch_code or not login_id:
         return "로그인 ID가 필요합니다."
 

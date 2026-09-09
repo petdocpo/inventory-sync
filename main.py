@@ -7334,9 +7334,8 @@ async def master_branch_manage_add(request: Request, session_token: str = Cookie
     if branch_type == "hq":
         if not login_id:
             return JSONResponse(status_code=400, content={"detail": "로그인 ID를 입력하세요."})
-        # 본사 계정은 지점명/지점코드 미입력 시 로그인ID로 자동 채움
-        branch_code = branch_code or login_id
-        branch_name = branch_name or login_id
+        # 본사 계정은 지점 매칭이 필요 없음 — 지점명/지점코드 미입력이 정상.
+        # 내부 식별자로만 login_id를 사용하고, 화면에는 add_branch()가 반환값을 통해 "-"로 표시되도록 함.
     else:
         if not branch_name or not branch_code:
             return JSONResponse(status_code=400, content={"detail": "지점명과 지점코드를 입력하세요."})
@@ -7376,8 +7375,13 @@ async def master_branch_manage_update(request: Request, session_token: str = Coo
     team = data.get("team")
     team = team.strip() if team else None
 
-    if not branch_code or not branch_name or not login_id or not password:
-        return JSONResponse(status_code=400, content={"detail": "모든 항목을 입력하세요."})
+    if branch_type == "hq":
+        # 본사 계정은 지점 매칭이 필요 없음 — 지점명 미입력 허용, login_id/password만 필수.
+        if not branch_code or not login_id or not password:
+            return JSONResponse(status_code=400, content={"detail": "로그인 ID와 비밀번호를 입력하세요."})
+    else:
+        if not branch_code or not branch_name or not login_id or not password:
+            return JSONResponse(status_code=400, content={"detail": "모든 항목을 입력하세요."})
 
     err = update_branch_account(branch_code, branch_name, login_id, password, branch_type, team)
     if err:
