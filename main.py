@@ -1065,7 +1065,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page():
-    branches = get_branches()
+    branches = get_branches(branch_type=None)  # 본사도 로그인 필요
     branch_options = "".join(
         f'<option value="{b["login_id"]}">{b["login_id"]}</option>' for b in branches
     )
@@ -7061,7 +7061,7 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
     if not has_menu_permission(user["login_id"], "branch-manage"):
         return RedirectResponse(url="/master", status_code=303)
 
-    branches = get_branches()
+    branches = get_branches(branch_type=None)  # 지점관리 화면은 본사도 포함
     rows_html = ""
     for b in branches:
       b_type = b.get("branch_type") or "branch"
@@ -8444,13 +8444,13 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
             schedule_map.setdefault(code, []).append(dict(s))
     conn.close()
 
-    known_codes = {"master"} | {b["branch_code"] for b in get_branches()}
+    known_codes = {"master"} | {b["branch_code"] for b in get_branches(branch_type=None)}
     free_channels = [
         {"branch_code": code, "branch_name": info["name"] or code}
         for code, info in existing.items()
         if code not in known_codes
     ]
-    targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + get_branches() + free_channels
+    targets = [{"branch_code": "master", "branch_name": "마스터(본사)"}] + get_branches(branch_type=None) + free_channels
 
     rows_html = ""
     reminder_setting_row = None

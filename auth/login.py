@@ -93,10 +93,13 @@ def init_auth_db():
     conn.close()
 
 
-def get_branches(branch_type: Optional[str] = None, team: Optional[str] = None) -> List[Dict]:
-    """현재 등록된 모든 지점 계정 목록을 DB에서 동적으로 조회 (BRANCHES 하드코딩 대체).
-    branch_type을 지정하면 'branch'(일반 지점) 또는 'hq'(본사 소속 팀)만 필터링.
-    team을 지정하면 해당 팀 소속만 필터링. 지정하지 않으면 기존과 동일하게 전체 반환 (하위 호환)."""
+def get_branches(branch_type: Optional[str] = "branch", team: Optional[str] = None) -> List[Dict]:
+    """현재 등록된 지점/본사 계정 목록을 DB에서 동적으로 조회 (BRANCHES 하드코딩 대체).
+    branch_type 기본값은 'branch'(일반 지점)만 반환 — 본사(hq) 계정은 실제 지점이 아니므로
+    재고실사/발주/설문/드롭다운 등 대부분의 기능에서 자동 제외됨.
+    본사 계정도 포함해서 전체를 봐야 하는 경우(로그인 페이지, 지점관리 화면, Teams 채널 대상 등)에는
+    호출부에서 명시적으로 get_branches(branch_type=None)을 사용해야 함.
+    team을 지정하면 해당 팀 소속만 추가 필터링."""
     conn = get_conn()
     query = "SELECT branch_code, branch_name, login_id, password, branch_type, team FROM accounts WHERE role='branch'"
     params = []
