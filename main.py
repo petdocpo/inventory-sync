@@ -84,7 +84,7 @@ MENU_DEFINITIONS = {
     "eval-criteria": "거래처 평가 문항 관리",
     "survey": "설문 관리",
     "vendor-eval-status": "거래처평가 제출현황",
-    "branch-manage": "지점 관리",
+    "branch-manage": "지점_계정 관리",
     "notification-settings": "알림 설정",
     "webhook-send-log": "웹훅 발송 이력",
     "login-history": "접속 이력",
@@ -7092,7 +7092,7 @@ async def master_branch_manage_page(session_token: str = Cookie(default=None)):
       """
 
     content = f"""
-    <h2 style="margin-bottom:16px;">🏬 지점 관리</h2>
+    <h2 style="margin-bottom:16px;">🏬 지점_계정 관리</h2>
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">새 지점을 추가하면 로그인 계정이 함께 생성됩니다. 삭제 시 계정도 함께 삭제되며, 되돌릴 수 없습니다. "본사"로 등록하면 로그인 드롭다운과 미제출 알림 대상에서 제외됩니다.</p>
     </div>
@@ -9759,14 +9759,14 @@ async def master_page(session_token: str = Cookie(default=None)):
     vendor_count = conn.execute("SELECT COUNT(*) AS cnt FROM vendor_master").fetchone()["cnt"]
     conn.close()
 
-    # ---- 지점 관리 (단독 상단, 아코디언 아님) ----
+    # ---- 지점_계정 관리 (단독 상단, 아코디언 아님) ----
     branch_card_html = ""
     if menu_allowed("branch-manage"):
         branch_card_html = """
       <a href="/master/branch-manage" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🏬</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 관리</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점_계정 관리</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">지점 추가/삭제</div>
         </div>
       </a>
@@ -10318,7 +10318,10 @@ async def purchase_tracking_page(session_token: str = Cookie(default=None)):
 
     conn = get_conn()
     record_count = conn.execute("SELECT COUNT(*) as cnt FROM purchase_records").fetchone()["cnt"]
-    leadtime_count = conn.execute("SELECT COUNT(*) as cnt FROM product_lead_time").fetchone()["cnt"]
+    # product_lead_time 폐기, product_master 기준으로 전환 (리드타임은 상품별 공통값이므로 item_name distinct)
+    leadtime_count = conn.execute(
+        "SELECT COUNT(DISTINCT item_name) as cnt FROM product_master WHERE lead_time_days IS NOT NULL"
+    ).fetchone()["cnt"]
     latest_purchase = conn.execute("SELECT MAX(purchase_datetime) as t FROM purchase_records").fetchone()["t"]
     conn.close()
 
@@ -12763,7 +12766,12 @@ async def _compute_purchase_tracking_snapshot():
     """지점×상품명별 A(실제간격) vs B(리드타임) 비교, 주간 스냅샷 계산 및 저장"""
     conn = get_conn()
 
-    leadtime_rows = conn.execute("SELECT item_name, lead_time_days FROM product_lead_time").fetchall()
+    # product_lead_time 폐기, product_master 기준으로 전환.
+    # 리드타임은 상품별 공통값(지점 무관)이므로 item_name별로 하나만 대표값 사용.
+    leadtime_rows = conn.execute(
+        "SELECT DISTINCT ON (item_name) item_name, lead_time_days FROM product_master "
+        "WHERE lead_time_days IS NOT NULL ORDER BY item_name, id"
+    ).fetchall()
     leadtime_map = {r["item_name"]: r["lead_time_days"] for r in leadtime_rows}
 
     if not leadtime_map:
