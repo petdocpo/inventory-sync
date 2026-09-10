@@ -10573,7 +10573,8 @@ async def purchase_order_product_settings_page(
     filter_branch: str = "",
     filter_consumable: str = "",
     sort_by: str = "item_name",
-    sort_dir: str = "asc"
+    sort_dir: str = "asc",
+    show_hidden: str = ""
 ):
     user = get_session(session_token)
     if not user or user["role"] != "master":
@@ -10589,6 +10590,8 @@ async def purchase_order_product_settings_page(
     conn = get_conn()
     query = "SELECT * FROM product_master WHERE 1=1"
     params: list = []
+    if not show_hidden:
+        query += " AND (order_excluded IS NOT TRUE)"
     if search_item:
         query += " AND (item_name LIKE ? OR item_code LIKE ?)"
         params.append(f"%{search_item}%")
@@ -10623,7 +10626,7 @@ async def purchase_order_product_settings_page(
 
     rows_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="10" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="13" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
     else:
         for r in rows:
             consumable_checked = "checked" if r["is_consumable"] else ""
@@ -10644,11 +10647,17 @@ async def purchase_order_product_settings_page(
               <td class="pm-col-leadtime"><input type="number" class="pm-leadtime" data-id="{r['id']}" value="{r['lead_time_days'] or 0}"></td>
               <td class="pm-col-moq"><input type="number" class="pm-moq" data-id="{r['id']}" value="{r['moq'] or 1}"></td>
               <td class="pm-col-consumable" style="text-align:center;"><input type="checkbox" class="pm-consumable" data-id="{r['id']}" {consumable_checked} style="width:18px;height:18px;"></td>
+              <td class="pm-col-category"><input type="text" class="pm-category" data-id="{r['id']}" value="{r['category'] or ''}"></td>
+              <td class="pm-col-ptype"><input type="text" class="pm-ptype" data-id="{r['id']}" value="{r['product_type'] or ''}"></td>
+              <td class="pm-col-ctype"><input type="text" class="pm-ctype" data-id="{r['id']}" value="{r['consumable_type'] or ''}"></td>
               <td class="pm-col-exc">
                 {exc_badge}
                 <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="openMonthlyExc('{safe_item_name}')">설정</button>
               </td>
-              <td><button class="btn" style="font-size:12px;padding:6px 12px;" onclick="savePmRow({r['id']})">저장</button></td>
+              <td style="display:flex;gap:4px;">
+                <button class="btn" style="font-size:12px;padding:6px 12px;" onclick="savePmRow({r['id']})">저장</button>
+                <button class="btn" style="font-size:12px;padding:6px 10px;background:#F59E0B;" onclick="hidePmRow({r['id']})">숨기기</button>
+              </td>
             </tr>
             """
 
@@ -10693,6 +10702,8 @@ async def purchase_order_product_settings_page(
 
     <div class="card">
       <form method="get" action="/master/purchase-order/product-settings" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+        <input type="hidden" name="sort_by" value="{sort_by}">
+        <input type="hidden" name="sort_dir" value="{sort_dir}">
         <input name="search_item" value="{search_item}" placeholder="상품명/품번 검색" style="flex:2;min-width:180px;">
         <select name="filter_branch" style="flex:1;min-width:120px;">{branch_filter_options}</select>
         <select name="filter_consumable" style="flex:1;min-width:120px;">
@@ -10700,6 +10711,7 @@ async def purchase_order_product_settings_page(
           <option value="yes" {'selected' if filter_consumable == 'yes' else ''}>소모품만</option>
           <option value="no" {'selected' if filter_consumable == 'no' else ''}>일반상품만</option>
         </select>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap;"><input type="checkbox" name="show_hidden" value="1" {'checked' if show_hidden else ''} onchange="this.form.submit()"> 숨김 상품도 보기</label>
         <button class="btn" type="submit">검색</button>
         <a href="/master/purchase-order/product-settings" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
         <button type="button" class="btn" style="background:#64748B;" onclick="openPmColSettings()">⚙️ 컬럼 설정</button>
@@ -10716,7 +10728,10 @@ async def purchase_order_product_settings_page(
           <th class="pm-col-leadtime" style="cursor:pointer;" onclick="sortPm('lead_time_days')">리드타임(일) {'▲' if sort_by=='lead_time_days' and sort_dir=='asc' else ('▼' if sort_by=='lead_time_days' else '')}</th>
           <th class="pm-col-moq" style="cursor:pointer;" onclick="sortPm('moq')">MOQ {'▲' if sort_by=='moq' and sort_dir=='asc' else ('▼' if sort_by=='moq' else '')}</th>
           <th class="pm-col-consumable" style="cursor:pointer;" onclick="sortPm('is_consumable')">소모품 {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
-          <th class="pm-col-exc">월1회예외 지점</th><th></th>
+          <th class="pm-col-category">품류</th>
+          <th class="pm-col-ptype">종류</th>
+          <th class="pm-col-ctype">소모품종류</th>
+          <th class="pm-col-exc">지방점 주발주 제외</th><th></th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
@@ -10724,7 +10739,7 @@ async def purchase_order_product_settings_page(
 
     <div id="monthlyExcModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
       <div style="background:#fff;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:80vh;overflow-y:auto;">
-        <h3 id="monthlyExcTitle" style="margin-bottom:12px;">월1회 예외 지점 설정</h3>
+        <h3 id="monthlyExcTitle" style="margin-bottom:12px;">지방점 주발주 제외</h3>
         <div id="monthlyExcBranchList" style="margin-bottom:16px;"></div>
         <div style="display:flex;gap:8px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeMonthlyExc()">닫기</button>
@@ -10758,7 +10773,10 @@ async def purchase_order_product_settings_page(
         {{ key: 'leadtime', label: '리드타임(일)', locked: false }},
         {{ key: 'moq', label: 'MOQ', locked: false }},
         {{ key: 'consumable', label: '소모품', locked: false }},
-        {{ key: 'exc', label: '월1회예외 지점', locked: false }},
+        {{ key: 'category', label: '품류', locked: false }},
+        {{ key: 'ptype', label: '종류', locked: false }},
+        {{ key: 'ctype', label: '소모품종류', locked: false }},
+        {{ key: 'exc', label: '지방점 주발주 제외', locked: false }},
       ];
       const PM_STORAGE_KEY = 'pm_product_settings_col_settings';
 
@@ -10876,6 +10894,9 @@ async def purchase_order_product_settings_page(
         const leadTimeEl = document.querySelector('.pm-leadtime[data-id="' + id + '"]');
         const moqEl = document.querySelector('.pm-moq[data-id="' + id + '"]');
         const consumableEl = document.querySelector('.pm-consumable[data-id="' + id + '"]');
+        const categoryEl = document.querySelector('.pm-category[data-id="' + id + '"]');
+        const ptypeEl = document.querySelector('.pm-ptype[data-id="' + id + '"]');
+        const ctypeEl = document.querySelector('.pm-ctype[data-id="' + id + '"]');
         const res = await fetch('/master/purchase-order/product-master/save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{
@@ -10883,10 +10904,22 @@ async def purchase_order_product_settings_page(
             purchase_price: parseFloat(priceEl.value) || 0,
             lead_time_days: parseInt(leadTimeEl.value) || 0,
             moq: parseInt(moqEl.value) || 1,
-            is_consumable: consumableEl.checked
+            is_consumable: consumableEl.checked,
+            category: categoryEl.value.trim(),
+            product_type: ptypeEl.value.trim(),
+            consumable_type: ctypeEl.value.trim()
           }})
         }});
         if (res.ok) {{ alert('저장되었습니다.'); }} else {{ alert('저장 실패'); }}
+      }}
+
+      async function hidePmRow(id) {{
+        if (!confirm('이 상품을 목록에서 숨기시겠습니까? (발주 대상에서도 제외됩니다. 나중에 "숨김 상품도 보기"로 다시 볼 수 있습니다)')) return;
+        const res = await fetch('/master/purchase-order/product-master/hide', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ id: id, hidden: true }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('처리 실패'); }}
       }}
 
       async function uploadPmExcel() {{
@@ -10929,15 +10962,20 @@ async def purchase_order_product_master_save(request: Request, session_token: st
     lead_time_days = data.get("lead_time_days", 0)
     moq = data.get("moq", 1)
     is_consumable = bool(data.get("is_consumable", False))
+    category = (data.get("category") or "").strip() or None
+    product_type = (data.get("product_type") or "").strip() or None
+    consumable_type = (data.get("consumable_type") or "").strip() or None
 
     now = datetime.now().isoformat()
     conn = get_conn()
     if row_id:
         conn.execute(
             """UPDATE product_master
-               SET purchase_price=?, lead_time_days=?, moq=?, is_consumable=?, updated_at=?
+               SET purchase_price=?, lead_time_days=?, moq=?, is_consumable=?,
+                   category=?, product_type=?, consumable_type=?, updated_at=?
                WHERE id=?""",
-            (purchase_price, lead_time_days, moq, is_consumable, now, row_id)
+            (purchase_price, lead_time_days, moq, is_consumable,
+             category, product_type, consumable_type, now, row_id)
         )
     else:
         if not branch_name or not item_name:
@@ -10946,15 +10984,42 @@ async def purchase_order_product_master_save(request: Request, session_token: st
         conn.execute("""
             INSERT INTO product_master
                 (branch_name, item_name, item_code, purchase_price, supplier,
-                 tax_setting, lead_time_days, moq, is_consumable, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 tax_setting, lead_time_days, moq, is_consumable,
+                 category, product_type, consumable_type, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (branch_name, item_code) DO UPDATE SET
                 item_name=excluded.item_name, purchase_price=excluded.purchase_price,
                 supplier=excluded.supplier, tax_setting=excluded.tax_setting,
                 lead_time_days=excluded.lead_time_days, moq=excluded.moq,
-                is_consumable=excluded.is_consumable, updated_at=excluded.updated_at
+                is_consumable=excluded.is_consumable,
+                category=excluded.category, product_type=excluded.product_type,
+                consumable_type=excluded.consumable_type, updated_at=excluded.updated_at
         """, (branch_name, item_name, item_code, purchase_price, supplier,
-              tax_setting, lead_time_days, moq, is_consumable, now))
+              tax_setting, lead_time_days, moq, is_consumable,
+              category, product_type, consumable_type, now))
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/purchase-order/product-master/hide")
+async def purchase_order_product_master_hide(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    row_id = data.get("id")
+    hidden = bool(data.get("hidden", True))
+    if not row_id:
+        return JSONResponse(status_code=400, content={"detail": "상품이 지정되지 않았습니다."})
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    conn.execute(
+        "UPDATE product_master SET order_excluded=?, updated_at=? WHERE id=?",
+        (hidden, now, row_id)
+    )
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
