@@ -10565,16 +10565,6 @@ PRODUCT_SETTINGS_EXTRA_CSS = """
 </style>
 """
 
-
-PRODUCT_SETTINGS_EXTRA_CSS = """
-<style>
-#colCheckboxList input[type="checkbox"] { width: auto !important; }
-.pm-table input[type="text"], .pm-table input[type="number"] { width: 100%; padding: 6px; box-sizing: border-box; }
-.pm-upload-box { border: 2px dashed #93C5FD; border-radius: 10px; padding: 16px; background: #EFF6FF; }
-</style>
-"""
-
-
 @app.get("/master/purchase-order/product-settings", response_class=HTMLResponse)
 async def purchase_order_product_settings_page(
     session_token: str = Cookie(default=None),
