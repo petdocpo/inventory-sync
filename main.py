@@ -10656,7 +10656,7 @@ async def purchase_order_product_settings_page(
               </td>
               <td style="display:flex;gap:4px;">
                 <button class="btn" style="font-size:12px;padding:6px 12px;" onclick="savePmRow({r['id']})">저장</button>
-                <button class="btn" style="font-size:12px;padding:6px 10px;background:#F59E0B;" onclick="hidePmRow({r['id']})">숨기기</button>
+                {f'<button class="btn" style="font-size:12px;padding:6px 10px;background:#22C55E;" onclick="hidePmRow({r["id"]}, false)">숨김해제</button>' if r['order_excluded'] else f'<button class="btn" style="font-size:12px;padding:6px 10px;background:#F59E0B;" onclick="hidePmRow({r["id"]}, true)">숨기기</button>'}
               </td>
             </tr>
             """
@@ -10913,11 +10913,14 @@ async def purchase_order_product_settings_page(
         if (res.ok) {{ alert('저장되었습니다.'); }} else {{ alert('저장 실패'); }}
       }}
 
-      async function hidePmRow(id) {{
-        if (!confirm('이 상품을 목록에서 숨기시겠습니까? (발주 대상에서도 제외됩니다. 나중에 "숨김 상품도 보기"로 다시 볼 수 있습니다)')) return;
+      async function hidePmRow(id, hidden) {{
+        const msg = hidden
+          ? '이 상품을 목록에서 숨기시겠습니까? (발주 대상에서도 제외됩니다. 나중에 "숨김 상품도 보기"로 다시 볼 수 있습니다)'
+          : '이 상품의 숨김을 해제하시겠습니까? (다시 발주 대상에 포함됩니다)';
+        if (!confirm(msg)) return;
         const res = await fetch('/master/purchase-order/product-master/hide', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ id: id, hidden: true }})
+          body: JSON.stringify({{ id: id, hidden: hidden }})
         }});
         if (res.ok) {{ location.reload(); }} else {{ alert('처리 실패'); }}
       }}
