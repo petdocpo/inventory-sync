@@ -12860,6 +12860,7 @@ async def _process_purchase_records_upload(file: UploadFile):
             continue
         try:
             purchase_datetime = str(row[0]).strip()
+            status = str(row[1]).strip() if len(row) > 1 and row[1] else ""
             vendor = str(row[2]).strip() if row[2] else ""
             branch_name = str(row[3]).strip() if row[3] else ""
             item_name = str(row[5]).strip() if row[5] else ""
@@ -12874,15 +12875,16 @@ async def _process_purchase_records_upload(file: UploadFile):
 
             conn.execute("""
                 INSERT INTO purchase_records
-                    (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (purchase_datetime, branch_name, item_name, item_code, quantity)
                 DO UPDATE SET
                     vendor=excluded.vendor,
                     unit_price=excluded.unit_price,
                     total_price=excluded.total_price,
+                    status=excluded.status,
                     created_at=excluded.created_at
-            """, (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, now))
+            """, (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, status, now))
             success += 1
         except Exception as e:
             errors.append(f"행 {idx}: {str(e)[:50]}")
@@ -13144,6 +13146,7 @@ async def _fetch_and_process_purchase_records_csv():
             continue
         try:
             purchase_datetime = str(row[0]).strip()
+            status = str(row[1]).strip() if len(row) > 1 and row[1] else ""
             vendor = str(row[2]).strip() if len(row) > 2 and row[2] else ""
             branch_name = str(row[3]).strip() if len(row) > 3 and row[3] else ""
             item_name = str(row[5]).strip() if len(row) > 5 and row[5] else ""
@@ -13158,15 +13161,16 @@ async def _fetch_and_process_purchase_records_csv():
 
             conn.execute("""
                 INSERT INTO purchase_records
-                    (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (purchase_datetime, branch_name, item_name, item_code, quantity)
                 DO UPDATE SET
                     vendor=excluded.vendor,
                     unit_price=excluded.unit_price,
                     total_price=excluded.total_price,
+                    status=excluded.status,
                     created_at=excluded.created_at
-            """, (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, now))
+            """, (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, status, now))
             success += 1
         except Exception as e:
             errors.append(f"행 {idx}: {str(e)[:50]}")
