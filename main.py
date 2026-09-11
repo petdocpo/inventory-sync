@@ -386,6 +386,252 @@ def send_push_notification(branch_code: str, title: str, body: str, event_type: 
     conn.close()
     return sent, failed
 
+# ══════════════════════════════════════════════
+# 공지사항 (Notice) - 지점용
+# ══════════════════════════════════════════════
+
+@app.get("/notice", response_class=HTMLResponse)
+async def notice_list_page(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login")
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    notices = conn.execute(
+        """
+        SELECT n.id, n.title, n.created_at,
+               CASE WHEN r.id IS NOT NULL THEN TRUE ELSE FALSE END AS is_read
+        FROM notice n
+        LEFT JOIN notice_read_log r ON r.notice_id = n.id AND r.branch_code = ?
+        WHERE n.is_active = TRUE
+        ORDER BY n.created_at DESC
+        """,
+        (branch_code,)
+    ).fetchall()
+
+    rows_html = ""
+    for n in notices:
+        badge = "" if n["is_read"] else '<span class="notice-badge">NEW</span>'
+        rows_html += (
+            '<tr onclick="location.href=\'/notice/' + str(n["id"]) + '\'" style="cursor:pointer;">'
+            '<td>' + badge + n["title"] + '</td>'
+            '<td>' + str(n["created_at"])[:16] + '</td>'
+            '</tr>'
+        )
+
+    style_block = """
+    <style>
+        .notice-badge { background:#e74c3c; color:#fff; font-size:11px; padding:2px 6px; border-radius:4px; margin-right:6px; }
+        .notice-table { width:100%; border-collapse:collapse; }
+        .notice-table td { padding:12px 8px; border-bottom:1px solid #eee; }
+    </style>
+    """
+
+    body_html = (
+        style_block +
+        '<h2>📢 공지사항</h2>'
+        '<table class="notice-table"><tbody>' + rows_html + '</tbody></table>'
+    )
+
+    return HTMLResponse(content=render_page(body_html, title="공지사항", user=user))
+
+
+@app.get("/notice/{notice_id}", response_class=HTMLResponse)
+async def notice_detail_page(notice_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login")
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    notice = conn.execute(
+        "SELECT id, title, content, created_at FROM notice WHERE id=? AND is_active=TRUE",
+        (notice_id,)
+    ).fetchone()
+
+    if not notice:
+        return HTMLResponse(content="<h3>존재하지 않는 공지입니다.</h3>", status_code=404)
+
+    already_read = conn.execute(
+        "SELECT id FROM notice_read_log WHERE notice_id=? AND branch_code=?",
+        (notice_id, branch_code)
+    ).fetchone()
+
+    check_button_html = (
+        '<p style="color:#27ae60;">✅ 확인 완료</p>' if already_read
+        else '<button onclick="checkNoticeRead(' + str(notice_id) + ')" class="btn-primary">확인했습니다</button>'
+    )
+
+    content_escaped = notice["content"].replace("\n", "<br>")
+
+    script_block = """
+    <script>
+    async function checkNoticeRead(noticeId) {
+        const res = await fetch('/notice/' + noticeId + '/read', { method: 'POST' });
+        if (res.ok) { location.reload(); } else { alert('처리 실패'); }
+    }
+    </script>
+    """
+
+    body_html = (
+        '<h2>' + notice["title"] + '</h2>'
+        '<p style="color:#999;font-size:13px;">' + str(notice["created_at"])[:16] + '</p>'
+        '<div style="margin:20px 0;line-height:1.6;">' + content_escaped + '</div>'
+        + check_button_html
+        + script_block
+    )
+
+    return HTMLResponse(content=render_page(body_html, title=notice["title"], user=user))
+
+
+@app.post("/notice/{notice_id}/read")
+async def notice_mark_read(notice_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+
+    branch_code = user["branch_code"]
+    account = user["login_id"]
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO notice_read_log (notice_id, branch_code, account)
+        VALUES (?, ?, ?)
+        ON CONFLICT (notice_id, branch_code) DO NOTHING
+        """,
+        (notice_id, branch_code, account)
+    )
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/api/notice/popup")
+async def notice_popup_check(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(content={"notices": []})
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    notices = conn.execute(
+        """
+        SELECT n.id, n.title, n.content
+        FROM notice n
+        WHERE n.is_active = TRUE AND n.is_popup = TRUE
+          AND NOT EXISTS (
+              SELECT 1 FROM notice_popup_dismiss d
+              WHERE d.notice_id = n.id AND d.branch_code = ?
+                AND d.dismissed_until >= CURRENT_DATE
+          )
+        ORDER BY n.created_at DESC
+        """,
+        (branch_code,)
+    ).fetchall()
+
+    result = [{"id": n["id"], "title": n["title"], "content": n["content"]} for n in notices]
+    return JSONResponse(content={"notices": result})
+
+
+@app.post("/notice/{notice_id}/popup-dismiss")
+async def notice_popup_dismiss(notice_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO notice_popup_dismiss (notice_id, branch_code, dismissed_until)
+        VALUES (?, ?, CURRENT_DATE + INTERVAL '7 days')
+        ON CONFLICT (notice_id, branch_code)
+        DO UPDATE SET dismissed_until = CURRENT_DATE + INTERVAL '7 days'
+        """,
+        (notice_id, branch_code)
+    )
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
+# ══════════════════════════════════════════════
+# 공지사항 (Notice) - 마스터(본사)용
+# ══════════════════════════════════════════════
+
+@app.get("/master/notice", response_class=HTMLResponse)
+async def master_notice_list(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login")
+
+    conn = get_conn()
+    notices = conn.execute(
+        """
+        SELECT n.id, n.title, n.is_active, n.is_popup, n.created_by, n.created_at,
+               (SELECT COUNT(*) FROM notice_read_log r WHERE r.notice_id = n.id) AS read_count
+        FROM notice n
+        ORDER BY n.created_at DESC
+        """
+    ).fetchall()
+
+    total_branches_row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM accounts WHERE branch_type='branch'"
+    ).fetchone()
+    total_branches = total_branches_row["cnt"] if total_branches_row else 0
+
+    rows_html = ""
+    for n in notices:
+        status_badge = '<span style="color:#27ae60;">게시중</span>' if n["is_active"] else '<span style="color:#999;">비활성</span>'
+        popup_badge = '📌' if n["is_popup"] else ''
+        rows_html += (
+            '<tr onclick="location.href=\'/master/notice/' + str(n["id"]) + '\'" style="cursor:pointer;">'
+            '<td>' + popup_badge + n["title"] + '</td>'
+            '<td>' + status_badge + '</td>'
+            '<td>' + str(n["read_count"]) + ' / ' + str(total_branches) + '</td>'
+            '<td>' + n["created_by"] + '</td>'
+            '<td>' + str(n["created_at"])[:16] + '</td>'
+            '</tr>'
+        )
+
+    body_html = (
+        '<h2>📢 공지사항 관리</h2>'
+        '<button onclick="location.href=\'/master/notice/create\'" class="btn-primary" style="margin-bottom:16px;">+ 새 공지 등록</button>'
+        '<table class="notice-table" style="width:100%;border-collapse:collapse;">'
+        '<thead><tr><th>제목</th><th>상태</th><th>읽음</th><th>작성자</th><th>등록일</th></tr></thead>'
+        '<tbody>' + rows_html + '</tbody></table>'
+    )
+
+    return HTMLResponse(content=render_page(body_html, title="공지사항 관리", user=user))
+
+
+@app.get("/master/notice/create", response_class=HTMLResponse)
+async def master_notice_create_form(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login")
+
+    script_block = """
+    <script>
+    async function submitNotice() {
+        const title = document.getElementById('title').value.trim();
+        const content = document.getElementById('content').value.trim();
+        const isPopup = document.getElementById('isPopup').checked;
+        if (!title || !content) { alert('제목과 내용을 입력하세요.'); return; }
+
+        const res = await fetch('/master/notice/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: title, content: content, is_popup: isPopup })
+        });
+        if (res.ok) {
+            alert('등록되었습니다.');
+            location.href = '/master/notice';
+        } else {
+            alert('등록 실패');
+        }
+    }
+    </script>
+    """
 
 @app.post("/api/push/subscribe")
 async def push_subscribe(request: Request, session_token: str = Cookie(default=None)):
