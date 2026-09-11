@@ -651,6 +651,29 @@ async def master_notice_create_form(request: Request, session_token: str = Cooki
     return HTMLResponse(content=render_page(body_html, user, "master-notice"))
 
 
+@app.post("/master/notice/create")
+async def master_notice_create(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    title = data.get("title", "").strip()
+    content = data.get("content", "").strip()
+    is_popup = bool(data.get("is_popup", False))
+
+    if not title or not content:
+        return JSONResponse(status_code=400, content={"detail": "제목과 내용을 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO notice (title, content, is_popup, created_by) VALUES (?, ?, ?, ?)",
+        (title, content, is_popup, user["login_id"])
+    )
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
 @app.post("/api/push/subscribe")
 async def push_subscribe(request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
