@@ -96,6 +96,8 @@ MENU_DEFINITIONS = {
     "cron-failure-log": "크론 실패 이력",
     "stocktake": "지점 월 재고실사(운영팀장)",
     "stocktake-result": "재고실사(결과)",
+    "notice-manage": "공지사항 관리",
+    "qna-manage": "Q&A 게시판 관리",
 }
 
 from auth.login import (  # noqa: E402
@@ -10160,6 +10162,26 @@ async def master_page(session_token: str = Cookie(default=None)):
 
     # ---- 그룹 4: 기타설정 ----
     etc_cards = []
+      if menu_allowed("notice-manage"):
+        etc_cards.append("""
+      <a href="/master/notice" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📢</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">공지사항 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">지점 공지 등록/읽음 현황</div>
+        </div>
+      </a>
+        """)
+    if menu_allowed("qna-manage"):
+        etc_cards.append("""
+      <a href="/master/qna" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">💬</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">Q&A 게시판</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">지점 문의 답변 관리</div>
+        </div>
+      </a>
+        """)
     if menu_allowed("notification-settings"):
         etc_cards.append("""
       <a href="/master/notification-settings" style="text-decoration:none;">
