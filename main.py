@@ -10162,7 +10162,7 @@ async def master_page(session_token: str = Cookie(default=None)):
 
     # ---- 그룹 4: 기타설정 ----
     etc_cards = []
-      if menu_allowed("notice-manage"):
+    if menu_allowed("notice-manage"):
         etc_cards.append("""
       <a href="/master/notice" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
