@@ -10604,11 +10604,116 @@ async def _compute_purchase_order_candidates() -> dict:
         else:
             weekly.append(candidate)
 
-    return {
+        return {
         "weekly": weekly,
         "monthly": monthly,
         "pending_report": pending_report
     }
+
+
+@app.get("/master/purchase-order/preview", response_class=HTMLResponse)
+async def purchase_order_preview_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    result = await _compute_purchase_order_candidates()
+
+    weekly = result.get("weekly", [])
+    monthly = result.get("monthly", [])
+    pending_report = result.get("pending_report", [])
+    message = result.get("message")
+
+    def render_rows(items):
+        if not items:
+            return '<tr><td colspan="6" style="text-align:center;padding:20px;color:#888;">대상 없음</td></tr>'
+        rows = ""
+        for it in items:
+            rows += f"""
+            <tr>
+              <td>{it['branch_name']}</td>
+              <td>{it['item_code']}</td>
+              <td>{it['item_name']}</td>
+              <td style="text-align:right;">{it['safety_qty']}</td>
+              <td style="text-align:right;">{it['moq']}</td>
+              <td style="text-align:right;font-weight:bold;">{it['final_qty']}</td>
+            </tr>
+            """
+        return rows
+
+    def render_pending_rows(items):
+        if not items:
+            return '<tr><td colspan="4" style="text-align:center;padding:20px;color:#888;">대상 없음</td></tr>'
+        rows = ""
+        for it in items:
+            rows += f"""
+            <tr>
+              <td>{it['branch_name']}</td>
+              <td>{it['item_code']}</td>
+              <td>{it['item_name']}</td>
+              <td>{it['status']}</td>
+            </tr>
+            """
+        return rows
+
+    message_html = ""
+    if message:
+        message_html = f'<div style="background:#fff3cd;padding:12px;border-radius:8px;margin-bottom:20px;color:#856404;">{message}</div>'
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+      <meta charset="UTF-8">
+      <title>발주서 미리보기</title>
+      <style>
+        body {{ font-family: -apple-system, sans-serif; background:#f5f6fa; padding:20px; }}
+        h2 {{ color:#1E2761; }}
+        table {{ width:100%; border-collapse:collapse; background:#fff; margin-bottom:32px; box-shadow:0 1px 3px rgba(0,0,0,0.1); }}
+        th, td {{ padding:10px 12px; border-bottom:1px solid #eee; font-size:13px; }}
+        th {{ background:#1E2761; color:#fff; text-align:left; }}
+        .count-badge {{ display:inline-block; background:#1E2761; color:#fff; border-radius:12px; padding:2px 10px; font-size:12px; margin-left:8px; }}
+        a.back-link {{ color:#1E2761; text-decoration:none; font-size:13px; }}
+      </style>
+    </head>
+    <body>
+      <a href="/master" class="back-link">&larr; 마스터 대시보드로</a>
+      {message_html}
+
+      <h2>주간 발주 대상 <span class="count-badge">{len(weekly)}건</span></h2>
+      <table>
+        <thead>
+          <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
+        </thead>
+        <tbody>
+          {render_rows(weekly)}
+        </tbody>
+      </table>
+
+      <h2>월간 발주 대상 <span class="count-badge">{len(monthly)}건</span></h2>
+      <table>
+        <thead>
+          <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
+        </thead>
+        <tbody>
+          {render_rows(monthly)}
+        </tbody>
+      </table>
+
+      <h2>미입고 보류 (별도 확인 필요) <span class="count-badge">{len(pending_report)}건</span></h2>
+      <table>
+        <thead>
+          <tr><th>지점</th><th>품번</th><th>품명</th><th>상태</th></tr>
+        </thead>
+        <tbody>
+          {render_pending_rows(pending_report)}
+        </tbody>
+      </table>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
 
 # ── 유비플러스 재고 (RAW 업로드) ────────────────────────
 
