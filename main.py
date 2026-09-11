@@ -89,6 +89,7 @@ MENU_DEFINITIONS = {
     "webhook-send-log": "웹훅 발송 이력",
     "login-history": "접속 이력",
     "purchase-tracking": "발주 주기 트래킹",
+    "purchase-order-preview": "발주서 미리보기",
     "product-settings": "상품 설정",
     "branch-exceptions": "발주서 지점 예외",
     "safety-stock": "안전재고 관리",
@@ -9844,6 +9845,16 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
+    if menu_allowed("purchase-order-preview"):
+        db_inventory_cards.append("""
+      <a href="/master/purchase-order/preview" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🧮</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주서 미리보기</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">계산 결과 검증용</div>
+        </div>
+      </a>
+        """)
 
     # ---- 그룹 2: 재고실사 ----
     stocktake_cards = []
@@ -10440,6 +10451,164 @@ async def purchase_tracking_upload_records(
     if not user or user["role"] != "master":
         return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
     return await _process_purchase_records_upload(file)
+
+# ============================================================
+# 발주서 자동생성 — 계산 로직
+# main.py의 구매내역 관련 함수들 근처(예: _process_purchase_records_upload 부근)에 추가
+# ============================================================
+
+async def _compute_purchase_order_candidates() -> dict:
+    """
+    지점x상품 조합별 발주 대상 여부 판정 + 주간/월간 분류 + 최종 발주수량 계산.
+
+    판정 순서 (하나라도 걸리면 제외):
+      1. product_master.order_excluded = TRUE (전체 미발주로 숨긴 상품)
+      2. 현재고(raw_inventory) >= 안전재고(safety_stock) (재고 충분)
+      3. is_consumable=TRUE 이고, 이 지점x상품이 product_branch_order_exclusion에 없음 (소모품 기본 제외)
+      4. 이 지점x상품의 가장 최근 purchase_records.status 가 '접수' 또는 '승인' (미입고 발주 존재, 중복 방지)
+
+    남은 대상 분류:
+      5. 리드타임 >= 35 또는 purchase_order_monthly_exception에 등록됨 -> 월간
+         그 외 -> 주간
+      6. 최종수량 = ceil(안전재고 / moq) * moq  (moq 없으면 1로 취급)
+
+    반환:
+      {
+        "weekly": [ {branch_code, branch_name, item_code, item_name, safety_qty, moq, final_qty}, ... ],
+        "monthly": [ 위와 동일 구조 ],
+        "pending_report": [ {branch_code, branch_name, item_code, item_name, status}, ... ]  # 4번 조건에 걸린 것들
+      }
+    """
+    import math
+
+    conn = get_conn()
+
+    # ── 1) 안전재고 전체 조회 (지점x상품 기준, 발주 대상 후보의 베이스) ──
+    safety_rows = conn.execute(
+        "SELECT branch_name, item_name, item_code, qty, moq FROM safety_stock WHERE qty > 0"
+    ).fetchall()
+
+    if not safety_rows:
+        conn.close()
+        return {"weekly": [], "monthly": [], "pending_report": [], "message": "등록된 안전재고가 없습니다."}
+
+    # ── 2) 지점명<->지점코드 매핑 (safety_stock은 branch_name, raw_inventory는 branch_code 기준) ──
+    branches = get_branches(branch_type='branch')
+    branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
+
+    # ── 3) 현재고(RAW재고) 맵: (branch_code, item_code) -> quantity ──
+    raw_rows = fetch_raw_inventory()
+    raw_map = {(r["branch_code"], r["item_code"]): r["quantity"] for r in raw_rows}
+
+    # ── 4) product_master에서 item_code별 대표 1행 (리드타임/MOQ/소모품여부/전체미발주 - 상품별 공통값) ──
+    pm_rows = conn.execute(
+        "SELECT DISTINCT ON (item_code) item_code, lead_time_days, moq, is_consumable, order_excluded "
+        "FROM product_master WHERE item_code IS NOT NULL AND item_code != '' "
+        "ORDER BY item_code, id"
+    ).fetchall()
+    pm_map = {r["item_code"]: r for r in pm_rows}
+
+    # ── 5) 월1회예외 목록: (item_name, branch_code) 조합 집합 ──
+    monthly_exc_rows = conn.execute(
+        "SELECT item_name, branch_code FROM purchase_order_monthly_exception"
+    ).fetchall()
+    monthly_exc_set = {(r["item_name"], r["branch_code"]) for r in monthly_exc_rows}
+
+    # ── 6) 소모품 지점별 예외(포함 허용) 목록: (item_code, branch_code) 조합 집합 ──
+    consumable_exc_rows = conn.execute(
+        "SELECT item_code, branch_code FROM product_branch_order_exclusion"
+    ).fetchall()
+    consumable_include_set = {(r["item_code"], r["branch_code"]) for r in consumable_exc_rows}
+
+    # ── 7) 지점x상품별 가장 최근 발주 상태 맵: (branch_name, item_name) -> 최신 status ──
+    status_rows = conn.execute("""
+        SELECT DISTINCT ON (branch_name, item_name) branch_name, item_name, status
+        FROM purchase_records
+        ORDER BY branch_name, item_name, purchase_datetime DESC
+    """).fetchall()
+    status_map = {(r["branch_name"], r["item_name"]): r["status"] for r in status_rows}
+
+    conn.close()
+
+    weekly = []
+    monthly = []
+    pending_report = []
+
+    PENDING_STATUSES = {"접수", "승인"}
+
+    for row in safety_rows:
+        branch_name = row["branch_name"]
+        item_name = row["item_name"]
+        item_code = row["item_code"] or ""
+        safety_qty = row["qty"] or 0
+
+        branch_code = branch_name_to_code.get(branch_name)
+        if not branch_code:
+            # 지점명이 매칭 안 되면(오타/미등록 지점) 스킵 - 별도 오류 처리는 상위에서
+            continue
+
+        pm = pm_map.get(item_code)
+
+        # 1. 전체 미발주 제외
+        if pm and pm["order_excluded"]:
+            continue
+
+        # 2. 현재고 >= 안전재고면 제외 (재고 충분)
+        current_qty = raw_map.get((branch_code, item_code), 0)
+        if current_qty >= safety_qty:
+            continue
+
+        # 3. 소모품 기본 제외 (지점별 예외 등록 시 포함)
+        is_consumable = bool(pm["is_consumable"]) if pm else False
+        if is_consumable and (item_code, branch_code) not in consumable_include_set:
+            continue
+
+        # 4. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고
+        latest_status = status_map.get((branch_name, item_name))
+        if latest_status in PENDING_STATUSES:
+            pending_report.append({
+                "branch_code": branch_code,
+                "branch_name": branch_name,
+                "item_code": item_code,
+                "item_name": item_name,
+                "status": latest_status
+            })
+            continue
+
+        # ── 여기까지 통과 = 발주 대상 확정 ──
+        lead_time_days = (pm["lead_time_days"] if pm and pm["lead_time_days"] is not None else 0)
+        moq = (pm["moq"] if pm and pm["moq"] else 1)
+        if moq <= 0:
+            moq = 1
+
+        # 6. MOQ 적용 최종 수량
+        final_qty = math.ceil(safety_qty / moq) * moq
+
+        candidate = {
+            "branch_code": branch_code,
+            "branch_name": branch_name,
+            "item_code": item_code,
+            "item_name": item_name,
+            "safety_qty": safety_qty,
+            "moq": moq,
+            "final_qty": final_qty,
+            "lead_time_days": lead_time_days
+        }
+
+        # 5. 주간/월간 분류
+        is_monthly_by_leadtime = lead_time_days >= 35
+        is_monthly_by_exception = (item_name, branch_code) in monthly_exc_set
+
+        if is_monthly_by_leadtime or is_monthly_by_exception:
+            monthly.append(candidate)
+        else:
+            weekly.append(candidate)
+
+    return {
+        "weekly": weekly,
+        "monthly": monthly,
+        "pending_report": pending_report
+    }
 
 # ── 유비플러스 재고 (RAW 업로드) ────────────────────────
 
