@@ -434,7 +434,7 @@ async def notice_list_page(request: Request, session_token: str = Cookie(default
         '<table class="notice-table"><tbody>' + rows_html + '</tbody></table>'
     )
 
-    return HTMLResponse(content=render_page(body_html, title="공지사항", user=user))
+    return HTMLResponse(content=render_page(body_html, user, "notice"))
 
 
 @app.get("/notice/{notice_id}", response_class=HTMLResponse)
@@ -482,7 +482,7 @@ async def notice_detail_page(notice_id: int, request: Request, session_token: st
         + script_block
     )
 
-    return HTMLResponse(content=render_page(body_html, title=notice["title"], user=user))
+    return HTMLResponse(content=render_page(body_html, user, "notice"))
 
 
 @app.post("/notice/{notice_id}/read")
@@ -601,7 +601,7 @@ async def master_notice_list(request: Request, session_token: str = Cookie(defau
         '<tbody>' + rows_html + '</tbody></table>'
     )
 
-    return HTMLResponse(content=render_page(body_html, title="공지사항 관리", user=user))
+    return HTMLResponse(content=render_page(body_html, user, "master-notice"))
 
 
 @app.get("/master/notice/create", response_class=HTMLResponse)
