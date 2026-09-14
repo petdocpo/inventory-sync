@@ -2671,7 +2671,62 @@ async def qr_page(
     options_html = '<option value="">-- 품목 선택 --</option>'
     for it in items:
         options_html += f'<option value="{it["branch_code"]}|{it["item_name"]}|{it["item_code"]}">{it["branch_name"]} / {it["item_name"]} ({it["item_code"]})</option>'
-
+ 
+    print_checkbox_html = ""
+    for it in items:
+        item_key_val = f'{it["branch_code"]}|{it["item_name"]}|{it["item_code"]}'
+        print_checkbox_html += f'''
+          <label style="display:flex;align-items:center;gap:8px;padding:8px 6px;
+                 border-bottom:1px solid #f0f0f0;font-size:13px;cursor:pointer;">
+            <input type="checkbox" name="print_items" value="{item_key_val}" style="width:auto;">
+            <span>{it["branch_name"]} / {it["item_name"]} ({it["item_code"]})</span>
+          </label>
+        '''
+ 
+    print_select_html = f"""
+    <div class="card" style="border:1px solid #1E2761;">
+      <h3 style="margin-bottom:8px;">🖨️ 인쇄용 선택</h3>
+      <p style="color:#666;font-size:12px;margin-bottom:10px;">
+        인쇄할 품목을 체크하고, 출력할 타입을 선택한 뒤 인쇄 페이지로 이동하세요.
+      </p>
+      <form method="get" action="/qr/print" target="_blank" id="printSelectForm">
+        <div style="margin-bottom:10px;">
+          <label style="font-size:13px;color:#555;margin-right:12px;">
+            <input type="radio" name="scan_type_filter" value="ALL" checked style="width:auto;"> 입고+출고 전체
+          </label>
+          <label style="font-size:13px;color:#555;margin-right:12px;">
+            <input type="radio" name="scan_type_filter" value="IN" style="width:auto;"> 입고만
+          </label>
+          <label style="font-size:13px;color:#555;">
+            <input type="radio" name="scan_type_filter" value="OUT" style="width:auto;"> 출고만
+          </label>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:10px;">
+          <button type="button" class="btn" style="flex:1;background:#64748B;"
+                  onclick="toggleAllPrintCheckboxes(true)">전체 선택</button>
+          <button type="button" class="btn" style="flex:1;background:#64748B;"
+                  onclick="toggleAllPrintCheckboxes(false)">전체 해제</button>
+        </div>
+        <div style="max-height:260px;overflow-y:auto;border:1px solid #eee;border-radius:8px;margin-bottom:12px;">
+          {print_checkbox_html if print_checkbox_html else '<p style="padding:12px;color:#888;font-size:13px;">품목이 없습니다.</p>'}
+        </div>
+        <button class="btn" type="submit" style="width:100%;">🖨️ 선택 품목 인쇄 페이지 열기</button>
+      </form>
+    </div>
+    <script>
+    function toggleAllPrintCheckboxes(checked) {{
+      document.querySelectorAll('input[name="print_items"]').forEach(cb => cb.checked = checked);
+    }}
+    document.getElementById('printSelectForm').addEventListener('submit', function(e) {{
+      const checked = document.querySelectorAll('input[name="print_items"]:checked');
+      if (checked.length === 0) {{
+        e.preventDefault();
+        alert('인쇄할 품목을 1개 이상 선택해주세요.');
+      }}
+    }});
+    </script>
+    """
+ 
     branch_filter_html = ""
     bulk_html = ""
 
@@ -2762,8 +2817,9 @@ async def qr_page(
       </form>
     </div>
     {bulk_html}
-
-    <div id="zipLoadingOverlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+    {print_select_html}
+ 
+    <div id="zipLoadingOverlay"" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
          background:rgba(0,0,0,0.5);z-index:999;justify-content:center;align-items:center;">
       <div style="background:white;padding:24px 32px;border-radius:12px;text-align:center;">
         <div style="font-size:32px;margin-bottom:8px;">📦</div>
@@ -14937,6 +14993,132 @@ async def qr_init_upload(
 
 
 # ── 마스터 > QR 일괄 생성 (ZIP) ────────────────────────
+
+@app.get("/qr/print", response_class=HTMLResponse)
+async def qr_print_page(
+    session_token: str = Cookie(default=None),
+    print_items: list[str] = Query(default=[]),
+    scan_type_filter: str = "ALL",
+    cols: int = 4,
+    rows: int = 6
+):
+    """선택된 품목들의 QR을 즉석 생성해 A4 인쇄용 그리드로 렌더링. 파일 저장 없음."""
+    import base64
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    if not print_items:
+        return HTMLResponse(content=render_page(
+            '<div class="card"><p>❌ 선택된 품목이 없습니다.</p>'
+            '<a href="/qr">← 돌아가기</a></div>', user, "qr"))
+
+    if cols < 1:
+        cols = 1
+    if rows < 1:
+        rows = 1
+
+    hostname_env = os.getenv("PUBLIC_SERVER_URL")
+    if hostname_env:
+        server_url = hostname_env
+    else:
+        hostname = socket.gethostbyname(socket.gethostname())
+        server_url = f"http://{hostname}:{SERVER_PORT}"
+
+    if scan_type_filter == "IN":
+        scan_types = ["IN"]
+    elif scan_type_filter == "OUT":
+        scan_types = ["OUT"]
+    else:
+        scan_types = ["IN", "OUT"]
+
+    cells_html = ""
+    total_count = 0
+    for item_key in print_items:
+        parts = item_key.split("|")
+        if len(parts) != 3:
+            continue
+        branch_code, item_name, item_code = parts
+        for scan_type in scan_types:
+            try:
+                img_bytes = generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name)
+            except Exception:
+                continue
+            b64 = base64.b64encode(img_bytes).decode("ascii")
+            total_count += 1
+            cells_html += f"""
+            <div class="qr-cell">
+              <img src="data:image/png;base64,{b64}" class="qr-cell-img">
+            </div>
+            """
+
+    if total_count == 0:
+        return HTMLResponse(content=render_page(
+            '<div class="card"><p>❌ QR 생성에 실패했습니다.</p>'
+            '<a href="/qr">← 돌아가기</a></div>', user, "qr"))
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+      <meta charset="UTF-8">
+      <title>QR 인쇄</title>
+      <style>
+        body {{ font-family: -apple-system, sans-serif; background:#eee; margin:0; padding:20px; }}
+        .no-print {{ background:#fff; padding:16px 20px; border-radius:10px; margin-bottom:16px;
+                     box-shadow:0 1px 3px rgba(0,0,0,0.1); display:flex; gap:12px; align-items:center;
+                     flex-wrap:wrap; }}
+        .no-print label {{ font-size:13px; color:#555; }}
+        .no-print input[type="number"] {{ width:60px; padding:6px; margin-left:6px; }}
+        .no-print button {{ padding:8px 16px; background:#1E2761; color:#fff; border:none;
+                            border-radius:6px; cursor:pointer; font-size:13px; }}
+        .print-page {{ background:#fff; width:210mm; min-height:297mm; margin:0 auto 20px auto;
+                       padding:10mm; box-sizing:border-box; box-shadow:0 1px 3px rgba(0,0,0,0.2); }}
+        .qr-grid {{ display:grid; width:100%; height:100%; }}
+        .qr-cell {{ display:flex; align-items:center; justify-content:center;
+                    border:1px dashed #ddd; padding:4mm; box-sizing:border-box; }}
+        .qr-cell-img {{ max-width:100%; max-height:100%; object-fit:contain; }}
+        @media print {{
+          body {{ background:#fff; padding:0; }}
+          .no-print {{ display:none; }}
+          .print-page {{ box-shadow:none; margin:0; page-break-after:always; }}
+          .qr-cell {{ border:none; page-break-inside:avoid; }}
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="no-print">
+        <a href="/qr" style="color:#1E2761;text-decoration:none;font-size:13px;">&larr; 돌아가기</a>
+        <span style="color:#ccc;">|</span>
+        <label>가로 칸수<input type="number" id="colsInput" value="{cols}" min="1" max="10"></label>
+        <label>세로 칸수<input type="number" id="rowsInput" value="{rows}" min="1" max="12"></label>
+        <button type="button" onclick="applyGrid()">그리드 적용</button>
+        <button type="button" onclick="window.print()">🖨️ 인쇄하기</button>
+        <span style="color:#888;font-size:13px;">총 {total_count}개 라벨</span>
+      </div>
+
+      <div class="print-page">
+        <div class="qr-grid" id="qrGrid" style="grid-template-columns:repeat({cols}, 1fr);
+             grid-template-rows:repeat({rows}, 1fr);">
+          {cells_html}
+        </div>
+      </div>
+
+      <script>
+      function applyGrid() {{
+        const cols = parseInt(document.getElementById('colsInput').value) || 4;
+        const rows = parseInt(document.getElementById('rowsInput').value) || 6;
+        const grid = document.getElementById('qrGrid');
+        grid.style.gridTemplateColumns = `repeat(${{cols}}, 1fr)`;
+        grid.style.gridTemplateRows = `repeat(${{rows}}, 1fr)`;
+      }}
+      </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
 
 @app.post("/master/qr/generate-bulk")
 async def master_qr_generate_bulk(
