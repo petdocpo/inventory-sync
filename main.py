@@ -461,11 +461,16 @@ async def notice_detail_page(notice_id: int, request: Request, session_token: st
     ).fetchone()
 
     check_button_html = (
-        '<p style="color:#27ae60;">✅ 확인 완료</p>' if already_read
-        else '<button onclick="checkNoticeRead(' + str(notice_id) + ')" class="btn-primary">확인했습니다</button>'
+        '<div style="display:inline-flex;align-items:center;gap:6px;'
+        'background:#E8F5E9;color:#2E7D32;padding:10px 20px;border-radius:24px;'
+        'font-weight:bold;font-size:14px;">✅ 확인 표시됨</div>' if already_read
+        else '<button onclick="checkNoticeRead(' + str(notice_id) + ')" '
+             'style="background:#1E2761;color:white;border:none;padding:11px 24px;'
+             'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">'
+             '확인 표시하기</button>'
     )
-
-    content_escaped = notice["content"].replace("\n", "<br>")
+ 
+    content_escaped = render_notice_content(notice["content"])
 
     script_block = """
     <script>
@@ -635,17 +640,132 @@ async def master_notice_create_form(request: Request, session_token: str = Cooki
     </script>
     """
 
+    editor_toolbar_html = (
+        '<div style="display:flex;gap:8px;margin:8px 0 4px;">'
+        '<button type="button" onclick="insertLink()" '
+        'style="background:#f0f0f0;border:1px solid #ddd;border-radius:6px;'
+        'padding:6px 12px;font-size:13px;cursor:pointer;">🔗 링크 삽입</button>'
+        '<button type="button" onclick="document.getElementById(\'imageFileInput\').click()" '
+        'style="background:#f0f0f0;border:1px solid #ddd;border-radius:6px;'
+        'padding:6px 12px;font-size:13px;cursor:pointer;">🖼️ 이미지 삽입</button>'
+        '<input type="file" id="imageFileInput" accept="image/*" style="display:none;" '
+        'onchange="handleImageFile(this.files[0])">'
+        '<span id="uploadStatus" style="font-size:12px;color:#888;align-self:center;"></span>'
+        '</div>'
+    )
+ 
+    script_block = """
+    <script>
+    async function updateNotice(noticeId) {
+        const title = document.getElementById('title').value.trim();
+        const content = document.getElementById('content').value.trim();
+        const isActive = document.getElementById('isActive').checked;
+        const isPopup = document.getElementById('isPopup').checked;
+
+        const res = await fetch('/master/notice/' + noticeId + '/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: title, content: content, is_active: isActive, is_popup: isPopup })
+        });
+        if (res.ok) { alert('수정되었습니다.'); location.reload(); } else { alert('수정 실패'); }
+    }
+
+    async function deleteNotice(noticeId) {
+        if (!confirm('삭제하시겠습니까? (비활성 처리됩니다)')) return;
+        const res = await fetch('/master/notice/' + noticeId + '/delete', { method: 'POST' });
+        if (res.ok) { alert('삭제되었습니다.'); location.href = '/master/notice'; } else { alert('삭제 실패'); }
+    }
+    </script>
+    """
+
+    editor_script = """
+    <script>
+    function toggleFlag(checkboxId, btnEl) {
+        const cb = document.getElementById(checkboxId);
+        cb.checked = !cb.checked;
+        if (cb.checked) {
+            btnEl.style.background = '#1E2761';
+            btnEl.style.color = 'white';
+            btnEl.style.borderColor = '#1E2761';
+        } else {
+            btnEl.style.background = 'white';
+            btnEl.style.color = '#555';
+            btnEl.style.borderColor = '#ddd';
+        }
+    }
+
+    function insertLink() {
+        const url = prompt('링크 URL을 입력하세요 (https://로 시작):');
+        if (!url) return;
+        const text = prompt('링크에 표시할 텍스트를 입력하세요:', url);
+        insertAtCursor('[' + (text || url) + '](' + url + ')');
+    }
+ 
+    function insertAtCursor(text) {
+        const ta = document.getElementById('content');
+        const start = ta.selectionStart;
+        const end = ta.selectionEnd;
+        ta.value = ta.value.substring(0, start) + text + ta.value.substring(end);
+        ta.selectionStart = ta.selectionEnd = start + text.length;
+        ta.focus();
+    }
+ 
+    async function handleImageFile(file) {
+        if (!file) return;
+        const statusEl = document.getElementById('uploadStatus');
+        statusEl.textContent = '업로드 중...';
+        const formData = new FormData();
+        formData.append('file', file);
+        try {
+            const res = await fetch('/master/notice/upload-image', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (res.ok) {
+                insertAtCursor('![](' + data.url + ')');
+                statusEl.textContent = '업로드 완료';
+                setTimeout(function() { statusEl.textContent = ''; }, 2000);
+            } else {
+                statusEl.textContent = '업로드 실패: ' + (data.detail || '');
+            }
+        } catch (e) {
+            statusEl.textContent = '업로드 실패';
+        }
+    }
+ 
+    (function() {
+        const ta = document.getElementById('content');
+        if (!ta) return;
+        ta.addEventListener('dragover', function(e) { e.preventDefault(); ta.style.background = '#f0f4ff'; });
+        ta.addEventListener('dragleave', function(e) { ta.style.background = ''; });
+        ta.addEventListener('drop', function(e) {
+            e.preventDefault();
+            ta.style.background = '';
+            const file = e.dataTransfer.files[0];
+            if (file && file.type.startsWith('image/')) { handleImageFile(file); }
+        });
+    })();
+    </script>
+    """
+ 
     body_html = (
         '<h2>새 공지 등록</h2>'
         '<div style="max-width:600px;">'
         '<label>제목</label><br>'
         '<input type="text" id="title" style="width:100%;padding:8px;margin:8px 0;"><br>'
-        '<label>내용</label><br>'
-        '<textarea id="content" rows="10" style="width:100%;padding:8px;margin:8px 0;"></textarea><br>'
-        '<label><input type="checkbox" id="isPopup"> 접속 시 팝업으로 노출</label><br><br>'
-        '<button onclick="submitNotice()" class="btn-primary">등록</button>'
+        '<label>내용</label>'
+        + editor_toolbar_html +
+        '<textarea id="content" rows="10" '
+        'style="width:100%;padding:8px;margin:4px 0 8px;" '
+        'placeholder="내용을 입력하거나, 이미지를 이 영역으로 드래그해서 넣을 수 있습니다."></textarea>'
+        '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">'
+        '<label style="font-size:13px;color:#555;">'
+        '<input type="checkbox" id="isPopup"> 접속 시 팝업으로 노출</label>'
+        '<button onclick="submitNotice()" '
+        'style="background:#1E2761;color:white;border:none;padding:10px 22px;'
+        'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">등록</button>'
+        '</div>'
         '</div>'
         + script_block
+        + editor_script
     )
 
     return HTMLResponse(content=render_page(body_html, user, "master-notice"))
@@ -670,6 +790,207 @@ async def master_notice_create(request: Request, session_token: str = Cookie(def
         "INSERT INTO notice (title, content, is_popup, created_by) VALUES (?, ?, ?, ?)",
         (title, content, is_popup, user["login_id"])
     )
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/master/notice/{notice_id}", response_class=HTMLResponse)
+async def master_notice_detail(notice_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login")
+
+    conn = get_conn()
+    notice = conn.execute(
+        "SELECT id, title, content, is_active, is_popup FROM notice WHERE id=?",
+        (notice_id,)
+    ).fetchone()
+
+    if not notice:
+        return HTMLResponse(content="<h3>존재하지 않는 공지입니다.</h3>", status_code=404)
+
+    read_branches = conn.execute(
+        "SELECT branch_code, account, read_at FROM notice_read_log WHERE notice_id=? ORDER BY read_at DESC",
+        (notice_id,)
+    ).fetchall()
+
+    read_rows_html = ""
+    for r in read_branches:
+        read_rows_html += (
+            '<tr><td>' + r["branch_code"] + '</td><td>' + r["account"] + '</td><td>' + str(r["read_at"])[:16] + '</td></tr>'
+        )
+
+    active_checked = "checked" if notice["is_active"] else ""
+    popup_checked = "checked" if notice["is_popup"] else ""
+    active_toggle_style = (
+        "background:#1E2761;color:white;border-color:#1E2761;" if notice["is_active"]
+        else "background:white;color:#555;border-color:#ddd;"
+    )
+    popup_toggle_style = (
+        "background:#1E2761;color:white;border-color:#1E2761;" if notice["is_popup"]
+        else "background:white;color:#555;border-color:#ddd;"
+    )
+
+    editor_toolbar_html = (
+        '<div style="display:flex;gap:8px;margin:8px 0 4px;">'
+        '<button type="button" onclick="insertLink()" '
+        'style="background:#f0f0f0;border:1px solid #ddd;border-radius:6px;'
+        'padding:6px 12px;font-size:13px;cursor:pointer;">🔗 링크 삽입</button>'
+        '<button type="button" onclick="document.getElementById(\'imageFileInput\').click()" '
+        'style="background:#f0f0f0;border:1px solid #ddd;border-radius:6px;'
+        'padding:6px 12px;font-size:13px;cursor:pointer;">🖼️ 이미지 삽입</button>'
+        '<input type="file" id="imageFileInput" accept="image/*" style="display:none;" '
+        'onchange="handleImageFile(this.files[0])">'
+        '<span id="uploadStatus" style="font-size:12px;color:#888;align-self:center;"></span>'
+        '</div>'
+    )
+
+    script_block = """
+    <script>
+    async function updateNotice(noticeId) {
+        const title = document.getElementById('title').value.trim();
+        const content = document.getElementById('content').value.trim();
+        const isActive = document.getElementById('isActive').checked;
+        const isPopup = document.getElementById('isPopup').checked;
+
+        const res = await fetch('/master/notice/' + noticeId + '/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: title, content: content, is_active: isActive, is_popup: isPopup })
+        });
+        if (res.ok) { alert('수정되었습니다.'); location.reload(); } else { alert('수정 실패'); }
+    }
+
+    async function deleteNotice(noticeId) {
+        if (!confirm('삭제하시겠습니까? (비활성 처리됩니다)')) return;
+        const res = await fetch('/master/notice/' + noticeId + '/delete', { method: 'POST' });
+        if (res.ok) { alert('삭제되었습니다.'); location.href = '/master/notice'; } else { alert('삭제 실패'); }
+    }
+    </script>
+    """
+
+    editor_script = """
+    <script>
+    function insertLink() {
+        const url = prompt('링크 URL을 입력하세요 (https://로 시작):');
+        if (!url) return;
+        const text = prompt('링크에 표시할 텍스트를 입력하세요:', url);
+        insertAtCursor('[' + (text || url) + '](' + url + ')');
+    }
+
+    function insertAtCursor(text) {
+        const ta = document.getElementById('content');
+        const start = ta.selectionStart;
+        const end = ta.selectionEnd;
+        ta.value = ta.value.substring(0, start) + text + ta.value.substring(end);
+        ta.selectionStart = ta.selectionEnd = start + text.length;
+        ta.focus();
+    }
+
+    async function handleImageFile(file) {
+        if (!file) return;
+        const statusEl = document.getElementById('uploadStatus');
+        statusEl.textContent = '업로드 중...';
+        const formData = new FormData();
+        formData.append('file', file);
+        try {
+            const res = await fetch('/master/notice/upload-image', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (res.ok) {
+                insertAtCursor('![](' + data.url + ')');
+                statusEl.textContent = '업로드 완료';
+                setTimeout(function() { statusEl.textContent = ''; }, 2000);
+            } else {
+                statusEl.textContent = '업로드 실패: ' + (data.detail || '');
+            }
+        } catch (e) {
+            statusEl.textContent = '업로드 실패';
+        }
+    }
+
+    (function() {
+        const ta = document.getElementById('content');
+        if (!ta) return;
+        ta.addEventListener('dragover', function(e) { e.preventDefault(); ta.style.background = '#f0f4ff'; });
+        ta.addEventListener('dragleave', function(e) { ta.style.background = ''; });
+        ta.addEventListener('drop', function(e) {
+            e.preventDefault();
+            ta.style.background = '';
+            const file = e.dataTransfer.files[0];
+            if (file && file.type.startsWith('image/')) { handleImageFile(file); }
+        });
+    })();
+    </script>
+    """
+
+    body_html = (
+        '<h2>공지 상세/수정</h2>'
+        '<div style="max-width:600px;">'
+        '<label>제목</label><br>'
+        '<input type="text" id="title" value="' + notice["title"] + '" style="width:100%;padding:8px;margin:8px 0;"><br>'
+        '<label>내용</label>'
+        + editor_toolbar_html +
+        '<textarea id="content" rows="10" style="width:100%;padding:8px;margin:4px 0 8px;">' + notice["content"] + '</textarea>'
+        '<input type="checkbox" id="isActive" ' + active_checked + ' style="display:none;">'
+        '<input type="checkbox" id="isPopup" ' + popup_checked + ' style="display:none;">'
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;">'
+        '<button type="button" onclick="toggleFlag(\'isActive\', this)" '
+        'style="' + active_toggle_style + 'border:1px solid;padding:9px 16px;'
+        'border-radius:20px;font-size:13px;cursor:pointer;">✅ 게시 활성화</button>'
+        '<button type="button" onclick="toggleFlag(\'isPopup\', this)" '
+        'style="' + popup_toggle_style + 'border:1px solid;padding:9px 16px;'
+        'border-radius:20px;font-size:13px;cursor:pointer;">📌 접속 시 팝업 노출</button>'
+        '<button onclick="updateNotice(' + str(notice_id) + ')" '
+        'style="background:#1E2761;color:white;border:none;padding:10px 22px;'
+        'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">저장</button>'
+        '<button onclick="deleteNotice(' + str(notice_id) + ')" '
+        'style="background:#e74c3c;color:#fff;border:none;padding:10px 22px;'
+        'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">삭제</button>'
+        '</div>'
+        '</div>'
+        '<h3 style="margin-top:30px;">읽음 현황 (' + str(len(read_branches)) + '건)</h3>'
+        '<table class="notice-table" style="width:100%;border-collapse:collapse;">'
+        '<thead><tr><th>지점</th><th>확인자</th><th>확인시각</th></tr></thead>'
+        '<tbody>' + read_rows_html + '</tbody></table>'
+        + script_block
+        + editor_script
+    )
+
+    return HTMLResponse(content=render_page(body_html, user, "master-notice"))
+
+
+@app.post("/master/notice/{notice_id}/update")
+async def master_notice_update(notice_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    title = data.get("title", "").strip()
+    content = data.get("content", "").strip()
+    is_active = bool(data.get("is_active", True))
+    is_popup = bool(data.get("is_popup", False))
+
+    if not title or not content:
+        return JSONResponse(status_code=400, content={"detail": "제목과 내용을 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "UPDATE notice SET title=?, content=?, is_active=?, is_popup=?, updated_at=NOW() WHERE id=?",
+        (title, content, is_active, is_popup, notice_id)
+    )
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/notice/{notice_id}/delete")
+async def master_notice_delete(notice_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    conn.execute("UPDATE notice SET is_active=FALSE WHERE id=?", (notice_id,))
     conn.commit()
     return JSONResponse(content={"status": "ok"})
 
@@ -1142,6 +1463,28 @@ init_db()
 
 # ── 공통 UI 컴포넌트 ────────────────────────────────────
 
+def render_notice_content(raw_content: str) -> str:
+    """공지 본문의 ![](이미지URL), [텍스트](URL) 패턴을 HTML로 변환하고 줄바꿈을 <br>로 치환."""
+    import re
+    import html as html_lib
+ 
+    escaped = html_lib.escape(raw_content)
+ 
+    # 이미지 패턴: ![](url) — 텍스트 부분은 사용하지 않음
+    escaped = re.sub(
+        r'!\[\]\((https?://[^\s)]+)\)',
+        r'<img src="\1" style="max-width:100%;border-radius:8px;margin:8px 0;display:block;">',
+        escaped
+    )
+    # 링크 패턴: [텍스트](url)
+    escaped = re.sub(
+        r'\[([^\]]+)\]\((https?://[^\s)]+)\)',
+        r'<a href="\2" target="_blank" style="color:#1E2761;text-decoration:underline;">\1</a>',
+        escaped
+    )
+    return escaped.replace("\n", "<br>")
+ 
+ 
 def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> str:
     """공통 레이아웃 — 상단 타이틀 + 하단 메뉴 포함"""
     # ⚠️ 모바일 전용 테이블 글씨 축소 — f-string 중괄호 충돌 방지를 위해 별도 문자열로 조립
@@ -6991,7 +7334,69 @@ async def master_survey_upload_image(request: Request, session_token: str = Cook
     public_url = f"{supabase_url}/storage/v1/object/public/survey-images/{new_filename}"
 
     return JSONResponse(content={"status": "ok", "url": public_url})
-
+ 
+ 
+@app.post("/master/notice/upload-image")
+async def master_notice_upload_image(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+ 
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse(status_code=400, content={"detail": "파일이 없습니다."})
+ 
+    filename = getattr(file, "filename", "") or ""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    allowed_ext = {"jpg", "jpeg", "png", "gif", "webp"}
+    if ext not in allowed_ext:
+        return JSONResponse(status_code=400, content={"detail": "이미지 파일(jpg/jpeg/png/gif/webp)만 업로드 가능합니다."})
+ 
+    raw = await file.read()
+    max_size = 5 * 1024 * 1024  # 5MB
+    if len(raw) > max_size:
+        return JSONResponse(status_code=400, content={"detail": "파일 크기는 5MB 이하만 가능합니다."})
+ 
+    content_type_map = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+        "gif": "image/gif", "webp": "image/webp"
+    }
+    content_type = content_type_map.get(ext, "application/octet-stream")
+ 
+    import uuid
+    new_filename = f"{uuid.uuid4().hex}.{ext}"
+ 
+    supabase_url = "https://fjznuesrbrwcqbdghegn.supabase.co"
+    service_role_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
+    if not service_role_key:
+        return JSONResponse(status_code=500, content={"detail": "서버 설정 오류: service_role 키가 없습니다."})
+ 
+    upload_url = f"{supabase_url}/storage/v1/object/survey-images/notice_{new_filename}"
+ 
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(
+            upload_url,
+            content=raw,
+            headers={
+                "Authorization": f"Bearer {service_role_key}",
+                "apikey": service_role_key,
+                "Content-Type": content_type,
+                "x-upsert": "true"
+            },
+            timeout=30.0
+        )
+ 
+    if resp.status_code not in (200, 201):
+        return JSONResponse(status_code=500, content={
+            "detail": f"업로드 실패 (Supabase 응답 {resp.status_code}): {resp.text[:200]}"
+        })
+ 
+    public_url = f"{supabase_url}/storage/v1/object/public/survey-images/notice_{new_filename}"
+ 
+    return JSONResponse(content={"status": "ok", "url": public_url})
+ 
+ 
 @app.post("/master/survey/{survey_id}/target-list/clear")
 async def master_survey_target_list_clear(survey_id: int, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
