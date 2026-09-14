@@ -1540,14 +1540,14 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         </div>
             """
             sub_items_html = "".join(
-                f'<a href="{sub_href}" style="display:block;padding:10px 16px;color:#333;'
-                f'text-decoration:none;font-size:13px;border-bottom:1px solid #f0f0f0;">{sub_label}</a>'
+                f'<a href="{sub_href}" style="display:block;padding:10px 16px;color:white;'
+                f'text-decoration:none;font-size:13px;border-bottom:1px solid rgba(255,255,255,0.15);">{sub_label}</a>'
                 for sub_label, sub_href in submenu
             )
             submenu_popups_html += f"""
         <div id="submenu-{key}" style="display:none;position:fixed;bottom:64px;
-             left:50%;transform:translateX(-50%);background:white;border-radius:10px;
-             box-shadow:0 2px 12px rgba(0,0,0,0.15);min-width:160px;z-index:200;overflow:hidden;">
+             left:50%;transform:translateX(-50%);background:#1E2761;border-radius:10px;
+             box-shadow:0 2px 12px rgba(0,0,0,0.25);min-width:160px;z-index:200;overflow:hidden;">
           {sub_items_html}
         </div>
             """
@@ -1660,9 +1660,13 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         function toggleSubmenu(key) {{
           var target = document.getElementById('submenu-' + key);
           var overlay = document.getElementById('submenuOverlay');
+          var trigger = document.querySelector('[onclick="toggleSubmenu(\\'' + key + '\\')"]');
           var isOpen = target.style.display === 'block';
           closeAllSubmenus();
-          if (!isOpen) {{
+          if (!isOpen && trigger) {{
+            var rect = trigger.getBoundingClientRect();
+            target.style.left = (rect.left + rect.width / 2) + 'px';
+            target.style.transform = 'translateX(-50%)';
             target.style.display = 'block';
             overlay.style.display = 'block';
           }}
@@ -11502,7 +11506,9 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
       {message_html}
 
       <h2>주간 발주 대상 <span class="count-badge">{len(weekly)}건</span></h2>
-      <table>
+      <table>      <h2>주간 발주 대상 <span class="count-badge">{len(weekly)}건</span>
+        <a href="/master/purchase-order/preview/export?order_type=weekly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">📥 엑셀 다운로드</a>
+      </h2>
         <thead>
           <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
         </thead>
@@ -11511,7 +11517,9 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
         </tbody>
       </table>
 
-      <h2>월간 발주 대상 <span class="count-badge">{len(monthly)}건</span></h2>
+      <h2>월간 발주 대상 <span class="count-badge">{len(monthly)}건</span>
+        <a href="/master/purchase-order/preview/export?order_type=monthly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">📥 엑셀 다운로드</a>
+      </h2>
       <table>
         <thead>
           <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
@@ -15119,6 +15127,101 @@ async def qr_print_page(
     """
     return HTMLResponse(content=html)
 
+def _build_purchase_order_excel(candidates: list, order_type: str) -> bytes:
+    """
+    발주 대상 리스트를 받아 엑셀(bytes)로 생성.
+    order_type: "weekly" 또는 "monthly" (시트 제목/파일명 라벨링에만 사용)
+    구조: [전체] 시트 1개 + 지점별 시트 N개
+    """
+    import io
+    import re
+
+    label = "주간발주" if order_type == "weekly" else "월간발주"
+
+    wb = openpyxl.Workbook()
+
+    headers = ["지점", "품번", "품명", "안전재고", "MOQ", "최종발주수량"]
+
+    def write_sheet(ws, rows):
+        ws.append(headers)
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+            cell.fill = openpyxl.styles.PatternFill(start_color="1E2761", end_color="1E2761", fill_type="solid")
+        for r in rows:
+            ws.append([
+                r["branch_name"], r["item_code"], r["item_name"],
+                r["safety_qty"], r["moq"], r["final_qty"]
+            ])
+        widths = [16, 18, 30, 10, 8, 12]
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+    ws_all = wb.active
+    ws_all.title = "전체"
+    write_sheet(ws_all, candidates)
+
+    by_branch: dict = {}
+    for r in candidates:
+        by_branch.setdefault(r["branch_name"], []).append(r)
+
+    def safe_sheet_name(name: str) -> str:
+        cleaned = re.sub(r'[\\/\?\*\[\]:]', '', name)
+        return cleaned[:28] if cleaned else "지점"
+
+    used_names = {"전체"}
+    for branch_name, rows in by_branch.items():
+        base_name = safe_sheet_name(branch_name)
+        sheet_name = base_name
+        suffix = 1
+        while sheet_name in used_names:
+            suffix += 1
+            sheet_name = f"{base_name[:26]}_{suffix}"
+        used_names.add(sheet_name)
+
+        ws = wb.create_sheet(title=sheet_name)
+        write_sheet(ws, rows)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@app.get("/master/purchase-order/preview/export")
+async def purchase_order_preview_export(
+    session_token: str = Cookie(default=None),
+    order_type: str = "weekly"
+):
+    from urllib.parse import quote
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    if order_type not in ("weekly", "monthly"):
+        order_type = "weekly"
+
+    result = await _compute_purchase_order_candidates()
+    candidates = result.get(order_type, [])
+
+    if not candidates:
+        return HTMLResponse(content=render_page(
+            '<div class="card"><p>❌ 발주 대상이 없어 엑셀을 생성할 수 없습니다.</p>'
+            '<a href="/master/purchase-order/preview">← 돌아가기</a></div>', user, "master"))
+
+    excel_bytes = _build_purchase_order_excel(candidates, order_type)
+
+    label = "주간발주서" if order_type == "weekly" else "월간발주서"
+    today_str = datetime.now().strftime("%Y%m%d")
+    filename = f"{label}_{today_str}.xlsx"
+    encoded_name = quote(filename)
+
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
+    )
 
 @app.post("/master/qr/generate-bulk")
 async def master_qr_generate_bulk(
