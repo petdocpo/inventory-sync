@@ -990,7 +990,9 @@ async def master_notice_delete(notice_id: int, session_token: str = Cookie(defau
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
 
     conn = get_conn()
-    conn.execute("UPDATE notice SET is_active=FALSE WHERE id=?", (notice_id,))
+    conn.execute("DELETE FROM notice_read_log WHERE notice_id=?", (notice_id,))
+    conn.execute("DELETE FROM notice_popup_dismiss WHERE notice_id=?", (notice_id,))
+    conn.execute("DELETE FROM notice WHERE id=?", (notice_id,))
     conn.commit()
     return JSONResponse(content={"status": "ok"})
 
