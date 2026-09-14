@@ -1159,29 +1159,63 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     raw_menu_href = "/master/raw-upload" if is_master else "/raw-branch"
     vendor_eval_href = "/master/vendor-eval" if is_master else "/vendor-eval"
     survey_menu_href = "/master/survey" if is_master else "/survey"
+    notice_menu_href = "/master/notice" if is_master else "/notice"
+    qna_menu_href = "/master/qna" if is_master else "/qna"
+
+    # menus: (key, href|None, icon, label, submenu|None)
+    # submenu가 있으면 href는 무시되고 클릭 시 소메뉴가 토글됩니다.
     menus = [
-        ("dashboard", "/", "⚠️", "대시보드"),
-        ("inventory", "/inventory", "📦", "재고현황"),
-        ("qr", "/qr", "📷", "QR생성"),
-        ("adjust", "/adjust", "✏️", "수기조정"),
-        ("scanlog", "/scan-log", "📜", "스캔이력"),
-        ("survey", survey_menu_href, "📋", "설문"),
-        ("vendor-eval", vendor_eval_href, "🤝", "거래처평가"),
-        ("purchase-history", "/purchase-history", "📦", "발주내역"),
+        ("dashboard", "/", "⚠️", "대시보드", None),
+        ("inventory", "/inventory", "📦", "재고현황", None),
+        ("qr", "/qr", "📷", "QR생성", None),
+        ("adjust", "/adjust", "✏️", "수기조정", None),
+        ("scanlog", "/scan-log", "📜", "스캔이력", None),
+        ("survey-group", None, "📋", "설문", [
+            ("설문 응답", survey_menu_href),
+            ("거래처 평가", vendor_eval_href),
+        ]),
+        ("notice-group", None, "📢", "공지", [
+            ("공지사항", notice_menu_href),
+            ("Q&A 게시판", qna_menu_href),
+        ]),
+        ("purchase-history", "/purchase-history", "📦", "발주내역", None),
     ]
     if is_master:
-        menus.append(("teams-webhook", "/master/teams-webhook", "🔔", "팀즈웹훅"))
-        menus.append(("master", "/master", "⚙️", "마스터"))
+        menus.append(("teams-webhook", "/master/teams-webhook", "🔔", "팀즈웹훅", None))
+        menus.append(("master", "/master", "⚙️", "마스터", None))
+
     menu_html = ""
-    for key, href, icon, label in menus:
+    submenu_popups_html = ""
+    for key, href, icon, label, submenu in menus:
         is_active = "background:#1E2761;color:white;" if active == key else "color:#555;"
-        menu_html += f"""
+        if submenu:
+            menu_html += f"""
+        <div onclick="toggleSubmenu('{key}')" style="flex:1;text-align:center;padding:8px 0;
+           cursor:pointer;font-size:12px;{is_active}border-radius:8px;position:relative;">
+          <div style="font-size:20px;">{icon}</div>
+          <div>{label}</div>
+        </div>
+            """
+            sub_items_html = "".join(
+                f'<a href="{sub_href}" style="display:block;padding:10px 16px;color:#333;'
+                f'text-decoration:none;font-size:13px;border-bottom:1px solid #f0f0f0;">{sub_label}</a>'
+                for sub_label, sub_href in submenu
+            )
+            submenu_popups_html += f"""
+        <div id="submenu-{key}" style="display:none;position:fixed;bottom:64px;
+             left:50%;transform:translateX(-50%);background:white;border-radius:10px;
+             box-shadow:0 2px 12px rgba(0,0,0,0.15);min-width:160px;z-index:200;overflow:hidden;">
+          {sub_items_html}
+        </div>
+            """
+        else:
+            menu_html += f"""
         <a href="{href}" style="flex:1;text-align:center;padding:8px 0;
            text-decoration:none;font-size:12px;{is_active}border-radius:8px;">
           <div style="font-size:20px;">{icon}</div>
           <div>{label}</div>
         </a>
-        """
+            """
 
     return f"""
     <html><head>
@@ -1275,7 +1309,26 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
       </div>
       <div class="content">{content}</div>
+      <div id="submenuOverlay" onclick="closeAllSubmenus()" style="display:none;position:fixed;
+           top:0;left:0;right:0;bottom:0;z-index:150;"></div>
+      {submenu_popups_html}
       <nav class="bottomnav">{menu_html}</nav>
+      <script>
+        function toggleSubmenu(key) {{
+          var target = document.getElementById('submenu-' + key);
+          var overlay = document.getElementById('submenuOverlay');
+          var isOpen = target.style.display === 'block';
+          closeAllSubmenus();
+          if (!isOpen) {{
+            target.style.display = 'block';
+            overlay.style.display = 'block';
+          }}
+        }}
+        function closeAllSubmenus() {{
+          document.querySelectorAll('[id^="submenu-"]').forEach(function(el) {{ el.style.display = 'none'; }});
+          document.getElementById('submenuOverlay').style.display = 'none';
+        }}
+      </script>
       <script>
       (function() {{
         // 모바일 가로스크롤을 위해 모든 table을 스크롤 컨테이너로 자동 래핑
