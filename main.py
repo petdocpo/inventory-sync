@@ -11414,9 +11414,9 @@ async def _compute_purchase_order_candidates() -> dict:
         item_code = row["item_code"] or ""
         safety_qty = row["qty"] or 0
 
-        is_debug_row = (item_code == DEBUG_ITEM_CODE)
+        is_debug_row = (DEBUG_ITEM_CODE in item_code) or (item_code in DEBUG_ITEM_CODE and item_code != "")
         if is_debug_row:
-            print(f"[PO_DEBUG] row start: branch_name={branch_name!r} item_code={item_code!r} safety_qty={safety_qty!r}")
+            print(f"[PO_DEBUG] row start: branch_name={branch_name!r} item_code={item_code!r} item_code_len={len(item_code)} item_code_repr={item_code.encode('utf-8')!r} safety_qty={safety_qty!r}")
 
         branch_code = branch_name_to_code.get(branch_name)
         if not branch_code:
