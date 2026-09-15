@@ -5440,10 +5440,11 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
                 return JSONResponse(status_code=400, content={"detail": f'"{q["question_text"]}" 문항의 서술 입력이 필요합니다.'})
 
     existing = conn.execute(
-        "SELECT id FROM survey_response WHERE survey_id=? AND branch_code=? AND writer_name=?",
+        "SELECT id, status FROM survey_response WHERE survey_id=? AND branch_code=? AND writer_name=?",
         (survey_id, branch_code, writer_name)
     ).fetchone()
-    if existing:
+    is_resubmit = bool(existing and existing["status"] == "resubmit_requested")
+    if existing and not is_resubmit:
         conn.close()
         return JSONResponse(status_code=400, content={
             "detail": "이미 같은 이름으로 제출된 기록이 있습니다.",
@@ -5497,16 +5498,25 @@ async def survey_submit(survey_id: int, request: Request, session_token: str = C
             achieved_percent = (total_score / max_score) * 100
             is_pass = achieved_percent >= pass_value
 
-    conn.execute("""
-        INSERT INTO survey_response (survey_id, writer_name, branch_code, branch_name, status, total_score, max_score, is_pass)
-        VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
-    """, (survey_id, writer_name, branch_code, branch_name, total_score, max_score, is_pass))
+    if is_resubmit:
+        response_id = existing["id"]
+        conn.execute("""
+            UPDATE survey_response
+            SET status='completed', total_score=?, max_score=?, is_pass=?, created_at=NOW()
+            WHERE id=?
+        """, (total_score, max_score, is_pass, response_id))
+        conn.execute("DELETE FROM survey_answer WHERE response_id=?", (response_id,))
+    else:
+        conn.execute("""
+            INSERT INTO survey_response (survey_id, writer_name, branch_code, branch_name, status, total_score, max_score, is_pass)
+            VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)
+        """, (survey_id, writer_name, branch_code, branch_name, total_score, max_score, is_pass))
 
-    new_row = conn.execute(
-        "SELECT id FROM survey_response WHERE survey_id=? AND branch_code=? AND writer_name=?",
-        (survey_id, branch_code, writer_name)
-    ).fetchone()
-    response_id = new_row["id"]
+        new_row = conn.execute(
+            "SELECT id FROM survey_response WHERE survey_id=? AND branch_code=? AND writer_name=?",
+            (survey_id, branch_code, writer_name)
+        ).fetchone()
+        response_id = new_row["id"]
 
     for a in answers:
         sel = a.get("selected_option")
@@ -7096,6 +7106,29 @@ async def master_survey_responses_page(
 
         status_badge = '<span class="badge-red">⚠️ 재제출요청</span>' if r["status"] == "resubmit_requested" else '<span class="badge-green">✅ 완료</span>'
 
+        # 정답/오답 개수 + 합격여부 계산 (정답이 있는 문항만 대상)
+        correct_count = 0
+        graded_count = 0
+        for a in answers:
+            q = question_map.get(a["question_id"])
+            if not q or not q["has_answer_key"]:
+                continue
+            graded_count += 1
+            option_rows_g = conn.execute(
+                "SELECT option_value, is_correct FROM survey_question_option WHERE question_id=?",
+                (a["question_id"],)
+            ).fetchall()
+            correct_values_g = {o["option_value"] for o in option_rows_g if o["is_correct"]}
+            if a["selected_option"] in correct_values_g:
+                correct_count += 1
+
+        score_badge = ""
+        if graded_count > 0:
+            score_badge = f'<div style="font-size:12px;color:#555;margin-top:2px;">{correct_count}/{graded_count} 정답</div>'
+        if r["is_pass"] is not None:
+            pass_html = '<span style="background:#D1FAE5;color:#065F46;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:bold;">✅ 합격</span>' if r["is_pass"] else '<span style="background:#FEE2E2;color:#991B1B;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:bold;">❌ 불합격</span>'
+            score_badge += f'<div style="margin-top:2px;">{pass_html}</div>'
+
         rows_html += f"""
         <tr>
             <td style="text-align:center;">
@@ -7104,7 +7137,7 @@ async def master_survey_responses_page(
             <td>{r['branch_name']}</td>
             <td>{r['writer_name']}</td>
             <td style="font-size:12px;">{answers_html}</td>
-            <td>{status_badge}</td>
+            <td>{status_badge}{score_badge}</td>
             <td style="font-size:11px;color:#888;">{str(r['created_at'])[:16]}</td>
         </tr>
         """
