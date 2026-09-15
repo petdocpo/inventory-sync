@@ -7106,22 +7106,28 @@ async def master_survey_responses_page(
 
         status_badge = '<span class="badge-red">⚠️ 재제출요청</span>' if r["status"] == "resubmit_requested" else '<span class="badge-green">✅ 완료</span>'
 
-        # 정답/오답 개수 + 합격여부 계산 (정답이 있는 문항만 대상)
+        # 정답/오답 개수 + 합격여부 계산 (정답이 있는 문항만 대상, 문항 단위로 판정 — 멀티셀렉트는 선택집합==정답집합으로 채점)
+        answers_by_qid_g: Dict[int, list] = {}
+        for a in answers:
+            answers_by_qid_g.setdefault(a["question_id"], []).append(a)
+
         correct_count = 0
         graded_count = 0
-        for a in answers:
-            q = question_map.get(a["question_id"])
+        for qid_g, a_list_g in answers_by_qid_g.items():
+            q = question_map.get(qid_g)
             if not q or not q["has_answer_key"]:
                 continue
             graded_count += 1
             option_rows_g = conn.execute(
                 "SELECT option_value, is_correct FROM survey_question_option WHERE question_id=?",
-                (a["question_id"],)
+                (qid_g,)
             ).fetchall()
             correct_values_g = {o["option_value"] for o in option_rows_g if o["is_correct"]}
-            if a["selected_option"] in correct_values_g:
+            selected_values_g = {a.get("selected_option") for a in a_list_g if a.get("selected_option")}
+            if selected_values_g == correct_values_g:
                 correct_count += 1
 
+        print(f"[DEBUG] response_id={r['id']} writer={r['writer_name']} graded_count={graded_count} correct_count={correct_count} answers_by_qid_g_keys={list(answers_by_qid_g.keys())}")
         score_badge = ""
         if graded_count > 0:
             score_badge = f'<div style="font-size:12px;color:#555;margin-top:2px;">{correct_count}/{graded_count} 정답</div>'
