@@ -7185,8 +7185,8 @@ async def master_survey_responses_page(
     <form method="post" action="/master/survey/{survey_id}/target-list/clear" id="targetListClearForm"></form>
     """
 
-    # 3. 자바스크립트 영역 (f를 빼고 안전하게 연결)
-    content += """
+    # 3. 자바스크립트 영역
+    content += f"""
     <script>
       (function() {{
         var allCheck = document.getElementById('svRespAllCheck');
