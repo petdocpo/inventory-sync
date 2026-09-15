@@ -11743,6 +11743,7 @@ async def purchase_order_product_settings_page(
             safe_item_name = (r["item_name"] or "").replace("'", "")
             rows_html += f"""
             <tr>
+              <td style="text-align:center;"><input type="checkbox" class="pm-row-check" data-id="{r['id']}" style="width:18px;height:18px;"></td>
               <td class="pm-col-branch">{r['branch_name'] or ''}</td>
               <td class="pm-col-item">{r['item_name'] or ''}</td>
               <td class="pm-col-code">{r['item_code'] or ''}</td>
@@ -11822,8 +11823,20 @@ async def purchase_order_product_settings_page(
         <button type="button" class="btn" style="background:#64748B;" onclick="openPmColSettings()">⚙️ 컬럼 설정</button>
       </form>
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
+      <div class="card" style="background:#F0FDF4;border:1px solid #86EFAC;margin-bottom:12px;">
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+          <button class="btn" type="button" onclick="saveAllPmRows()" style="background:#22C55E;">💾 화면 전체 저장</button>
+          <span style="color:#ccc;">|</span>
+          <span id="pmCheckedCount" style="font-size:13px;color:#555;">선택됨: 0건</span>
+          <input type="number" id="pmBulkLeadTime" placeholder="리드타임 일괄값" style="width:130px;">
+          <input type="number" id="pmBulkMoq" placeholder="MOQ 일괄값" style="width:110px;">
+          <button class="btn" type="button" onclick="applyBulkToChecked()" style="background:#8B5CF6;">✓ 체크 항목에 적용</button>
+        </div>
+      </div>
+
       <table class="pm-table">
         <thead><tr>
+          <th style="text-align:center;"><input type="checkbox" id="pmCheckAll" onclick="togglePmCheckAll(this)" style="width:18px;height:18px;"></th>
           <th class="pm-col-branch">지점</th>
           <th class="pm-col-item" style="cursor:pointer;" onclick="sortPm('item_name')">상품명 {'▲' if sort_by=='item_name' and sort_dir=='asc' else ('▼' if sort_by=='item_name' else '')}</th>
           <th class="pm-col-code">품번</th>
@@ -12048,6 +12061,78 @@ async def purchase_order_product_settings_page(
         }}
       }}
 
+      function togglePmCheckAll(el) {{
+        document.querySelectorAll('.pm-row-check').forEach(cb => cb.checked = el.checked);
+        updatePmCheckedCount();
+      }}
+
+      function updatePmCheckedCount() {{
+        const count = document.querySelectorAll('.pm-row-check:checked').length;
+        document.getElementById('pmCheckedCount').innerText = '선택됨: ' + count + '건';
+      }}
+
+      document.addEventListener('change', function(e) {{
+        if (e.target.classList.contains('pm-row-check')) updatePmCheckedCount();
+      }});
+
+      async function saveAllPmRows() {{
+        const ids = Array.from(document.querySelectorAll('.pm-price[data-id]')).map(el => el.dataset.id);
+        const rows = ids.map(id => {{
+          const priceEl = document.querySelector('.pm-price[data-id="' + id + '"]');
+          const leadTimeEl = document.querySelector('.pm-leadtime[data-id="' + id + '"]');
+          const moqEl = document.querySelector('.pm-moq[data-id="' + id + '"]');
+          const consumableEl = document.querySelector('.pm-consumable[data-id="' + id + '"]');
+          const categoryEl = document.querySelector('.pm-category[data-id="' + id + '"]');
+          const ptypeEl = document.querySelector('.pm-ptype[data-id="' + id + '"]');
+          const ctypeEl = document.querySelector('.pm-ctype[data-id="' + id + '"]');
+          return {{
+            id: id,
+            purchase_price: parseFloat(priceEl.value) || 0,
+            lead_time_days: parseInt(leadTimeEl.value) || 0,
+            moq: parseInt(moqEl.value) || 1,
+            is_consumable: consumableEl.checked,
+            category: categoryEl.value.trim(),
+            product_type: ptypeEl.value.trim(),
+            consumable_type: ctypeEl.value.trim()
+          }};
+        }});
+        if (!rows.length) {{ alert('저장할 항목이 없습니다.'); return; }}
+        if (!confirm(rows.length + '건을 전체 저장하시겠습니까?')) return;
+        const res = await fetch('/master/purchase-order/product-master/bulk-save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ rows: rows }})
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          alert('저장 완료: ' + data.success + '건' + (data.errors && data.errors.length ? ' / 오류 ' + data.errors.length + '건' : ''));
+        }} else {{
+          alert('저장 실패: ' + (data.detail || '오류'));
+        }}
+      }}
+
+      async function applyBulkToChecked() {{
+        const ids = Array.from(document.querySelectorAll('.pm-row-check:checked')).map(cb => cb.dataset.id);
+        if (!ids.length) {{ alert('체크된 품목이 없습니다.'); return; }}
+        const leadTimeVal = document.getElementById('pmBulkLeadTime').value;
+        const moqVal = document.getElementById('pmBulkMoq').value;
+        if (!leadTimeVal && !moqVal) {{ alert('리드타임 또는 MOQ 값을 입력하세요.'); return; }}
+        const payload = {{ ids: ids }};
+        if (leadTimeVal) payload.lead_time_days = parseInt(leadTimeVal);
+        if (moqVal) payload.moq = parseInt(moqVal);
+        if (!confirm(ids.length + '건에 값을 일괄 적용하시겠습니까? (즉시 DB에 저장됩니다)')) return;
+        const res = await fetch('/master/purchase-order/product-master/bulk-apply', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(payload)
+        }});
+        const data = await res.json();
+        if (res.ok) {{
+          alert('적용 완료: ' + data.success + '건');
+          location.reload();
+        }} else {{
+          alert('적용 실패: ' + (data.detail || '오류'));
+        }}
+      }}
+
       applyPmColVisibility();
     </script>
     """
@@ -12109,6 +12194,89 @@ async def purchase_order_product_master_save(request: Request, session_token: st
     conn.close()
     return JSONResponse(content={"status": "ok"})
 
+@app.post("/master/purchase-order/product-master/bulk-save")
+async def purchase_order_product_master_bulk_save(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    rows = data.get("rows", [])
+    if not rows:
+        return JSONResponse(status_code=400, content={"detail": "저장할 항목이 없습니다."})
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    updated = 0
+    errors = []
+    for r in rows:
+        row_id = r.get("id")
+        if not row_id:
+            continue
+        try:
+            conn.execute(
+                """UPDATE product_master
+                   SET purchase_price=?, lead_time_days=?, moq=?, is_consumable=?,
+                       category=?, product_type=?, consumable_type=?, updated_at=?
+                   WHERE id=?""",
+                (
+                    r.get("purchase_price", 0), r.get("lead_time_days", 0), r.get("moq", 1),
+                    bool(r.get("is_consumable", False)),
+                    (r.get("category") or "").strip() or None,
+                    (r.get("product_type") or "").strip() or None,
+                    (r.get("consumable_type") or "").strip() or None,
+                    now, row_id
+                )
+            )
+            updated += 1
+        except Exception as e:
+            errors.append(f"id={row_id}: {str(e)}")
+
+    conn.commit()
+    conn.close()
+    return {"success": updated, "errors": errors}
+
+
+@app.post("/master/purchase-order/product-master/bulk-apply")
+async def purchase_order_product_master_bulk_apply(request: Request, session_token: str = Cookie(default=None)):
+    """체크된 품목들에 리드타임/MOQ 값을 일괄 적용"""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    ids = data.get("ids", [])
+    lead_time_days = data.get("lead_time_days")
+    moq = data.get("moq")
+
+    if not ids:
+        return JSONResponse(status_code=400, content={"detail": "선택된 품목이 없습니다."})
+    if lead_time_days is None and moq is None:
+        return JSONResponse(status_code=400, content={"detail": "변경할 값을 입력하세요."})
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    placeholders = ",".join("?" for _ in ids)
+
+    if lead_time_days is not None and moq is not None:
+        conn.execute(
+            f"UPDATE product_master SET lead_time_days=?, moq=?, updated_at=? WHERE id IN ({placeholders})",
+            [lead_time_days, moq, now] + [int(i) for i in ids]
+        )
+    elif lead_time_days is not None:
+        conn.execute(
+            f"UPDATE product_master SET lead_time_days=?, updated_at=? WHERE id IN ({placeholders})",
+            [lead_time_days, now] + [int(i) for i in ids]
+        )
+    else:
+        conn.execute(
+            f"UPDATE product_master SET moq=?, updated_at=? WHERE id IN ({placeholders})",
+            [moq, now] + [int(i) for i in ids]
+        )
+
+    conn.commit()
+    conn.close()
+    return {"success": len(ids)}
 
 @app.post("/master/purchase-order/product-master/hide")
 async def purchase_order_product_master_hide(request: Request, session_token: str = Cookie(default=None)):
