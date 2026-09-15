@@ -7127,7 +7127,7 @@ async def master_survey_responses_page(
             if selected_values_g == correct_values_g:
                 correct_count += 1
 
-        print(f"[DEBUG] response_id={r['id']} writer={r['writer_name']} graded_count={graded_count} correct_count={correct_count} answers_by_qid_g_keys={list(answers_by_qid_g.keys())}")
+    
         score_badge = ""
         if graded_count > 0:
             score_badge = f'<div style="font-size:12px;color:#555;margin-top:2px;">{correct_count}/{graded_count} 정답</div>'
@@ -11402,36 +11402,57 @@ async def _compute_purchase_order_candidates() -> dict:
 
     PENDING_STATUSES = {"접수", "승인"}
 
+    DEBUG_ITEM_CODE = "CSAS01-000149"
+
     for row in safety_rows:
         branch_name = row["branch_name"]
         item_name = row["item_name"]
         item_code = row["item_code"] or ""
         safety_qty = row["qty"] or 0
 
+        is_debug_row = (item_code == DEBUG_ITEM_CODE)
+        if is_debug_row:
+            print(f"[PO_DEBUG] row start: branch_name={branch_name!r} item_code={item_code!r} safety_qty={safety_qty!r}")
+
         branch_code = branch_name_to_code.get(branch_name)
         if not branch_code:
-            # 지점명이 매칭 안 되면(오타/미등록 지점) 스킵 - 별도 오류 처리는 상위에서
+            if is_debug_row:
+                print(f"[PO_DEBUG] SKIP at step1(branch match): branch_name={branch_name!r} not in branch_name_to_code keys sample={list(branch_name_to_code.keys())[:5]}")
             continue
 
         pm = pm_map.get(item_code)
+        if is_debug_row:
+            print(f"[PO_DEBUG] branch_code={branch_code!r} pm={dict(pm) if pm else None}")
 
         # 1. 전체 미발주 제외
         if pm and pm["order_excluded"]:
+            if is_debug_row:
+                print(f"[PO_DEBUG] SKIP at step1(order_excluded)")
             continue
 
         # 2. 현재고 >= 안전재고면 제외 (재고 충분)
         current_qty = raw_map.get((branch_code, item_code), 0)
+        if is_debug_row:
+            print(f"[PO_DEBUG] step2 check: current_qty={current_qty!r} (raw_map key={(branch_code, item_code)!r}) vs safety_qty={safety_qty!r}")
         if current_qty >= safety_qty:
+            if is_debug_row:
+                print(f"[PO_DEBUG] SKIP at step2(current>=safety)")
             continue
 
         # 3. 소모품 기본 제외 (지점별 예외 등록 시 포함)
         is_consumable = bool(pm["is_consumable"]) if pm else False
         if is_consumable and (item_code, branch_code) not in consumable_include_set:
+            if is_debug_row:
+                print(f"[PO_DEBUG] SKIP at step3(consumable)")
             continue
 
         # 4. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고
         latest_status = status_map.get((branch_name, item_name))
+        if is_debug_row:
+            print(f"[PO_DEBUG] step4 check: latest_status={latest_status!r} (status_map key={(branch_name, item_name)!r})")
         if latest_status in PENDING_STATUSES:
+            if is_debug_row:
+                print(f"[PO_DEBUG] SKIP at step4(pending status)")
             pending_report.append({
                 "branch_code": branch_code,
                 "branch_name": branch_name,
