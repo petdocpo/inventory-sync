@@ -11354,6 +11354,10 @@ async def _compute_purchase_order_candidates() -> dict:
         "SELECT branch_name, item_name, item_code, qty, moq FROM safety_stock WHERE qty > 0"
     ).fetchall()
 
+    print(f"[PO_DEBUG] ENTRY: safety_rows count={len(safety_rows)}")
+    debug_codes_in_rows = [r["item_code"] for r in safety_rows if r["item_code"] == "CSAS01-000149"]
+    print(f"[PO_DEBUG] ENTRY: CSAS01-000149 rows in safety_rows = {len(debug_codes_in_rows)}")
+
     if not safety_rows:
         conn.close()
         return {"weekly": [], "monthly": [], "pending_report": [], "message": "등록된 안전재고가 없습니다."}
