@@ -671,7 +671,7 @@ async def master_notice_create_form(request: Request, session_token: str = Cooki
     }
 
     async function deleteNotice(noticeId) {
-        if (!confirm('삭제하시겠습니까? (비활성 처리됩니다)')) return;
+        if (!confirm('삭제하시겠습니까? (완전 삭제 처리됩니다)')) return;
         const res = await fetch('/master/notice/' + noticeId + '/delete', { method: 'POST' });
         if (res.ok) { alert('삭제되었습니다.'); location.href = '/master/notice'; } else { alert('삭제 실패'); }
     }
@@ -11408,15 +11408,34 @@ async def _compute_purchase_order_candidates() -> dict:
 
     DEBUG_ITEM_CODE = "CSAS01-000149"
 
+    print(f"[PO_DEBUG] safety_rows type={type(safety_rows)!r} len={len(safety_rows)}")
+    try:
+        sample_row = safety_rows[0]
+        print(f"[PO_DEBUG] sample_row type={type(sample_row)!r} keys={list(sample_row.keys()) if hasattr(sample_row, 'keys') else 'NO KEYS METHOD'}")
+        matching = [i for i, r in enumerate(safety_rows) if r["item_code"] == "CSAS01-000149"]
+        print(f"[PO_DEBUG] matching indices for CSAS01-000149 = {matching}")
+        for idx in matching:
+            r = safety_rows[idx]
+            print(f"[PO_DEBUG] index {idx}: branch_name={r['branch_name']!r} item_code={r['item_code']!r}")
+    except Exception as e:
+        print(f"[PO_DEBUG] EXCEPTION during pre-loop inspection: {e!r}")
+
     for row in safety_rows:
         branch_name = row["branch_name"]
         item_name = row["item_name"]
         item_code = row["item_code"] or ""
         safety_qty = row["qty"] or 0
 
-        is_debug_row = (DEBUG_ITEM_CODE in item_code) or (item_code in DEBUG_ITEM_CODE and item_code != "")
+        try:
+            is_debug_row = ("CSAS01" in str(item_code))
+        except Exception as e:
+            print(f"[PO_DEBUG] EXCEPTION in is_debug_row calc: {e!r} item_code_type={type(item_code)!r}")
+            is_debug_row = False
         if is_debug_row:
-            print(f"[PO_DEBUG] row start: branch_name={branch_name!r} item_code={item_code!r} item_code_len={len(item_code)} item_code_repr={item_code.encode('utf-8')!r} safety_qty={safety_qty!r}")
+            try:
+                print(f"[PO_DEBUG] row start: branch_name={branch_name!r} item_code={item_code!r} type={type(item_code)!r} safety_qty={safety_qty!r}")
+            except Exception as e:
+                print(f"[PO_DEBUG] EXCEPTION in print: {e!r}")
 
         branch_code = branch_name_to_code.get(branch_name)
         if not branch_code:
@@ -11508,7 +11527,9 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
     if not user:
         return RedirectResponse(url="/login", status_code=303)
 
+    print(f"[PO_DEBUG] BEFORE calling _compute_purchase_order_candidates")
     result = await _compute_purchase_order_candidates()
+    print(f"[PO_DEBUG] AFTER calling, result keys={list(result.keys())} weekly_len={len(result.get('weekly', []))}")
 
     weekly = result.get("weekly", [])
     monthly = result.get("monthly", [])
