@@ -11354,10 +11354,6 @@ async def _compute_purchase_order_candidates() -> dict:
         "SELECT branch_name, item_name, item_code, qty, moq FROM safety_stock WHERE qty > 0"
     ).fetchall()
 
-    print(f"[PO_DEBUG] ENTRY: safety_rows count={len(safety_rows)}")
-    debug_codes_in_rows = [r["item_code"] for r in safety_rows if r["item_code"] == "CSAS01-000149"]
-    print(f"[PO_DEBUG] ENTRY: CSAS01-000149 rows in safety_rows = {len(debug_codes_in_rows)}")
-
     if not safety_rows:
         conn.close()
         return {"weekly": [], "monthly": [], "pending_report": [], "message": "등록된 안전재고가 없습니다."}
@@ -11406,76 +11402,35 @@ async def _compute_purchase_order_candidates() -> dict:
 
     PENDING_STATUSES = {"접수", "승인"}
 
-    DEBUG_ITEM_CODE = "CSAS01-000149"
-
-    print(f"[PO_DEBUG] safety_rows type={type(safety_rows)!r} len={len(safety_rows)}")
-    try:
-        sample_row = safety_rows[0]
-        print(f"[PO_DEBUG] sample_row type={type(sample_row)!r} keys={list(sample_row.keys()) if hasattr(sample_row, 'keys') else 'NO KEYS METHOD'}")
-        matching = [i for i, r in enumerate(safety_rows) if r["item_code"] == "CSAS01-000149"]
-        print(f"[PO_DEBUG] matching indices for CSAS01-000149 = {matching}")
-        for idx in matching:
-            r = safety_rows[idx]
-            print(f"[PO_DEBUG] index {idx}: branch_name={r['branch_name']!r} item_code={r['item_code']!r}")
-    except Exception as e:
-        print(f"[PO_DEBUG] EXCEPTION during pre-loop inspection: {e!r}")
-
     for row in safety_rows:
         branch_name = row["branch_name"]
         item_name = row["item_name"]
         item_code = row["item_code"] or ""
         safety_qty = row["qty"] or 0
 
-        try:
-            is_debug_row = ("CSAS01" in str(item_code))
-        except Exception as e:
-            print(f"[PO_DEBUG] EXCEPTION in is_debug_row calc: {e!r} item_code_type={type(item_code)!r}")
-            is_debug_row = False
-        if is_debug_row:
-            try:
-                print(f"[PO_DEBUG] row start: branch_name={branch_name!r} item_code={item_code!r} type={type(item_code)!r} safety_qty={safety_qty!r}")
-            except Exception as e:
-                print(f"[PO_DEBUG] EXCEPTION in print: {e!r}")
-
         branch_code = branch_name_to_code.get(branch_name)
         if not branch_code:
-            if is_debug_row:
-                print(f"[PO_DEBUG] SKIP at step1(branch match): branch_name={branch_name!r} not in branch_name_to_code keys sample={list(branch_name_to_code.keys())[:5]}")
             continue
 
         pm = pm_map.get(item_code)
-        if is_debug_row:
-            print(f"[PO_DEBUG] branch_code={branch_code!r} pm={dict(pm) if pm else None}")
 
         # 1. 전체 미발주 제외
         if pm and pm["order_excluded"]:
-            if is_debug_row:
-                print(f"[PO_DEBUG] SKIP at step1(order_excluded)")
             continue
 
         # 2. 현재고 >= 안전재고면 제외 (재고 충분)
         current_qty = raw_map.get((branch_code, item_code), 0)
-        if is_debug_row:
-            print(f"[PO_DEBUG] step2 check: current_qty={current_qty!r} (raw_map key={(branch_code, item_code)!r}) vs safety_qty={safety_qty!r}")
         if current_qty >= safety_qty:
-            if is_debug_row:
-                print(f"[PO_DEBUG] SKIP at step2(current>=safety)")
             continue
 
         # 3. 소모품 기본 제외 (지점별 예외 등록 시 포함)
         is_consumable = bool(pm["is_consumable"]) if pm else False
         if is_consumable and (item_code, branch_code) not in consumable_include_set:
-            if is_debug_row:
-                print(f"[PO_DEBUG] SKIP at step3(consumable)")
             continue
 
         # 4. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고
         latest_status = status_map.get((branch_name, item_name))
-        if is_debug_row:
-            print(f"[PO_DEBUG] step4 check: latest_status={latest_status!r} (status_map key={(branch_name, item_name)!r})")
         if latest_status in PENDING_STATUSES:
-            if is_debug_row:
-                print(f"[PO_DEBUG] SKIP at step4(pending status)")
             pending_report.append({
                 "branch_code": branch_code,
                 "branch_name": branch_name,
@@ -11514,7 +11469,7 @@ async def _compute_purchase_order_candidates() -> dict:
         else:
             weekly.append(candidate)
 
-        return {
+    return {
         "weekly": weekly,
         "monthly": monthly,
         "pending_report": pending_report
@@ -11527,9 +11482,7 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
     if not user:
         return RedirectResponse(url="/login", status_code=303)
 
-    print(f"[PO_DEBUG] BEFORE calling _compute_purchase_order_candidates")
     result = await _compute_purchase_order_candidates()
-    print(f"[PO_DEBUG] AFTER calling, result keys={list(result.keys())} weekly_len={len(result.get('weekly', []))}")
 
     weekly = result.get("weekly", [])
     monthly = result.get("monthly", [])
