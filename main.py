@@ -1010,7 +1010,8 @@ async def qna_list_page(request: Request, session_token: str = Cookie(default=No
     branch_code = user["branch_code"]
     conn = get_conn()
     posts = conn.execute(
-        "SELECT id, title, author, status, created_at FROM qna_post WHERE branch_code=? ORDER BY created_at DESC",
+        "SELECT id, branch_code, title, author, status, created_at, is_secret FROM qna_post "
+        "WHERE is_secret=FALSE OR branch_code=? ORDER BY created_at DESC",
         (branch_code,)
     ).fetchall()
 
@@ -1021,10 +1022,19 @@ async def qna_list_page(request: Request, session_token: str = Cookie(default=No
             if p["status"] == "answered"
             else '<span style="background:#FEE2E2;color:#991B1B;padding:2px 8px;border-radius:10px;font-size:12px;">대기중</span>'
         )
+        is_masked = p["is_secret"] and p["branch_code"] != branch_code
+        if is_masked:
+            title_display = "🔒 비공개 문의입니다"
+            author_display = "-"
+        else:
+            secret_icon = "🔒 " if p["is_secret"] else ""
+            title_display = secret_icon + p["title"]
+            author_display = p["author"]
         rows_html += (
             '<tr onclick="location.href=\'/qna/' + str(p["id"]) + '\'" style="cursor:pointer;">'
-            '<td>' + status_badge + ' ' + p["title"] + '</td>'
-            '<td>' + p["author"] + '</td>'
+            '<td>' + status_badge + ' ' + title_display + '</td>'
+            '<td>' + p["branch_code"] + '</td>'
+            '<td>' + author_display + '</td>'
             '<td>' + str(p["created_at"])[:16] + '</td>'
             '</tr>'
         )
@@ -1036,7 +1046,7 @@ async def qna_list_page(request: Request, session_token: str = Cookie(default=No
         'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;margin-bottom:16px;">'
         '+ 문의 작성</button>'
         '<table style="width:100%;border-collapse:collapse;">'
-        '<thead><tr><th>제목</th><th>작성자</th><th>작성일</th></tr></thead>'
+        '<thead><tr><th>제목</th><th>지점</th><th>작성자</th><th>작성일</th></tr></thead>'
         '<tbody>' + rows_html + '</tbody></table>'
     )
 
@@ -1055,12 +1065,13 @@ async def qna_write_form(request: Request, session_token: str = Cookie(default=N
         const author = document.getElementById('author').value.trim();
         const title = document.getElementById('title').value.trim();
         const content = document.getElementById('content').value.trim();
+        const isSecret = document.getElementById('isSecret').checked;
         if (!author || !title || !content) { alert('작성자, 제목, 내용을 모두 입력하세요.'); return; }
 
         const res = await fetch('/qna/write', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ author: author, title: title, content: content })
+            body: JSON.stringify({ author: author, title: title, content: content, is_secret: isSecret })
         });
         if (res.ok) {
             alert('등록되었습니다.');
@@ -1082,6 +1093,9 @@ async def qna_write_form(request: Request, session_token: str = Cookie(default=N
         '<input type="text" id="title" style="width:100%;padding:8px;margin:8px 0;"><br>'
         '<label>내용</label><br>'
         '<textarea id="content" rows="10" style="width:100%;padding:8px;margin:8px 0;"></textarea><br>'
+        '<label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#555;margin:4px 0 16px;">'
+        '<input type="checkbox" id="isSecret" style="width:auto;margin:0;">'
+        '🔒 비밀글로 작성 (본사와 작성 지점만 조회 가능)</label>'
         '<button onclick="submitQna()" '
         'style="background:#1E2761;color:white;border:none;padding:10px 22px;'
         'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">등록</button>'
@@ -1103,14 +1117,15 @@ async def qna_write_submit(request: Request, session_token: str = Cookie(default
     author = data.get("author", "").strip()
     title = data.get("title", "").strip()
     content = data.get("content", "").strip()
+    is_secret = bool(data.get("is_secret", False))
 
     if not author or not title or not content:
         return JSONResponse(status_code=400, content={"detail": "작성자, 제목, 내용을 모두 입력하세요."})
 
     conn = get_conn()
     conn.execute(
-        "INSERT INTO qna_post (branch_code, author, title, content, status) VALUES (?, ?, ?, ?, 'waiting')",
-        (branch_code, author, title, content)
+        "INSERT INTO qna_post (branch_code, author, title, content, status, is_secret) VALUES (?, ?, ?, ?, 'waiting', ?)",
+        (branch_code, author, title, content, is_secret)
     )
     conn.commit()
     return JSONResponse(content={"status": "ok"})
@@ -1125,12 +1140,15 @@ async def qna_detail_page(post_id: int, request: Request, session_token: str = C
     branch_code = user["branch_code"]
     conn = get_conn()
     post = conn.execute(
-        "SELECT id, branch_code, author, title, content, status, created_at FROM qna_post WHERE id=?",
+        "SELECT id, branch_code, author, title, content, status, created_at, is_secret FROM qna_post WHERE id=?",
         (post_id,)
     ).fetchone()
 
-    if not post or post["branch_code"] != branch_code:
-        return HTMLResponse(content="<h3>존재하지 않거나 접근 권한이 없는 게시글입니다.</h3>", status_code=404)
+    if not post:
+        return HTMLResponse(content="<h3>존재하지 않는 게시글입니다.</h3>", status_code=404)
+
+    if post["is_secret"] and post["branch_code"] != branch_code:
+        return HTMLResponse(content="<h3>비밀글입니다. 작성 지점과 본사만 조회할 수 있습니다.</h3>", status_code=403)
 
     answer = conn.execute(
         "SELECT answered_by, content, answered_at FROM qna_answer WHERE qna_post_id=?",
@@ -1147,21 +1165,341 @@ async def qna_detail_page(post_id: int, request: Request, session_token: str = C
             '<div style="color:#999;font-size:12px;margin-top:10px;">' + str(answer["answered_at"])[:16] + '</div>'
             '</div>'
         )
+        edit_delete_html = ""
     else:
         answer_html = (
             '<div style="background:#FEF3C7;border-radius:10px;padding:16px;margin-top:20px;color:#92400E;">'
             '⏳ 아직 답변이 등록되지 않았습니다.'
             '</div>'
         )
+        edit_delete_html = (
+            '<div style="display:flex;gap:8px;margin-top:16px;">'
+            '<button onclick="location.href=\'/qna/' + str(post_id) + '/edit\'" '
+            'style="background:#1E2761;color:white;border:none;padding:9px 18px;'
+            'border-radius:20px;font-size:13px;cursor:pointer;">수정</button>'
+            '<button onclick="deleteMyQna(' + str(post_id) + ')" '
+            'style="background:#e74c3c;color:#fff;border:none;padding:9px 18px;'
+            'border-radius:20px;font-size:13px;cursor:pointer;">삭제</button>'
+            '</div>'
+        )
+
+    delete_script = """
+    <script>
+    async function deleteMyQna(postId) {
+        if (!confirm('삭제하시겠습니까? (복구할 수 없습니다)')) return;
+        const res = await fetch('/qna/' + postId + '/delete', { method: 'POST' });
+        if (res.ok) { alert('삭제되었습니다.'); location.href = '/qna'; } else {
+            const data = await res.json();
+            alert('삭제 실패: ' + (data.detail || ''));
+        }
+    }
+    </script>
+    """
 
     body_html = (
         '<h2>' + post["title"] + '</h2>'
         '<p style="color:#999;font-size:13px;">작성자: ' + post["author"] + ' · ' + str(post["created_at"])[:16] + '</p>'
         '<div style="margin:20px 0;line-height:1.6;">' + content_escaped + '</div>'
+        + edit_delete_html
         + answer_html
+        + delete_script
     )
 
     return HTMLResponse(content=render_page(body_html, user, "notice-group"))
+
+
+@app.get("/qna/{post_id}/edit", response_class=HTMLResponse)
+async def qna_edit_form(post_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login")
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    post = conn.execute(
+        "SELECT id, branch_code, author, title, content, is_secret FROM qna_post WHERE id=?",
+        (post_id,)
+    ).fetchone()
+
+    if not post or post["branch_code"] != branch_code:
+        return HTMLResponse(content="<h3>존재하지 않거나 접근 권한이 없는 게시글입니다.</h3>", status_code=404)
+
+    answer_exists = conn.execute("SELECT id FROM qna_answer WHERE qna_post_id=?", (post_id,)).fetchone()
+    if answer_exists:
+        return HTMLResponse(content="<h3>이미 답변이 등록된 글은 수정할 수 없습니다.</h3>", status_code=403)
+
+    secret_checked = "checked" if post["is_secret"] else ""
+
+    script_block = """
+    <script>
+    async function submitQnaEdit(postId) {
+        const author = document.getElementById('author').value.trim();
+        const title = document.getElementById('title').value.trim();
+        const content = document.getElementById('content').value.trim();
+        const isSecret = document.getElementById('isSecret').checked;
+        if (!author || !title || !content) { alert('작성자, 제목, 내용을 모두 입력하세요.'); return; }
+
+        const res = await fetch('/qna/' + postId + '/edit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ author: author, title: title, content: content, is_secret: isSecret })
+        });
+        if (res.ok) {
+            alert('수정되었습니다.');
+            location.href = '/qna/' + postId;
+        } else {
+            const data = await res.json();
+            alert('수정 실패: ' + (data.detail || ''));
+        }
+    }
+    </script>
+    """
+
+    body_html = (
+        '<h2>문의 수정</h2>'
+        '<div style="max-width:600px;">'
+        '<label>작성자</label><br>'
+        '<input type="text" id="author" value="' + post["author"] + '" style="width:100%;padding:8px;margin:8px 0;"><br>'
+        '<label>제목</label><br>'
+        '<input type="text" id="title" value="' + post["title"] + '" style="width:100%;padding:8px;margin:8px 0;"><br>'
+        '<label>내용</label><br>'
+        '<textarea id="content" rows="10" style="width:100%;padding:8px;margin:8px 0;">' + post["content"] + '</textarea><br>'
+        '<label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#555;margin:4px 0 16px;">'
+        '<input type="checkbox" id="isSecret" ' + secret_checked + ' style="width:auto;margin:0;">'
+        '🔒 비밀글로 작성 (본사와 작성 지점만 조회 가능)</label>'
+        '<button onclick="submitQnaEdit(' + str(post_id) + ')" '
+        'style="background:#1E2761;color:white;border:none;padding:10px 22px;'
+        'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">저장</button>'
+        '</div>'
+        + script_block
+    )
+
+    return HTMLResponse(content=render_page(body_html, user, "notice-group"))
+
+
+@app.post("/qna/{post_id}/edit")
+async def qna_edit_submit(post_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    post = conn.execute("SELECT branch_code FROM qna_post WHERE id=?", (post_id,)).fetchone()
+    if not post or post["branch_code"] != branch_code:
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    answer_exists = conn.execute("SELECT id FROM qna_answer WHERE qna_post_id=?", (post_id,)).fetchone()
+    if answer_exists:
+        return JSONResponse(status_code=403, content={"detail": "이미 답변이 등록된 글은 수정할 수 없습니다."})
+
+    data = await request.json()
+    author = data.get("author", "").strip()
+    title = data.get("title", "").strip()
+    content = data.get("content", "").strip()
+    is_secret = bool(data.get("is_secret", False))
+
+    if not author or not title or not content:
+        return JSONResponse(status_code=400, content={"detail": "작성자, 제목, 내용을 모두 입력하세요."})
+
+    conn.execute(
+        "UPDATE qna_post SET author=?, title=?, content=?, is_secret=? WHERE id=?",
+        (author, title, content, is_secret, post_id)
+    )
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/qna/{post_id}/delete")
+async def qna_delete(post_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    post = conn.execute("SELECT branch_code FROM qna_post WHERE id=?", (post_id,)).fetchone()
+    if not post or post["branch_code"] != branch_code:
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    answer_exists = conn.execute("SELECT id FROM qna_answer WHERE qna_post_id=?", (post_id,)).fetchone()
+    if answer_exists:
+        return JSONResponse(status_code=403, content={"detail": "이미 답변이 등록된 글은 삭제할 수 없습니다."})
+
+    conn.execute("DELETE FROM qna_post WHERE id=?", (post_id,))
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
+# ══════════════════════════════════════════════
+# Q&A 게시판 - 마스터(본사)용
+# ══════════════════════════════════════════════
+
+@app.get("/master/qna", response_class=HTMLResponse)
+async def master_qna_list(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login")
+
+    conn = get_conn()
+    posts = conn.execute(
+        "SELECT id, branch_code, author, title, status, created_at, is_secret FROM qna_post "
+        "ORDER BY CASE WHEN status='waiting' THEN 0 ELSE 1 END, created_at DESC"
+    ).fetchall()
+
+    rows_html = ""
+    for p in posts:
+        status_badge = (
+            '<span style="background:#D1FAE5;color:#065F46;padding:2px 8px;border-radius:10px;font-size:12px;">답변완료</span>'
+            if p["status"] == "answered"
+            else '<span style="background:#FEE2E2;color:#991B1B;padding:2px 8px;border-radius:10px;font-size:12px;">대기중</span>'
+        )
+        secret_icon = "🔒 " if p["is_secret"] else ""
+        rows_html += (
+            '<tr onclick="location.href=\'/master/qna/' + str(p["id"]) + '\'" style="cursor:pointer;">'
+            '<td>' + status_badge + ' ' + secret_icon + p["title"] + '</td>'
+            '<td>' + p["branch_code"] + '</td>'
+            '<td>' + p["author"] + '</td>'
+            '<td>' + str(p["created_at"])[:16] + '</td>'
+            '</tr>'
+        )
+
+    body_html = (
+        '<h2>💬 Q&A 게시판 관리</h2>'
+        '<table style="width:100%;border-collapse:collapse;">'
+        '<thead><tr><th>제목</th><th>지점</th><th>작성자</th><th>작성일</th></tr></thead>'
+        '<tbody>' + rows_html + '</tbody></table>'
+    )
+
+    return HTMLResponse(content=render_page(body_html, user, "notice-group"))
+
+
+@app.get("/master/qna/{post_id}", response_class=HTMLResponse)
+async def master_qna_detail(post_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login")
+
+    conn = get_conn()
+    post = conn.execute(
+        "SELECT id, branch_code, author, title, content, status, created_at, is_secret FROM qna_post WHERE id=?",
+        (post_id,)
+    ).fetchone()
+
+    if not post:
+        return HTMLResponse(content="<h3>존재하지 않는 게시글입니다.</h3>", status_code=404)
+
+    answer = conn.execute(
+        "SELECT answered_by, content, answered_at FROM qna_answer WHERE qna_post_id=?",
+        (post_id,)
+    ).fetchone()
+
+    content_escaped = post["content"].replace("\n", "<br>")
+    secret_badge = '<span style="color:#e74c3c;font-size:12px;margin-left:8px;">🔒 비밀글</span>' if post["is_secret"] else ""
+
+    script_block = """
+    <script>
+    async function submitAnswer(postId) {
+        const content = document.getElementById('answerContent').value.trim();
+        if (!content) { alert('답변 내용을 입력하세요.'); return; }
+
+        const res = await fetch('/master/qna/' + postId + '/answer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: content })
+        });
+        if (res.ok) { alert('답변이 등록되었습니다.'); location.reload(); } else { alert('답변 등록 실패'); }
+    }
+    </script>
+    """
+
+    if answer:
+        answer_section_html = (
+            '<div style="background:#f5f7fa;border-radius:10px;padding:16px;margin-top:20px;">'
+            '<div style="font-weight:bold;color:#1E2761;margin-bottom:8px;">💬 등록된 답변 (' + answer["answered_by"] + ')</div>'
+            '<div style="line-height:1.6;">' + answer["content"].replace("\n", "<br>") + '</div>'
+            '<div style="color:#999;font-size:12px;margin-top:10px;">' + str(answer["answered_at"])[:16] + '</div>'
+            '</div>'
+        )
+    else:
+        answer_section_html = (
+            '<div style="margin-top:24px;">'
+            '<label style="font-weight:bold;">답변 작성</label><br>'
+            '<textarea id="answerContent" rows="8" style="width:100%;padding:8px;margin:8px 0;"></textarea><br>'
+            '<button onclick="submitAnswer(' + str(post_id) + ')" '
+            'style="background:#1E2761;color:white;border:none;padding:10px 22px;'
+            'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">답변 등록</button>'
+            '</div>'
+        )
+
+    master_delete_html = (
+        '<button onclick="deleteMasterQna(' + str(post_id) + ')" '
+        'style="background:#e74c3c;color:#fff;border:none;padding:9px 18px;'
+        'border-radius:20px;font-size:13px;cursor:pointer;margin-top:12px;">🗑️ 이 글 삭제</button>'
+    )
+
+    master_delete_script = """
+    <script>
+    async function deleteMasterQna(postId) {
+        if (!confirm('삭제하시겠습니까? (복구할 수 없습니다)')) return;
+        const res = await fetch('/master/qna/' + postId + '/delete', { method: 'POST' });
+        if (res.ok) { alert('삭제되었습니다.'); location.href = '/master/qna'; } else { alert('삭제 실패'); }
+    }
+    </script>
+    """
+
+    body_html = (
+        '<h2>' + post["title"] + secret_badge + '</h2>'
+        '<p style="color:#999;font-size:13px;">' + post["branch_code"] + ' · 작성자: ' + post["author"] + ' · ' + str(post["created_at"])[:16] + '</p>'
+        '<div style="margin:20px 0;line-height:1.6;">' + content_escaped + '</div>'
+        + master_delete_html
+        + answer_section_html
+        + script_block
+        + master_delete_script
+    )
+
+    return HTMLResponse(content=render_page(body_html, user, "notice-group"))
+
+
+@app.post("/master/qna/{post_id}/delete")
+async def master_qna_delete(post_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    conn.execute("DELETE FROM qna_answer WHERE qna_post_id=?", (post_id,))
+    conn.execute("DELETE FROM qna_post WHERE id=?", (post_id,))
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/qna/{post_id}/answer")
+async def master_qna_answer(post_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    content = data.get("content", "").strip()
+    if not content:
+        return JSONResponse(status_code=400, content={"detail": "답변 내용을 입력하세요."})
+
+    conn = get_conn()
+    existing = conn.execute("SELECT id FROM qna_answer WHERE qna_post_id=?", (post_id,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE qna_answer SET content=?, answered_by=?, answered_at=NOW() WHERE qna_post_id=?",
+            (content, user["login_id"], post_id)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO qna_answer (qna_post_id, answered_by, content) VALUES (?, ?, ?)",
+            (post_id, user["login_id"], content)
+        )
+    conn.execute("UPDATE qna_post SET status='answered' WHERE id=?", (post_id,))
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
 
 
 @app.post("/api/push/subscribe")
