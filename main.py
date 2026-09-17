@@ -664,30 +664,6 @@ async def master_notice_create_form(request: Request, session_token: str = Cooki
         '<span id="uploadStatus" style="font-size:12px;color:#888;align-self:center;"></span>'
         '</div>'
     )
- 
-    script_block = """
-    <script>
-    async function updateNotice(noticeId) {
-        const title = document.getElementById('title').value.trim();
-        const content = document.getElementById('content').value.trim();
-        const isActive = document.getElementById('isActive').checked;
-        const isPopup = document.getElementById('isPopup').checked;
-
-        const res = await fetch('/master/notice/' + noticeId + '/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: title, content: content, is_active: isActive, is_popup: isPopup })
-        });
-        if (res.ok) { alert('수정되었습니다.'); location.reload(); } else { alert('수정 실패'); }
-    }
-
-    async function deleteNotice(noticeId) {
-        if (!confirm('삭제하시겠습니까? (완전 삭제 처리됩니다)')) return;
-        const res = await fetch('/master/notice/' + noticeId + '/delete', { method: 'POST' });
-        if (res.ok) { alert('삭제되었습니다.'); location.href = '/master/notice'; } else { alert('삭제 실패'); }
-    }
-    </script>
-    """
 
     editor_script = """
     <script>
@@ -825,7 +801,7 @@ async def master_notice_detail(notice_id: int, request: Request, session_token: 
 
     conn = get_conn()
     notice = conn.execute(
-        "SELECT id, title, content, is_active, is_popup FROM notice WHERE id=?",
+        "SELECT id, title, content, is_active, is_popup, popup_end_date FROM notice WHERE id=?",
         (notice_id,)
     ).fetchone()
 
