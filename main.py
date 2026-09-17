@@ -526,6 +526,7 @@ async def notice_popup_check(session_token: str = Cookie(default=None)):
         SELECT n.id, n.title, n.content
         FROM notice n
         WHERE n.is_active = TRUE AND n.is_popup = TRUE
+          AND (n.popup_end_date IS NULL OR n.popup_end_date >= CURRENT_DATE)
           AND NOT EXISTS (
               SELECT 1 FROM notice_popup_dismiss d
               WHERE d.notice_id = n.id AND d.branch_code = ?
@@ -541,19 +542,23 @@ async def notice_popup_check(session_token: str = Cookie(default=None)):
 
 
 @app.post("/notice/{notice_id}/popup-dismiss")
-async def notice_popup_dismiss(notice_id: int, session_token: str = Cookie(default=None)):
+async def notice_popup_dismiss(notice_id: int, request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user:
         return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
 
+    data = await request.json()
+    duration = data.get("duration", "week")  # "today" 또는 "week"
+    interval_sql = "CURRENT_DATE" if duration == "today" else "CURRENT_DATE + INTERVAL '7 days'"
+
     branch_code = user["branch_code"]
     conn = get_conn()
     conn.execute(
-        """
+        f"""
         INSERT INTO notice_popup_dismiss (notice_id, branch_code, dismissed_until)
-        VALUES (?, ?, CURRENT_DATE + INTERVAL '7 days')
+        VALUES (?, ?, {interval_sql})
         ON CONFLICT (notice_id, branch_code)
-        DO UPDATE SET dismissed_until = CURRENT_DATE + INTERVAL '7 days'
+        DO UPDATE SET dismissed_until = {interval_sql}
         """,
         (notice_id, branch_code)
     )
@@ -619,16 +624,22 @@ async def master_notice_create_form(request: Request, session_token: str = Cooki
 
     script_block = """
     <script>
+    function togglePopupEndDate() {
+        const isPopup = document.getElementById('isPopup').checked;
+        document.getElementById('popupEndDateWrap').style.display = isPopup ? 'block' : 'none';
+    }
+
     async function submitNotice() {
         const title = document.getElementById('title').value.trim();
         const content = document.getElementById('content').value.trim();
         const isPopup = document.getElementById('isPopup').checked;
+        const popupEndDate = document.getElementById('popupEndDate').value || null;
         if (!title || !content) { alert('제목과 내용을 입력하세요.'); return; }
 
         const res = await fetch('/master/notice/create', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: title, content: content, is_popup: isPopup })
+            body: JSON.stringify({ title: title, content: content, is_popup: isPopup, popup_end_date: popupEndDate })
         });
         if (res.ok) {
             alert('등록되었습니다.');
@@ -694,6 +705,12 @@ async def master_notice_create_form(request: Request, session_token: str = Cooki
         }
     }
 
+    function toggleFlagAndPopupDate(checkboxId, btnEl) {
+        toggleFlag(checkboxId, btnEl);
+        const isPopup = document.getElementById('isPopup').checked;
+        document.getElementById('popupEndDateWrap').style.display = isPopup ? 'block' : 'none';
+    }
+
     function insertLink() {
         const url = prompt('링크 URL을 입력하세요 (https://로 시작):');
         if (!url) return;
@@ -756,9 +773,14 @@ async def master_notice_create_form(request: Request, session_token: str = Cooki
         '<textarea id="content" rows="10" '
         'style="width:100%;padding:8px;margin:4px 0 8px;" '
         'placeholder="내용을 입력하거나, 이미지를 이 영역으로 드래그해서 넣을 수 있습니다."></textarea>'
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">'
-        '<label style="font-size:13px;color:#555;">'
-        '<input type="checkbox" id="isPopup"> 접속 시 팝업으로 노출</label>'
+        '<label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#555;margin:8px 0;">'
+        '<input type="checkbox" id="isPopup" onchange="togglePopupEndDate()" style="width:auto;margin:0;">'
+        '접속 시 팝업으로 노출</label>'
+        '<div id="popupEndDateWrap" style="display:none;margin:0 0 12px;">'
+        '<label style="font-size:13px;color:#555;">팝업 종료일 (비워두면 무기한 노출)</label><br>'
+        '<input type="date" id="popupEndDate" style="width:auto;padding:8px;margin-top:4px;">'
+        '</div>'
+        '<div style="display:flex;justify-content:flex-end;align-items:center;margin-top:8px;">'
         '<button onclick="submitNotice()" '
         'style="background:#1E2761;color:white;border:none;padding:10px 22px;'
         'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">등록</button>'
@@ -781,14 +803,15 @@ async def master_notice_create(request: Request, session_token: str = Cookie(def
     title = data.get("title", "").strip()
     content = data.get("content", "").strip()
     is_popup = bool(data.get("is_popup", False))
+    popup_end_date = data.get("popup_end_date") or None
 
     if not title or not content:
         return JSONResponse(status_code=400, content={"detail": "제목과 내용을 입력하세요."})
 
     conn = get_conn()
     conn.execute(
-        "INSERT INTO notice (title, content, is_popup, created_by) VALUES (?, ?, ?, ?)",
-        (title, content, is_popup, user["login_id"])
+        "INSERT INTO notice (title, content, is_popup, created_by, popup_end_date) VALUES (?, ?, ?, ?, ?)",
+        (title, content, is_popup, user["login_id"], popup_end_date)
     )
     conn.commit()
     return JSONResponse(content={"status": "ok"})
@@ -830,6 +853,8 @@ async def master_notice_detail(notice_id: int, request: Request, session_token: 
         "background:#1E2761;color:white;border-color:#1E2761;" if notice["is_popup"]
         else "background:white;color:#555;border-color:#ddd;"
     )
+    popup_end_date_value = str(notice["popup_end_date"]) if notice["popup_end_date"] else ""
+    popup_end_date_display = "block" if notice["is_popup"] else "none"
 
     editor_toolbar_html = (
         '<div style="display:flex;gap:8px;margin:8px 0 4px;">'
@@ -852,11 +877,12 @@ async def master_notice_detail(notice_id: int, request: Request, session_token: 
         const content = document.getElementById('content').value.trim();
         const isActive = document.getElementById('isActive').checked;
         const isPopup = document.getElementById('isPopup').checked;
+        const popupEndDate = document.getElementById('popupEndDate').value || null;
 
         const res = await fetch('/master/notice/' + noticeId + '/update', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: title, content: content, is_active: isActive, is_popup: isPopup })
+            body: JSON.stringify({ title: title, content: content, is_active: isActive, is_popup: isPopup, popup_end_date: popupEndDate })
         });
         if (res.ok) { alert('수정되었습니다.'); location.reload(); } else { alert('수정 실패'); }
     }
@@ -933,11 +959,15 @@ async def master_notice_detail(notice_id: int, request: Request, session_token: 
         '<textarea id="content" rows="10" style="width:100%;padding:8px;margin:4px 0 8px;">' + notice["content"] + '</textarea>'
         '<input type="checkbox" id="isActive" ' + active_checked + ' style="display:none;">'
         '<input type="checkbox" id="isPopup" ' + popup_checked + ' style="display:none;">'
+        '<div id="popupEndDateWrap" style="display:' + popup_end_date_display + ';margin:12px 0;">'
+        '<label style="font-size:13px;color:#555;">팝업 종료일 (비워두면 무기한 노출)</label><br>'
+        '<input type="date" id="popupEndDate" value="' + popup_end_date_value + '" style="width:auto;padding:8px;margin-top:4px;">'
+        '</div>'
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;">'
         '<button type="button" onclick="toggleFlag(\'isActive\', this)" '
         'style="' + active_toggle_style + 'border:1px solid;padding:9px 16px;'
         'border-radius:20px;font-size:13px;cursor:pointer;">✅ 게시 활성화</button>'
-        '<button type="button" onclick="toggleFlag(\'isPopup\', this)" '
+        '<button type="button" onclick="toggleFlagAndPopupDate(\'isPopup\', this)" '
         'style="' + popup_toggle_style + 'border:1px solid;padding:9px 16px;'
         'border-radius:20px;font-size:13px;cursor:pointer;">📌 접속 시 팝업 노출</button>'
         '<button onclick="updateNotice(' + str(notice_id) + ')" '
@@ -970,14 +1000,15 @@ async def master_notice_update(notice_id: int, request: Request, session_token: 
     content = data.get("content", "").strip()
     is_active = bool(data.get("is_active", True))
     is_popup = bool(data.get("is_popup", False))
+    popup_end_date = data.get("popup_end_date") or None
 
     if not title or not content:
         return JSONResponse(status_code=400, content={"detail": "제목과 내용을 입력하세요."})
 
     conn = get_conn()
     conn.execute(
-        "UPDATE notice SET title=?, content=?, is_active=?, is_popup=?, updated_at=NOW() WHERE id=?",
-        (title, content, is_active, is_popup, notice_id)
+        "UPDATE notice SET title=?, content=?, is_active=?, is_popup=?, popup_end_date=?, updated_at=NOW() WHERE id=?",
+        (title, content, is_active, is_popup, popup_end_date, notice_id)
     )
     conn.commit()
     return JSONResponse(content={"status": "ok"})
@@ -2159,6 +2190,22 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
       </div>
       <div class="content">{content}</div>
+      <div id="noticePopupOverlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+           background:rgba(0,0,0,0.5);z-index:300;"></div>
+      <div id="noticePopupModal" style="display:none;position:fixed;top:50%;left:50%;
+           transform:translate(-50%,-50%);background:white;border-radius:14px;
+           max-width:420px;width:90%;max-height:70vh;overflow-y:auto;z-index:301;
+           box-shadow:0 8px 30px rgba(0,0,0,0.3);">
+        <div id="noticePopupBody" style="padding:24px;"></div>
+        <div style="display:flex;gap:8px;padding:0 24px 20px;flex-wrap:wrap;">
+          <button onclick="closeNoticePopup()" style="flex:1;background:#1E2761;color:white;
+             border:none;padding:10px;border-radius:20px;font-size:13px;cursor:pointer;">닫기</button>
+          <button onclick="dismissNoticePopup('today')" style="flex:1;background:#f0f0f0;color:#555;
+             border:none;padding:10px;border-radius:20px;font-size:13px;cursor:pointer;">오늘 하루 보지 않기</button>
+          <button onclick="dismissNoticePopup('week')" style="flex:1;background:#f0f0f0;color:#555;
+             border:none;padding:10px;border-radius:20px;font-size:13px;cursor:pointer;">일주일간 보지 않기</button>
+        </div>
+      </div>
       <div id="submenuOverlay" onclick="closeAllSubmenus()" style="display:none;position:fixed;
            top:0;left:0;right:0;bottom:0;z-index:150;"></div>
       {submenu_popups_html}
@@ -2182,6 +2229,44 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           document.querySelectorAll('[id^="submenu-"]').forEach(function(el) {{ el.style.display = 'none'; }});
           document.getElementById('submenuOverlay').style.display = 'none';
         }}
+
+        var noticePopupQueue = [];
+        async function checkNoticePopup() {{
+          try {{
+            const res = await fetch('/api/notice/popup');
+            const data = await res.json();
+            noticePopupQueue = data.notices || [];
+            showNextNoticePopup();
+          }} catch (e) {{}}
+        }}
+        function showNextNoticePopup() {{
+          if (noticePopupQueue.length === 0) return;
+          var n = noticePopupQueue[0];
+          document.getElementById('noticePopupBody').innerHTML =
+            '<h3 style="margin-bottom:12px;">' + n.title + '</h3>'
+            + '<div style="line-height:1.6;">' + n.content.replace(/\\n/g, '<br>') + '</div>';
+          document.getElementById('noticePopupModal').dataset.noticeId = n.id;
+          document.getElementById('noticePopupOverlay').style.display = 'block';
+          document.getElementById('noticePopupModal').style.display = 'block';
+        }}
+        function closeNoticePopup() {{
+          noticePopupQueue.shift();
+          document.getElementById('noticePopupOverlay').style.display = 'none';
+          document.getElementById('noticePopupModal').style.display = 'none';
+          showNextNoticePopup();
+        }}
+        async function dismissNoticePopup(duration) {{
+          var noticeId = document.getElementById('noticePopupModal').dataset.noticeId;
+          try {{
+            await fetch('/notice/' + noticeId + '/popup-dismiss', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ duration: duration }})
+            }});
+          }} catch (e) {{}}
+          closeNoticePopup();
+        }}
+        {("checkNoticePopup();" if user and user.get("role") != "master" else "")}
       </script>
       <script>
       (function() {{
