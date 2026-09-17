@@ -997,6 +997,173 @@ async def master_notice_delete(notice_id: int, session_token: str = Cookie(defau
     return JSONResponse(content={"status": "ok"})
 
 
+# ══════════════════════════════════════════════
+# Q&A 게시판 - 지점용
+# ══════════════════════════════════════════════
+
+@app.get("/qna", response_class=HTMLResponse)
+async def qna_list_page(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login")
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    posts = conn.execute(
+        "SELECT id, title, author, status, created_at FROM qna_post WHERE branch_code=? ORDER BY created_at DESC",
+        (branch_code,)
+    ).fetchall()
+
+    rows_html = ""
+    for p in posts:
+        status_badge = (
+            '<span style="background:#D1FAE5;color:#065F46;padding:2px 8px;border-radius:10px;font-size:12px;">답변완료</span>'
+            if p["status"] == "answered"
+            else '<span style="background:#FEE2E2;color:#991B1B;padding:2px 8px;border-radius:10px;font-size:12px;">대기중</span>'
+        )
+        rows_html += (
+            '<tr onclick="location.href=\'/qna/' + str(p["id"]) + '\'" style="cursor:pointer;">'
+            '<td>' + status_badge + ' ' + p["title"] + '</td>'
+            '<td>' + p["author"] + '</td>'
+            '<td>' + str(p["created_at"])[:16] + '</td>'
+            '</tr>'
+        )
+
+    body_html = (
+        '<h2>💬 Q&A 게시판</h2>'
+        '<button onclick="location.href=\'/qna/write\'" '
+        'style="background:#1E2761;color:white;border:none;padding:10px 22px;'
+        'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;margin-bottom:16px;">'
+        '+ 문의 작성</button>'
+        '<table style="width:100%;border-collapse:collapse;">'
+        '<thead><tr><th>제목</th><th>작성자</th><th>작성일</th></tr></thead>'
+        '<tbody>' + rows_html + '</tbody></table>'
+    )
+
+    return HTMLResponse(content=render_page(body_html, user, "notice-group"))
+
+
+@app.get("/qna/write", response_class=HTMLResponse)
+async def qna_write_form(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login")
+
+    script_block = """
+    <script>
+    async function submitQna() {
+        const author = document.getElementById('author').value.trim();
+        const title = document.getElementById('title').value.trim();
+        const content = document.getElementById('content').value.trim();
+        if (!author || !title || !content) { alert('작성자, 제목, 내용을 모두 입력하세요.'); return; }
+
+        const res = await fetch('/qna/write', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ author: author, title: title, content: content })
+        });
+        if (res.ok) {
+            alert('등록되었습니다.');
+            location.href = '/qna';
+        } else {
+            const data = await res.json();
+            alert('등록 실패: ' + (data.detail || ''));
+        }
+    }
+    </script>
+    """
+
+    body_html = (
+        '<h2>문의 작성</h2>'
+        '<div style="max-width:600px;">'
+        '<label>작성자</label><br>'
+        '<input type="text" id="author" style="width:100%;padding:8px;margin:8px 0;" placeholder="이름을 입력하세요"><br>'
+        '<label>제목</label><br>'
+        '<input type="text" id="title" style="width:100%;padding:8px;margin:8px 0;"><br>'
+        '<label>내용</label><br>'
+        '<textarea id="content" rows="10" style="width:100%;padding:8px;margin:8px 0;"></textarea><br>'
+        '<button onclick="submitQna()" '
+        'style="background:#1E2761;color:white;border:none;padding:10px 22px;'
+        'border-radius:24px;font-size:14px;font-weight:bold;cursor:pointer;">등록</button>'
+        '</div>'
+        + script_block
+    )
+
+    return HTMLResponse(content=render_page(body_html, user, "notice-group"))
+
+
+@app.post("/qna/write")
+async def qna_write_submit(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+
+    branch_code = user["branch_code"]
+    data = await request.json()
+    author = data.get("author", "").strip()
+    title = data.get("title", "").strip()
+    content = data.get("content", "").strip()
+
+    if not author or not title or not content:
+        return JSONResponse(status_code=400, content={"detail": "작성자, 제목, 내용을 모두 입력하세요."})
+
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO qna_post (branch_code, author, title, content, status) VALUES (?, ?, ?, ?, 'waiting')",
+        (branch_code, author, title, content)
+    )
+    conn.commit()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/qna/{post_id}", response_class=HTMLResponse)
+async def qna_detail_page(post_id: int, request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login")
+
+    branch_code = user["branch_code"]
+    conn = get_conn()
+    post = conn.execute(
+        "SELECT id, branch_code, author, title, content, status, created_at FROM qna_post WHERE id=?",
+        (post_id,)
+    ).fetchone()
+
+    if not post or post["branch_code"] != branch_code:
+        return HTMLResponse(content="<h3>존재하지 않거나 접근 권한이 없는 게시글입니다.</h3>", status_code=404)
+
+    answer = conn.execute(
+        "SELECT answered_by, content, answered_at FROM qna_answer WHERE qna_post_id=?",
+        (post_id,)
+    ).fetchone()
+
+    content_escaped = post["content"].replace("\n", "<br>")
+
+    if answer:
+        answer_html = (
+            '<div style="background:#f5f7fa;border-radius:10px;padding:16px;margin-top:20px;">'
+            '<div style="font-weight:bold;color:#1E2761;margin-bottom:8px;">💬 답변</div>'
+            '<div style="line-height:1.6;">' + answer["content"].replace("\n", "<br>") + '</div>'
+            '<div style="color:#999;font-size:12px;margin-top:10px;">' + str(answer["answered_at"])[:16] + '</div>'
+            '</div>'
+        )
+    else:
+        answer_html = (
+            '<div style="background:#FEF3C7;border-radius:10px;padding:16px;margin-top:20px;color:#92400E;">'
+            '⏳ 아직 답변이 등록되지 않았습니다.'
+            '</div>'
+        )
+
+    body_html = (
+        '<h2>' + post["title"] + '</h2>'
+        '<p style="color:#999;font-size:13px;">작성자: ' + post["author"] + ' · ' + str(post["created_at"])[:16] + '</p>'
+        '<div style="margin:20px 0;line-height:1.6;">' + content_escaped + '</div>'
+        + answer_html
+    )
+
+    return HTMLResponse(content=render_page(body_html, user, "notice-group"))
+
+
 @app.post("/api/push/subscribe")
 async def push_subscribe(request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -10619,6 +10786,32 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """
 
+    # ---- 발주서 미리보기 (단독 상단, 아코디언 아님) ----
+    po_preview_card_html = ""
+    if menu_allowed("purchase-order-preview"):
+        po_preview_card_html = """
+      <a href="/master/purchase-order/preview" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🧮</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주서 미리보기</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">계산 결과 검증용</div>
+        </div>
+      </a>
+        """
+
+    # ---- 발주서 미리보기 (단독 상단, 아코디언 아님) ----
+    po_preview_card_html = ""
+    if menu_allowed("purchase-order-preview"):
+        po_preview_card_html = """
+      <a href="/master/purchase-order/preview" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🧮</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주서 미리보기</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">계산 결과 검증용</div>
+        </div>
+      </a>
+        """
+
     # ---- 그룹 1: DB재고관리 ----
     db_inventory_cards = []
     if menu_allowed("data"):
@@ -10638,16 +10831,6 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">🔄</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">QR 재고 업로드</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">엑셀로 초기 수량 업로드</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("product-unified"):
-        db_inventory_cards.append("""
-      <a href="/master/product-unified" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">🧩</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">지점 무관 통합 상품관리</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">품번/상품명 통합 조회 (준비중)</div>
         </div>
       </a>
         """)
@@ -10688,16 +10871,6 @@ async def master_page(session_token: str = Cookie(default=None)):
           <div style="font-size:32px;">📈</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주 주기 트래킹</div>
           <div style="color:#888;font-size:12px;margin-top:4px;">구매 패턴 분석/추천</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("purchase-order-preview"):
-        db_inventory_cards.append("""
-      <a href="/master/purchase-order/preview" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">🧮</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주서 미리보기</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">계산 결과 검증용</div>
         </div>
       </a>
         """)
@@ -10760,26 +10933,6 @@ async def master_page(session_token: str = Cookie(default=None)):
 
     # ---- 그룹 4: 기타설정 ----
     etc_cards = []
-    if menu_allowed("notice-manage"):
-        etc_cards.append("""
-      <a href="/master/notice" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">📢</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">공지사항 관리</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">지점 공지 등록/읽음 현황</div>
-        </div>
-      </a>
-        """)
-    if menu_allowed("qna-manage"):
-        etc_cards.append("""
-      <a href="/master/qna" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">💬</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">Q&A 게시판</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">지점 문의 답변 관리</div>
-        </div>
-      </a>
-        """)
     if menu_allowed("notification-settings"):
         etc_cards.append("""
       <a href="/master/notification-settings" style="text-decoration:none;">
@@ -10852,20 +11005,6 @@ async def master_page(session_token: str = Cookie(default=None)):
     <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
     {f'<div style="margin-bottom:14px;">{branch_card_html}</div>' if branch_card_html else ""}
     {groups_html}
-    """
-    return HTMLResponse(content=render_page(content, user, "master"))
-
-@app.get("/master/product-unified", response_class=HTMLResponse)
-async def product_unified_page(session_token: str = Cookie(default=None)):
-    user = get_session(session_token)
-    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
-        return RedirectResponse(url="/login", status_code=303)
-
-    content = """
-    <h2 style="margin-bottom:16px;">🧩 지점 무관 통합 상품관리</h2>
-    <div class="card" style="padding:32px;text-align:center;color:#888;">
-      준비중입니다. 다음 단계에서 items.is_consumable 토글 기능이 여기 추가될 예정입니다.
-    </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
 
@@ -11545,10 +11684,10 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
       <a href="/master" class="back-link">&larr; 마스터 대시보드로</a>
       {message_html}
 
-      <h2>주간 발주 대상 <span class="count-badge">{len(weekly)}건</span></h2>
-      <table>      <h2>주간 발주 대상 <span class="count-badge">{len(weekly)}건</span>
+      <h2>주간 발주 대상 <span class="count-badge">{len(weekly)}건</span>
         <a href="/master/purchase-order/preview/export?order_type=weekly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">📥 엑셀 다운로드</a>
       </h2>
+      <table>
         <thead>
           <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
         </thead>
