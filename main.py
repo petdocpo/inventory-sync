@@ -1134,7 +1134,36 @@ async def qna_write_submit(request: Request, session_token: str = Cookie(default
         "INSERT INTO qna_post (branch_code, author, title, content, status, is_secret) VALUES (?, ?, ?, ?, 'waiting', ?)",
         (branch_code, author, title, content, is_secret)
     )
+    new_row = conn.execute(
+        "SELECT id FROM qna_post WHERE branch_code=? AND created_at = (SELECT MAX(created_at) FROM qna_post WHERE branch_code=?)",
+        (branch_code, branch_code)
+    ).fetchone()
+    new_post_id = new_row["id"] if new_row else None
     conn.commit()
+
+    if new_post_id:
+        try:
+            send_teams_notification(
+                "admin_hs",
+                title="💬 새 Q&A 문의 등록",
+                message=f"[{branch_code}] {author}: {title}",
+                link_url=f"https://inventory-sync-teal.vercel.app/master/qna/{new_post_id}",
+                link_text="문의 확인하기",
+                sent_by=author
+            )
+        except Exception:
+            pass
+        try:
+            send_push_notification(
+                "admin_hq",
+                title="💬 새 Q&A 문의",
+                body=f"[{branch_code}] {title}",
+                event_type="qna_new",
+                url=f"/master/qna/{new_post_id}"
+            )
+        except Exception:
+            pass
+
     return JSONResponse(content={"status": "ok"})
 
 
@@ -13859,7 +13888,8 @@ async def _select_stocktake_items():
     conn = get_conn()
 
     already_selected = conn.execute(
-        "SELECT id FROM stocktake_selection WHERE year_month=?", (year_month,)
+        "SELECT id FROM stocktake_selection WHERE year_month=? AND branch_code IS NOT NULL",
+        (year_month,)
     ).fetchall()
     if already_selected:
         conn.close()
@@ -13869,68 +13899,85 @@ async def _select_stocktake_items():
     prev_month = today.month - 1 if today.month > 1 else 12
     prev_year_month = f"{prev_year}-{prev_month:02d}"
 
-    prev_items = conn.execute(
-        "SELECT item_code FROM stocktake_selection WHERE year_month=?", (prev_year_month,)
-    ).fetchall()
-    prev_item_codes = {r["item_code"] for r in prev_items}
-
     EXCLUDED_STOCKTAKE_BRANCHES = ('남양주점', '본사')
-
-    placeholders = ','.join(['?'] * len(EXCLUDED_STOCKTAKE_BRANCHES))
-    all_rows = conn.execute(
-        f"SELECT item_code, item_name, branch_code, quantity FROM raw_inventory WHERE item_code IS NOT NULL AND item_code != '' AND branch_code NOT IN ({placeholders})",
-        EXCLUDED_STOCKTAKE_BRANCHES
-    ).fetchall()
-
-    by_item: Dict[str, Dict] = {}
-    for r in all_rows:
-        code = r["item_code"]
-        if code not in by_item:
-            by_item[code] = {"item_name": r["item_name"], "min_qty": r["quantity"], "branch_count": 1}
-        else:
-            by_item[code]["min_qty"] = min(by_item[code]["min_qty"], r["quantity"])
-            by_item[code]["branch_count"] += 1
-
-    candidates = [
-        {"item_code": code, "item_name": info["item_name"]}
-        for code, info in by_item.items()
-        if info["min_qty"] > 0 and code not in prev_item_codes
-    ]
-
-    if len(candidates) < 5:
-        conn.close()
-        return {"status": "error", "reason": f"조건에 맞는 후보 품목이 {len(candidates)}개뿐입니다 (5개 필요).", "candidates": len(candidates)}
-
     MAX_PER_CATEGORY = 2
-    shuffled_candidates = candidates.copy()
-    random.shuffle(shuffled_candidates)
+    TARGET_COUNT = 5
 
-    selected = []
-    category_count: Dict[str, int] = {}
-    for item in shuffled_candidates:
-        if len(selected) >= 5:
-            break
-        category = item["item_name"].split("_")[0]
-        if category_count.get(category, 0) >= MAX_PER_CATEGORY:
+    branch_rows = conn.execute(
+        "SELECT DISTINCT branch_code FROM raw_inventory WHERE branch_code IS NOT NULL AND branch_code != ''"
+    ).fetchall()
+    all_branch_codes = [r["branch_code"] for r in branch_rows if r["branch_code"] not in EXCLUDED_STOCKTAKE_BRANCHES]
+
+    result_summary = {}
+    skipped_branches = {}
+
+    for branch_code in all_branch_codes:
+        prev_items = conn.execute(
+            "SELECT item_code FROM stocktake_selection WHERE year_month=? AND branch_code=?",
+            (prev_year_month, branch_code)
+        ).fetchall()
+        prev_item_codes = {r["item_code"] for r in prev_items}
+
+        branch_rows_inv = conn.execute(
+            "SELECT item_code, item_name, quantity FROM raw_inventory WHERE item_code IS NOT NULL AND item_code != '' AND branch_code=?",
+            (branch_code,)
+        ).fetchall()
+
+        by_item: Dict[str, Dict] = {}
+        for r in branch_rows_inv:
+            code = r["item_code"]
+            if code not in by_item:
+                by_item[code] = {"item_name": r["item_name"], "qty": r["quantity"]}
+            else:
+                by_item[code]["qty"] = min(by_item[code]["qty"], r["quantity"])
+
+        candidates = [
+            {"item_code": code, "item_name": info["item_name"]}
+            for code, info in by_item.items()
+            if info["qty"] > 0 and code not in prev_item_codes
+        ]
+
+        if len(candidates) < TARGET_COUNT:
+            skipped_branches[branch_code] = len(candidates)
             continue
-        selected.append(item)
-        category_count[category] = category_count.get(category, 0) + 1
 
-    if len(selected) < 5:
-        remaining_needed = 5 - len(selected)
-        already_picked_codes = {s["item_code"] for s in selected}
-        fallback_pool = [c for c in shuffled_candidates if c["item_code"] not in already_picked_codes]
-        selected.extend(fallback_pool[:remaining_needed])
+        shuffled_candidates = candidates.copy()
+        random.shuffle(shuffled_candidates)
 
-    for item in selected:
-        conn.execute(
-            "INSERT INTO stocktake_selection (year_month, item_code, item_name) VALUES (?, ?, ?)",
-            (year_month, item["item_code"], item["item_name"])
-        )
+        selected = []
+        category_count: Dict[str, int] = {}
+        for item in shuffled_candidates:
+            if len(selected) >= TARGET_COUNT:
+                break
+            category = item["item_name"].split("_")[0]
+            if category_count.get(category, 0) >= MAX_PER_CATEGORY:
+                continue
+            selected.append(item)
+            category_count[category] = category_count.get(category, 0) + 1
+
+        if len(selected) < TARGET_COUNT:
+            remaining_needed = TARGET_COUNT - len(selected)
+            already_picked_codes = {s["item_code"] for s in selected}
+            fallback_pool = [c for c in shuffled_candidates if c["item_code"] not in already_picked_codes]
+            selected.extend(fallback_pool[:remaining_needed])
+
+        for item in selected:
+            conn.execute(
+                "INSERT INTO stocktake_selection (year_month, branch_code, item_code, item_name) VALUES (?, ?, ?, ?)",
+                (year_month, branch_code, item["item_code"], item["item_name"])
+            )
+
+        result_summary[branch_code] = len(selected)
+
     conn.commit()
     conn.close()
 
-    return {"status": "ok", "year_month": year_month, "selected": selected}
+    return {
+        "status": "ok",
+        "year_month": year_month,
+        "selected_by_branch": result_summary,
+        "skipped_branches": skipped_branches
+    }
 
 
 @app.get("/master/stocktake", response_class=HTMLResponse)
@@ -14042,7 +14089,7 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
         return RedirectResponse(url="/master/stocktake", status_code=303)
 
     selected_items = conn.execute(
-        "SELECT item_code, item_name FROM stocktake_selection WHERE year_month=?", (year_month,)
+        "SELECT item_code, item_name FROM stocktake_selection WHERE year_month=? AND branch_code=?", (year_month, branch_code)
     ).fetchall()
 
     existing_records = conn.execute(
