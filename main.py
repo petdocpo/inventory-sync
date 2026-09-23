@@ -13878,12 +13878,13 @@ async def cron_select_stocktake_items(authorization: str = Header(default="")):
     return JSONResponse(content=result)
 
 
-async def _select_stocktake_items():
+async def _select_stocktake_items(year_month: str = None):
     import random
     from datetime import date
 
-    today = date.today()
-    year_month = f"{today.year}-{today.month:02d}"
+    if year_month is None:
+        today = date.today()
+        year_month = f"{today.year}-{today.month:02d}"
 
     conn = get_conn()
 
@@ -13895,8 +13896,9 @@ async def _select_stocktake_items():
         conn.close()
         return {"status": "skipped", "reason": f"{year_month}에 이미 선정된 품목이 있습니다.", "count": len(already_selected)}
 
-    prev_year = today.year if today.month > 1 else today.year - 1
-    prev_month = today.month - 1 if today.month > 1 else 12
+    ym_year, ym_month = int(year_month.split("-")[0]), int(year_month.split("-")[1])
+    prev_year = ym_year if ym_month > 1 else ym_year - 1
+    prev_month = ym_month - 1 if ym_month > 1 else 12
     prev_year_month = f"{prev_year}-{prev_month:02d}"
 
     EXCLUDED_STOCKTAKE_BRANCHES = ('남양주점', '본사')
@@ -13978,6 +13980,20 @@ async def _select_stocktake_items():
         "selected_by_branch": result_summary,
         "skipped_branches": skipped_branches
     }
+
+@app.post("/master/stocktake/admin-reselect")
+async def master_stocktake_admin_reselect(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    year_month = data.get("year_month", "").strip()
+    if not year_month:
+        return JSONResponse(status_code=400, content={"detail": "연월이 지정되지 않았습니다."})
+
+    result = await _select_stocktake_items(year_month=year_month)
+    return JSONResponse(content=result)
 
 
 @app.get("/master/stocktake", response_class=HTMLResponse)
