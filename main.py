@@ -36,6 +36,8 @@ QR_DIR = "./qr_codes"
 
 app = FastAPI(title="포포즈 발주_재고", version="1.2.0")
 
+VENDOR_EVAL_EXCLUDED_BRANCH_CODES = ("admin_hs",)
+
 NOTIFICATION_TYPES = {
     "qr_raw_mismatch":     {"label": "재고 불일치 알림",      "desc": "QR-RAW 재고 불일치 시 (3시간마다 검사)"},
     "vendor_eval_missing": {"label": "거래처평가 미제출 알림", "desc": "거래처 미평가 지점 Teams 웹훅 연동"},
@@ -4770,7 +4772,7 @@ async def master_vendor_eval_status(session_token: str = Cookie(default=None), m
 
     rows_html = ""
     submitted_count = 0
-    branches = get_branches()
+    branches = [b for b in get_branches() if b["branch_code"] not in VENDOR_EVAL_EXCLUDED_BRANCH_CODES]
     for b in branches:
         done_cnt = conn.execute("""
             SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
@@ -4795,7 +4797,7 @@ async def master_vendor_eval_status(session_token: str = Cookie(default=None), m
         """
     conn.close()
 
-    total_branches = len(get_branches())
+    total_branches = len(branches)
     month_options = ""
     for i in range(6):
         m = today.month - i
@@ -4854,7 +4856,7 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
     evaluations = conn.execute(query, params).fetchall()
 
     branch_options_html = '<option value="">전체 지점</option>'
-    branches = get_branches()
+    branches = [b for b in get_branches() if b["branch_code"] not in VENDOR_EVAL_EXCLUDED_BRANCH_CODES]
     for b in branches:
         sel = 'selected' if branch == b["branch_code"] else ''
         branch_options_html += f'<option value="{b["branch_code"]}" {sel}>{b["branch_name"]}</option>'
@@ -4905,7 +4907,7 @@ async def master_vendor_eval_page(session_token: str = Cookie(default=None), bra
     summary_total_vendors = conn3.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
 
     summary_chips_html = ""
-    all_branches = get_branches(branch_type='branch')
+    all_branches = [b for b in get_branches(branch_type='branch') if b["branch_code"] not in VENDOR_EVAL_EXCLUDED_BRANCH_CODES]
     for b in all_branches:
         done_cnt = conn3.execute("""
             SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
@@ -9326,7 +9328,7 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
     total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
 
     unsubmitted_branches = []
-    branches = get_branches(branch_type='branch')
+    branches = [b for b in get_branches(branch_type='branch') if b["branch_code"] not in VENDOR_EVAL_EXCLUDED_BRANCH_CODES]
     for b in branches:
         done_cnt = conn.execute("""
             SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
