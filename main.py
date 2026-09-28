@@ -11433,7 +11433,7 @@ async def master_page(session_token: str = Cookie(default=None)):
     content = f"""
     {ACCORDION_CSS_JS}
     <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
-    {f'<div style="margin-bottom:14px;">{branch_card_html}</div>' if branch_card_html else ""}
+    {f'<div style="display:flex;gap:16px;margin-bottom:14px;">{branch_card_html}{po_preview_card_html}</div>' if (branch_card_html or po_preview_card_html) else ""}
     {groups_html}
     """
     return HTMLResponse(content=render_page(content, user, "master"))
