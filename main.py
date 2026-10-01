@@ -16018,6 +16018,7 @@ async def purchase_order_preview_export(
     session_token: str = Cookie(default=None),
     order_type: str = "weekly"
 ):
+    import io
     from urllib.parse import quote
 
     user = get_session(session_token)
@@ -16429,6 +16430,175 @@ async def _po_verify_read_upload(f):
     data = await f.read()
     return data or None
 
+def _po_verify_legacy_only_info(r: dict, other_label: str, ctx_all: dict):
+    """'기존 양식에만 있음' 한 건의 (시스템 판정, 안전재고, 현재고, 사유) — 엑셀 저장용"""
+    if r["where"] == "other":
+        return "시스템에서는 " + other_label + " 대상으로 분류", None, None, ""
+    if r["where"] == "pending":
+        verdict = "시스템에서는 미입고 보류" + (" (" + r["note"] + ")" if r["note"] else "")
+        return verdict, None, None, "이미 접수/승인된 발주 이력 있음"
+    c = _po_verify_find_ctx(ctx_all, r["branch_name"], r["item_name"])
+    safety = c["safety_qty"] if c else None
+    cur = c["current_qty"] if c else None
+    return "시스템 발주 대상 아님", safety, cur, _po_verify_guess_reason(c) + " (추정)"
+
+
+def _po_verify_build_export_rows(cmp_res: dict, other_label: str, ctx_all: dict) -> list:
+    """엑셀 한 시트에 들어갈 행 목록. 컬럼 순서는 _build_po_verify_excel의 헤더와 동일."""
+    def nz(v):
+        return "" if v is None else v
+
+    rows = []
+    for r in cmp_res["qty_diff"]:
+        note = ("시스템 품명: " + r["name_note"]) if r["name_note"] else ""
+        rows.append(["수량 불일치", r["branch_name"], r["item_name"], r["legacy_qty"], r["system_qty"],
+                     r["system_qty"] - r["legacy_qty"], note, nz(r["system_safety"]), nz(r["system_moq"]), "", ""])
+    for r in cmp_res["legacy_only"]:
+        verdict, safety, cur, reason = _po_verify_legacy_only_info(r, other_label, ctx_all)
+        rows.append(["기존 양식에만", r["branch_name"], r["item_name"], r["legacy_qty"], "", "",
+                     verdict, nz(safety), "", nz(cur), reason])
+    for it in cmp_res["system_only"]:
+        rows.append(["시스템에만", str(it["branch_name"]), str(it["item_name"]), "", it["final_qty"], "",
+                     "", nz(it.get("safety_qty")), nz(it.get("moq")), "", ""])
+    for r in cmp_res["matched"]:
+        note = ("시스템 품명: " + r["name_note"]) if r["name_note"] else ""
+        rows.append(["일치", r["branch_name"], r["item_name"], r["legacy_qty"], r["system_qty"], 0,
+                     note, nz(r["system_safety"]), nz(r["system_moq"]), "", ""])
+    return rows
+
+
+def _po_verify_export_form_html(export_sections: list) -> str:
+    """결과 화면 상단의 엑셀 다운로드 버튼. 화면에 표시된 비교 결과를 그대로 서버로 되돌려보낸다."""
+    import json
+    from html import escape as esc
+    payload = json.dumps(
+        {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "sections": export_sections},
+        ensure_ascii=False
+    )
+    return (
+        '<div class="card" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+        '<form method="post" action="/master/purchase-order/verify/export" style="margin:0;">'
+        '<input type="hidden" name="payload" value="' + esc(payload, quote=True) + '">'
+        '<button class="btn" type="submit">📥 비교 결과 엑셀 다운로드</button></form>'
+        '<span style="font-size:12px;color:#888;">화면에 표시된 비교 결과(이 시점의 시스템 산출 기준)를 그대로 저장합니다.</span>'
+        "</div>"
+    )
+
+
+def _build_po_verify_excel(data: dict) -> bytes:
+    """비교 결과(payload)를 엑셀로 생성: [요약] 시트 + 유형별(주간/월간) 비교 시트"""
+    import io
+    import re
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    sections = data.get("sections") or []
+    if not sections:
+        raise ValueError("저장할 비교 결과가 없습니다.")
+
+    head_font = Font(bold=True, color="FFFFFF")
+    head_fill = PatternFill(start_color="1E2761", end_color="1E2761", fill_type="solid")
+    fills = {
+        "일치": PatternFill(start_color="ECFDF5", end_color="ECFDF5", fill_type="solid"),
+        "수량 불일치": PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
+        "기존 양식에만": PatternFill(start_color="FEF9C3", end_color="FEF9C3", fill_type="solid"),
+        "시스템에만": PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid"),
+    }
+
+    def put(ws, row, col, value):
+        cell = ws.cell(row=row, column=col, value=value)
+        if isinstance(value, str) and value.startswith("="):
+            cell.data_type = "s"   # 품명이 '='로 시작해도 수식으로 해석되지 않게
+        return cell
+
+    def write_header(ws, row, headers):
+        for ci, h in enumerate(headers, start=1):
+            c = put(ws, row, ci, h)
+            c.font = head_font
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="center", vertical="center")
+
+    wb = openpyxl.Workbook()
+
+    # ── 요약 시트 ──
+    ws0 = wb.active
+    ws0.title = "요약"
+    put(ws0, 1, 1, "발주서 검수 결과 (기존 양식 vs 시스템)").font = Font(bold=True, size=13)
+    put(ws0, 2, 1, "생성 일시: " + str(data.get("generated_at", "")))
+    put(ws0, 3, 1, "※ 시스템 결과는 생성 시점의 현재고·안전재고 기준이며, 기존 양식 산출 시점과 다를 수 있습니다.")
+    sum_headers = ["유형", "기존 양식 건수", "시스템 건수", "일치", "수량 불일치", "기존 양식에만", "시스템에만"]
+    write_header(ws0, 5, sum_headers)
+    for i, sec in enumerate(sections):
+        s = sec.get("summary", {})
+        vals = [sec.get("title", ""), s.get("legacy_total", 0), s.get("system_total", 0), s.get("matched", 0),
+                s.get("qty_diff", 0), s.get("legacy_only", 0), s.get("system_only", 0)]
+        for ci, v in enumerate(vals, start=1):
+            put(ws0, 6 + i, ci, v)
+    for ci, w in enumerate([22, 16, 12, 8, 12, 14, 12], start=1):
+        ws0.column_dimensions[get_column_letter(ci)].width = w
+
+    # ── 유형별 비교 시트 ──
+    headers = ["구분", "지점", "품명", "기존 양식 수량", "시스템 수량", "차이(시스템-기존)",
+               "시스템 판정 / 비고", "시스템 안전재고", "시스템 MOQ", "시스템 현재고", "사유(추정)"]
+    widths = [14, 16, 42, 14, 12, 16, 34, 14, 12, 14, 36]
+    used_names = {"요약"}
+    for sec in sections:
+        base = re.sub(r"[\\/\?\*\[\]:]", "", str(sec.get("title", "비교"))) or "비교"
+        name = base[:28]
+        n = 1
+        while name in used_names:
+            n += 1
+            name = base[:26] + "_" + str(n)
+        used_names.add(name)
+
+        ws = wb.create_sheet(title=name)
+        write_header(ws, 1, headers)
+        rows = sec.get("rows") or []
+        for ri, row in enumerate(rows, start=2):
+            fill = fills.get(row[0])
+            for ci, v in enumerate(row, start=1):
+                c = put(ws, ri, ci, v)
+                if fill is not None:
+                    c.fill = fill
+        for ci, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = "A1:" + get_column_letter(len(headers)) + str(max(len(rows) + 1, 2))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+@app.post("/master/purchase-order/verify/export")
+async def purchase_order_verify_export(
+    session_token: str = Cookie(default=None),
+    payload: str = Form(...)
+):
+    import io
+    import json
+    from urllib.parse import quote
+
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "purchase-order-verify"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    try:
+        data = json.loads(payload)
+        excel_bytes = _build_po_verify_excel(data)
+    except Exception as e:
+        return HTMLResponse(content=render_page(
+            _po_verify_page_html(error_msg="엑셀 생성 실패: " + str(e)), user, "master"))
+
+    filename = "발주서검수결과_" + datetime.now().strftime("%Y%m%d_%H%M") + ".xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)}
+    )
 
 @app.get("/master/purchase-order/verify", response_class=HTMLResponse)
 async def purchase_order_verify_page(session_token: str = Cookie(default=None)):
@@ -16471,6 +16641,7 @@ async def purchase_order_verify_run(
 
     sections = ""
     errors = []
+    export_sections = []
     for label, order_type, data in uploads:
         try:
             legacy = _parse_legacy_purchase_info(data)
@@ -16486,9 +16657,15 @@ async def purchase_order_verify_run(
             result.get("pending_report", []),
         )
         sections += _po_verify_render_section(label + " 발주 비교", other_label, cmp_res, ctx_all)
+        export_sections.append({
+            "title": label + " 발주 비교",
+            "summary": cmp_res["summary"],
+            "rows": _po_verify_build_export_rows(cmp_res, other_label, ctx_all),
+        })
 
+    export_form = _po_verify_export_form_html(export_sections) if export_sections else ""
     return HTMLResponse(content=render_page(
-        _po_verify_page_html(sections, " / ".join(errors)), user, "master"))
+        _po_verify_page_html(export_form + sections, " / ".join(errors)), user, "master"))
 
 @app.post("/master/qr/generate-bulk")
 async def master_qr_generate_bulk(
