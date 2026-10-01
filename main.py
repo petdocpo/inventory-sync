@@ -15952,60 +15952,113 @@ async def qr_print_page(
     """
     return HTMLResponse(content=html)
 
+PO_EXCEL_HEADERS = ["지점", "구분", "상품명", "거래처명", "구매일자", "구매시간", "담당자",
+                    "과세설정", "구매단가", "수량", "공급가액", "부가세", "합계액", "메모"]
+
+
+def _kst_now():
+    """서버(UTC) 시간대와 무관하게 한국 시간 기준 현재 시각"""
+    from datetime import timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=9)))
+
+
+def _po_load_product_info() -> dict:
+    """item_code -> {supplier, purchase_price}. 기존 양식의 [상품내역](구매처/구매금액) 조회에 해당하며,
+    상품 설정 화면이 이미 쓰는 product_master의 supplier/purchase_price 컬럼을 사용."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT ON (item_code) item_code, supplier, purchase_price "
+        "FROM product_master WHERE item_code IS NOT NULL AND item_code != '' "
+        "ORDER BY item_code, id"
+    ).fetchall()
+    conn.close()
+    return {
+        r["item_code"]: {
+            "supplier": (r["supplier"] or "").strip(),
+            "purchase_price": r["purchase_price"] or 0,
+        }
+        for r in rows
+    }
+
+
 def _build_purchase_order_excel(candidates: list, order_type: str) -> bytes:
-    """
-    발주 대상 리스트를 받아 엑셀(bytes)로 생성.
-    order_type: "weekly" 또는 "monthly" (시트 제목/파일명 라벨링에만 사용)
-    구조: [전체] 시트 1개 + 지점별 시트 N개
-    """
+    """발주 대상 -> 기존 양식 [구매정보] 시트와 동일한 컬럼(A~N)의 엑셀(bytes).
+    구성: [구매정보] 시트(전체) + 지점별 시트(같은 컬럼). order_type은 호출부 호환용."""
     import io
     import re
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
 
-    label = "주간발주" if order_type == "weekly" else "월간발주"
+    info = _po_load_product_info()
+    now = _kst_now()
+    buy_date = now.replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+    buy_time = now.strftime("%H:%M")
 
-    wb = openpyxl.Workbook()
+    def num(v):
+        try:
+            f = float(v)
+            return int(f) if f == int(f) else f
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
-    headers = ["지점", "품번", "품명", "안전재고", "MOQ", "최종발주수량"]
+    def build_row(c):
+        pinfo = info.get(c["item_code"], {})
+        price = num(pinfo.get("purchase_price", 0))
+        qty = num(c["final_qty"])
+        tokens = str(c["branch_name"]).split()
+        last_token = tokens[-1] if tokens else ""
+        # 기존 양식: 구분=접수 / 담당자="포포즈 "+지점명 마지막 단어 / 과세설정·공급가액·부가세·메모는 공란
+        return [c["branch_name"], "접수", c["item_name"], pinfo.get("supplier", ""), buy_date, buy_time,
+                "포포즈 " + last_token, None, price, qty, None, None, price * qty, None]
+
+    head_font = Font(name="맑은 고딕", size=10, bold=True, color="FF0000")
+    head_fill = PatternFill(start_color="156082", end_color="156082", fill_type="solid")
+    body_font = Font(name="맑은 고딕", size=11)
+    widths = [14.9, 5.2, 42.9, 20.6, 11.1, 8.2, 13.8, 8.2, 13.0, 8.9, 8.2, 6.5, 12.0, 4.9]
 
     def write_sheet(ws, rows):
-        ws.append(headers)
-        for col_idx in range(1, len(headers) + 1):
-            cell = ws.cell(row=1, column=col_idx)
-            cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
-            cell.fill = openpyxl.styles.PatternFill(start_color="1E2761", end_color="1E2761", fill_type="solid")
-        for r in rows:
-            ws.append([
-                r["branch_name"], r["item_code"], r["item_name"],
-                r["safety_qty"], r["moq"], r["final_qty"]
-            ])
-        widths = [16, 18, 30, 10, 8, 12]
-        for i, w in enumerate(widths, start=1):
-            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+        for ci, h in enumerate(PO_EXCEL_HEADERS, start=1):
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font = head_font
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="center", vertical="center")
+        for ri, row in enumerate(rows, start=2):
+            for ci, v in enumerate(row, start=1):
+                c = ws.cell(row=ri, column=ci, value=v)
+                c.font = body_font
+                if isinstance(v, str) and v.startswith("="):
+                    c.data_type = "s"
+                if ci == 5:
+                    c.number_format = "mm-dd-yy"
+        for ci, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
 
+    ordered = sorted(candidates, key=lambda c: (str(c["branch_name"]), str(c["item_name"])))
+    all_rows = [build_row(c) for c in ordered]
+
+    wb = openpyxl.Workbook()
     ws_all = wb.active
-    ws_all.title = "전체"
-    write_sheet(ws_all, candidates)
+    ws_all.title = "구매정보"
+    write_sheet(ws_all, all_rows)
 
     by_branch: dict = {}
-    for r in candidates:
-        by_branch.setdefault(r["branch_name"], []).append(r)
+    for row in all_rows:
+        by_branch.setdefault(row[0], []).append(row)
 
     def safe_sheet_name(name: str) -> str:
-        cleaned = re.sub(r'[\\/\?\*\[\]:]', '', name)
+        cleaned = re.sub(r'[\\/\?\*\[\]:]', '', str(name))
         return cleaned[:28] if cleaned else "지점"
 
-    used_names = {"전체"}
+    used_names = {"구매정보"}
     for branch_name, rows in by_branch.items():
         base_name = safe_sheet_name(branch_name)
         sheet_name = base_name
         suffix = 1
         while sheet_name in used_names:
             suffix += 1
-            sheet_name = f"{base_name[:26]}_{suffix}"
+            sheet_name = base_name[:26] + "_" + str(suffix)
         used_names.add(sheet_name)
-
-        ws = wb.create_sheet(title=sheet_name)
-        write_sheet(ws, rows)
+        write_sheet(wb.create_sheet(title=sheet_name), rows)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -16059,12 +16112,20 @@ PO_VERIFY_CSS = """
 .pov-table th { background:#1E2761; color:#fff; padding:8px 10px; text-align:left; white-space:nowrap; }
 .pov-table td { padding:8px 10px; border-bottom:1px solid #eee; }
 .pov-table td.num { text-align:right; }
-.pov-badge { display:inline-block; padding:3px 12px; border-radius:12px; font-size:12px; font-weight:bold; margin:0 6px 6px 0; }
-.pov-ok { background:#D1FAE5; color:#065F46; }
-.pov-bad { background:#FEE2E2; color:#991B1B; }
-.pov-gray { background:#E5E7EB; color:#374151; }
+.pov-row-diff td { background:#FEE2E2; }
+.pov-row-legacyonly td { background:#FEF9C3; }
+.pov-row-sysonly td { background:#DBEAFE; }
 .pov-scroll { overflow-x:auto; }
 </style>
+"""
+
+PO_VERIFY_JS = """
+<script>
+function povToggle(cb) {
+  var rows = cb.closest('.card').querySelectorAll('tr.pov-row-ok');
+  for (var i = 0; i < rows.length; i++) { rows[i].style.display = cb.checked ? 'none' : ''; }
+}
+</script>
 """
 
 
@@ -16286,101 +16347,89 @@ def _po_verify_guess_reason(c) -> str:
     return "원인 추가 확인 필요"
 
 
+def _po_verify_legacy_only_info(r: dict, other_label: str, ctx_all: dict):
+    """'기존 양식에만 있음' 한 건의 (시스템 판정/비고, 사유)"""
+    if r["where"] == "other":
+        return "시스템에서는 " + other_label + " 대상으로 분류", ""
+    if r["where"] == "pending":
+        verdict = "시스템에서는 미입고 보류" + (" (" + r["note"] + ")" if r["note"] else "")
+        return verdict, "이미 접수/승인된 발주 이력 있음"
+    c = _po_verify_find_ctx(ctx_all, r["branch_name"], r["item_name"])
+    reason = _po_verify_guess_reason(c)
+    if c is not None:
+        cur = "-" if c["current_qty"] is None else str(c["current_qty"])
+        reason += " [안전재고 " + str(c["safety_qty"]) + " / 현재고 " + cur + "]"
+    return "시스템 발주 대상 아님", reason + " (추정)"
+
+
+def _po_verify_build_export_rows(cmp_res: dict, other_label: str, ctx_all: dict) -> list:
+    """화면·엑셀 공통 행 목록. 컬럼: 지점 | 상품명 | 자동 수량 | 수기 수량 | 오차(자동-수기) | 시스템 판정/비고 | 사유
+    자동 수량 = 시스템 산출, 수기 수량 = 기존 양식(업로드 파일). 한쪽에만 있으면 없는 쪽은 0."""
+    def note_of(r):
+        return (" (시스템 품명: " + r["name_note"] + ")") if r["name_note"] else ""
+
+    rows = []
+    for r in cmp_res["matched"]:
+        rows.append([r["branch_name"], r["item_name"], r["system_qty"], r["legacy_qty"],
+                     r["system_qty"] - r["legacy_qty"], "일치" + note_of(r), ""])
+    for r in cmp_res["qty_diff"]:
+        rows.append([r["branch_name"], r["item_name"], r["system_qty"], r["legacy_qty"],
+                     r["system_qty"] - r["legacy_qty"], "수량 불일치" + note_of(r),
+                     "시스템 안전재고 " + str(r["system_safety"]) + " / MOQ " + str(r["system_moq"]) + " 기준"])
+    for r in cmp_res["legacy_only"]:
+        verdict, reason = _po_verify_legacy_only_info(r, other_label, ctx_all)
+        rows.append([r["branch_name"], r["item_name"], 0, r["legacy_qty"], 0 - r["legacy_qty"], verdict, reason])
+    for it in cmp_res["system_only"]:
+        rows.append([str(it["branch_name"]), str(it["item_name"]), it["final_qty"], 0, it["final_qty"],
+                     "기존 양식에 없음 (시스템만 산출)",
+                     "시스템 안전재고 " + str(it.get("safety_qty")) + " / MOQ " + str(it.get("moq")) + " 기준"])
+    rows.sort(key=lambda x: (x[0], x[1]))
+    return rows
+
+
+def _po_verify_row_kind(row) -> str:
+    f = str(row[5])
+    if f.startswith("일치"):
+        return "ok"
+    if f.startswith("수량 불일치"):
+        return "diff"
+    if f.startswith("기존 양식에 없음"):
+        return "sysonly"
+    return "legacyonly"
+
+
 def _po_verify_render_section(title: str, other_label: str, cmp_res: dict, ctx_all: dict) -> str:
     from html import escape as esc
 
-    s = cmp_res["summary"]
-    all_ok = (s["qty_diff"] == 0 and s["legacy_only"] == 0 and s["system_only"] == 0)
-
-    def badge(label, count, bad_if_nonzero=True):
-        cls = "pov-ok"
-        if bad_if_nonzero and count > 0:
-            cls = "pov-bad"
-        return '<span class="pov-badge ' + cls + '">' + label + " " + str(count) + "</span>"
-
-    head = '<div class="card"><h3 style="margin-bottom:10px;">' + esc(title) + "</h3>"
-    head += '<p style="font-size:13px;color:#555;margin-bottom:10px;">기존 양식 ' + str(s["legacy_total"]) + "건 / 시스템 " + str(s["system_total"]) + "건</p>"
-    head += '<span class="pov-badge pov-ok">일치 ' + str(s["matched"]) + "</span>"
-    head += badge("수량 불일치", s["qty_diff"])
-    head += badge("기존 양식에만 있음", s["legacy_only"])
-    head += badge("시스템에만 있음", s["system_only"])
-    if all_ok and s["legacy_total"] > 0:
-        head += '<p style="color:#065F46;font-weight:bold;margin-top:8px;">✅ 전 항목 일치</p>'
-
-    def table(headers, rows_html, empty_msg):
-        if not rows_html:
-            return '<p style="color:#888;font-size:13px;margin:6px 0 14px 0;">' + empty_msg + "</p>"
-        th = "".join("<th>" + h + "</th>" for h in headers)
-        return '<div class="pov-scroll"><table class="pov-table"><thead><tr>' + th + "</tr></thead><tbody>" + rows_html + "</tbody></table></div>"
-
-    # --- 수량 불일치 ---
-    rows = ""
-    for r in cmp_res["qty_diff"]:
-        diff = r["system_qty"] - r["legacy_qty"]
-        sign = "+" if diff > 0 else ""
-        note = ""
-        if r["name_note"]:
-            note = '<br><span style="color:#888;font-size:11px;">시스템 품명: ' + esc(r["name_note"]) + "</span>"
-        rows += (
-            "<tr><td>" + esc(r["branch_name"]) + "</td><td>" + esc(r["item_name"]) + note + "</td>"
-            + '<td class="num">' + str(r["legacy_qty"]) + "</td>"
-            + '<td class="num">' + str(r["system_qty"]) + "</td>"
-            + '<td class="num" style="font-weight:bold;color:#991B1B;">' + sign + str(diff) + "</td>"
-            + '<td class="num">' + str(r["system_safety"]) + "</td>"
-            + '<td class="num">' + str(r["system_moq"]) + "</td></tr>"
+    rows = _po_verify_build_export_rows(cmp_res, other_label, ctx_all)
+    body = ""
+    for r in rows:
+        kind = _po_verify_row_kind(r)
+        err = r[4]
+        err_txt = ("+" if err > 0 else "") + str(err)
+        err_style = "" if err == 0 else "font-weight:bold;color:#991B1B;"
+        body += (
+            '<tr class="pov-row-' + kind + '"><td>' + esc(str(r[0])) + "</td><td>" + esc(str(r[1])) + "</td>"
+            + '<td class="num">' + str(r[2]) + "</td>"
+            + '<td class="num">' + str(r[3]) + "</td>"
+            + '<td class="num" style="' + err_style + '">' + err_txt + "</td>"
+            + "<td>" + esc(str(r[5])) + "</td><td>" + esc(str(r[6])) + "</td></tr>"
         )
-    body = '<h4 style="margin:14px 0 6px 0;">⚠️ 수량 불일치</h4>'
-    body += table(["지점", "품명", "기존 양식", "시스템", "차이", "시스템 안전재고", "시스템 MOQ"], rows, "없음")
 
-    # --- 기존 양식에만 있음 ---
-    rows = ""
-    for r in cmp_res["legacy_only"]:
-        if r["where"] == "other":
-            verdict = "시스템에서는 " + other_label + " 대상으로 분류"
-            extra = '<td class="num">-</td><td class="num">-</td><td>-</td>'
-        elif r["where"] == "pending":
-            verdict = "시스템에서는 미입고 보류" + (" (" + esc(r["note"]) + ")" if r["note"] else "")
-            extra = '<td class="num">-</td><td class="num">-</td><td>이미 접수/승인된 발주 이력 있음</td>'
-        else:
-            verdict = "시스템 발주 대상 아님"
-            c = _po_verify_find_ctx(ctx_all, r["branch_name"], r["item_name"])
-            safety = str(c["safety_qty"]) if c else "-"
-            cur = "-" if (c is None or c["current_qty"] is None) else str(c["current_qty"])
-            extra = '<td class="num">' + safety + '</td><td class="num">' + cur + "</td><td>" + esc(_po_verify_guess_reason(c)) + " <span style=\"color:#aaa;font-size:11px;\">(추정)</span></td>"
-        rows += (
-            "<tr><td>" + esc(r["branch_name"]) + "</td><td>" + esc(r["item_name"]) + "</td>"
-            + '<td class="num">' + str(r["legacy_qty"]) + "</td><td>" + verdict + "</td>" + extra + "</tr>"
-        )
-    body += '<h4 style="margin:14px 0 6px 0;">📄 기존 양식에만 있음 (시스템 미산출)</h4>'
-    body += table(["지점", "품명", "기존 수량", "시스템 판정", "시스템 안전재고", "시스템 현재고", "사유"], rows, "없음")
-
-    # --- 시스템에만 있음 ---
-    rows = ""
-    for it in cmp_res["system_only"]:
-        rows += (
-            "<tr><td>" + esc(str(it["branch_name"])) + "</td><td>" + esc(str(it["item_name"])) + "</td>"
-            + '<td class="num">' + str(it["final_qty"]) + "</td>"
-            + '<td class="num">' + str(it.get("safety_qty")) + "</td>"
-            + '<td class="num">' + str(it.get("moq")) + "</td></tr>"
-        )
-    body += '<h4 style="margin:14px 0 6px 0;">🖥️ 시스템에만 있음 (기존 양식 미산출)</h4>'
-    body += table(["지점", "품명", "시스템 수량", "안전재고", "MOQ"], rows, "없음")
-
-    # --- 일치 목록 (접기) ---
-    rows = ""
-    for r in cmp_res["matched"]:
-        note = ""
-        if r["name_note"]:
-            note = ' <span style="color:#888;font-size:11px;">(시스템 품명: ' + esc(r["name_note"]) + ")</span>"
-        rows += (
-            "<tr><td>" + esc(r["branch_name"]) + "</td><td>" + esc(r["item_name"]) + note + "</td>"
-            + '<td class="num">' + str(r["legacy_qty"]) + "</td></tr>"
-        )
-    body += '<details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#1E2761;">✅ 일치 목록 보기 (' + str(s["matched"]) + "건)</summary>"
-    body += table(["지점", "품명", "수량"], rows, "없음")
-    body += "</details>"
-
-    return head + body + "</div>"
+    out = '<div class="card">'
+    out += ('<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;">'
+            '<h3>' + esc(title) + '</h3>'
+            '<label style="font-size:13px;color:#555;cursor:pointer;">'
+            '<input type="checkbox" style="width:auto;" onchange="povToggle(this)"> 불일치만 보기</label></div>')
+    out += '<p style="font-size:12px;color:#888;margin-bottom:10px;">자동 수량 = 시스템 산출 / 수기 수량 = 기존 양식 / 오차 = 자동 − 수기</p>'
+    if not body:
+        out += '<p style="color:#888;font-size:13px;">비교할 항목이 없습니다.</p>'
+    else:
+        heads = ["지점", "상품명", "자동 수량", "수기 수량", "오차", "시스템 판정/비고", "사유"]
+        th = "".join("<th>" + h + "</th>" for h in heads)
+        out += ('<div class="pov-scroll"><table class="pov-table"><thead><tr>' + th + "</tr></thead><tbody>"
+                + body + "</tbody></table></div>")
+    return out + "</div>"
 
 
 def _po_verify_page_html(result_html: str = "", error_msg: str = "") -> str:
@@ -16418,53 +16467,7 @@ def _po_verify_page_html(result_html: str = "", error_msg: str = "") -> str:
       </form>
     </div>
     """
-    return PO_VERIFY_CSS + form + err + result_html
-
-
-async def _po_verify_read_upload(f):
-    """선택 안 된 파일 입력(None 또는 빈 문자열/빈 파일명)은 None 처리"""
-    if f is None or isinstance(f, str):
-        return None
-    if not getattr(f, "filename", ""):
-        return None
-    data = await f.read()
-    return data or None
-
-def _po_verify_legacy_only_info(r: dict, other_label: str, ctx_all: dict):
-    """'기존 양식에만 있음' 한 건의 (시스템 판정, 안전재고, 현재고, 사유) — 엑셀 저장용"""
-    if r["where"] == "other":
-        return "시스템에서는 " + other_label + " 대상으로 분류", None, None, ""
-    if r["where"] == "pending":
-        verdict = "시스템에서는 미입고 보류" + (" (" + r["note"] + ")" if r["note"] else "")
-        return verdict, None, None, "이미 접수/승인된 발주 이력 있음"
-    c = _po_verify_find_ctx(ctx_all, r["branch_name"], r["item_name"])
-    safety = c["safety_qty"] if c else None
-    cur = c["current_qty"] if c else None
-    return "시스템 발주 대상 아님", safety, cur, _po_verify_guess_reason(c) + " (추정)"
-
-
-def _po_verify_build_export_rows(cmp_res: dict, other_label: str, ctx_all: dict) -> list:
-    """엑셀 한 시트에 들어갈 행 목록. 컬럼 순서는 _build_po_verify_excel의 헤더와 동일."""
-    def nz(v):
-        return "" if v is None else v
-
-    rows = []
-    for r in cmp_res["qty_diff"]:
-        note = ("시스템 품명: " + r["name_note"]) if r["name_note"] else ""
-        rows.append(["수량 불일치", r["branch_name"], r["item_name"], r["legacy_qty"], r["system_qty"],
-                     r["system_qty"] - r["legacy_qty"], note, nz(r["system_safety"]), nz(r["system_moq"]), "", ""])
-    for r in cmp_res["legacy_only"]:
-        verdict, safety, cur, reason = _po_verify_legacy_only_info(r, other_label, ctx_all)
-        rows.append(["기존 양식에만", r["branch_name"], r["item_name"], r["legacy_qty"], "", "",
-                     verdict, nz(safety), "", nz(cur), reason])
-    for it in cmp_res["system_only"]:
-        rows.append(["시스템에만", str(it["branch_name"]), str(it["item_name"]), "", it["final_qty"], "",
-                     "", nz(it.get("safety_qty")), nz(it.get("moq")), "", ""])
-    for r in cmp_res["matched"]:
-        note = ("시스템 품명: " + r["name_note"]) if r["name_note"] else ""
-        rows.append(["일치", r["branch_name"], r["item_name"], r["legacy_qty"], r["system_qty"], 0,
-                     note, nz(r["system_safety"]), nz(r["system_moq"]), "", ""])
-    return rows
+    return PO_VERIFY_CSS + PO_VERIFY_JS + form + err + result_html
 
 
 def _po_verify_export_form_html(export_sections: list) -> str:
@@ -16472,7 +16475,7 @@ def _po_verify_export_form_html(export_sections: list) -> str:
     import json
     from html import escape as esc
     payload = json.dumps(
-        {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "sections": export_sections},
+        {"generated_at": _kst_now().strftime("%Y-%m-%d %H:%M"), "sections": export_sections},
         ensure_ascii=False
     )
     return (
@@ -16486,7 +16489,8 @@ def _po_verify_export_form_html(export_sections: list) -> str:
 
 
 def _build_po_verify_excel(data: dict) -> bytes:
-    """비교 결과(payload)를 엑셀로 생성: [요약] 시트 + 유형별(주간/월간) 비교 시트"""
+    """비교 결과(payload)를 엑셀로 생성: 유형별(주간/월간) 시트 1개씩.
+    컬럼: 지점 | 상품명 | 자동 수량 | 수기 수량 | 오차 | 시스템 판정/비고 | 사유"""
     import io
     import re
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -16499,50 +16503,16 @@ def _build_po_verify_excel(data: dict) -> bytes:
     head_font = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill(start_color="1E2761", end_color="1E2761", fill_type="solid")
     fills = {
-        "일치": PatternFill(start_color="ECFDF5", end_color="ECFDF5", fill_type="solid"),
-        "수량 불일치": PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
-        "기존 양식에만": PatternFill(start_color="FEF9C3", end_color="FEF9C3", fill_type="solid"),
-        "시스템에만": PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid"),
+        "diff": PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid"),
+        "legacyonly": PatternFill(start_color="FEF9C3", end_color="FEF9C3", fill_type="solid"),
+        "sysonly": PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid"),
     }
-
-    def put(ws, row, col, value):
-        cell = ws.cell(row=row, column=col, value=value)
-        if isinstance(value, str) and value.startswith("="):
-            cell.data_type = "s"   # 품명이 '='로 시작해도 수식으로 해석되지 않게
-        return cell
-
-    def write_header(ws, row, headers):
-        for ci, h in enumerate(headers, start=1):
-            c = put(ws, row, ci, h)
-            c.font = head_font
-            c.fill = head_fill
-            c.alignment = Alignment(horizontal="center", vertical="center")
+    headers = ["지점", "상품명", "자동 수량", "수기 수량", "오차", "시스템 판정/비고", "사유"]
+    widths = [16, 44, 12, 12, 10, 40, 52]
 
     wb = openpyxl.Workbook()
-
-    # ── 요약 시트 ──
-    ws0 = wb.active
-    ws0.title = "요약"
-    put(ws0, 1, 1, "발주서 검수 결과 (기존 양식 vs 시스템)").font = Font(bold=True, size=13)
-    put(ws0, 2, 1, "생성 일시: " + str(data.get("generated_at", "")))
-    put(ws0, 3, 1, "※ 시스템 결과는 생성 시점의 현재고·안전재고 기준이며, 기존 양식 산출 시점과 다를 수 있습니다.")
-    sum_headers = ["유형", "기존 양식 건수", "시스템 건수", "일치", "수량 불일치", "기존 양식에만", "시스템에만"]
-    write_header(ws0, 5, sum_headers)
-    for i, sec in enumerate(sections):
-        s = sec.get("summary", {})
-        vals = [sec.get("title", ""), s.get("legacy_total", 0), s.get("system_total", 0), s.get("matched", 0),
-                s.get("qty_diff", 0), s.get("legacy_only", 0), s.get("system_only", 0)]
-        for ci, v in enumerate(vals, start=1):
-            put(ws0, 6 + i, ci, v)
-    for ci, w in enumerate([22, 16, 12, 8, 12, 14, 12], start=1):
-        ws0.column_dimensions[get_column_letter(ci)].width = w
-
-    # ── 유형별 비교 시트 ──
-    headers = ["구분", "지점", "품명", "기존 양식 수량", "시스템 수량", "차이(시스템-기존)",
-               "시스템 판정 / 비고", "시스템 안전재고", "시스템 MOQ", "시스템 현재고", "사유(추정)"]
-    widths = [14, 16, 42, 14, 12, 16, 34, 14, 12, 14, 36]
-    used_names = {"요약"}
-    for sec in sections:
+    used_names = set()
+    for idx, sec in enumerate(sections):
         base = re.sub(r"[\\/\?\*\[\]:]", "", str(sec.get("title", "비교"))) or "비교"
         name = base[:28]
         n = 1
@@ -16551,13 +16521,22 @@ def _build_po_verify_excel(data: dict) -> bytes:
             name = base[:26] + "_" + str(n)
         used_names.add(name)
 
-        ws = wb.create_sheet(title=name)
-        write_header(ws, 1, headers)
+        ws = wb.active if idx == 0 else wb.create_sheet()
+        ws.title = name
+
+        for ci, h in enumerate(headers, start=1):
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font = head_font
+            c.fill = head_fill
+            c.alignment = Alignment(horizontal="center", vertical="center")
+
         rows = sec.get("rows") or []
         for ri, row in enumerate(rows, start=2):
-            fill = fills.get(row[0])
+            fill = fills.get(_po_verify_row_kind(row))
             for ci, v in enumerate(row, start=1):
-                c = put(ws, ri, ci, v)
+                c = ws.cell(row=ri, column=ci, value=v)
+                if isinstance(v, str) and v.startswith("="):
+                    c.data_type = "s"   # 품명이 '='로 시작해도 수식으로 해석되지 않게
                 if fill is not None:
                     c.fill = fill
         for ci, w in enumerate(widths, start=1):
@@ -16571,34 +16550,15 @@ def _build_po_verify_excel(data: dict) -> bytes:
     return buf.getvalue()
 
 
-@app.post("/master/purchase-order/verify/export")
-async def purchase_order_verify_export(
-    session_token: str = Cookie(default=None),
-    payload: str = Form(...)
-):
-    import io
-    import json
-    from urllib.parse import quote
+async def _po_verify_read_upload(f):
+    """선택 안 된 파일 입력(None 또는 빈 문자열/빈 파일명)은 None 처리"""
+    if f is None or isinstance(f, str):
+        return None
+    if not getattr(f, "filename", ""):
+        return None
+    data = await f.read()
+    return data or None
 
-    user = get_session(session_token)
-    if not user or user["role"] != "master":
-        return RedirectResponse(url="/login", status_code=303)
-    if not has_menu_permission(user["login_id"], "purchase-order-verify"):
-        return RedirectResponse(url="/master", status_code=303)
-
-    try:
-        data = json.loads(payload)
-        excel_bytes = _build_po_verify_excel(data)
-    except Exception as e:
-        return HTMLResponse(content=render_page(
-            _po_verify_page_html(error_msg="엑셀 생성 실패: " + str(e)), user, "master"))
-
-    filename = "발주서검수결과_" + datetime.now().strftime("%Y%m%d_%H%M") + ".xlsx"
-    return StreamingResponse(
-        io.BytesIO(excel_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)}
-    )
 
 @app.get("/master/purchase-order/verify", response_class=HTMLResponse)
 async def purchase_order_verify_page(session_token: str = Cookie(default=None)):
@@ -16659,13 +16619,43 @@ async def purchase_order_verify_run(
         sections += _po_verify_render_section(label + " 발주 비교", other_label, cmp_res, ctx_all)
         export_sections.append({
             "title": label + " 발주 비교",
-            "summary": cmp_res["summary"],
             "rows": _po_verify_build_export_rows(cmp_res, other_label, ctx_all),
         })
 
     export_form = _po_verify_export_form_html(export_sections) if export_sections else ""
     return HTMLResponse(content=render_page(
         _po_verify_page_html(export_form + sections, " / ".join(errors)), user, "master"))
+
+
+@app.post("/master/purchase-order/verify/export")
+async def purchase_order_verify_export(
+    session_token: str = Cookie(default=None),
+    payload: str = Form(...)
+):
+    import io
+    import json
+    from urllib.parse import quote
+
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "purchase-order-verify"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    try:
+        data = json.loads(payload)
+        excel_bytes = _build_po_verify_excel(data)
+    except Exception as e:
+        return HTMLResponse(content=render_page(
+            _po_verify_page_html(error_msg="엑셀 생성 실패: " + str(e)), user, "master"))
+
+    filename = "발주서검수결과_" + _kst_now().strftime("%Y%m%d_%H%M") + ".xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)}
+    )
+
 
 @app.post("/master/qr/generate-bulk")
 async def master_qr_generate_bulk(
