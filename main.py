@@ -92,6 +92,7 @@ MENU_DEFINITIONS = {
     "login-history": "접속 이력",
     "purchase-tracking": "발주 주기 트래킹",
     "purchase-order-preview": "발주서 미리보기",
+    "purchase-order-verify": "발주서 검수(기존 양식 비교)",
     "product-settings": "상품 설정",
     "branch-exceptions": "발주서 지점 예외",
     "safety-stock": "안전재고 관리",
@@ -11242,6 +11243,19 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """
 
+    # ---- 발주서 검수 (단독 상단, 아코디언 아님) ----
+    po_verify_card_html = ""
+    if menu_allowed("purchase-order-verify"):
+        po_verify_card_html = """
+      <a href="/master/purchase-order/verify" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🧾</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주서 검수</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">기존 양식과 비교</div>
+        </div>
+      </a>
+        """
+
     # ---- 그룹 1: DB재고관리 ----
     db_inventory_cards = []
     if menu_allowed("data"):
@@ -11433,7 +11447,7 @@ async def master_page(session_token: str = Cookie(default=None)):
     content = f"""
     {ACCORDION_CSS_JS}
     <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
-    {f'<div style="display:flex;gap:16px;margin-bottom:14px;">{branch_card_html}{po_preview_card_html}</div>' if (branch_card_html or po_preview_card_html) else ""}
+    {f'<div style="display:flex;gap:16px;margin-bottom:14px;">{branch_card_html}{po_preview_card_html}{po_verify_card_html}</div>' if (branch_card_html or po_preview_card_html or po_verify_card_html) else ""}
     {groups_html}
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -16033,6 +16047,448 @@ async def purchase_order_preview_export(
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"}
     )
+
+# ============================================================
+# 발주서 검수 — 기존 양식(엑셀 [구매정보]) vs 시스템 산출 비교
+# ============================================================
+
+PO_VERIFY_CSS = """
+<style>
+.pov-table { width:100%; border-collapse:collapse; font-size:13px; margin-bottom:8px; }
+.pov-table th { background:#1E2761; color:#fff; padding:8px 10px; text-align:left; white-space:nowrap; }
+.pov-table td { padding:8px 10px; border-bottom:1px solid #eee; }
+.pov-table td.num { text-align:right; }
+.pov-badge { display:inline-block; padding:3px 12px; border-radius:12px; font-size:12px; font-weight:bold; margin:0 6px 6px 0; }
+.pov-ok { background:#D1FAE5; color:#065F46; }
+.pov-bad { background:#FEE2E2; color:#991B1B; }
+.pov-gray { background:#E5E7EB; color:#374151; }
+.pov-scroll { overflow-x:auto; }
+</style>
+"""
+
+
+def _po_norm_strict(s) -> str:
+    """앞뒤/중복 공백만 정리 (정확 매칭용)"""
+    return " ".join(str(s or "").split())
+
+
+def _po_norm_loose(s) -> str:
+    """한글/영문/숫자만 남기고 소문자화 (괄호·기호 표기 차이 흡수용)"""
+    import re
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", str(s or "")).lower()
+
+
+def _po_to_number(v):
+    try:
+        f = float(v)
+        return int(f) if f == int(f) else f
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _parse_legacy_purchase_info(file_bytes: bytes) -> dict:
+    """기존 양식 엑셀의 [구매정보] 시트 A~M열을 읽어 {(지점, 상품명): {...}} 로 반환.
+    A=지점 B=구분 C=상품명 D=거래처명 E=구매일자 F=구매시간 G=담당자 H=과세설정
+    I=구매단가 J=수량 K=공급가액 L=부가세 M=합계액"""
+    import io
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    if "구매정보" not in wb.sheetnames:
+        raise ValueError("[구매정보] 시트를 찾을 수 없습니다.")
+    ws = wb["구매정보"]
+    result = {}
+    for r in ws.iter_rows(min_row=2, max_col=13, values_only=True):
+        branch = _po_norm_strict(r[0])
+        item = _po_norm_strict(r[2])
+        if not branch or not item:
+            continue
+        qty = _po_to_number(r[9])
+        if qty <= 0:
+            continue
+        key = (branch, item)
+        if key in result:
+            result[key]["qty"] += qty
+            result[key]["dup_count"] += 1
+        else:
+            result[key] = {
+                "branch_name": branch,
+                "item_name": item,
+                "qty": qty,
+                "unit_price": _po_to_number(r[8]),
+                "total": _po_to_number(r[12]),
+                "supplier": _po_norm_strict(r[3]),
+                "dup_count": 1,
+            }
+    return result
+
+
+def _compare_po_with_legacy(legacy: dict, system_same: list, system_other: list, system_pending: list) -> dict:
+    """기존 양식(legacy)과 시스템 산출을 (지점, 상품명) 기준으로 비교.
+    1차: 정확 매칭 / 2차: 기호·괄호 표기만 다른 경우 느슨한 매칭(품명표기 참고로 표시).
+    legacy_only 항목은 시스템의 반대 유형(주간<->월간) 또는 미입고 보류에 있는지도 함께 판정."""
+    AMBIG = object()
+
+    def build_index(items):
+        strict, loose = {}, {}
+        for it in items:
+            b = _po_norm_strict(it["branch_name"])
+            strict[(b, _po_norm_strict(it["item_name"]))] = it
+            lk = (b, _po_norm_loose(it["item_name"]))
+            loose[lk] = AMBIG if lk in loose else it
+        return strict, loose
+
+    def strict_get(index, b, n):
+        return index[0].get((b, n))
+
+    def loose_get(index, b, n):
+        it = index[1].get((b, _po_norm_loose(n)))
+        return None if it is AMBIG else it
+
+    same_idx = build_index(system_same)
+    other_idx = build_index(system_other)
+    pend_idx = build_index(system_pending)
+
+    used = set()
+    matched, qty_diff, legacy_only = [], [], []
+
+    def add_pair(L, it, loosely):
+        used.add(id(it))
+        sys_name = _po_norm_strict(it["item_name"])
+        row = {
+            "branch_name": L["branch_name"],
+            "item_name": L["item_name"],
+            "legacy_qty": L["qty"],
+            "system_qty": it["final_qty"],
+            "system_safety": it.get("safety_qty"),
+            "system_moq": it.get("moq"),
+            "name_note": sys_name if (loosely and sys_name != L["item_name"]) else "",
+        }
+        if abs(float(L["qty"]) - float(it["final_qty"])) < 1e-9:
+            matched.append(row)
+        else:
+            qty_diff.append(row)
+
+    # 1차: 정확 매칭
+    rest = []
+    for key, L in legacy.items():
+        it = strict_get(same_idx, key[0], key[1])
+        if it is not None and id(it) not in used:
+            add_pair(L, it, False)
+        else:
+            rest.append((key, L))
+
+    # 2차: 느슨한 매칭 + 미매칭 분류
+    for key, L in rest:
+        b, n = key
+        it = loose_get(same_idx, b, n)
+        if it is not None and id(it) not in used:
+            add_pair(L, it, True)
+            continue
+        where, note = "none", ""
+        o = strict_get(other_idx, b, n) or loose_get(other_idx, b, n)
+        if o is not None:
+            where = "other"
+        else:
+            p = strict_get(pend_idx, b, n) or loose_get(pend_idx, b, n)
+            if p is not None:
+                where = "pending"
+                note = p.get("status") or ""
+        legacy_only.append({
+            "branch_name": b, "item_name": n, "legacy_qty": L["qty"],
+            "where": where, "note": note,
+        })
+
+    system_only = [it for it in system_same if id(it) not in used]
+
+    def sort_key(x):
+        return (x["branch_name"], x["item_name"])
+
+    matched.sort(key=sort_key)
+    qty_diff.sort(key=sort_key)
+    legacy_only.sort(key=sort_key)
+    system_only.sort(key=sort_key)
+
+    return {
+        "matched": matched,
+        "qty_diff": qty_diff,
+        "legacy_only": legacy_only,
+        "system_only": system_only,
+        "summary": {
+            "legacy_total": len(legacy),
+            "system_total": len(system_same),
+            "matched": len(matched),
+            "qty_diff": len(qty_diff),
+            "legacy_only": len(legacy_only),
+            "system_only": len(system_only),
+        },
+    }
+
+
+def _po_verify_build_context() -> dict:
+    """'기존 양식에만 있음' 항목의 시스템 측 참고값(안전재고/현재고/상품설정) 조회. 이미 운영 중인 조회식만 재사용."""
+    conn = get_conn()
+    safety_rows = conn.execute(
+        "SELECT branch_name, item_name, item_code, qty FROM safety_stock"
+    ).fetchall()
+    pm_rows = conn.execute(
+        "SELECT DISTINCT ON (item_code) item_code, lead_time_days, moq, is_consumable, order_excluded "
+        "FROM product_master WHERE item_code IS NOT NULL AND item_code != '' "
+        "ORDER BY item_code, id"
+    ).fetchall()
+    conn.close()
+
+    branches = get_branches(branch_type='branch')
+    name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
+    raw_map = {(r["branch_code"], r["item_code"]): (r["quantity"] or 0) for r in fetch_raw_inventory()}
+    pm_map = {r["item_code"]: r for r in pm_rows}
+
+    strict, loose = {}, {}
+    for row in safety_rows:
+        b = _po_norm_strict(row["branch_name"])
+        n = _po_norm_strict(row["item_name"])
+        code = row["item_code"] or ""
+        pm = pm_map.get(code)
+        branch_code = name_to_code.get(row["branch_name"])
+        ctx = {
+            "safety_qty": row["qty"] or 0,
+            "current_qty": raw_map.get((branch_code, code), 0) if branch_code else None,
+            "moq": (pm["moq"] if pm and pm["moq"] else 1),
+            "lead_time_days": (pm["lead_time_days"] if pm and pm["lead_time_days"] is not None else 0),
+            "is_consumable": bool(pm["is_consumable"]) if pm else False,
+            "order_excluded": bool(pm["order_excluded"]) if pm else False,
+        }
+        strict[(b, n)] = ctx
+        loose.setdefault((b, _po_norm_loose(row["item_name"])), ctx)
+    return {"strict": strict, "loose": loose}
+
+
+def _po_verify_find_ctx(ctx_all: dict, b: str, n: str):
+    c = ctx_all["strict"].get((b, n))
+    if c is None:
+        c = ctx_all["loose"].get((b, _po_norm_loose(n)))
+    return c
+
+
+def _po_verify_guess_reason(c) -> str:
+    """표시 전용 추정 사유 (발주 판정 로직과는 별개)"""
+    if c is None:
+        return "안전재고 미등록 (또는 지점/품명 표기 불일치)"
+    if c["order_excluded"]:
+        return "숨김 상품 (전체 미발주)"
+    if c["safety_qty"] <= 0:
+        return "안전재고 0"
+    if c["current_qty"] is None:
+        return "지점 매칭 실패 (지점명 확인)"
+    if c["current_qty"] >= c["safety_qty"]:
+        return "현재고 ≥ 안전재고"
+    if c["is_consumable"]:
+        return "소모품 (지점 예외 등록 여부 확인)"
+    return "원인 추가 확인 필요"
+
+
+def _po_verify_render_section(title: str, other_label: str, cmp_res: dict, ctx_all: dict) -> str:
+    from html import escape as esc
+
+    s = cmp_res["summary"]
+    all_ok = (s["qty_diff"] == 0 and s["legacy_only"] == 0 and s["system_only"] == 0)
+
+    def badge(label, count, bad_if_nonzero=True):
+        cls = "pov-ok"
+        if bad_if_nonzero and count > 0:
+            cls = "pov-bad"
+        return '<span class="pov-badge ' + cls + '">' + label + " " + str(count) + "</span>"
+
+    head = '<div class="card"><h3 style="margin-bottom:10px;">' + esc(title) + "</h3>"
+    head += '<p style="font-size:13px;color:#555;margin-bottom:10px;">기존 양식 ' + str(s["legacy_total"]) + "건 / 시스템 " + str(s["system_total"]) + "건</p>"
+    head += '<span class="pov-badge pov-ok">일치 ' + str(s["matched"]) + "</span>"
+    head += badge("수량 불일치", s["qty_diff"])
+    head += badge("기존 양식에만 있음", s["legacy_only"])
+    head += badge("시스템에만 있음", s["system_only"])
+    if all_ok and s["legacy_total"] > 0:
+        head += '<p style="color:#065F46;font-weight:bold;margin-top:8px;">✅ 전 항목 일치</p>'
+
+    def table(headers, rows_html, empty_msg):
+        if not rows_html:
+            return '<p style="color:#888;font-size:13px;margin:6px 0 14px 0;">' + empty_msg + "</p>"
+        th = "".join("<th>" + h + "</th>" for h in headers)
+        return '<div class="pov-scroll"><table class="pov-table"><thead><tr>' + th + "</tr></thead><tbody>" + rows_html + "</tbody></table></div>"
+
+    # --- 수량 불일치 ---
+    rows = ""
+    for r in cmp_res["qty_diff"]:
+        diff = r["system_qty"] - r["legacy_qty"]
+        sign = "+" if diff > 0 else ""
+        note = ""
+        if r["name_note"]:
+            note = '<br><span style="color:#888;font-size:11px;">시스템 품명: ' + esc(r["name_note"]) + "</span>"
+        rows += (
+            "<tr><td>" + esc(r["branch_name"]) + "</td><td>" + esc(r["item_name"]) + note + "</td>"
+            + '<td class="num">' + str(r["legacy_qty"]) + "</td>"
+            + '<td class="num">' + str(r["system_qty"]) + "</td>"
+            + '<td class="num" style="font-weight:bold;color:#991B1B;">' + sign + str(diff) + "</td>"
+            + '<td class="num">' + str(r["system_safety"]) + "</td>"
+            + '<td class="num">' + str(r["system_moq"]) + "</td></tr>"
+        )
+    body = '<h4 style="margin:14px 0 6px 0;">⚠️ 수량 불일치</h4>'
+    body += table(["지점", "품명", "기존 양식", "시스템", "차이", "시스템 안전재고", "시스템 MOQ"], rows, "없음")
+
+    # --- 기존 양식에만 있음 ---
+    rows = ""
+    for r in cmp_res["legacy_only"]:
+        if r["where"] == "other":
+            verdict = "시스템에서는 " + other_label + " 대상으로 분류"
+            extra = '<td class="num">-</td><td class="num">-</td><td>-</td>'
+        elif r["where"] == "pending":
+            verdict = "시스템에서는 미입고 보류" + (" (" + esc(r["note"]) + ")" if r["note"] else "")
+            extra = '<td class="num">-</td><td class="num">-</td><td>이미 접수/승인된 발주 이력 있음</td>'
+        else:
+            verdict = "시스템 발주 대상 아님"
+            c = _po_verify_find_ctx(ctx_all, r["branch_name"], r["item_name"])
+            safety = str(c["safety_qty"]) if c else "-"
+            cur = "-" if (c is None or c["current_qty"] is None) else str(c["current_qty"])
+            extra = '<td class="num">' + safety + '</td><td class="num">' + cur + "</td><td>" + esc(_po_verify_guess_reason(c)) + " <span style=\"color:#aaa;font-size:11px;\">(추정)</span></td>"
+        rows += (
+            "<tr><td>" + esc(r["branch_name"]) + "</td><td>" + esc(r["item_name"]) + "</td>"
+            + '<td class="num">' + str(r["legacy_qty"]) + "</td><td>" + verdict + "</td>" + extra + "</tr>"
+        )
+    body += '<h4 style="margin:14px 0 6px 0;">📄 기존 양식에만 있음 (시스템 미산출)</h4>'
+    body += table(["지점", "품명", "기존 수량", "시스템 판정", "시스템 안전재고", "시스템 현재고", "사유"], rows, "없음")
+
+    # --- 시스템에만 있음 ---
+    rows = ""
+    for it in cmp_res["system_only"]:
+        rows += (
+            "<tr><td>" + esc(str(it["branch_name"])) + "</td><td>" + esc(str(it["item_name"])) + "</td>"
+            + '<td class="num">' + str(it["final_qty"]) + "</td>"
+            + '<td class="num">' + str(it.get("safety_qty")) + "</td>"
+            + '<td class="num">' + str(it.get("moq")) + "</td></tr>"
+        )
+    body += '<h4 style="margin:14px 0 6px 0;">🖥️ 시스템에만 있음 (기존 양식 미산출)</h4>'
+    body += table(["지점", "품명", "시스템 수량", "안전재고", "MOQ"], rows, "없음")
+
+    # --- 일치 목록 (접기) ---
+    rows = ""
+    for r in cmp_res["matched"]:
+        note = ""
+        if r["name_note"]:
+            note = ' <span style="color:#888;font-size:11px;">(시스템 품명: ' + esc(r["name_note"]) + ")</span>"
+        rows += (
+            "<tr><td>" + esc(r["branch_name"]) + "</td><td>" + esc(r["item_name"]) + note + "</td>"
+            + '<td class="num">' + str(r["legacy_qty"]) + "</td></tr>"
+        )
+    body += '<details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#1E2761;">✅ 일치 목록 보기 (' + str(s["matched"]) + "건)</summary>"
+    body += table(["지점", "품명", "수량"], rows, "없음")
+    body += "</details>"
+
+    return head + body + "</div>"
+
+
+def _po_verify_page_html(result_html: str = "", error_msg: str = "") -> str:
+    from html import escape as esc
+    err = ""
+    if error_msg:
+        err = ('<div class="card" style="background:#FEE2E2;border:1px solid #FCA5A5;">'
+               '<p style="font-size:13px;color:#991B1B;">' + esc(error_msg) + "</p></div>")
+    form = """
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>🧾 발주서 검수 (기존 양식 vs 시스템)</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;line-height:1.6;">
+        기존 양식 엑셀의 <b>[구매정보]</b> 시트(A~M열)에서 지점·상품명·수량을 읽어, 지금 시스템이 산출한 발주 대상과 비교합니다.<br>
+        비교 기준은 <b>(지점, 상품명) → 수량</b> 입니다. 주간/월간 파일 중 하나만 올려도 됩니다.<br>
+        시스템 결과는 <b>지금 이 순간의 현재고 기준</b>이라, 기존 양식을 뽑은 직후(구매내역 업로드 전)에 비교해야 정확합니다.
+      </p>
+    </div>
+    <div class="card">
+      <form method="post" action="/master/purchase-order/verify" enctype="multipart/form-data"
+            onsubmit="var b=this.querySelector('button');b.disabled=true;b.innerText='비교 중...';">
+        <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px;">
+          <div style="flex:1;min-width:240px;">
+            <label style="font-size:13px;color:#555;">주간 발주 엑셀 (기존 양식)</label>
+            <input type="file" name="weekly_file" accept=".xlsx,.xlsm">
+          </div>
+          <div style="flex:1;min-width:240px;">
+            <label style="font-size:13px;color:#555;">월간 발주 엑셀 (기존 양식)</label>
+            <input type="file" name="monthly_file" accept=".xlsx,.xlsm">
+          </div>
+        </div>
+        <button class="btn" type="submit">비교하기</button>
+      </form>
+    </div>
+    """
+    return PO_VERIFY_CSS + form + err + result_html
+
+
+async def _po_verify_read_upload(f):
+    """선택 안 된 파일 입력(None 또는 빈 문자열/빈 파일명)은 None 처리"""
+    if f is None or isinstance(f, str):
+        return None
+    if not getattr(f, "filename", ""):
+        return None
+    data = await f.read()
+    return data or None
+
+
+@app.get("/master/purchase-order/verify", response_class=HTMLResponse)
+async def purchase_order_verify_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "purchase-order-verify"):
+        return RedirectResponse(url="/master", status_code=303)
+    return HTMLResponse(content=render_page(_po_verify_page_html(), user, "master"))
+
+
+@app.post("/master/purchase-order/verify", response_class=HTMLResponse)
+async def purchase_order_verify_run(
+    session_token: str = Cookie(default=None),
+    weekly_file: UploadFile = File(None),
+    monthly_file: UploadFile = File(None)
+):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "purchase-order-verify"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    uploads = []
+    for label, order_type, f in (("주간", "weekly", weekly_file), ("월간", "monthly", monthly_file)):
+        data = await _po_verify_read_upload(f)
+        if data:
+            uploads.append((label, order_type, data))
+
+    if not uploads:
+        return HTMLResponse(content=render_page(
+            _po_verify_page_html(error_msg="비교할 엑셀 파일을 1개 이상 선택해주세요."), user, "master"))
+
+    try:
+        result = await _compute_purchase_order_candidates()
+        ctx_all = _po_verify_build_context()
+    except Exception as e:
+        return HTMLResponse(content=render_page(
+            _po_verify_page_html(error_msg="시스템 산출 중 오류: " + str(e)), user, "master"))
+
+    sections = ""
+    errors = []
+    for label, order_type, data in uploads:
+        try:
+            legacy = _parse_legacy_purchase_info(data)
+        except Exception as e:
+            errors.append(label + " 파일 읽기 실패: " + str(e))
+            continue
+        other_type = "monthly" if order_type == "weekly" else "weekly"
+        other_label = "월간" if order_type == "weekly" else "주간"
+        cmp_res = _compare_po_with_legacy(
+            legacy,
+            result.get(order_type, []),
+            result.get(other_type, []),
+            result.get("pending_report", []),
+        )
+        sections += _po_verify_render_section(label + " 발주 비교", other_label, cmp_res, ctx_all)
+
+    return HTMLResponse(content=render_page(
+        _po_verify_page_html(sections, " / ".join(errors)), user, "master"))
 
 @app.post("/master/qr/generate-bulk")
 async def master_qr_generate_bulk(
