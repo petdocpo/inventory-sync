@@ -3553,6 +3553,122 @@ def adjust_quantity(branch_code: str, item_code: str, delta: int, absolute: bool
 
 @app.get("/scan", response_class=HTMLResponse)
 async def scan_get(request: Request, branch_code: str, item_code: str, scan_type: str):
+    conn = get_conn()
+
+    # ── 1분 내 동일 지점+품번+구분 중복 여부 확인 ──
+    recent_dup = conn.execute(
+        "SELECT id, scanned_at FROM scan_log "
+        "WHERE branch_code=? AND item_code=? AND scan_type=? "
+        "AND scanned_at::timestamp > (NOW() - INTERVAL '1 minute') "
+        "ORDER BY scanned_at DESC LIMIT 1"
+    ).fetchone()
+
+    if recent_dup:
+        item = conn.execute(
+            "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
+            (branch_code, item_code)
+        ).fetchone()
+        item_name = item["item_name"] if item else item_code
+        branch_name = item["branch_name"] if item else branch_code
+        conn.close()
+
+        import uuid
+        token = uuid.uuid4().hex
+        conn2 = get_conn()
+        conn2.execute(
+            "INSERT INTO scan_pending_confirm (token, branch_code, item_code, scan_type) VALUES (?, ?, ?, ?)",
+            (token, branch_code, item_code, scan_type)
+        )
+        conn2.commit()
+        conn2.close()
+
+        action_label = "입고" if scan_type == "IN" else "출고"
+
+        return HTMLResponse(content=f"""
+        <html><head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>중복 확인</title>
+        </head>
+        <body style="font-family:-apple-system,sans-serif;background:#f5f7fa;
+                     display:flex;justify-content:center;align-items:center;
+                     min-height:100vh;margin:0;">
+          <div style="background:white;max-width:340px;width:90%;padding:32px;
+                      border-radius:20px;box-shadow:0 4px 20px rgba(0,0,0,0.1);
+                      text-align:center;">
+            <div style="background:#FEF3C7;border-radius:12px;padding:16px;
+                        margin-bottom:20px;">
+              <div style="font-size:36px;margin-bottom:4px;">⚠️</div>
+              <div style="font-size:18px;font-weight:bold;color:#92400E;">
+                중복 제출 의심
+              </div>
+            </div>
+            <div style="text-align:left;background:#f8fafc;border-radius:10px;
+                        padding:16px;margin-bottom:20px;">
+              <div style="margin-bottom:10px;">
+                <div style="font-size:11px;color:#888;margin-bottom:2px;">지점</div>
+                <div style="font-size:15px;font-weight:bold;">{branch_name}</div>
+              </div>
+              <div style="margin-bottom:10px;">
+                <div style="font-size:11px;color:#888;margin-bottom:2px;">상품명</div>
+                <div style="font-size:15px;font-weight:bold;">{item_name}</div>
+              </div>
+              <div>
+                <div style="font-size:11px;color:#888;margin-bottom:2px;">구분</div>
+                <div style="font-size:15px;font-weight:bold;">{action_label}</div>
+              </div>
+            </div>
+            <p style="font-size:14px;color:#555;margin-bottom:20px;line-height:1.5;">
+              1분 이내 같은 상품을 이미 {action_label} 처리하셨습니다.<br>
+              <b>정말 또 {action_label} 처리하시겠습니까?</b>
+            </p>
+            <div style="display:flex;gap:8px;">
+              <button onclick="history.back()" style="flex:1;background:#f0f0f0;color:#555;
+                      border:none;padding:14px;border-radius:12px;font-size:14px;
+                      font-weight:bold;cursor:pointer;">취소</button>
+              <button onclick="confirmSubmit()" id="confirmBtn" style="flex:1;background:#1E2761;color:white;
+                      border:none;padding:14px;border-radius:12px;font-size:14px;
+                      font-weight:bold;cursor:pointer;">예, 맞습니다</button>
+            </div>
+          </div>
+          <script>
+            function confirmSubmit() {{
+              document.getElementById('confirmBtn').disabled = true;
+              document.getElementById('confirmBtn').innerText = '처리 중...';
+              window.location.href = '/scan/confirm?token={token}';
+            }}
+          </script>
+        </body></html>
+        """)
+
+    conn.close()
+    return _do_scan_and_log(request, branch_code, item_code, scan_type)
+
+
+@app.get("/scan/confirm", response_class=HTMLResponse)
+async def scan_confirm(request: Request, token: str):
+    conn = get_conn()
+    pending = conn.execute(
+        "SELECT * FROM scan_pending_confirm WHERE token=?", (token,)
+    ).fetchone()
+
+    if not pending:
+        conn.close()
+        return HTMLResponse(content="<h3 style='text-align:center;margin-top:80px;'>❌ 유효하지 않거나 만료된 요청입니다.</h3>", status_code=404)
+
+    branch_code = pending["branch_code"]
+    item_code = pending["item_code"]
+    scan_type = pending["scan_type"]
+
+    conn.execute("DELETE FROM scan_pending_confirm WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
+
+    return _do_scan_and_log(request, branch_code, item_code, scan_type)
+
+
+def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_type: str) -> HTMLResponse:
+    """실제 재고 반영 + scan_log 기록 + 완료 화면 렌더링 (기존 scan_get의 처리부를 분리)"""
     delta = 1 if scan_type == "IN" else -1
     new_qty = adjust_quantity(branch_code, item_code, delta)
 
