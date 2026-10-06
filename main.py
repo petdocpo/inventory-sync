@@ -13926,6 +13926,9 @@ async def _select_stocktake_items(year_month: str = None):
     ).fetchall()
     all_branch_codes = [r["branch_code"] for r in branch_rows if r["branch_code"] not in EXCLUDED_STOCKTAKE_BRANCHES]
 
+    excluded_item_rows = conn.execute("SELECT item_code FROM stocktake_excluded_items").fetchall()
+    excluded_item_codes = {r["item_code"] for r in excluded_item_rows}
+
     result_summary = {}
     skipped_branches = {}
 
@@ -13952,7 +13955,7 @@ async def _select_stocktake_items(year_month: str = None):
         candidates = [
             {"item_code": code, "item_name": info["item_name"]}
             for code, info in by_item.items()
-            if info["qty"] > 0 and code not in prev_item_codes
+            if info["qty"] > 0 and code not in prev_item_codes and code not in excluded_item_codes
         ]
 
         if len(candidates) < TARGET_COUNT:
