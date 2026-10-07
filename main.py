@@ -876,6 +876,26 @@ async def master_notice_detail(notice_id: int, request: Request, session_token: 
 
     editor_script = """
     <script>
+    function toggleFlag(checkboxId, btnEl) {
+        const cb = document.getElementById(checkboxId);
+        cb.checked = !cb.checked;
+        if (cb.checked) {
+            btnEl.style.background = '#1E2761';
+            btnEl.style.color = 'white';
+            btnEl.style.borderColor = '#1E2761';
+        } else {
+            btnEl.style.background = 'white';
+            btnEl.style.color = '#555';
+            btnEl.style.borderColor = '#ddd';
+        }
+    }
+
+    function toggleFlagAndPopupDate(checkboxId, btnEl) {
+        toggleFlag(checkboxId, btnEl);
+        const isPopup = document.getElementById('isPopup').checked;
+        document.getElementById('popupEndDateWrap').style.display = isPopup ? 'block' : 'none';
+    }
+
     function insertLink() {
         const url = prompt('링크 URL을 입력하세요 (https://로 시작):');
         if (!url) return;
@@ -6925,14 +6945,9 @@ async def survey_answer_key_page(token: str):
             else:
                 answer_html = '<div style="margin-top:6px;padding:8px 12px;background:#F9FAFB;border-radius:6px;color:#888;font-size:13px;">서술형 문항 (정답 없음)</div>'
 
-            description_html = ""
-            if q["description"]:
-                description_html = f'<div style="color:#888;font-size:12px;margin-top:4px;">{q["description"].replace(chr(10), "<br>")}</div>'
-
             blocks_html += f"""
             <div style="margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid #eee;">
               <div style="font-weight:bold;font-size:14px;">{global_idx}. {q['question_text']}</div>
-              {description_html}
               {answer_html}
             </div>
             """
