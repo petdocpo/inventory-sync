@@ -3560,7 +3560,8 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
         "SELECT id, scanned_at FROM scan_log "
         "WHERE branch_code=? AND item_code=? AND scan_type=? "
         "AND scanned_at::timestamp > (NOW() - INTERVAL '1 minute') "
-        "ORDER BY scanned_at DESC LIMIT 1"
+        "ORDER BY scanned_at DESC LIMIT 1",
+        (branch_code, item_code, scan_type)
     ).fetchone()
 
     if recent_dup:
