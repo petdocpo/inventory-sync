@@ -3564,7 +3564,7 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
         (branch_code, item_code, scan_type)
     ).fetchone()
 
-    if recent_dup:
+        if recent_dup:
         item = conn.execute(
             "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
             (branch_code, item_code)
@@ -3623,17 +3623,25 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
               1분 이내 같은 상품을 이미 {action_label} 처리하셨습니다.<br>
               <b>정말 또 {action_label} 처리하시겠습니까?</b>
             </p>
-            <div style="display:flex;gap:8px;">
-              <button onclick="history.back()" style="flex:1;background:#f0f0f0;color:#555;
-                      border:none;padding:14px;border-radius:12px;font-size:14px;
-                      font-weight:bold;cursor:pointer;">취소</button>
-              <button onclick="confirmSubmit()" id="confirmBtn" style="flex:1;background:#1E2761;color:white;
-                      border:none;padding:14px;border-radius:12px;font-size:14px;
-                      font-weight:bold;cursor:pointer;">예, 맞습니다</button>
+            <div id="choiceButtons" style="display:flex;gap:8px;">
+              <button onclick="chooseOne()" style="flex:1;background:#f0f0f0;color:#555;
+                      border:none;padding:14px;border-radius:12px;font-size:13px;
+                      font-weight:bold;cursor:pointer;">아니요<br><span style="font-weight:normal;font-size:11px;">1개만 제출</span></button>
+              <button onclick="chooseTwo()" id="confirmBtn" style="flex:1;background:#1E2761;color:white;
+                      border:none;padding:14px;border-radius:12px;font-size:13px;
+                      font-weight:bold;cursor:pointer;">맞습니다<br><span style="font-weight:normal;font-size:11px;">2개(중복) 제출</span></button>
+            </div>
+            <div id="closingMsg" style="display:none;font-size:14px;color:#888;padding:10px 0;">
+              처리되었습니다. 창을 닫아주세요.
             </div>
           </div>
           <script>
-            function confirmSubmit() {{
+            function chooseOne() {{
+              document.getElementById('choiceButtons').style.display = 'none';
+              document.getElementById('closingMsg').style.display = 'block';
+              setTimeout(function() {{ window.close(); }}, 600);
+            }}
+            function chooseTwo() {{
               document.getElementById('confirmBtn').disabled = true;
               document.getElementById('confirmBtn').innerText = '처리 중...';
               window.location.href = '/scan/confirm?token={token}';
@@ -3695,7 +3703,7 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
     bg_color = "#D1FAE5" if scan_type == "IN" else "#FEE2E2"
     text_color = "#065F46" if scan_type == "IN" else "#991B1B"
 
-    return HTMLResponse(content=f"""
+        return HTMLResponse(content=f"""
     <html><head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3733,9 +3741,12 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
             <div style="font-size:28px;font-weight:bold;color:#1E2761;">{new_qty}개</div>
           </div>
         </div>
-        <div style="font-size:12px;color:#aaa;">
+        <div style="font-size:12px;color:#aaa;margin-bottom:16px;">
           {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         </div>
+        <button onclick="window.close()" style="width:100%;background:#1E2761;color:white;
+                border:none;padding:14px;border-radius:12px;font-size:15px;
+                font-weight:bold;cursor:pointer;">확인</button>
       </div>
     </body></html>
     """)
