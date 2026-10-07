@@ -3564,7 +3564,7 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
         (branch_code, item_code, scan_type)
     ).fetchone()
 
-        if recent_dup:
+    if recent_dup:
         item = conn.execute(
             "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
             (branch_code, item_code)
@@ -3703,7 +3703,7 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
     bg_color = "#D1FAE5" if scan_type == "IN" else "#FEE2E2"
     text_color = "#065F46" if scan_type == "IN" else "#991B1B"
 
-        return HTMLResponse(content=f"""
+    return HTMLResponse(content=f"""
     <html><head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -6592,6 +6592,7 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
                   <a href="/master/survey/{s['id']}/questions" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;">문항관리</a>
                   <a href="/master/survey/{s['id']}/responses" class="btn" style="font-size:11px;padding:4px 8px;text-decoration:none;background:#64748B;">제출현황</a>
                   <button class="btn" style="font-size:11px;padding:4px 8px;background:#0EA5E9;" onclick="copySurveyLink({s['id']}, this)">🔗 링크복사</button>
+                  <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="copyAnswerKeyLink({s['id']}, this)">🔑 정답링크복사</button>
                   <button class="btn" style="font-size:11px;padding:4px 8px;background:#22C55E;" onclick="duplicateSurvey({s['id']}, '{safe_title}', this)">📋 설문복사</button>
                   <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="toggleSurvey({s['id']}, {str(not s['active']).lower()})">{'비활성화' if s['active'] else '활성화'}</button>
                   <button class="btn btn-red" style="font-size:11px;padding:4px 8px;" onclick="deleteSurvey({s['id']}, '{safe_title}', {response_count})">삭제</button>
@@ -6784,6 +6785,35 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
         }}
       }}
 
+      async function copyAnswerKeyLink(id, btnEl) {{
+        const original = btnEl.innerText;
+        btnEl.innerText = '생성 중...';
+        btnEl.disabled = true;
+        try {{
+          const res = await fetch('/master/survey/' + id + '/answer-key-link', {{ method: 'POST' }});
+          const data = await res.json();
+          if (!res.ok) {{
+            alert('오류: ' + (data.detail || '링크 생성 실패'));
+            btnEl.innerText = original;
+            btnEl.disabled = false;
+            return;
+          }}
+          const url = window.location.origin + '/survey/answer-key/' + data.token;
+          try {{
+            await navigator.clipboard.writeText(url);
+            btnEl.innerText = '✅ 복사됨';
+          }} catch (e) {{
+            prompt('아래 링크를 복사하세요:', url);
+            btnEl.innerText = original;
+          }}
+        }} catch (e) {{
+          alert('링크 생성 중 오류가 발생했습니다.');
+          btnEl.innerText = original;
+        }}
+        btnEl.disabled = false;
+        setTimeout(() => {{ btnEl.innerText = original; }}, 1500);
+      }}
+
       async function duplicateSurvey(id, title, btnEl) {{
         if (!confirm('"' + title + '" 설문을 복사합니다. 문항/분야/점수표가 그대로 복제되고, 제출된 응답은 복사되지 않습니다. 계속할까요?')) return;
         const original = btnEl.innerText;
@@ -6825,6 +6855,104 @@ async def master_survey_list_page(session_token: str = Cookie(default=None)):
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
+@app.post("/master/survey/{survey_id}/answer-key-link")
+async def master_survey_answer_key_link(survey_id: int, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    conn = get_conn()
+    survey = conn.execute("SELECT id, answer_key_token FROM survey WHERE id=?", (survey_id,)).fetchone()
+    if not survey:
+        conn.close()
+        return JSONResponse(status_code=404, content={"detail": "설문을 찾을 수 없습니다."})
+
+    token = survey["answer_key_token"]
+    if not token:
+        import secrets
+        token = secrets.token_urlsafe(24)
+        conn.execute("UPDATE survey SET answer_key_token=? WHERE id=?", (token, survey_id))
+        conn.commit()
+
+    conn.close()
+    return JSONResponse(content={"token": token})
+
+
+@app.get("/survey/answer-key/{token}", response_class=HTMLResponse)
+async def survey_answer_key_page(token: str):
+    conn = get_conn()
+    survey = conn.execute("SELECT * FROM survey WHERE answer_key_token=?", (token,)).fetchone()
+    if not survey:
+        conn.close()
+        return HTMLResponse(content="<h2 style='text-align:center;margin-top:60px;'>유효하지 않은 링크입니다.</h2>", status_code=404)
+
+    section_rows = conn.execute(
+        "SELECT * FROM survey_section WHERE survey_id=? ORDER BY display_order", (survey["id"],)
+    ).fetchall()
+    question_rows = conn.execute(
+        "SELECT * FROM survey_question WHERE survey_id=? AND active=TRUE ORDER BY display_order", (survey["id"],)
+    ).fetchall()
+
+    questions_by_section: Dict = {}
+    for q in question_rows:
+        questions_by_section.setdefault(q["section_id"], []).append(q)
+
+    section_order = [(sec["id"], sec["section_name"]) for sec in section_rows]
+    section_order.append((None, None))
+
+    blocks_html = ""
+    global_idx = 0
+    for sec_id, sec_name in section_order:
+        sec_questions = questions_by_section.get(sec_id, [])
+        if not sec_questions:
+            continue
+        if sec_name:
+            blocks_html += f'<div style="font-weight:bold;font-size:15px;color:#1E2761;margin:20px 0 12px;padding-bottom:6px;border-bottom:2px solid #1E2761;">📂 {sec_name}</div>'
+        for q in sec_questions:
+            global_idx += 1
+            answer_html = ""
+            if q["has_options"]:
+                option_rows = conn.execute(
+                    "SELECT option_label, is_correct FROM survey_question_option WHERE question_id=? ORDER BY display_order",
+                    (q["id"],)
+                ).fetchall()
+                correct_labels = [o["option_label"] for o in option_rows if o["is_correct"]]
+                if correct_labels:
+                    answer_html = f'<div style="margin-top:6px;padding:8px 12px;background:#F0FDF4;border-radius:6px;color:#166534;font-size:13px;"><b>정답:</b> {", ".join(correct_labels)}</div>'
+                else:
+                    answer_html = '<div style="margin-top:6px;padding:8px 12px;background:#F9FAFB;border-radius:6px;color:#888;font-size:13px;">정답 미설정</div>'
+            else:
+                answer_html = '<div style="margin-top:6px;padding:8px 12px;background:#F9FAFB;border-radius:6px;color:#888;font-size:13px;">서술형 문항 (정답 없음)</div>'
+
+            blocks_html += f"""
+            <div style="margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid #eee;">
+              <div style="font-weight:bold;font-size:14px;">{global_idx}. {q['question_text']}</div>
+              {answer_html}
+            </div>
+            """
+
+    conn.close()
+
+    page_html = f"""
+    <html><head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{survey['title']} - 정답</title>
+      <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7fa; padding: 20px 14px; }}
+        .card {{ background: white; border-radius: 12px; padding: 20px; max-width: 560px; margin: 0 auto; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h2 style="margin-bottom:16px;">🔑 {survey['title']} — 정답</h2>
+        {blocks_html if blocks_html else '<p style="color:#888;text-align:center;padding:20px 0;">등록된 문항이 없습니다.</p>'}
+      </div>
+    </body></html>
+    """
+    return HTMLResponse(content=page_html)
 
 
 @app.post("/master/survey/create")
