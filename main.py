@@ -6925,9 +6925,14 @@ async def survey_answer_key_page(token: str):
             else:
                 answer_html = '<div style="margin-top:6px;padding:8px 12px;background:#F9FAFB;border-radius:6px;color:#888;font-size:13px;">서술형 문항 (정답 없음)</div>'
 
+            description_html = ""
+            if q["description"]:
+                description_html = f'<div style="color:#888;font-size:12px;margin-top:4px;">{q["description"].replace(chr(10), "<br>")}</div>'
+
             blocks_html += f"""
             <div style="margin-bottom:16px;padding-bottom:14px;border-bottom:1px solid #eee;">
               <div style="font-weight:bold;font-size:14px;">{global_idx}. {q['question_text']}</div>
+              {description_html}
               {answer_html}
             </div>
             """
