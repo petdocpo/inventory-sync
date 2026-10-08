@@ -337,6 +337,52 @@ async def cron_cleanup_purchase_history(authorization: str = Header(default=""))
         return JSONResponse(status_code=500, content={"detail": err})
     return JSONResponse(content={"deleted_count": deleted_count})
 
+
+
+def delete_old_records(table: str, date_column: str, days: int, cast_timestamp: bool = False) -> int:
+    """지정 테이블에서 date_column 기준 N일 경과한 행을 삭제하고 삭제 건수를 반환합니다."""
+    conn = get_conn()
+    col_expr = f"{date_column}::timestamp" if cast_timestamp else date_column
+    cursor = conn.execute(
+        f"DELETE FROM {table} WHERE {col_expr} < NOW() - INTERVAL '{days} days'"
+    )
+    deleted = cursor.rowcount if hasattr(cursor, "rowcount") else 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+@app.get("/api/cron/cleanup-old-data")
+async def cron_cleanup_old_data(authorization: str = Header(default="")):
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    targets = [
+        ("purchase_records", "created_at", 100, True),
+        ("scan_log", "scanned_at", 100, True),
+        ("adjustment_log", "adjusted_at", 100, True),
+        ("notification_events", "created_at", 100, False),
+        ("purchase_tracking_snapshot", "created_at", 180, True),
+    ]
+
+    results = {}
+    had_error = False
+    for table, col, days, cast in targets:
+        try:
+            deleted = delete_old_records(table, col, days, cast_timestamp=cast)
+            results[table] = {"deleted_count": deleted, "status": "ok"}
+        except Exception as e:
+            had_error = True
+            err_msg = f"{table} 삭제 실패: {str(e)[:300]}"
+            results[table] = {"deleted_count": 0, "status": "error", "detail": err_msg}
+            report_cron_failure("cleanup-old-data", err_msg)
+
+    return JSONResponse(content={
+        "status": "partial_error" if had_error else "ok",
+        "results": results
+    })
+
 def send_push_notification(branch_code: str, title: str, body: str, event_type: str, url: str = "/"):
     """특정 지점의 등록된 기기 중, 해당 알림 종류를 켜놓은 기기에만 웹 푸시 발송 + notification_events 기록."""
     from pywebpush import webpush, WebPushException
@@ -12670,6 +12716,7 @@ async def purchase_order_product_settings_page(
       <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
       <h2>📝 상품 마스터 (단가/거래처/리드타임/MOQ/소모품)</h2>
     </div>
+    {_po_unregistered_banner_html()}
 
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">상품별 단가, 거래처, 과세설정, 리드타임, MOQ, 소모품 여부를 관리합니다. 발주서 자동생성 시 이 정보를 사용합니다.</p>
@@ -13034,6 +13081,282 @@ async def purchase_order_product_settings_page(
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
+# ============================================================
+# 미등록 상품 감지 / 등록 (상품 설정 페이지)
+# ============================================================
+
+PO_MASTER_DEFAULT_BRANCH = "본사"
+
+PO_UNREG_TEMPLATE = """
+<style>
+.unreg-f { margin-bottom:10px; }
+.unreg-f label { display:block; font-size:12px; color:#555; margin-bottom:4px; }
+.unreg-f input, .unreg-f select { width:100%; box-sizing:border-box; }
+.unreg-f input[readonly] { background:#F3F4F6; color:#555; }
+.unreg-req { color:#DC2626; }
+</style>
+<div id="unregBanner" style="background:#FEF3C7;border:1px solid #F59E0B;border-radius:10px;padding:14px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+  <div style="font-size:14px;color:#92400E;">⚠️ <b>상품 설정에 미등록 상품이 __COUNT__개 있습니다.</b> 등록해주세요.</div>
+  <button type="button" class="btn" style="background:#F59E0B;" onclick="unregOpen()">등록하기</button>
+</div>
+
+<div id="unregModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:12px;padding:22px;max-width:480px;width:92%;max-height:88vh;overflow-y:auto;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+      <h3 style="margin:0;">미등록 상품 등록</h3>
+      <span id="unregProgress" style="font-size:12px;color:#888;"></span>
+    </div>
+    <p style="font-size:12px;color:#888;margin:0 0 12px 0;">품번·상품명은 크론 데이터 값입니다. <span class="unreg-req">*</span> 항목은 필수입니다. (등록 지점: 본사)</p>
+
+    <div class="unreg-f"><label>품번</label><input type="text" id="unregCode" readonly></div>
+    <div class="unreg-f"><label>상품명</label><input type="text" id="unregName" readonly></div>
+    <div class="unreg-f"><label>구매금액 <span class="unreg-req">*</span></label><input type="number" id="unregPrice" min="0" step="any"></div>
+    <div class="unreg-f"><label>거래처 <span class="unreg-req">*</span></label><input type="text" id="unregSupplier"></div>
+    <div class="unreg-f"><label>과세설정 <span class="unreg-req">*</span></label>
+      <select id="unregTax"><option value="">선택</option><option value="과세">과세</option><option value="면세">면세</option></select></div>
+    <div class="unreg-f"><label>리드타임(일) <span class="unreg-req">*</span></label><input type="number" id="unregLead" min="0" step="1"></div>
+    <div class="unreg-f"><label>MOQ <span class="unreg-req">*</span></label><input type="number" id="unregMoq" min="1" step="1"></div>
+    <div class="unreg-f"><label>소모품 여부 <span class="unreg-req">*</span></label>
+      <select id="unregConsumable"><option value="">선택</option><option value="Y">예 (소모품)</option><option value="N">아니오</option></select></div>
+    <div class="unreg-f"><label>품류 (선택)</label><input type="text" id="unregCategory"></div>
+    <div class="unreg-f"><label>종류 (선택)</label><input type="text" id="unregPtype"></div>
+    <div class="unreg-f"><label>소모품종류 (선택)</label><input type="text" id="unregCtype"></div>
+
+    <div id="unregHint" style="font-size:12px;color:#1E40AF;margin-bottom:6px;"></div>
+    <div id="unregError" style="color:#DC2626;font-size:13px;margin-bottom:8px;"></div>
+    <div style="display:flex;gap:8px;">
+      <button type="button" class="btn" style="flex:1;background:#eee;color:#333;" onclick="unregClose()">닫기</button>
+      <button type="button" class="btn" style="flex:1;background:#64748B;" onclick="unregSkip()">건너뛰기</button>
+      <button type="button" class="btn" style="flex:2;" id="unregSaveBtn" onclick="unregSave()">저장 후 다음</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var UNREG_ITEMS = __DATA__;
+var unregIdx = 0;
+
+function unregEl(id) { return document.getElementById(id); }
+
+function unregOpen() {
+  unregIdx = 0;
+  unregLoad();
+  unregEl('unregModal').style.display = 'flex';
+}
+
+function unregClose() {
+  unregEl('unregModal').style.display = 'none';
+}
+
+function unregLoad() {
+  var it = UNREG_ITEMS[unregIdx];
+  var hasPrice = !(it.last_price === '' || it.last_price === null || it.last_price === undefined);
+  unregEl('unregProgress').innerText = (unregIdx + 1) + ' / ' + UNREG_ITEMS.length;
+  unregEl('unregCode').value = it.item_code;
+  unregEl('unregName').value = it.item_name;
+  unregEl('unregSupplier').value = it.last_vendor || '';
+  unregEl('unregPrice').value = hasPrice ? it.last_price : '';
+  unregEl('unregTax').value = '';
+  unregEl('unregLead').value = '';
+  unregEl('unregMoq').value = '';
+  unregEl('unregConsumable').value = '';
+  unregEl('unregCategory').value = '';
+  unregEl('unregPtype').value = '';
+  unregEl('unregCtype').value = '';
+  unregEl('unregError').innerText = '';
+  unregEl('unregHint').innerText = (it.last_vendor || hasPrice) ? '구매내역 최근값(거래처/구매금액)을 미리 채웠습니다. 확인 후 수정하세요.' : '';
+  unregEl('unregSaveBtn').disabled = false;
+}
+
+function unregNext() {
+  unregIdx++;
+  if (unregIdx >= UNREG_ITEMS.length) {
+    location.reload();
+    return;
+  }
+  unregLoad();
+}
+
+function unregSkip() {
+  unregNext();
+}
+
+async function unregSave() {
+  var err = unregEl('unregError');
+  err.innerText = '';
+  var price = unregEl('unregPrice').value.trim();
+  var supplier = unregEl('unregSupplier').value.trim();
+  var tax = unregEl('unregTax').value;
+  var lead = unregEl('unregLead').value.trim();
+  var moq = unregEl('unregMoq').value.trim();
+  var cons = unregEl('unregConsumable').value;
+
+  if (price === '' || isNaN(Number(price)) || Number(price) < 0) { err.innerText = '구매금액을 입력하세요. (0 이상 숫자)'; return; }
+  if (!supplier) { err.innerText = '거래처를 입력하세요.'; return; }
+  if (tax !== '과세' && tax !== '면세') { err.innerText = '과세설정을 선택하세요.'; return; }
+  if (!/^[0-9]+$/.test(lead)) { err.innerText = '리드타임(일)을 입력하세요. (0 이상 정수)'; return; }
+  if (!/^[0-9]+$/.test(moq) || parseInt(moq, 10) < 1) { err.innerText = 'MOQ를 입력하세요. (1 이상 정수)'; return; }
+  if (cons !== 'Y' && cons !== 'N') { err.innerText = '소모품 여부를 선택하세요.'; return; }
+
+  var payload = {
+    item_code: unregEl('unregCode').value,
+    item_name: unregEl('unregName').value,
+    purchase_price: Number(price),
+    supplier: supplier,
+    tax_setting: tax,
+    lead_time_days: parseInt(lead, 10),
+    moq: parseInt(moq, 10),
+    is_consumable: (cons === 'Y'),
+    category: unregEl('unregCategory').value.trim(),
+    product_type: unregEl('unregPtype').value.trim(),
+    consumable_type: unregEl('unregCtype').value.trim()
+  };
+
+  var btn = unregEl('unregSaveBtn');
+  btn.disabled = true;
+  try {
+    var res = await fetch('/master/purchase-order/product-master/register-new', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    var data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (!res.ok) {
+      err.innerText = data.detail || '저장에 실패했습니다.';
+      btn.disabled = false;
+      return;
+    }
+    unregNext();
+  } catch (e) {
+    err.innerText = '저장 중 오류가 발생했습니다.';
+    btn.disabled = false;
+  }
+}
+</script>
+"""
+
+
+def _po_get_unregistered_products() -> list:
+    """크론 데이터(재고·구매내역)와 안전재고에 있는 품번 중 product_master에 없는 품번 목록.
+    상품명은 크론 최신 데이터(raw_inventory) 우선. 품번이 없어 자동 생성된 '미지정' 코드는 제외."""
+    conn = get_conn()
+    rows = conn.execute("""
+        WITH cand AS (
+            SELECT item_code, item_name, 1 AS prio, 'raw_inventory' AS src,
+                   CAST(uploaded_at AS text) AS ts FROM raw_inventory
+            UNION ALL
+            SELECT item_code, item_name, 2 AS prio, 'purchase_records' AS src,
+                   CAST(purchase_datetime AS text) AS ts FROM purchase_records
+            UNION ALL
+            SELECT item_code, item_name, 3 AS prio, 'safety_stock' AS src,
+                   CAST(updated_at AS text) AS ts FROM safety_stock
+        )
+        SELECT DISTINCT ON (c.item_code) c.item_code, c.item_name, c.src
+        FROM cand c
+        WHERE COALESCE(c.item_code, '') <> ''
+          AND LEFT(c.item_code, 3) <> '미지정'
+          AND NOT EXISTS (SELECT 1 FROM product_master p WHERE p.item_code = c.item_code)
+        ORDER BY c.item_code, c.prio, c.ts DESC NULLS LAST
+    """).fetchall()
+
+    items = [{"item_code": r["item_code"], "item_name": r["item_name"] or "", "src": r["src"]} for r in rows]
+    if not items:
+        conn.close()
+        return []
+
+    codes = [it["item_code"] for it in items]
+    placeholders = ",".join("?" for _ in codes)
+    last_rows = conn.execute(
+        "SELECT DISTINCT ON (item_code) item_code, vendor, unit_price FROM purchase_records "
+        "WHERE item_code IN (" + placeholders + ") ORDER BY item_code, purchase_datetime DESC",
+        codes
+    ).fetchall()
+    conn.close()
+
+    last_map = {r["item_code"]: r for r in last_rows}
+    for it in items:
+        lr = last_map.get(it["item_code"])
+        it["last_vendor"] = (lr["vendor"] or "").strip() if lr else ""
+        price = ""
+        if lr and lr["unit_price"] is not None:
+            f = float(lr["unit_price"])
+            price = int(f) if f == int(f) else f
+        it["last_price"] = price
+    return items
+
+
+def _po_unregistered_banner_html() -> str:
+    """상품 설정 페이지 상단: 미등록 상품 알럿 + 등록 창. 조회 실패해도 페이지 자체는 정상 표시."""
+    import json
+    try:
+        items = _po_get_unregistered_products()
+    except Exception as e:
+        print("[unregistered] 조회 실패: " + str(e)[:200])
+        return ""
+    if not items:
+        return ""
+    data_json = (json.dumps(items, ensure_ascii=False)
+                 .replace("<", "\\u003c")
+                 .replace("\u2028", "\\u2028")
+                 .replace("\u2029", "\\u2029"))
+    return PO_UNREG_TEMPLATE.replace("__COUNT__", str(len(items))).replace("__DATA__", data_json)
+
+
+@app.post("/master/purchase-order/product-master/register-new")
+async def purchase_order_product_master_register_new(request: Request, session_token: str = Cookie(default=None)):
+    """미등록 상품 신규 등록 (필수값 서버 검증, 지점은 '본사' 고정, 이미 있는 품번은 거부)"""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    if not has_menu_permission(user["login_id"], "product-settings"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    item_code = str(data.get("item_code") or "").strip()
+    item_name = str(data.get("item_name") or "").strip()
+    supplier = str(data.get("supplier") or "").strip()
+    tax_setting = str(data.get("tax_setting") or "").strip()
+    is_consumable = data.get("is_consumable")
+
+    if not item_code or not item_name:
+        return JSONResponse(status_code=400, content={"detail": "품번/상품명이 없습니다."})
+    if not supplier:
+        return JSONResponse(status_code=400, content={"detail": "거래처를 입력하세요."})
+    if tax_setting not in ("과세", "면세"):
+        return JSONResponse(status_code=400, content={"detail": "과세설정을 선택하세요."})
+    if not isinstance(is_consumable, bool):
+        return JSONResponse(status_code=400, content={"detail": "소모품 여부를 선택하세요."})
+    try:
+        purchase_price = float(data.get("purchase_price"))
+        lead_time_days = int(data.get("lead_time_days"))
+        moq = int(data.get("moq"))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"detail": "구매금액/리드타임/MOQ는 숫자로 입력하세요."})
+    if purchase_price < 0 or lead_time_days < 0 or moq < 1:
+        return JSONResponse(status_code=400, content={"detail": "구매금액·리드타임은 0 이상, MOQ는 1 이상이어야 합니다."})
+
+    category = str(data.get("category") or "").strip() or None
+    product_type = str(data.get("product_type") or "").strip() or None
+    consumable_type = str(data.get("consumable_type") or "").strip() or None
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    exists = conn.execute("SELECT 1 AS x FROM product_master WHERE item_code=? LIMIT 1", (item_code,)).fetchone()
+    if exists:
+        conn.close()
+        return JSONResponse(status_code=409, content={"detail": "이미 상품 마스터에 등록된 품번입니다."})
+    conn.execute("""
+        INSERT INTO product_master
+            (branch_name, item_name, item_code, purchase_price, supplier, tax_setting,
+             lead_time_days, moq, is_consumable, category, product_type, consumable_type, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (PO_MASTER_DEFAULT_BRANCH, item_name, item_code, purchase_price, supplier, tax_setting,
+          lead_time_days, moq, is_consumable, category, product_type, consumable_type, now))
+    conn.commit()
+    conn.close()
+    return {"success": True}
 
 @app.post("/master/purchase-order/product-master/save")
 async def purchase_order_product_master_save(request: Request, session_token: str = Cookie(default=None)):
