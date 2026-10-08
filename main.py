@@ -332,10 +332,16 @@ async def cron_cleanup_purchase_history(authorization: str = Header(default=""))
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
 
-    deleted_count, err = await delete_old_purchase_history(days=21)
-    if err:
-        return JSONResponse(status_code=500, content={"detail": err})
-    return JSONResponse(content={"deleted_count": deleted_count})
+    try:
+        deleted_count, err = await delete_old_purchase_history(days=21)
+        if err:
+            report_cron_failure("cleanup-purchase-history", err)
+            return JSONResponse(status_code=500, content={"detail": err})
+        return JSONResponse(content={"deleted_count": deleted_count})
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("cleanup-purchase-history", err_msg)
+        return JSONResponse(status_code=500, content={"detail": err_msg})
 
 
 
@@ -9585,38 +9591,43 @@ async def cron_send_scheduled_messages(authorization: str = Header(default="")):
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
 
-    from datetime import date
-    today = date.today()
-    conn = get_conn()
-    schedules = conn.execute("SELECT * FROM teams_scheduled_message WHERE active = TRUE").fetchall()
+    try:
+        from datetime import date
+        today = date.today()
+        conn = get_conn()
+        schedules = conn.execute("SELECT * FROM teams_scheduled_message WHERE active = TRUE").fetchall()
 
-    sent_count = 0
-    for s in schedules:
-        start = s["start_date"] if isinstance(s["start_date"], date) else datetime.strptime(str(s["start_date"]), "%Y-%m-%d").date()
-        if today < start:
-            continue
-        days_since_start = (today - start).days
-        if days_since_start % s["interval_days"] != 0:
-            continue
-        if s["last_sent_date"]:
-            last = s["last_sent_date"] if isinstance(s["last_sent_date"], date) else datetime.strptime(str(s["last_sent_date"]), "%Y-%m-%d").date()
-            if last == today:
+        sent_count = 0
+        for s in schedules:
+            start = s["start_date"] if isinstance(s["start_date"], date) else datetime.strptime(str(s["start_date"]), "%Y-%m-%d").date()
+            if today < start:
                 continue
+            days_since_start = (today - start).days
+            if days_since_start % s["interval_days"] != 0:
+                continue
+            if s["last_sent_date"]:
+                last = s["last_sent_date"] if isinstance(s["last_sent_date"], date) else datetime.strptime(str(s["last_sent_date"]), "%Y-%m-%d").date()
+                if last == today:
+                    continue
 
-        codes = s["target_codes"].split(",")
-        for code in codes:
-            if s["target_type"] == "branch":
-                send_teams_notification(code, s["title"] or "반복 알림", s["message"], sent_by="system_cron")
-            else:
-                row = conn.execute("SELECT webhook_url, channel_name FROM teams_custom_channel WHERE id=?", (code,)).fetchone()
-                if row:
-                    send_teams_notification_to_url(row["webhook_url"], s["title"] or "반복 알림", s["message"], sent_by="system_cron", target_label=f"custom:{row['channel_name']}")
-        conn.execute("UPDATE teams_scheduled_message SET last_sent_date=? WHERE id=?", (today.isoformat(), s["id"]))
-        sent_count += 1
+            codes = s["target_codes"].split(",")
+            for code in codes:
+                if s["target_type"] == "branch":
+                    send_teams_notification(code, s["title"] or "반복 알림", s["message"], sent_by="system_cron")
+                else:
+                    row = conn.execute("SELECT webhook_url, channel_name FROM teams_custom_channel WHERE id=?", (code,)).fetchone()
+                    if row:
+                        send_teams_notification_to_url(row["webhook_url"], s["title"] or "반복 알림", s["message"], sent_by="system_cron", target_label=f"custom:{row['channel_name']}")
+            conn.execute("UPDATE teams_scheduled_message SET last_sent_date=? WHERE id=?", (today.isoformat(), s["id"]))
+            sent_count += 1
 
-    conn.commit()
-    conn.close()
-    return JSONResponse(content={"processed": sent_count, "date": today.isoformat()})
+        conn.commit()
+        conn.close()
+        return JSONResponse(content={"processed": sent_count, "date": today.isoformat()})
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("send-scheduled-messages", err_msg)
+        return JSONResponse(status_code=500, content={"detail": err_msg})
 
 @app.get("/api/cron/send-unsubmitted-reminder")
 async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")):
@@ -9775,55 +9786,59 @@ async def cron_check_qr_raw_mismatch(authorization: str = Header(default="")):
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
 
-    conn = get_conn()
-    teams_setting_row = conn.execute(
-        "SELECT value FROM system_settings WHERE key='qr_raw_mismatch_teams_enabled'"
-    ).fetchone()
-    teams_enabled = (teams_setting_row["value"] == "true") if teams_setting_row else False
+    try:
+        conn = get_conn()
+        teams_setting_row = conn.execute(
+            "SELECT value FROM system_settings WHERE key='qr_raw_mismatch_teams_enabled'"
+        ).fetchone()
+        teams_enabled = (teams_setting_row["value"] == "true") if teams_setting_row else False
 
-    inventory_rows = conn.execute("SELECT * FROM inventory").fetchall()
-    conn.close()
+        inventory_rows = conn.execute("SELECT * FROM inventory").fetchall()
+        conn.close()
 
-    raw_rows = fetch_raw_inventory()
-    raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in raw_rows}
+        raw_rows = fetch_raw_inventory()
+        raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in raw_rows}
 
-    mismatch_by_branch = {}
-    for r in inventory_rows:
-        key = f"{r['branch_code']}|{r['item_code']}"
-        raw_qty = raw_map.get(key, 0)
-        diff = r["quantity"] - raw_qty
-        if diff != 0:
-            mismatch_by_branch.setdefault(r["branch_code"], []).append({
-                "item_name": r["item_name"],
-                "item_code": r["item_code"],
-                "diff": diff
-            })
+        mismatch_by_branch = {}
+        for r in inventory_rows:
+            key = f"{r['branch_code']}|{r['item_code']}"
+            raw_qty = raw_map.get(key, 0)
+            diff = r["quantity"] - raw_qty
+            if diff != 0:
+                mismatch_by_branch.setdefault(r["branch_code"], []).append({
+                    "item_name": r["item_name"],
+                    "item_code": r["item_code"],
+                    "diff": diff
+                })
 
-    branches = get_branches(branch_type='branch')
-    branch_codes_set = {b["branch_code"] for b in branches}
+        branches = get_branches(branch_type='branch')
+        branch_codes_set = {b["branch_code"] for b in branches}
 
-    sent_count = 0
-    for branch_code, items in mismatch_by_branch.items():
-        if branch_code not in branch_codes_set:
-            continue
+        sent_count = 0
+        for branch_code, items in mismatch_by_branch.items():
+            if branch_code not in branch_codes_set:
+                continue
 
-        count = len(items)
-        preview = "\n".join(f"{it['item_name']}_{it['diff']:+d}" for it in items[:5])
-        more_note = f"\n...외 {count - 5}건" if count > 5 else ""
+            count = len(items)
+            preview = "\n".join(f"{it['item_name']}_{it['diff']:+d}" for it in items[:5])
+            more_note = f"\n...외 {count - 5}건" if count > 5 else ""
 
-        title = "재고 불일치 알림"
-        body = f"불일치 품목 {count}건 발견\n{preview}{more_note}"
+            title = "재고 불일치 알림"
+            body = f"불일치 품목 {count}건 발견\n{preview}{more_note}"
 
-        send_push_notification(branch_code, title, body, event_type="qr_raw_mismatch", url="/")
-        if teams_enabled:
-            send_teams_notification(branch_code, title, body, sent_by="system_cron_qr_raw_mismatch")
-        sent_count += 1
+            send_push_notification(branch_code, title, body, event_type="qr_raw_mismatch", url="/")
+            if teams_enabled:
+                send_teams_notification(branch_code, title, body, sent_by="system_cron_qr_raw_mismatch")
+            sent_count += 1
 
-
-    return JSONResponse(content={
-        "processed_branches": sent_count,
-        "total_mismatch_branches": len(mismatch_by_branch)
-    }) 
+        return JSONResponse(content={
+            "processed_branches": sent_count,
+            "total_mismatch_branches": len(mismatch_by_branch)
+        })
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("check-qr-raw-mismatch", err_msg)
+        return JSONResponse(status_code=500, content={"detail": err_msg})
 
 @app.get("/api/cron/check-new-purchase")
 async def cron_check_new_purchase(authorization: str = Header(default="")):
@@ -9831,82 +9846,88 @@ async def cron_check_new_purchase(authorization: str = Header(default="")):
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
 
-    conn = get_conn()
-    teams_setting_row = conn.execute(
-        "SELECT value FROM system_settings WHERE key='purchase_new_teams_enabled'"
-    ).fetchone()
-    teams_enabled = (teams_setting_row["value"] == "true") if teams_setting_row else False
+    try:
+        conn = get_conn()
+        teams_setting_row = conn.execute(
+            "SELECT value FROM system_settings WHERE key='purchase_new_teams_enabled'"
+        ).fetchone()
+        teams_enabled = (teams_setting_row["value"] == "true") if teams_setting_row else False
 
-    last_check_row = conn.execute(
-        "SELECT value FROM system_settings WHERE key='purchase_new_last_checked_at'"
-    ).fetchone()
-    conn.close()
+        last_check_row = conn.execute(
+            "SELECT value FROM system_settings WHERE key='purchase_new_last_checked_at'"
+        ).fetchone()
+        conn.close()
 
-    from datetime import datetime, timedelta, timezone
-    now = datetime.now(timezone.utc)
-    if last_check_row and last_check_row["value"]:
-        try:
-            last_checked = datetime.fromisoformat(last_check_row["value"])
-        except Exception:
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        if last_check_row and last_check_row["value"]:
+            try:
+                last_checked = datetime.fromisoformat(last_check_row["value"])
+            except Exception:
+                last_checked = now - timedelta(minutes=10)
+        else:
             last_checked = now - timedelta(minutes=10)
-    else:
-        last_checked = now - timedelta(minutes=10)
 
-    rows, err = await fetch_purchase_history(limit=500)
-    if err:
-        return JSONResponse(status_code=500, content={"detail": err})
+        rows, err = await fetch_purchase_history(limit=500)
+        if err:
+            report_cron_failure("check-new-purchase", err)
+            return JSONResponse(status_code=500, content={"detail": err})
 
-    new_rows = [r for r in rows if r.get("registered_at") and r["registered_at"] > last_checked.isoformat()]
+        new_rows = [r for r in rows if r.get("registered_at") and r["registered_at"] > last_checked.isoformat()]
 
-    branches = get_branches(branch_type='branch')
-    branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
+        branches = get_branches(branch_type='branch')
+        branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
 
-    # 지점별로 신규 발주를 묶음 (요약 알림 1건으로 발송하기 위함)
-    rows_by_branch: Dict[str, list] = {}
-    for r in new_rows:
-        branch_name = r.get("branch", "")
-        branch_code = branch_name_to_code.get(branch_name)
-        if not branch_code:
-            continue
-        rows_by_branch.setdefault(branch_code, []).append(r)
+        # 지점별로 신규 발주를 묶음 (요약 알림 1건으로 발송하기 위함)
+        rows_by_branch: Dict[str, list] = {}
+        for r in new_rows:
+            branch_name = r.get("branch", "")
+            branch_code = branch_name_to_code.get(branch_name)
+            if not branch_code:
+                continue
+            rows_by_branch.setdefault(branch_code, []).append(r)
 
-    sent_count = 0
-    for branch_code, branch_rows in rows_by_branch.items():
-        branch_name = branch_rows[0].get("branch", "")
-        count = len(branch_rows)
+        sent_count = 0
+        for branch_code, branch_rows in rows_by_branch.items():
+            branch_name = branch_rows[0].get("branch", "")
+            count = len(branch_rows)
 
-        preview = "\n".join(
-            f"{r.get('vendor', '-')} {r.get('product_name', '-')}_{r.get('quantity', '-')}개"
-            for r in branch_rows[:10]
-        )
-        more_note = f"\n...외 {count - 10}건" if count > 10 else ""
+            preview = "\n".join(
+                f"{r.get('vendor', '-')} {r.get('product_name', '-')}_{r.get('quantity', '-')}개"
+                for r in branch_rows[:10]
+            )
+            more_note = f"\n...외 {count - 10}건" if count > 10 else ""
 
-        title = "발주내역 알림"
-        body = f"{branch_name} 신규 발주 {count}건\n{preview}{more_note}"
+            title = "발주내역 알림"
+            body = f"{branch_name} 신규 발주 {count}건\n{preview}{more_note}"
 
-        send_push_notification(branch_code, title, body, event_type="purchase_new", url="/purchase-history")
-        if teams_enabled:
-            send_teams_notification(branch_code, title, body, sent_by="system_cron_purchase_new")
-        sent_count += 1
+            send_push_notification(branch_code, title, body, event_type="purchase_new", url="/purchase-history")
+            if teams_enabled:
+                send_teams_notification(branch_code, title, body, sent_by="system_cron_purchase_new")
+            sent_count += 1
 
-    conn2 = get_conn()
-    existing_ts = conn2.execute(
-        "SELECT value FROM system_settings WHERE key='purchase_new_last_checked_at'"
-    ).fetchone()
-    if existing_ts:
-        conn2.execute(
-            "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='purchase_new_last_checked_at'",
-            (now.isoformat(),)
-        )
-    else:
-        conn2.execute(
-            "INSERT INTO system_settings (key, value) VALUES ('purchase_new_last_checked_at', ?)",
-            (now.isoformat(),)
-        )
-    conn2.commit()
-    conn2.close()
+        conn2 = get_conn()
+        existing_ts = conn2.execute(
+            "SELECT value FROM system_settings WHERE key='purchase_new_last_checked_at'"
+        ).fetchone()
+        if existing_ts:
+            conn2.execute(
+                "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='purchase_new_last_checked_at'",
+                (now.isoformat(),)
+            )
+        else:
+            conn2.execute(
+                "INSERT INTO system_settings (key, value) VALUES ('purchase_new_last_checked_at', ?)",
+                (now.isoformat(),)
+            )
+        conn2.commit()
+        conn2.close()
 
-    return JSONResponse(content={"new_count": len(new_rows), "sent_count": sent_count})
+        return JSONResponse(content={"new_count": len(new_rows), "sent_count": sent_count})
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("check-new-purchase", err_msg)
+        return JSONResponse(status_code=500, content={"detail": err_msg})
 
 @app.post("/master/teams-webhook/test-unsubmitted-reminder")
 async def master_test_unsubmitted_reminder(request: Request, session_token: str = Cookie(default=None)):
