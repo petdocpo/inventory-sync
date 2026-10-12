@@ -14313,7 +14313,50 @@ async def raw_upload_ajax(
     user = get_session(session_token)
     if not user:
         return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
-    return await _process_raw_upload_master(file)
+    upload_result = await _process_raw_upload_master(file)
+    _sync_item_names_by_code()
+    return upload_result
+
+def _sync_item_names_by_code() -> dict:
+    """품번(item_code) 기준으로 items / inventory / safety_stock / product_master 의
+    item_name 을 크론 원본(raw_inventory)의 최신 이름으로 맞춘다.
+    - raw_inventory 에 없는 품번(예: 서비스 상품 SVSTSC-000001)은 건드리지 않는다.
+    - 이름이 실제로 다른 행만 UPDATE 한다.
+    - 반환: {테이블명: 변경 건수}
+    """
+    latest_sql = """
+        SELECT DISTINCT ON (item_code) item_code, item_name
+        FROM raw_inventory
+        WHERE item_code IS NOT NULL AND item_code <> ''
+          AND item_name IS NOT NULL AND item_name <> ''
+        ORDER BY item_code, uploaded_at DESC NULLS LAST
+    """
+    result = {}
+    conn = get_conn()
+    try:
+        for tbl in ("items", "inventory", "safety_stock", "product_master"):
+            cnt_row = conn.execute(
+                f"""SELECT COUNT(*) AS c FROM {tbl} t
+                    JOIN ({latest_sql}) l ON l.item_code = t.item_code
+                    WHERE t.item_name IS DISTINCT FROM l.item_name"""
+            ).fetchone()
+            cnt = int(cnt_row["c"]) if cnt_row else 0
+            if cnt > 0:
+                conn.execute(
+                    f"""UPDATE {tbl} SET item_name = l.item_name
+                        FROM ({latest_sql}) l
+                        WHERE {tbl}.item_code = l.item_code
+                          AND {tbl}.item_name IS DISTINCT FROM l.item_name"""
+                )
+            result[tbl] = cnt
+        conn.commit()
+        if any(result.values()):
+            print(f"[item-name-sync] 품번 기준 이름 갱신: {result}")
+    except Exception as e:
+        print(f"[item-name-sync] 실패: {e}")
+    finally:
+        conn.close()
+    return result
 
 async def _fetch_and_process_s3_csv():
     """S3의 유비플러스 재고현황 CSV를 다운로드하여 재고수불부 형식과 동일하게 파싱/반영"""
@@ -14491,9 +14534,11 @@ async def _fetch_and_process_s3_csv():
             conn2.commit()
             conn2.close()
 
+        name_sync = _sync_item_names_by_code()
         return {"success": success, "skipped": skipped, "errors": errors[:10],
                 "header_row_used": header_row_idx,
                 "hq_debug": debug_hq_log[:20],
+                "name_sync": name_sync,
                 "synced_at": now}
     except Exception as e:
         err_msg = str(e)[:500]
