@@ -16305,6 +16305,7 @@ async def raw_branch_upload(
         return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
 
     result = await _process_raw_upload(file, restrict_branch=(user["branch_code"] if user["role"] == "branch" else None))
+    _sync_item_names_by_code()
     return result
 
 
