@@ -9635,73 +9635,73 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
 
-    from datetime import date
-    today = date.today()
+    try:
+        from datetime import date
+        today = date.today()
 
-    conn = get_conn()
+        conn = get_conn()
 
-    setting_row = conn.execute(
-        "SELECT value FROM system_settings WHERE key='unsubmitted_reminder_enabled'"
-    ).fetchone()
-    reminder_enabled = (setting_row["value"] == "true") if setting_row else True
+        setting_row = conn.execute(
+            "SELECT value FROM system_settings WHERE key='unsubmitted_reminder_enabled'"
+        ).fetchone()
+        reminder_enabled = (setting_row["value"] == "true") if setting_row else True
 
-    if not reminder_enabled:
+        if not reminder_enabled:
+            conn.close()
+            return JSONResponse(content={"skipped": True, "reason": "reminder disabled", "date": today.isoformat()})
+
+        # 5, 10, 15, 20, 25, 30일에만 발송 (그 외 날짜에 호출되면 조용히 스킵)
+        if today.day not in (5, 10, 15, 20, 25, 30):
+            conn.close()
+            return JSONResponse(content={"skipped": True, "reason": "not a reminder day", "date": today.isoformat()})
+
+        # vendor-eval/status와 동일한 "전월" 계산 로직
+        prev_month_num = today.month - 1 if today.month > 1 else 12
+        prev_month_year = today.year if today.month > 1 else today.year - 1
+        month = f"{prev_month_year}-{prev_month_num:02d}"
+
+        total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
+
+        unsubmitted_branches = []
+        branches = [b for b in get_branches(branch_type='branch') if b["branch_code"] not in VENDOR_EVAL_EXCLUDED_BRANCH_CODES]
+        for b in branches:
+            done_cnt = conn.execute("""
+                SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
+                WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
+            """, (b["branch_code"], month)).fetchone()["cnt"]
+
+            is_complete = (done_cnt >= total_vendors and total_vendors > 0)
+            if not is_complete:
+                unsubmitted_branches.append({
+                    "branch_code": b["branch_code"],
+                    "branch_name": b["branch_name"],
+                    "done_cnt": done_cnt,
+                    "total_vendors": total_vendors
+                })
+
+        sent_count = 0
+        for ub in unsubmitted_branches:
+            message = (
+                f"{month} 거래처평가 미제출 안내드립니다.\n"
+                f"현재 진행률: {ub['done_cnt']} / {ub['total_vendors']}\n"
+                f"빠른 시일 내 제출 부탁드립니다."
+            )
+            send_teams_notification(
+                ub["branch_code"],
+                "거래처평가 미제출 알림",
+                message,
+                link_url="https://inventory-sync-teal.vercel.app/vendor-eval",
+                link_text="거래처 평가하러 가기",
+                sent_by="system_cron"
+            )
+            sent_count += 1
+
         conn.close()
-        return JSONResponse(content={"skipped": True, "reason": "reminder disabled", "date": today.isoformat()})
-
-    # 5, 10, 15, 20, 25, 30일에만 발송 (그 외 날짜에 호출되면 조용히 스킵)
-    if today.day not in (5, 10, 15, 20, 25, 30):
-        conn.close()
-        return JSONResponse(content={"skipped": True, "reason": "not a reminder day", "date": today.isoformat()})
-
-    # vendor-eval/status와 동일한 "전월" 계산 로직
-    prev_month_num = today.month - 1 if today.month > 1 else 12
-    prev_month_year = today.year if today.month > 1 else today.year - 1
-    month = f"{prev_month_year}-{prev_month_num:02d}"
-
-    total_vendors = conn.execute("SELECT COUNT(*) as cnt FROM vendor_master").fetchone()["cnt"]
-
-    unsubmitted_branches = []
-    branches = [b for b in get_branches(branch_type='branch') if b["branch_code"] not in VENDOR_EVAL_EXCLUDED_BRANCH_CODES]
-    for b in branches:
-        done_cnt = conn.execute("""
-            SELECT COUNT(DISTINCT vendor_name) as cnt FROM vendor_evaluation_v2
-            WHERE branch_code = ? AND eval_month = ? AND status = 'completed'
-        """, (b["branch_code"], month)).fetchone()["cnt"]
-
-        is_complete = (done_cnt >= total_vendors and total_vendors > 0)
-        if not is_complete:
-            unsubmitted_branches.append({
-                "branch_code": b["branch_code"],
-                "branch_name": b["branch_name"],
-                "done_cnt": done_cnt,
-                "total_vendors": total_vendors
-            })
-
-    sent_count = 0
-    for ub in unsubmitted_branches:
-        message = (
-            f"{month} 거래처평가 미제출 안내드립니다.\n"
-            f"현재 진행률: {ub['done_cnt']} / {ub['total_vendors']}\n"
-            f"빠른 시일 내 제출 부탁드립니다."
-        )
-        send_teams_notification(
-            ub["branch_code"],
-            "거래처평가 미제출 알림",
-            message,
-            link_url="https://inventory-sync-teal.vercel.app/vendor-eval",
-            link_text="거래처 평가하러 가기",
-            sent_by="system_cron_unsubmitted"
-        )
-        sent_count += 1
-
-    conn.close()
-    return JSONResponse(content={
-        "processed": sent_count,
-        "month": month,
-        "date": today.isoformat(),
-        "unsubmitted_branches": [ub["branch_code"] for ub in unsubmitted_branches]
-    })
+        return JSONResponse(content={"date": today.isoformat(), "month": month, "sent_count": sent_count})
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("send-unsubmitted-reminder", err_msg)
+        return JSONResponse(status_code=500, content={"detail": err_msg})
 
 @app.get("/api/cron/send-survey-unsubmitted-reminder")
 async def cron_send_survey_unsubmitted_reminder(authorization: str = Header(default="")):
@@ -14321,179 +14321,184 @@ async def _fetch_and_process_s3_csv():
     import csv
     import io as io_module
 
-    CSV_URL = "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/stock/유비플러스_재고현황.csv"
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(CSV_URL)
-        resp.raise_for_status()
-        raw_bytes = resp.content
-
-    # 인코딩 자동 판별 (한글 CSV는 보통 cp949 또는 utf-8-sig)
     try:
-        text = raw_bytes.decode('utf-8-sig')
-    except UnicodeDecodeError:
-        text = raw_bytes.decode('cp949')
+        CSV_URL = "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/stock/유비플러스_재고현황.csv"
 
-    reader = csv.reader(io_module.StringIO(text))
-    rows_raw = list(reader)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(CSV_URL)
+            resp.raise_for_status()
+            raw_bytes = resp.content
 
-    header_row_idx = None
-    col_map = {}
-    KEYWORDS = {
-        "branch": ["지점"],
-        "item_name": ["상품명"],
-        "item_code": ["품번"],
-        "qty": ["기말수량"],
-        "h": ["증가수량"],
-        "q": ["재고조정"],
-    }
-    for row_idx in range(min(5, len(rows_raw))):
-        row_vals = rows_raw[row_idx]
-        found = {}
-        for col_idx, cell_val in enumerate(row_vals):
-            if not cell_val:
-                continue
-            text_val = str(cell_val).strip()
-            for key, keywords in KEYWORDS.items():
-                if key in found:
-                    continue
-                if any(kw in text_val for kw in keywords):
-                    found[key] = col_idx
-        if all(k in found for k in ("branch", "item_name", "item_code")):
-            header_row_idx = row_idx
-            col_map = found
-            break
-
-    if header_row_idx is None:
-        return {"success": 0, "skipped": 0, "errors": ["CSV 헤더를 찾을 수 없습니다."]}
-
-    branch_map = {}
-    branches = get_branches()
-    for b in branches:
-        branch_map[b["branch_name"]] = b["branch_code"]
-        branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
-        branch_map[b["branch_code"]] = b["branch_code"]
-
-    now = datetime.now().isoformat()
-    success, skipped, errors = 0, 0, []
-    hq_adjustments = []
-    debug_hq_log = []
-    data_start_row = header_row_idx + 1
-
-    branches_in_file = set()
-    parsed_rows = []
-    for idx in range(data_start_row, len(rows_raw)):
-        row = rows_raw[idx]
-        branch_col = col_map.get("branch")
-        if branch_col is None or branch_col >= len(row) or not row[branch_col]:
-            continue
-        branch_name = str(row[branch_col]).strip()
-        branch_code = (branch_map.get(branch_name)
-                       or branch_map.get(branch_name.replace(" ", ""))
-                       or branch_name)
-        branches_in_file.add(branch_code)
-        parsed_rows.append((idx, row, branch_code, branch_name))
-
-    if not branches_in_file:
-        return {"success": 0, "skipped": 0, "errors": ["CSV에서 유효한 지점 데이터를 찾지 못했습니다."]}
-
-    conn = get_conn()
-    for bc in branches_in_file:
-        conn.execute("DELETE FROM raw_inventory WHERE branch_code=?", (bc,))
-    old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
-    old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
-    for bc in branches_in_file:
-        conn.execute("DELETE FROM hq_bonus_log WHERE branch_code=?", (bc,))
-    conn.commit()
-
-    for idx, row, branch_code, branch_name in parsed_rows:
+        # 인코딩 자동 판별 (한글 CSV는 보통 cp949 또는 utf-8-sig)
         try:
-            item_name = str(row[col_map["item_name"]]).strip() if col_map["item_name"] < len(row) and row[col_map["item_name"]] else ""
-            item_code = str(row[col_map["item_code"]]).strip() if col_map["item_code"] < len(row) and row[col_map["item_code"]] else ""
+            text = raw_bytes.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            text = raw_bytes.decode('cp949')
 
-            if not item_code:
-                import hashlib
-                name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
-                item_code = f"미지정_{name_hash}"
+        reader = csv.reader(io_module.StringIO(text))
+        rows_raw = list(reader)
 
-            qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
-            qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
-            qty_q = row[col_map["q"]] if "q" in col_map and col_map["q"] < len(row) else None
+        header_row_idx = None
+        col_map = {}
+        KEYWORDS = {
+            "branch": ["지점"],
+            "item_name": ["상품명"],
+            "item_code": ["품번"],
+            "qty": ["기말수량"],
+            "h": ["증가수량"],
+            "q": ["재고조정"],
+        }
+        for row_idx in range(min(5, len(rows_raw))):
+            row_vals = rows_raw[row_idx]
+            found = {}
+            for col_idx, cell_val in enumerate(row_vals):
+                if not cell_val:
+                    continue
+                text_val = str(cell_val).strip()
+                for key, keywords in KEYWORDS.items():
+                    if key in found:
+                        continue
+                    if any(kw in text_val for kw in keywords):
+                        found[key] = col_idx
+            if all(k in found for k in ("branch", "item_name", "item_code")):
+                header_row_idx = row_idx
+                col_map = found
+                break
 
-            raw_quantity = int(float(str(qty_n))) if qty_n not in (None, "") else 0
-            add_h = int(float(str(qty_h))) if qty_h not in (None, "") else 0
-            add_q = int(float(str(qty_q))) if qty_q not in (None, "") else 0
-            hq_total = add_h + add_q
+        if header_row_idx is None:
+            return {"success": 0, "skipped": 0, "errors": ["CSV 헤더를 찾을 수 없습니다."]}
 
-            conn.execute("""
-                INSERT INTO raw_inventory
-                  (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
-                VALUES (?, ?, ?, ?, ?, 'auto_s3', ?)
+        branch_map = {}
+        branches = get_branches()
+        for b in branches:
+            branch_map[b["branch_name"]] = b["branch_code"]
+            branch_map[b["branch_name"].replace(" ", "")] = b["branch_code"]
+            branch_map[b["branch_code"]] = b["branch_code"]
+
+        now = datetime.now().isoformat()
+        success, skipped, errors = 0, 0, []
+        hq_adjustments = []
+        debug_hq_log = []
+        data_start_row = header_row_idx + 1
+
+        branches_in_file = set()
+        parsed_rows = []
+        for idx in range(data_start_row, len(rows_raw)):
+            row = rows_raw[idx]
+            branch_col = col_map.get("branch")
+            if branch_col is None or branch_col >= len(row) or not row[branch_col]:
+                continue
+            branch_name = str(row[branch_col]).strip()
+            branch_code = (branch_map.get(branch_name)
+                           or branch_map.get(branch_name.replace(" ", ""))
+                           or branch_name)
+            branches_in_file.add(branch_code)
+            parsed_rows.append((idx, row, branch_code, branch_name))
+
+        if not branches_in_file:
+            return {"success": 0, "skipped": 0, "errors": ["CSV에서 유효한 지점 데이터를 찾지 못했습니다."]}
+
+        conn = get_conn()
+        for bc in branches_in_file:
+            conn.execute("DELETE FROM raw_inventory WHERE branch_code=?", (bc,))
+        old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
+        old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
+        for bc in branches_in_file:
+            conn.execute("DELETE FROM hq_bonus_log WHERE branch_code=?", (bc,))
+        conn.commit()
+
+        for idx, row, branch_code, branch_name in parsed_rows:
+            try:
+                item_name = str(row[col_map["item_name"]]).strip() if col_map["item_name"] < len(row) and row[col_map["item_name"]] else ""
+                item_code = str(row[col_map["item_code"]]).strip() if col_map["item_code"] < len(row) and row[col_map["item_code"]] else ""
+
+                if not item_code:
+                    import hashlib
+                    name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
+                    item_code = f"미지정_{name_hash}"
+
+                qty_n = row[col_map["qty"]] if "qty" in col_map and col_map["qty"] < len(row) else None
+                qty_h = row[col_map["h"]] if "h" in col_map and col_map["h"] < len(row) else None
+                qty_q = row[col_map["q"]] if "q" in col_map and col_map["q"] < len(row) else None
+
+                raw_quantity = int(float(str(qty_n))) if qty_n not in (None, "") else 0
+                add_h = int(float(str(qty_h))) if qty_h not in (None, "") else 0
+                add_q = int(float(str(qty_q))) if qty_q not in (None, "") else 0
+                hq_total = add_h + add_q
+
+                conn.execute("""
+                    INSERT INTO raw_inventory
+                      (branch_code, branch_name, item_name, item_code, quantity, source, uploaded_at)
+                    VALUES (?, ?, ?, ?, ?, 'auto_s3', ?)
+                    ON CONFLICT(branch_code, item_code) DO UPDATE SET
+                      quantity=excluded.quantity,
+                      item_name=excluded.item_name,
+                      branch_name=excluded.branch_name,
+                      source=excluded.source,
+                      uploaded_at=excluded.uploaded_at
+                """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
+
+                existing_item = conn.execute(
+                    "SELECT id FROM items WHERE branch_code=? AND item_code=?",
+                    (branch_code, item_code)
+                ).fetchone()
+                if not existing_item:
+                    conn.execute("""
+                        INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
+                    """, (branch_code, branch_name, item_name, item_code, now))
+                    conn.execute("""
+                        INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
+                        VALUES (?, ?, ?, 0, ?)
+                        ON CONFLICT(branch_code, item_code) DO NOTHING
+                    """, (branch_code, item_name, item_code, now))
+
+                if item_code.startswith("미지정_") or is_item_consumable(conn, branch_code, item_code):
+                    conn.execute("""
+                        UPDATE inventory SET quantity=?, last_updated=?
+                        WHERE branch_code=? AND item_code=?
+                    """, (raw_quantity, now, branch_code, item_code))
+
+                if hq_total != 0:
+                    hq_adjustments.append((branch_code, item_name, item_code, hq_total))
+                    debug_hq_log.append(f"{item_name}({item_code}): 증가={add_h}, 조정={add_q}, 합계={hq_total}")
+
+                success += 1
+            except Exception as e:
+                errors.append(f"행 {idx}: {str(e)[:50]}")
+                skipped += 1
+
+        conn.commit()
+        conn.close()
+
+        for branch_code, item_name, item_code, new_hq_total in hq_adjustments:
+            conn2 = get_conn()
+            prev_hq_total = old_hq_map.get(f"{branch_code}|{item_code}", 0)
+            net_delta = new_hq_total - prev_hq_total
+            if net_delta != 0:
+                new_qty = adjust_quantity(branch_code, item_code, net_delta, absolute=False)
+                conn2.execute(
+                    "INSERT INTO adjustment_log (branch_code, item_name, item_code, delta, result_quantity, adjusted_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (branch_code, item_name, item_code, net_delta, new_qty, now)
+                )
+            conn2.execute("""
+                INSERT INTO hq_bonus_log (branch_code, item_code, last_hq_total, updated_at)
+                VALUES (?, ?, ?, ?)
                 ON CONFLICT(branch_code, item_code) DO UPDATE SET
-                  quantity=excluded.quantity,
-                  item_name=excluded.item_name,
-                  branch_name=excluded.branch_name,
-                  source=excluded.source,
-                  uploaded_at=excluded.uploaded_at
-            """, (branch_code, branch_name, item_name, item_code, raw_quantity, now))
+                  last_hq_total=excluded.last_hq_total, updated_at=excluded.updated_at
+            """, (branch_code, item_code, new_hq_total, now))
+            conn2.commit()
+            conn2.close()
 
-            existing_item = conn.execute(
-                "SELECT id FROM items WHERE branch_code=? AND item_code=?",
-                (branch_code, item_code)
-            ).fetchone()
-            if not existing_item:
-                conn.execute("""
-                    INSERT INTO items (branch_code, branch_name, item_name, item_code, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(branch_code, item_code) DO UPDATE SET item_name=excluded.item_name
-                """, (branch_code, branch_name, item_name, item_code, now))
-                conn.execute("""
-                    INSERT INTO inventory (branch_code, item_name, item_code, quantity, last_updated)
-                    VALUES (?, ?, ?, 0, ?)
-                    ON CONFLICT(branch_code, item_code) DO NOTHING
-                """, (branch_code, item_name, item_code, now))
-
-            if item_code.startswith("미지정_") or is_item_consumable(conn, branch_code, item_code):
-                conn.execute("""
-                    UPDATE inventory SET quantity=?, last_updated=?
-                    WHERE branch_code=? AND item_code=?
-                """, (raw_quantity, now, branch_code, item_code))
-
-            if hq_total != 0:
-                hq_adjustments.append((branch_code, item_name, item_code, hq_total))
-                debug_hq_log.append(f"{item_name}({item_code}): 증가={add_h}, 조정={add_q}, 합계={hq_total}")
-
-            success += 1
-        except Exception as e:
-            errors.append(f"행 {idx}: {str(e)[:50]}")
-            skipped += 1
-
-    conn.commit()
-    conn.close()
-
-    for branch_code, item_name, item_code, new_hq_total in hq_adjustments:
-        conn2 = get_conn()
-        prev_hq_total = old_hq_map.get(f"{branch_code}|{item_code}", 0)
-        net_delta = new_hq_total - prev_hq_total
-        if net_delta != 0:
-            new_qty = adjust_quantity(branch_code, item_code, net_delta, absolute=False)
-            conn2.execute(
-                "INSERT INTO adjustment_log (branch_code, item_name, item_code, delta, result_quantity, adjusted_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (branch_code, item_name, item_code, net_delta, new_qty, now)
-            )
-        conn2.execute("""
-            INSERT INTO hq_bonus_log (branch_code, item_code, last_hq_total, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(branch_code, item_code) DO UPDATE SET
-              last_hq_total=excluded.last_hq_total, updated_at=excluded.updated_at
-        """, (branch_code, item_code, new_hq_total, now))
-        conn2.commit()
-        conn2.close()
-
-    return {"success": success, "skipped": skipped, "errors": errors[:10],
-            "header_row_used": header_row_idx,
-            "hq_debug": debug_hq_log[:20],
-            "synced_at": now}
+        return {"success": success, "skipped": skipped, "errors": errors[:10],
+                "header_row_used": header_row_idx,
+                "hq_debug": debug_hq_log[:20],
+                "synced_at": now}
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("sync-raw-inventory", err_msg)
+        return {"success": 0, "skipped": 0, "errors": [err_msg]}
 
 @app.get("/api/cron/compute-purchase-tracking-snapshot")
 async def cron_compute_purchase_tracking_snapshot(authorization: str = Header(default="")):
@@ -14518,107 +14523,112 @@ async def _select_stocktake_items(year_month: str = None):
     import random
     from datetime import date
 
-    if year_month is None:
-        today = date.today()
-        year_month = f"{today.year}-{today.month:02d}"
+    try:
+        if year_month is None:
+            today = date.today()
+            year_month = f"{today.year}-{today.month:02d}"
 
-    conn = get_conn()
+        conn = get_conn()
 
-    already_selected = conn.execute(
-        "SELECT id FROM stocktake_selection WHERE year_month=? AND branch_code IS NOT NULL",
-        (year_month,)
-    ).fetchall()
-    if already_selected:
-        conn.close()
-        return {"status": "skipped", "reason": f"{year_month}에 이미 선정된 품목이 있습니다.", "count": len(already_selected)}
-
-    ym_year, ym_month = int(year_month.split("-")[0]), int(year_month.split("-")[1])
-    prev_year = ym_year if ym_month > 1 else ym_year - 1
-    prev_month = ym_month - 1 if ym_month > 1 else 12
-    prev_year_month = f"{prev_year}-{prev_month:02d}"
-
-    EXCLUDED_STOCKTAKE_BRANCHES = ('남양주점', '본사')
-    MAX_PER_CATEGORY = 2
-    TARGET_COUNT = 5
-
-    branch_rows = conn.execute(
-        "SELECT DISTINCT branch_code FROM raw_inventory WHERE branch_code IS NOT NULL AND branch_code != ''"
-    ).fetchall()
-    all_branch_codes = [r["branch_code"] for r in branch_rows if r["branch_code"] not in EXCLUDED_STOCKTAKE_BRANCHES]
-
-    excluded_item_rows = conn.execute("SELECT item_code FROM stocktake_excluded_items").fetchall()
-    excluded_item_codes = {r["item_code"] for r in excluded_item_rows}
-
-    result_summary = {}
-    skipped_branches = {}
-
-    for branch_code in all_branch_codes:
-        prev_items = conn.execute(
-            "SELECT item_code FROM stocktake_selection WHERE year_month=? AND branch_code=?",
-            (prev_year_month, branch_code)
+        already_selected = conn.execute(
+            "SELECT id FROM stocktake_selection WHERE year_month=? AND branch_code IS NOT NULL",
+            (year_month,)
         ).fetchall()
-        prev_item_codes = {r["item_code"] for r in prev_items}
+        if already_selected:
+            conn.close()
+            return {"status": "skipped", "reason": f"{year_month}에 이미 선정된 품목이 있습니다.", "count": len(already_selected)}
 
-        branch_rows_inv = conn.execute(
-            "SELECT item_code, item_name, quantity FROM raw_inventory WHERE item_code IS NOT NULL AND item_code != '' AND branch_code=?",
-            (branch_code,)
+        ym_year, ym_month = int(year_month.split("-")[0]), int(year_month.split("-")[1])
+        prev_year = ym_year if ym_month > 1 else ym_year - 1
+        prev_month = ym_month - 1 if ym_month > 1 else 12
+        prev_year_month = f"{prev_year}-{prev_month:02d}"
+
+        EXCLUDED_STOCKTAKE_BRANCHES = ('남양주점', '본사')
+        MAX_PER_CATEGORY = 2
+        TARGET_COUNT = 5
+
+        branch_rows = conn.execute(
+            "SELECT DISTINCT branch_code FROM raw_inventory WHERE branch_code IS NOT NULL AND branch_code != ''"
         ).fetchall()
+        all_branch_codes = [r["branch_code"] for r in branch_rows if r["branch_code"] not in EXCLUDED_STOCKTAKE_BRANCHES]
 
-        by_item: Dict[str, Dict] = {}
-        for r in branch_rows_inv:
-            code = r["item_code"]
-            if code not in by_item:
-                by_item[code] = {"item_name": r["item_name"], "qty": r["quantity"]}
-            else:
-                by_item[code]["qty"] = min(by_item[code]["qty"], r["quantity"])
+        excluded_item_rows = conn.execute("SELECT item_code FROM stocktake_excluded_items").fetchall()
+        excluded_item_codes = {r["item_code"] for r in excluded_item_rows}
 
-        candidates = [
-            {"item_code": code, "item_name": info["item_name"]}
-            for code, info in by_item.items()
-            if info["qty"] > 0 and code not in prev_item_codes and code not in excluded_item_codes
-        ]
+        result_summary = {}
+        skipped_branches = {}
 
-        if len(candidates) < TARGET_COUNT:
-            skipped_branches[branch_code] = len(candidates)
-            continue
+        for branch_code in all_branch_codes:
+            prev_items = conn.execute(
+                "SELECT item_code FROM stocktake_selection WHERE year_month=? AND branch_code=?",
+                (prev_year_month, branch_code)
+            ).fetchall()
+            prev_item_codes = {r["item_code"] for r in prev_items}
 
-        shuffled_candidates = candidates.copy()
-        random.shuffle(shuffled_candidates)
+            branch_rows_inv = conn.execute(
+                "SELECT item_code, item_name, quantity FROM raw_inventory WHERE item_code IS NOT NULL AND item_code != '' AND branch_code=?",
+                (branch_code,)
+            ).fetchall()
 
-        selected = []
-        category_count: Dict[str, int] = {}
-        for item in shuffled_candidates:
-            if len(selected) >= TARGET_COUNT:
-                break
-            category = item["item_name"].split("_")[0]
-            if category_count.get(category, 0) >= MAX_PER_CATEGORY:
+            by_item: Dict[str, Dict] = {}
+            for r in branch_rows_inv:
+                code = r["item_code"]
+                if code not in by_item:
+                    by_item[code] = {"item_name": r["item_name"], "qty": r["quantity"]}
+                else:
+                    by_item[code]["qty"] = min(by_item[code]["qty"], r["quantity"])
+
+            candidates = [
+                {"item_code": code, "item_name": info["item_name"]}
+                for code, info in by_item.items()
+                if info["qty"] > 0 and code not in prev_item_codes and code not in excluded_item_codes
+            ]
+
+            if len(candidates) < TARGET_COUNT:
+                skipped_branches[branch_code] = len(candidates)
                 continue
-            selected.append(item)
-            category_count[category] = category_count.get(category, 0) + 1
 
-        if len(selected) < TARGET_COUNT:
-            remaining_needed = TARGET_COUNT - len(selected)
-            already_picked_codes = {s["item_code"] for s in selected}
-            fallback_pool = [c for c in shuffled_candidates if c["item_code"] not in already_picked_codes]
-            selected.extend(fallback_pool[:remaining_needed])
+            shuffled_candidates = candidates.copy()
+            random.shuffle(shuffled_candidates)
 
-        for item in selected:
-            conn.execute(
-                "INSERT INTO stocktake_selection (year_month, branch_code, item_code, item_name) VALUES (?, ?, ?, ?)",
-                (year_month, branch_code, item["item_code"], item["item_name"])
-            )
+            selected = []
+            category_count: Dict[str, int] = {}
+            for item in shuffled_candidates:
+                if len(selected) >= TARGET_COUNT:
+                    break
+                category = item["item_name"].split("_")[0]
+                if category_count.get(category, 0) >= MAX_PER_CATEGORY:
+                    continue
+                selected.append(item)
+                category_count[category] = category_count.get(category, 0) + 1
 
-        result_summary[branch_code] = len(selected)
+            if len(selected) < TARGET_COUNT:
+                remaining_needed = TARGET_COUNT - len(selected)
+                already_picked_codes = {s["item_code"] for s in selected}
+                fallback_pool = [c for c in shuffled_candidates if c["item_code"] not in already_picked_codes]
+                selected.extend(fallback_pool[:remaining_needed])
 
-    conn.commit()
-    conn.close()
+            for item in selected:
+                conn.execute(
+                    "INSERT INTO stocktake_selection (year_month, branch_code, item_code, item_name) VALUES (?, ?, ?, ?)",
+                    (year_month, branch_code, item["item_code"], item["item_name"])
+                )
 
-    return {
-        "status": "ok",
-        "year_month": year_month,
-        "selected_by_branch": result_summary,
-        "skipped_branches": skipped_branches
-    }
+            result_summary[branch_code] = len(selected)
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "status": "ok",
+            "year_month": year_month,
+            "selected_by_branch": result_summary,
+            "skipped_branches": skipped_branches
+        }
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("select-stocktake-items", err_msg)
+        return {"status": "error", "error": err_msg}
 
 @app.post("/master/stocktake/admin-reselect")
 async def master_stocktake_admin_reselect(request: Request, session_token: str = Cookie(default=None)):
@@ -15459,104 +15469,109 @@ def _get_iso_week_str(dt: datetime) -> str:
 
 async def _compute_purchase_tracking_snapshot():
     """지점×상품명별 A(실제간격) vs B(리드타임) 비교, 주간 스냅샷 계산 및 저장"""
-    conn = get_conn()
+    try:
+        conn = get_conn()
 
-    # product_lead_time 폐기, product_master 기준으로 전환.
-    # 리드타임은 상품별 공통값(지점 무관)이므로 item_name별로 하나만 대표값 사용.
-    leadtime_rows = conn.execute(
-        "SELECT DISTINCT ON (item_name) item_name, lead_time_days FROM product_master "
-        "WHERE lead_time_days IS NOT NULL ORDER BY item_name, id"
-    ).fetchall()
-    leadtime_map = {r["item_name"]: r["lead_time_days"] for r in leadtime_rows}
+        # product_lead_time 폐기, product_master 기준으로 전환.
+        # 리드타임은 상품별 공통값(지점 무관)이므로 item_name별로 하나만 대표값 사용.
+        leadtime_rows = conn.execute(
+            "SELECT DISTINCT ON (item_name) item_name, lead_time_days FROM product_master "
+            "WHERE lead_time_days IS NOT NULL ORDER BY item_name, id"
+        ).fetchall()
+        leadtime_map = {r["item_name"]: r["lead_time_days"] for r in leadtime_rows}
 
-    if not leadtime_map:
-        conn.close()
-        return {"processed": 0, "skipped_no_leadtime": 0, "message": "등록된 리드타임이 없습니다."}
+        if not leadtime_map:
+            conn.close()
+            return {"processed": 0, "skipped_no_leadtime": 0, "message": "등록된 리드타임이 없습니다."}
 
-    combos = conn.execute("""
-        SELECT DISTINCT branch_name, item_name FROM purchase_records
-    """).fetchall()
+        combos = conn.execute("""
+            SELECT DISTINCT branch_name, item_name FROM purchase_records
+        """).fetchall()
 
-    now = datetime.now()
-    snapshot_week = _get_iso_week_str(now)
-    now_iso = now.isoformat()
+        now = datetime.now()
+        snapshot_week = _get_iso_week_str(now)
+        now_iso = now.isoformat()
 
-    processed = 0
-    skipped_no_leadtime = 0
+        processed = 0
+        skipped_no_leadtime = 0
 
-    for combo in combos:
-        branch_name = combo["branch_name"]
-        item_name = combo["item_name"]
+        for combo in combos:
+            branch_name = combo["branch_name"]
+            item_name = combo["item_name"]
 
-        lead_time_days = leadtime_map.get(item_name)
-        if lead_time_days is None:
-            skipped_no_leadtime += 1
-            continue
+            lead_time_days = leadtime_map.get(item_name)
+            if lead_time_days is None:
+                skipped_no_leadtime += 1
+                continue
 
-        history = conn.execute("""
-            SELECT purchase_datetime, quantity FROM purchase_records
-            WHERE branch_name = ? AND item_name = ?
-            ORDER BY purchase_datetime DESC
-            LIMIT 2
-        """, (branch_name, item_name)).fetchall()
+            history = conn.execute("""
+                SELECT purchase_datetime, quantity FROM purchase_records
+                WHERE branch_name = ? AND item_name = ?
+                ORDER BY purchase_datetime DESC
+                LIMIT 2
+            """, (branch_name, item_name)).fetchall()
 
-        if not history:
-            continue
+            if not history:
+                continue
 
-        last_purchase_date = history[0]["purchase_datetime"]
-        last_qty = float(history[0]["quantity"])
+            last_purchase_date = history[0]["purchase_datetime"]
+            last_qty = float(history[0]["quantity"])
 
-        if len(history) >= 2:
-            try:
-                d1 = datetime.fromisoformat(history[0]["purchase_datetime"])
-                d2 = datetime.fromisoformat(history[1]["purchase_datetime"])
-                actual_interval_days = abs((d1 - d2).days)
-                if actual_interval_days == 0:
-                    actual_interval_days = 1
-            except Exception:
+            if len(history) >= 2:
+                try:
+                    d1 = datetime.fromisoformat(history[0]["purchase_datetime"])
+                    d2 = datetime.fromisoformat(history[1]["purchase_datetime"])
+                    actual_interval_days = abs((d1 - d2).days)
+                    if actual_interval_days == 0:
+                        actual_interval_days = 1
+                except Exception:
+                    actual_interval_days = lead_time_days
+            else:
                 actual_interval_days = lead_time_days
-        else:
-            actual_interval_days = lead_time_days
 
-        deviation_days = lead_time_days - actual_interval_days
+            deviation_days = lead_time_days - actual_interval_days
 
-        try:
-            recommended_qty = round(last_qty * (lead_time_days / actual_interval_days), 1)
-        except ZeroDivisionError:
-            recommended_qty = last_qty
+            try:
+                recommended_qty = round(last_qty * (lead_time_days / actual_interval_days), 1)
+            except ZeroDivisionError:
+                recommended_qty = last_qty
 
-        try:
-            last_dt = datetime.fromisoformat(last_purchase_date)
-            from datetime import timedelta
-            recommended_next_date = (last_dt + timedelta(days=lead_time_days)).date().isoformat()
-        except Exception:
-            recommended_next_date = None
+            try:
+                last_dt = datetime.fromisoformat(last_purchase_date)
+                from datetime import timedelta
+                recommended_next_date = (last_dt + timedelta(days=lead_time_days)).date().isoformat()
+            except Exception:
+                recommended_next_date = None
 
-        conn.execute("""
-            INSERT INTO purchase_tracking_snapshot
-                (snapshot_week, branch_name, item_name, last_purchase_date, actual_interval_days,
-                 lead_time_days, deviation_days, recommended_next_date, recommended_qty, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (snapshot_week, branch_name, item_name) DO UPDATE SET
-                last_purchase_date=excluded.last_purchase_date,
-                actual_interval_days=excluded.actual_interval_days,
-                lead_time_days=excluded.lead_time_days,
-                deviation_days=excluded.deviation_days,
-                recommended_next_date=excluded.recommended_next_date,
-                recommended_qty=excluded.recommended_qty,
-                created_at=excluded.created_at
-        """, (snapshot_week, branch_name, item_name, last_purchase_date, actual_interval_days,
-              lead_time_days, deviation_days, recommended_next_date, recommended_qty, now_iso))
-        processed += 1
+            conn.execute("""
+                INSERT INTO purchase_tracking_snapshot
+                    (snapshot_week, branch_name, item_name, last_purchase_date, actual_interval_days,
+                     lead_time_days, deviation_days, recommended_next_date, recommended_qty, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (snapshot_week, branch_name, item_name) DO UPDATE SET
+                    last_purchase_date=excluded.last_purchase_date,
+                    actual_interval_days=excluded.actual_interval_days,
+                    lead_time_days=excluded.lead_time_days,
+                    deviation_days=excluded.deviation_days,
+                    recommended_next_date=excluded.recommended_next_date,
+                    recommended_qty=excluded.recommended_qty,
+                    created_at=excluded.created_at
+            """, (snapshot_week, branch_name, item_name, last_purchase_date, actual_interval_days,
+                  lead_time_days, deviation_days, recommended_next_date, recommended_qty, now_iso))
+            processed += 1
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
 
-    return {
-        "processed": processed,
-        "skipped_no_leadtime": skipped_no_leadtime,
-        "snapshot_week": snapshot_week
-    }
+        return {
+            "processed": processed,
+            "skipped_no_leadtime": skipped_no_leadtime,
+            "snapshot_week": snapshot_week
+        }
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("compute-purchase-tracking-snapshot", err_msg)
+        return {"error": err_msg}
 
 async def _process_lead_time_upload(file: UploadFile):
     """상품별 리드타임/MOQ(단위)/소모품여부 엑셀 업로드 처리 — 헤더 2행, 상품명 기준 UPSERT
@@ -15659,84 +15674,88 @@ async def _fetch_and_process_purchase_records_csv():
     import csv
     import io as io_module
 
-    csv_url = os.environ.get("PURCHASE_RECORDS_CSV_URL", "")
-    if not csv_url:
-        return {"success": 0, "skipped": 0, "errors": ["PURCHASE_RECORDS_CSV_URL 환경변수가 설정되지 않았습니다."]}
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(csv_url)
-        resp.raise_for_status()
-        raw_bytes = resp.content
-
     try:
-        text = raw_bytes.decode('utf-8-sig')
-    except UnicodeDecodeError:
-        text = raw_bytes.decode('cp949')
+        csv_url = os.environ.get("PURCHASE_RECORDS_CSV_URL", "")
+        if not csv_url:
+            return {"success": 0, "skipped": 0, "errors": ["PURCHASE_RECORDS_CSV_URL 환경변수가 설정되지 않았습니다."]}
 
-    reader = csv.reader(io_module.StringIO(text))
-    rows_raw = list(reader)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(csv_url)
+            resp.raise_for_status()
+            raw_bytes = resp.content
 
-    header_row_idx = None
-    for row_idx in range(min(5, len(rows_raw))):
-        row_vals = rows_raw[row_idx]
-        if row_vals and row_vals[0] and "구매일시" in str(row_vals[0]):
-            header_row_idx = row_idx
-            break
-
-    if header_row_idx is None:
-        return {"success": 0, "skipped": 0, "errors": ["CSV에서 '구매일시' 헤더를 찾을 수 없습니다."]}
-
-    now = datetime.now().isoformat()
-    success, skipped, errors = 0, 0, []
-    data_start_row = header_row_idx + 1
-
-    conn = get_conn()
-    for idx in range(data_start_row, len(rows_raw)):
-        row = rows_raw[idx]
-        if not row or not row[0]:
-            continue
         try:
-            purchase_datetime = str(row[0]).strip()
-            status = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-            vendor = str(row[2]).strip() if len(row) > 2 and row[2] else ""
-            branch_name = str(row[3]).strip() if len(row) > 3 and row[3] else ""
-            item_name = str(row[5]).strip() if len(row) > 5 and row[5] else ""
-            item_code = str(row[6]).strip() if len(row) > 6 and row[6] else ""
-            quantity = float(row[7]) if len(row) > 7 and row[7] not in (None, "") else 0
-            unit_price = float(row[8]) if len(row) > 8 and row[8] not in (None, "") else None
-            total_price = float(row[9]) if len(row) > 9 and row[9] not in (None, "") else None
+            text = raw_bytes.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            text = raw_bytes.decode('cp949')
 
-            if not branch_name or not item_name:
-                skipped += 1
+        reader = csv.reader(io_module.StringIO(text))
+        rows_raw = list(reader)
+
+        header_row_idx = None
+        for row_idx in range(min(5, len(rows_raw))):
+            row_vals = rows_raw[row_idx]
+            if row_vals and row_vals[0] and "구매일시" in str(row_vals[0]):
+                header_row_idx = row_idx
+                break
+
+        if header_row_idx is None:
+            return {"success": 0, "skipped": 0, "errors": ["CSV에서 '구매일시' 헤더를 찾을 수 없습니다."]}
+
+        now = datetime.now().isoformat()
+        success, skipped, errors = 0, 0, []
+        data_start_row = header_row_idx + 1
+
+        conn = get_conn()
+        for idx in range(data_start_row, len(rows_raw)):
+            row = rows_raw[idx]
+            if not row or not row[0]:
                 continue
+            try:
+                purchase_datetime = str(row[0]).strip()
+                status = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+                vendor = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+                branch_name = str(row[3]).strip() if len(row) > 3 and row[3] else ""
+                item_name = str(row[5]).strip() if len(row) > 5 and row[5] else ""
+                item_code = str(row[6]).strip() if len(row) > 6 and row[6] else ""
+                quantity = float(row[7]) if len(row) > 7 and row[7] not in (None, "") else 0
+                unit_price = float(row[8]) if len(row) > 8 and row[8] not in (None, "") else None
+                total_price = float(row[9]) if len(row) > 9 and row[9] not in (None, "") else None
 
-            conn.execute("""
-                INSERT INTO purchase_records
-                    (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (purchase_datetime, branch_name, item_name, item_code, quantity)
-                DO UPDATE SET
-                    vendor=excluded.vendor,
-                    unit_price=excluded.unit_price,
-                    total_price=excluded.total_price,
-                    status=excluded.status,
-                    created_at=excluded.created_at
-            """, (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, status, now))
-            success += 1
-        except Exception as e:
-            errors.append(f"행 {idx}: {str(e)[:50]}")
-            skipped += 1
+                if not branch_name or not item_name:
+                    skipped += 1
+                    continue
 
-    conn.commit()
+                conn.execute("""
+                    INSERT INTO purchase_records
+                        (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (purchase_datetime, branch_name, item_name, item_code, quantity)
+                    DO UPDATE SET
+                        vendor=excluded.vendor,
+                        unit_price=excluded.unit_price,
+                        total_price=excluded.total_price,
+                        status=excluded.status,
+                        created_at=excluded.created_at
+                """, (purchase_datetime, branch_name, vendor, item_name, item_code, quantity, unit_price, total_price, status, now))
+                success += 1
+            except Exception as e:
+                errors.append(f"행 {idx}: {str(e)[:50]}")
+                skipped += 1
 
-    from datetime import timedelta
-    cutoff = (datetime.now() - timedelta(days=90)).isoformat()
-    conn.execute("DELETE FROM purchase_records WHERE purchase_datetime < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+        conn.commit()
 
-    return {"success": success, "skipped": skipped, "errors": errors[:10], "synced_at": now}
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=90)).isoformat()
+        conn.execute("DELETE FROM purchase_records WHERE purchase_datetime < ?", (cutoff,))
+        conn.commit()
+        conn.close()
 
+        return {"success": success, "skipped": skipped, "errors": errors[:10], "synced_at": now}
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("sync-purchase-records", err_msg)
+        return {"success": 0, "skipped": 0, "errors": [err_msg]}
 
 @app.get("/api/cron/sync-purchase-records")
 async def cron_sync_purchase_records(request: Request):
