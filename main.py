@@ -12302,9 +12302,11 @@ async def _compute_purchase_order_candidates() -> dict:
 
     # ── 5) 월1회예외 목록: (item_name, branch_code) 조합 집합 ──
     monthly_exc_rows = conn.execute(
-        "SELECT item_name, branch_code FROM purchase_order_monthly_exception"
+        "SELECT item_code, item_name, branch_code FROM purchase_order_monthly_exception"
     ).fetchall()
-    monthly_exc_set = {(r["item_name"], r["branch_code"]) for r in monthly_exc_rows}
+    # 품번이 있는 행은 (품번, 지점)으로, 품번이 비어 있는 과거 행만 (상품명, 지점)으로 판정
+    monthly_exc_set = {(r["item_code"], r["branch_code"]) for r in monthly_exc_rows if r["item_code"]}
+    monthly_exc_name_set = {(r["item_name"], r["branch_code"]) for r in monthly_exc_rows if not r["item_code"]}
 
     # ── 6) 소모품 지점별 예외(포함 허용) 목록: (item_code, branch_code) 조합 집합 ──
     consumable_exc_rows = conn.execute(
@@ -12388,7 +12390,7 @@ async def _compute_purchase_order_candidates() -> dict:
 
         # 5. 주간/월간 분류
         is_monthly_by_leadtime = lead_time_days >= 35
-        is_monthly_by_exception = (item_name, branch_code) in monthly_exc_set
+        is_monthly_by_exception = ((item_code, branch_code) in monthly_exc_set) or ((item_name, branch_code) in monthly_exc_name_set)
 
         if is_monthly_by_leadtime or is_monthly_by_exception:
             monthly.append(candidate)
@@ -12682,8 +12684,8 @@ async def purchase_order_product_settings_page(
 
     monthly_exc_map: Dict[str, list] = {}
     for r in monthly_exc_rows:
-        monthly_exc_map.setdefault(r["item_name"], []).append(r["branch_code"])
-
+        monthly_exc_map.setdefault(r["item_code"] or r["item_name"], []).append(r["branch_code"])
+        
     branches = get_branches(branch_type='branch')
     branch_options_json = json.dumps(
         [{"code": b["branch_code"], "name": b["branch_name"]} for b in branches], ensure_ascii=False
@@ -12699,7 +12701,7 @@ async def purchase_order_product_settings_page(
     else:
         for r in rows:
             consumable_checked = "checked" if r["is_consumable"] else ""
-            exc_branches = monthly_exc_map.get(r["item_name"], [])
+            exc_branches = monthly_exc_map.get(r["item_code"] or r["item_name"], [])
             exc_badge = (
                 f'<span class="badge-green">{len(exc_branches)}개 지점</span>'
                 if exc_branches else '<span style="color:#888;font-size:11px;">없음</span>'
@@ -13622,15 +13624,32 @@ async def purchase_order_product_master_upload(request: Request, session_token: 
     return JSONResponse(content={"status": "ok", "inserted": inserted})
 
 
+def _po_resolve_item_code(conn, item_name: str) -> str:
+    """상품명 -> 품번. product_master 기준으로 품번이 정확히 1개일 때만 반환하고, 없거나 여러 개면 빈 문자열."""
+    rows = conn.execute(
+        "SELECT DISTINCT item_code FROM product_master WHERE item_name=? AND item_code IS NOT NULL AND item_code <> ''",
+        (item_name,)
+    ).fetchall()
+    codes = [r["item_code"] for r in rows]
+    return codes[0] if len(codes) == 1 else ""
+
+
 @app.get("/master/purchase-order/monthly-exception/list")
 async def purchase_order_monthly_exception_list(item_name: str, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT branch_code FROM purchase_order_monthly_exception WHERE item_name=?", (item_name,)
-    ).fetchall()
+    item_code = _po_resolve_item_code(conn, item_name)
+    if item_code:
+        rows = conn.execute(
+            "SELECT branch_code FROM purchase_order_monthly_exception WHERE item_code=?", (item_code,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT branch_code FROM purchase_order_monthly_exception WHERE item_name=? AND (item_code IS NULL OR item_code='')",
+            (item_name,)
+        ).fetchall()
     conn.close()
     return JSONResponse(content={"branches": [r["branch_code"] for r in rows]})
 
@@ -13648,15 +13667,26 @@ async def purchase_order_monthly_exception_save(request: Request, session_token:
         return JSONResponse(status_code=400, content={"detail": "상품명이 없습니다."})
 
     conn = get_conn()
-    conn.execute("DELETE FROM purchase_order_monthly_exception WHERE item_name=?", (item_name,))
+    item_code = _po_resolve_item_code(conn, item_name)
+    if not item_code:
+        conn.close()
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "상품 마스터에서 품번을 특정할 수 없는 상품입니다. 상품 마스터 등록을 먼저 확인해 주세요."}
+        )
+    conn.execute(
+        "DELETE FROM purchase_order_monthly_exception WHERE item_code=? OR (item_name=? AND (item_code IS NULL OR item_code=''))",
+        (item_code, item_name)
+    )
     for bc in branch_codes:
         conn.execute(
-            "INSERT INTO purchase_order_monthly_exception (item_name, branch_code) VALUES (?, ?)",
-            (item_name, bc)
+            "INSERT INTO purchase_order_monthly_exception (item_name, item_code, branch_code) VALUES (?, ?, ?)",
+            (item_name, item_code, bc)
         )
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
+
 
 @app.get("/master/purchase-tracking/status", response_class=HTMLResponse)
 async def purchase_tracking_status_page(
