@@ -15453,6 +15453,179 @@ async def master_stocktake_result_export(session_token: str = Cookie(default=Non
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
+# ── 판매내역(유비플러스) 일일 적재 크론 ─────────────────────────
+SALES_S3_BASE_URL = "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/sale/"
+SALES_RETENTION_DAYS = 100
+
+
+def _sales_http_get(url: str, timeout: int = 25) -> bytes:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "inventory-sync/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _parse_sales_csv(raw: bytes):
+    """판매내역 CSV bytes -> (rows, skipped)
+    rows: [(sale_date, sale_datetime, branch_name, customer_name, item_name, item_code, quantity)]
+    skipped: [(줄번호, 사유)]
+    """
+    import csv
+    import io
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp949")
+    reader = csv.DictReader(io.StringIO(text))
+    header = [(h or "").strip() for h in (reader.fieldnames or [])]
+    required = ["판매일시", "지점", "고객명", "상품명", "품번", "수량"]
+    missing = [h for h in required if h not in header]
+    if missing:
+        raise ValueError(f"CSV 헤더 불일치: 누락 {missing}, 실제 {header}")
+    reader.fieldnames = header
+
+    rows = []
+    skipped = []
+    for line_no, r in enumerate(reader, start=2):
+        dt_raw = (r.get("판매일시") or "").strip()
+        dt = None
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(dt_raw, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            skipped.append((line_no, f"판매일시 형식 오류: {dt_raw}"))
+            continue
+        branch_name = (r.get("지점") or "").strip()
+        item_name = (r.get("상품명") or "").strip()
+        if not branch_name or not item_name:
+            skipped.append((line_no, "지점 또는 상품명 비어 있음"))
+            continue
+        qty_raw = (r.get("수량") or "").strip()
+        try:
+            quantity = int(float(qty_raw))
+        except ValueError:
+            skipped.append((line_no, f"수량 형식 오류: {qty_raw}"))
+            continue
+        rows.append((
+            dt.strftime("%Y-%m-%d"),
+            dt.strftime("%Y-%m-%d %H:%M"),
+            branch_name,
+            (r.get("고객명") or "").strip(),
+            item_name,
+            (r.get("품번") or "").strip(),
+            quantity,
+        ))
+    return rows, skipped
+
+
+async def _sync_sales_records(target_date: str = "") -> dict:
+    """전날(또는 지정일) 판매내역 CSV를 받아 sales_records에 적재하고, 100일 지난 데이터를 삭제한다.
+    - 같은 날짜를 다시 실행하면 그 날짜 행을 지우고 다시 넣는다(중복 없음).
+    - 파일이 없거나 비어 있으면 아무것도 지우지 않고 실패로 알린다.
+    - 적재와 보관기간 삭제는 서로 독립적으로 실행하고 각각 실패 알림을 보낸다.
+    """
+    import asyncio
+    import urllib.parse
+    import urllib.error
+    from datetime import timedelta
+
+    kst_now = _kst_now()
+    if not target_date:
+        target_date = (kst_now - timedelta(days=1)).strftime("%Y%m%d")
+    filename = f"유비플러스_판매내역_{target_date}.csv"
+    url = SALES_S3_BASE_URL + urllib.parse.quote(filename)
+    result = {"target_date": target_date, "url": url}
+
+    # 1) 다운로드 + 적재
+    try:
+        try:
+            raw = await asyncio.to_thread(_sales_http_get, url)
+        except urllib.error.HTTPError as he:
+            raise RuntimeError(f"S3 다운로드 실패 HTTP {he.code} (파일 미업로드 가능성): {url}")
+        rows, skipped = _parse_sales_csv(raw)
+        if not rows:
+            raise ValueError(f"유효한 판매 행이 없습니다 (건너뜀 {len(skipped)}건): {url}")
+
+        now_iso = kst_now.strftime("%Y-%m-%d %H:%M:%S")
+        dates = sorted({r[0] for r in rows})
+        conn = get_conn()
+        try:
+            for d in dates:
+                conn.execute("DELETE FROM sales_records WHERE sale_date=?", (d,))
+            for start in range(0, len(rows), 200):
+                chunk = rows[start:start + 200]
+                placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+                params = []
+                for r in chunk:
+                    params.extend(list(r) + [now_iso])
+                conn.execute(
+                    "INSERT INTO sales_records "
+                    "(sale_date, sale_datetime, branch_name, customer_name, item_name, item_code, quantity, created_at) "
+                    "VALUES " + placeholders,
+                    tuple(params)
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result["inserted"] = len(rows)
+        result["dates"] = dates
+        result["skipped"] = len(skipped)
+        if skipped:
+            result["skipped_samples"] = [f"{ln}행: {why}" for ln, why in skipped[:5]]
+            report_cron_failure(
+                "sync-sales-records(경고)",
+                f"{target_date} 파일 {len(skipped)}행을 건너뛰었습니다. 예: {result['skipped_samples']}"
+            )
+    except Exception as e:
+        err_msg = str(e)[:500]
+        result["error"] = err_msg
+        report_cron_failure("sync-sales-records", err_msg)
+
+    # 2) 보관기간(100일) 지난 데이터 삭제 — 적재 성공 여부와 무관하게 실행
+    try:
+        cutoff = (kst_now - timedelta(days=SALES_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        conn = get_conn()
+        try:
+            cnt_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM sales_records WHERE sale_date < ?", (cutoff,)
+            ).fetchone()
+            old_cnt = int(cnt_row["c"]) if cnt_row else 0
+            if old_cnt > 0:
+                conn.execute("DELETE FROM sales_records WHERE sale_date < ?", (cutoff,))
+                conn.commit()
+        finally:
+            conn.close()
+        result["retention_cutoff"] = cutoff
+        result["deleted_old"] = old_cnt
+    except Exception as e:
+        err_msg = str(e)[:500]
+        result["retention_error"] = err_msg
+        report_cron_failure("cleanup-sales-records", err_msg)
+
+    return result
+
+
+@app.get("/api/cron/sync-sales-records")
+async def cron_sync_sales_records(request: Request, date: str = ""):
+    import re
+    auth_header = request.headers.get("authorization", "")
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+    date = (date or "").strip()
+    if date and not re.fullmatch(r"\d{8}", date):
+        return JSONResponse(status_code=400, content={"detail": "date는 YYYYMMDD 형식이어야 합니다."})
+
+    result = await _sync_sales_records(date)
+    failed = bool(result.get("error") or result.get("retention_error"))
+    return JSONResponse(status_code=500 if failed else 200, content=result)
+
+
 @app.get("/api/cron/sync-raw-inventory")
 async def cron_sync_raw_inventory(request: Request):
     # Vercel Cron 요청 검증 (Authorization 헤더로 비인가 접근 차단)
