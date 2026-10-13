@@ -12678,7 +12678,7 @@ async def purchase_order_product_settings_page(
     rows = conn.execute(query, params).fetchall()
 
     monthly_exc_rows = conn.execute(
-        "SELECT item_name, branch_code FROM purchase_order_monthly_exception"
+        "SELECT item_code, item_name, branch_code FROM purchase_order_monthly_exception"
     ).fetchall()
     conn.close()
 
