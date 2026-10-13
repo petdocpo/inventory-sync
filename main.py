@@ -12175,6 +12175,20 @@ async def purchase_tracking_page(session_token: str = Cookie(default=None)):
       <div id="leadtimeResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;font-size:13px;"></div>
     </div>
 
+    <div class="card">
+      <h3 style="margin-bottom:8px;">🧾 판매내역(유비플러스) 엑셀 업로드</h3>
+      <p style="color:#666;font-size:12px;margin-bottom:12px;">
+        컬럼: 판매일시 / 지점 / 고객명 / 상품명 / 품번 / 수량 (.xlsx, 헤더는 위쪽 5줄 안). 파일에 들어 있는 날짜는 기존 데이터를 모두 지우고 다시 넣습니다.
+        오늘 기준 100일보다 오래된 행은 건너뜁니다. 한 파일은 4MB 이하(약 한 달분)로 올리고, 파일을 나눌 때는 날짜 단위로 나눠 주세요.
+        같은 날짜가 두 파일에 걸치면 먼저 올린 부분이 지워집니다.
+      </p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="file" id="salesFile" accept=".xlsx" style="width:auto;flex:1;">
+        <button class="btn" type="button" onclick="uploadSales()">업로드</button>
+      </div>
+      <div id="salesResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;font-size:13px;"></div>
+    </div>
+
     <script>
       async function uploadRecords() {{
         const file = document.getElementById('recordsFile').files[0];
@@ -12195,6 +12209,44 @@ async def purchase_tracking_page(session_token: str = Cookie(default=None)):
           실패: <b style="color:#EF4444">${{data.skipped}}건</b>
           ${{data.errors && data.errors.length ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${{e}}</li>`).join('') + '</ul>' : ''}}`;
           setTimeout(() => location.reload(), 2000);
+        }} catch(e) {{
+          alert('업로드 중 오류가 발생했습니다.');
+        }} finally {{
+          btn.textContent = '업로드';
+          btn.disabled = false;
+        }}
+      }}
+
+      async function uploadSales() {{
+        const file = document.getElementById('salesFile').files[0];
+        if (!file) {{ alert('파일을 선택해주세요.'); return; }}
+        if (!file.name.toLowerCase().endsWith('.xlsx')) {{ alert('.xlsx 파일만 업로드할 수 있습니다.'); return; }}
+        if (file.size > 4 * 1024 * 1024) {{ alert('파일이 4MB를 넘습니다. 날짜 단위로 나누어 올려주세요.'); return; }}
+        const fd = new FormData();
+        fd.append('file', file);
+        const btn = event.target;
+        btn.textContent = '업로드 중...';
+        btn.disabled = true;
+        const box = document.getElementById('salesResult');
+        try {{
+          const res = await fetch('/master/purchase-tracking/upload-sales', {{ method: 'POST', body: fd }});
+          let data = null;
+          try {{ data = await res.json(); }} catch (e2) {{ data = null; }}
+          box.style.display = 'block';
+          if (!data) {{
+            box.style.background = '#FEE2E2';
+            box.innerHTML = '<b>❌ 업로드 실패</b><br>서버 응답을 읽지 못했습니다. (상태 ' + res.status + ')';
+            return;
+          }}
+          const ok = res.ok && data.success > 0;
+          const hasErr = data.errors && data.errors.length;
+          box.style.background = !ok ? '#FEE2E2' : ((hasErr || data.skipped_old) ? '#FEF9C3' : '#D1FAE5');
+          box.innerHTML = `<b>${{ok ? '✅ 업로드 완료' : '❌ 업로드 실패'}}</b><br>
+          적재: <b style="color:#22C55E">${{data.success}}행</b> &nbsp;
+          건너뜀: <b style="color:#EF4444">${{data.skipped}}행</b> &nbsp;
+          보관기간 밖: <b style="color:#888">${{data.skipped_old || 0}}행</b>
+          ${{data.date_from ? '<br>기간: <b>' + data.date_from + ' ~ ' + data.date_to + '</b> (' + data.date_count + '일)' : ''}}
+          ${{hasErr ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${{e}}</li>`).join('') + '</ul>' : ''}}`;
         }} catch(e) {{
           alert('업로드 중 오류가 발생했습니다.');
         }} finally {{
@@ -15607,6 +15659,164 @@ async def _sync_sales_records(target_date: str = "") -> dict:
         report_cron_failure("cleanup-sales-records", err_msg)
 
     return result
+
+def _parse_sales_xlsx(contents: bytes):
+    """판매내역 엑셀(.xlsx) -> (rows, skipped, header_row)
+    rows: [(sale_date, sale_datetime, branch_name, customer_name, item_name, item_code, quantity)]
+    skipped: [(행번호, 사유)]
+    헤더(판매일시/지점/고객명/상품명/품번/수량)는 위쪽 5줄 안에서 이름으로 찾는다.
+    """
+    import io
+    import openpyxl
+    from openpyxl.utils.datetime import from_excel
+
+    required = ["판매일시", "지점", "고객명", "상품명", "품번", "수량"]
+    date_formats = (
+        "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+        "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d",
+    )
+
+    def _get(values, idx):
+        return values[idx] if idx < len(values) else None
+
+    def _text(v):
+        return "" if v is None else str(v).strip()
+
+    wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
+    rows = []
+    skipped = []
+    col_idx = {}
+    header_row = 0
+    try:
+        ws = wb.active
+        if ws is None:
+            raise ValueError("시트를 찾을 수 없습니다.")
+        for row_no, values in enumerate(ws.iter_rows(values_only=True), start=1):
+            if not col_idx:
+                if row_no > 5:
+                    break
+                names = [_text(v) for v in values]
+                if all(h in names for h in required):
+                    col_idx = {h: names.index(h) for h in required}
+                    header_row = row_no
+                continue
+
+            if all(_text(v) == "" for v in values):
+                continue
+
+            dt_val = _get(values, col_idx["판매일시"])
+            dt = None
+            if isinstance(dt_val, datetime):
+                dt = dt_val
+            elif isinstance(dt_val, (int, float)):
+                try:
+                    dt = from_excel(dt_val)
+                except Exception:
+                    dt = None
+            elif dt_val is not None:
+                s = _text(dt_val)
+                for fmt in date_formats:
+                    try:
+                        dt = datetime.strptime(s, fmt)
+                        break
+                    except ValueError:
+                        continue
+            if not isinstance(dt, datetime):
+                skipped.append((row_no, f"판매일시 형식 오류: {_text(dt_val)}"))
+                continue
+
+            branch_name = _text(_get(values, col_idx["지점"]))
+            item_name = _text(_get(values, col_idx["상품명"]))
+            if not branch_name or not item_name:
+                skipped.append((row_no, "지점 또는 상품명 비어 있음"))
+                continue
+
+            qty_text = _text(_get(values, col_idx["수량"])).replace(",", "")
+            try:
+                quantity = int(float(qty_text))
+            except ValueError:
+                skipped.append((row_no, f"수량 형식 오류: {qty_text}"))
+                continue
+
+            rows.append((
+                dt.strftime("%Y-%m-%d"),
+                dt.strftime("%Y-%m-%d %H:%M"),
+                branch_name,
+                _text(_get(values, col_idx["고객명"])),
+                item_name,
+                _text(_get(values, col_idx["품번"])),
+                quantity,
+            ))
+    finally:
+        wb.close()
+
+    if not col_idx:
+        raise ValueError("헤더(판매일시/지점/고객명/상품명/품번/수량)를 위쪽 5줄 안에서 찾지 못했습니다.")
+    return rows, skipped, header_row
+
+
+def _save_sales_rows(rows: list, now_iso: str) -> list:
+    """sales_records에 날짜 단위로 교체 저장한다(해당 날짜의 기존 행은 모두 지우고 다시 넣음).
+    반환: 교체된 날짜 목록
+    """
+    dates = sorted({r[0] for r in rows})
+    conn = get_conn()
+    try:
+        for d in dates:
+            conn.execute("DELETE FROM sales_records WHERE sale_date=?", (d,))
+        for start in range(0, len(rows), 1000):
+            chunk = rows[start:start + 1000]
+            placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+            params = []
+            for r in chunk:
+                params.extend(list(r) + [now_iso])
+            conn.execute(
+                "INSERT INTO sales_records "
+                "(sale_date, sale_datetime, branch_name, customer_name, item_name, item_code, quantity, created_at) "
+                "VALUES " + placeholders,
+                tuple(params)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return dates
+
+
+@app.post("/master/purchase-tracking/upload-sales")
+async def purchase_tracking_upload_sales(session_token: str = Cookie(default=None), file: UploadFile = File(...)):
+    from datetime import timedelta
+    user = get_session(session_token)
+    if not user or user["role"] != "master" or not has_menu_permission(user["login_id"], "purchase-tracking"):
+        return JSONResponse(status_code=403, content={"success": 0, "skipped": 0, "errors": ["권한이 없습니다."]})
+
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".xlsx"):
+        return JSONResponse(status_code=400, content={"success": 0, "skipped": 0, "errors": [".xlsx 파일만 업로드할 수 있습니다."]})
+
+    try:
+        contents = await file.read()
+        rows, skipped, header_row = _parse_sales_xlsx(contents)
+        kst_now = _kst_now()
+        cutoff = (kst_now - timedelta(days=SALES_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        kept = [r for r in rows if r[0] >= cutoff]
+        old_cnt = len(rows) - len(kept)
+        if not kept:
+            return JSONResponse(status_code=400, content={
+                "success": 0, "skipped": len(skipped), "skipped_old": old_cnt,
+                "errors": [f"보관기간({SALES_RETENTION_DAYS}일, {cutoff} 이후) 안의 판매 행이 없습니다. 전체 {len(rows)}행 중 {old_cnt}행이 기간 밖, {len(skipped)}행이 형식 오류입니다."]
+            })
+        dates = _save_sales_rows(kept, kst_now.strftime("%Y-%m-%d %H:%M:%S"))
+        return JSONResponse(content={
+            "success": len(kept),
+            "skipped": len(skipped),
+            "skipped_old": old_cnt,
+            "date_from": dates[0],
+            "date_to": dates[-1],
+            "date_count": len(dates),
+            "errors": [f"{ln}행: {why}" for ln, why in skipped[:10]],
+        })
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": 0, "skipped": 0, "errors": [str(e)[:300]]})
 
 
 @app.get("/api/cron/sync-sales-records")
