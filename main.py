@@ -17904,6 +17904,282 @@ SAFETY_STOCK_EXTRA_CSS = """
 </style>
 """
 
+SAFETY_COMPARE_CSS = """
+<style>
+.sc-wrap { overflow-x: auto; }
+.sc-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.sc-table th, .sc-table td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; white-space: nowrap; }
+.sc-table th { background: #F8FAFC; }
+.sc-num { text-align: right !important; }
+.sc-up { color: #B91C1C; font-weight: bold; }
+.sc-down { color: #1D4ED8; font-weight: bold; }
+.sc-chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #E2E8F0; color: #334155; }
+.sc-sum { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.sc-sum div { background: #F1F5F9; border-radius: 8px; padding: 8px 12px; font-size: 12px; }
+</style>
+"""
+
+SAFETY_COMPARE_STATUSES = [
+    "상향", "하향", "동일", "신규 후보", "판매 없음(유지)", "리드타임 없음",
+    "제외(소모품)", "제외(발주 제외)", "제외(마스터 없음)",
+]
+
+
+def _compute_safety_recommendations(start_date: str, end_date: str, factor: float, min_qty: int) -> list:
+    """판매내역 기준 안전재고 추천값 계산(읽기 전용).
+    추천 안전재고 = max(min_qty, 올림(기간 일평균 순판매량 x 리드타임 x 안전계수))
+    본사는 판매 지점이 아니므로 제외한다. 현재값과 판매가 모두 0인 조합은 목록에서 뺀다.
+    """
+    import math
+    from datetime import date as _date
+
+    d0 = _date.fromisoformat(start_date)
+    d1 = _date.fromisoformat(end_date)
+    days = (d1 - d0).days + 1
+
+    conn = get_conn()
+    try:
+        safety_rows = conn.execute(
+            "SELECT id, branch_name, item_name, item_code, qty FROM safety_stock WHERE branch_name <> '본사'"
+        ).fetchall()
+        pm_rows = conn.execute(
+            "SELECT item_code, MAX(item_name) AS item_name, MIN(NULLIF(lead_time_days, 0)) AS lead_time_days, "
+            "BOOL_OR(COALESCE(is_consumable, FALSE)) AS is_consumable, "
+            "BOOL_OR(COALESCE(order_excluded, FALSE)) AS order_excluded "
+            "FROM product_master WHERE item_code IS NOT NULL AND item_code <> '' GROUP BY item_code"
+        ).fetchall()
+        sales_rows = conn.execute(
+            "SELECT branch_name, item_code, SUM(quantity) AS sold FROM sales_records "
+            "WHERE sale_date >= ? AND sale_date <= ? AND item_code <> '' GROUP BY branch_name, item_code",
+            (start_date, end_date)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    pm = {r["item_code"]: r for r in pm_rows}
+    sold_map = {(r["branch_name"], r["item_code"]): int(r["sold"] or 0) for r in sales_rows}
+    branches = {r["branch_name"] for r in safety_rows}
+
+    def _make_row(row_id, branch, name, code, cur, sold):
+        p = pm.get(code)
+        lead = int(p["lead_time_days"]) if p and p["lead_time_days"] else 0
+        avg = sold / days
+        rec = None
+        if p is None:
+            status = "제외(마스터 없음)"
+        elif p["is_consumable"]:
+            status = "제외(소모품)"
+        elif p["order_excluded"]:
+            status = "제외(발주 제외)"
+        elif lead <= 0:
+            status = "리드타임 없음"
+        elif sold <= 0:
+            status = "판매 없음(유지)"
+        else:
+            rec = max(min_qty, math.ceil(round(avg * lead * factor, 6)))
+            if cur <= 0:
+                status = "신규 후보"
+            elif rec > cur:
+                status = "상향"
+            elif rec < cur:
+                status = "하향"
+            else:
+                status = "동일"
+        return {
+            "id": row_id, "branch_name": branch, "item_name": name, "item_code": code,
+            "lead_time": lead, "sold": sold, "avg_daily": avg, "current": cur,
+            "recommended": rec, "diff": (rec - cur) if rec is not None else None, "status": status,
+        }
+
+    out = []
+    seen = set()
+    for r in safety_rows:
+        code = r["item_code"] or ""
+        branch = r["branch_name"]
+        cur = int(r["qty"] or 0)
+        seen.add((branch, code))
+        sold = sold_map.get((branch, code), 0)
+        if cur <= 0 and sold <= 0:
+            continue
+        out.append(_make_row(r["id"], branch, r["item_name"], code, cur, sold))
+
+    # 판매는 있는데 안전재고 행 자체가 없는 조합(신규 후보)
+    for (branch, code), sold in sold_map.items():
+        if (branch, code) in seen or branch not in branches or sold <= 0:
+            continue
+        p = pm.get(code)
+        if p is None or p["is_consumable"] or p["order_excluded"]:
+            continue
+        out.append(_make_row(None, branch, p["item_name"], code, 0, sold))
+    return out
+
+
+@app.get("/master/purchase-order/safety-stock/compare", response_class=HTMLResponse)
+async def safety_stock_compare_page(
+    session_token: str = Cookie(default=None),
+    start: str = "",
+    end: str = "",
+    factor: str = "1.05",
+    min_qty: str = "1",
+    filter_branch: str = "",
+    filter_status: str = "",
+    search_item: str = "",
+    sort: str = "name"
+):
+    from html import escape as _esc
+    from datetime import date as _date, timedelta
+    import collections
+
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "safety-stock"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    conn = get_conn()
+    rng = conn.execute("SELECT MIN(sale_date) AS d0, MAX(sale_date) AS d1 FROM sales_records").fetchone()
+    conn.close()
+    if not rng or not rng["d0"]:
+        content = '<div class="card"><p>판매내역 데이터가 없습니다. 먼저 판매내역을 적재해 주세요.</p></div>'
+        return HTMLResponse(content=render_page(content, user, "master"))
+    data_start, data_end = rng["d0"], rng["d1"]
+
+    def _valid_date(s: str, default: str) -> str:
+        try:
+            _date.fromisoformat(s)
+            return s
+        except Exception:
+            return default
+
+    start_v = _valid_date((start or "").strip(), data_start)
+    end_v = _valid_date((end or "").strip(), data_end)
+    if start_v > end_v:
+        start_v, end_v = end_v, start_v
+    try:
+        factor_v = float(factor)
+        if factor_v <= 0 or factor_v > 10:
+            factor_v = 1.05
+    except ValueError:
+        factor_v = 1.05
+    try:
+        min_v = max(0, int(min_qty))
+    except ValueError:
+        min_v = 1
+
+    all_rows = _compute_safety_recommendations(start_v, end_v, factor_v, min_v)
+    days = (_date.fromisoformat(end_v) - _date.fromisoformat(start_v)).days + 1
+
+    counts = collections.Counter(r["status"] for r in all_rows)
+    cur_total = sum(r["current"] for r in all_rows if r["recommended"] is not None)
+    rec_total = sum(r["recommended"] for r in all_rows if r["recommended"] is not None)
+
+    rows = all_rows
+    if filter_branch:
+        rows = [r for r in rows if r["branch_name"] == filter_branch]
+    if filter_status:
+        rows = [r for r in rows if r["status"] == filter_status]
+    kw = (search_item or "").strip().lower()
+    if kw:
+        rows = [r for r in rows if kw in (r["item_name"] or "").lower() or kw in (r["item_code"] or "").lower()]
+    if sort == "diff":
+        rows = sorted(rows, key=lambda r: -abs(r["diff"]) if r["diff"] is not None else 0)
+    else:
+        rows = sorted(rows, key=lambda r: (r["branch_name"], r["item_name"] or ""))
+    total_rows = len(rows)
+    rows = rows[:2000]
+
+    branch_names = sorted({r["branch_name"] for r in all_rows})
+    branch_opts = '<option value="">전체 지점</option>' + "".join(
+        f'<option value="{_esc(b)}" {"selected" if b == filter_branch else ""}>{_esc(b)}</option>' for b in branch_names
+    )
+    status_opts = '<option value="">전체 상태</option>' + "".join(
+        f'<option value="{_esc(s)}" {"selected" if s == filter_status else ""}>{_esc(s)} ({counts.get(s, 0)})</option>'
+        for s in SAFETY_COMPARE_STATUSES
+    )
+
+    def _preset(label: str, n_days: int) -> str:
+        e = _date.fromisoformat(data_end)
+        s = max(_date.fromisoformat(data_start), e - timedelta(days=n_days - 1))
+        return (f'<a href="?start={s.isoformat()}&end={e.isoformat()}&factor={factor_v}&min_qty={min_v}" '
+                f'style="font-size:12px;color:#1E2761;margin-right:10px;">{label}</a>')
+
+    presets = (_preset("최근 28일", 28) + _preset("최근 56일", 56)
+               + f'<a href="?start={data_start}&end={data_end}&factor={factor_v}&min_qty={min_v}" '
+                 f'style="font-size:12px;color:#1E2761;">전체 보관기간</a>')
+
+    body = ""
+    for r in rows:
+        diff = r["diff"]
+        diff_cls = "sc-up" if (diff is not None and diff > 0) else ("sc-down" if (diff is not None and diff < 0) else "")
+        diff_txt = "-" if diff is None else f"{diff:+d}"
+        rec_txt = "-" if r["recommended"] is None else str(r["recommended"])
+        body += (
+            "<tr>"
+            f"<td>{_esc(r['branch_name'])}</td>"
+            f"<td>{_esc(r['item_name'] or '')}</td>"
+            f"<td>{_esc(r['item_code'] or '')}</td>"
+            f"<td class=\"sc-num\">{r['lead_time'] or '-'}</td>"
+            f"<td class=\"sc-num\">{r['sold']}</td>"
+            f"<td class=\"sc-num\">{r['avg_daily']:.2f}</td>"
+            f"<td class=\"sc-num\">{r['current']}</td>"
+            f"<td class=\"sc-num\"><b>{rec_txt}</b></td>"
+            f"<td class=\"sc-num {diff_cls}\">{diff_txt}</td>"
+            f"<td><span class=\"sc-chip\">{_esc(r['status'])}</span></td>"
+            "</tr>"
+        )
+    if not body:
+        body = '<tr><td colspan="10" style="text-align:center;padding:20px;color:#888;">조건에 맞는 항목이 없습니다.</td></tr>'
+
+    chips = "".join(f'<div>{_esc(s)} <b>{counts.get(s, 0)}</b></div>' for s in SAFETY_COMPARE_STATUSES)
+
+    content = f"""
+    {SAFETY_COMPARE_CSS}
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master/purchase-order/safety-stock" style="color:#1E2761;">← 안전재고 관리</a>
+      <h2>📊 안전재고 판매 기반 비교</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">
+        추천 안전재고 = 올림(기간 일평균 순판매량 × 리드타임 × 안전계수), 최소값 적용. 리드타임에 발주 주기가 포함돼 있다고 보고 별도로 더하지 않습니다.
+        이 화면은 비교만 하며 안전재고 값은 바뀌지 않습니다. 소모품·발주 제외·본사는 계산에서 제외하고 기존 값을 유지합니다.
+      </p>
+    </div>
+    <div class="card">
+      <form method="get" action="/master/purchase-order/safety-stock/compare" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+        <div><label style="font-size:12px;color:#888;">시작일</label><input type="date" name="start" value="{start_v}"></div>
+        <div><label style="font-size:12px;color:#888;">종료일</label><input type="date" name="end" value="{end_v}"></div>
+        <div><label style="font-size:12px;color:#888;">안전계수</label><input type="number" step="0.01" name="factor" value="{factor_v}" style="width:90px;"></div>
+        <div><label style="font-size:12px;color:#888;">최소값</label><input type="number" name="min_qty" value="{min_v}" style="width:80px;"></div>
+        <div><label style="font-size:12px;color:#888;">지점</label><select name="filter_branch">{branch_opts}</select></div>
+        <div><label style="font-size:12px;color:#888;">상태</label><select name="filter_status">{status_opts}</select></div>
+        <div><label style="font-size:12px;color:#888;">검색</label><input type="text" name="search_item" value="{_esc(search_item or '')}" placeholder="상품명/품번"></div>
+        <div><label style="font-size:12px;color:#888;">정렬</label>
+          <select name="sort"><option value="name" {"selected" if sort != "diff" else ""}>지점·상품명</option><option value="diff" {"selected" if sort == "diff" else ""}>변화 큰 순</option></select></div>
+        <button class="btn" type="submit">조회</button>
+      </form>
+      <p style="margin-top:8px;">{presets}</p>
+      <p style="font-size:12px;color:#666;margin-top:6px;">
+        적용 기간 {start_v} ~ {end_v} ({days}일) · 보관 데이터 {data_start} ~ {data_end}
+      </p>
+    </div>
+    <div class="sc-sum">{chips}
+      <div>계산 대상 현재 합계 <b>{cur_total}</b></div><div>추천 합계 <b>{rec_total}</b></div>
+    </div>
+    <div class="card">
+      <p style="font-size:12px;color:#666;margin-bottom:8px;">표시 {len(rows)}건 / 조건 일치 {total_rows}건{' (상위 2000건만 표시)' if total_rows > 2000 else ''}</p>
+      <div class="sc-wrap">
+        <table class="sc-table">
+          <thead><tr>
+            <th>지점</th><th>상품명</th><th>품번</th><th class="sc-num">리드타임</th><th class="sc-num">기간 판매</th>
+            <th class="sc-num">일평균</th><th class="sc-num">현재</th><th class="sc-num">추천</th><th class="sc-num">증감</th><th>상태</th>
+          </tr></thead>
+          <tbody>{body}</tbody>
+        </table>
+      </div>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
 
 @app.get("/master/purchase-order/safety-stock", response_class=HTMLResponse)
 async def safety_stock_page(
@@ -17983,6 +18259,7 @@ async def safety_stock_page(
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
       <a href="/master/purchase-tracking" style="color:#1E2761;">← 발주 주기 트래킹</a>
       <h2>🎯 안전재고 관리</h2>
+      <a href="/master/purchase-order/safety-stock/compare" style="margin-left:auto;padding:8px 14px;background:#8B5CF6;color:white;border-radius:8px;font-size:13px;text-decoration:none;">📊 판매 기반 비교</a>
     </div>
 
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
