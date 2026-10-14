@@ -12244,7 +12244,8 @@ async def purchase_tracking_page(session_token: str = Cookie(default=None)):
           box.innerHTML = `<b>${{ok ? '✅ 업로드 완료' : '❌ 업로드 실패'}}</b><br>
           적재: <b style="color:#22C55E">${{data.success}}행</b> &nbsp;
           건너뜀: <b style="color:#EF4444">${{data.skipped}}행</b> &nbsp;
-          보관기간 밖: <b style="color:#888">${{data.skipped_old || 0}}행</b>
+          보관기간 밖: <b style="color:#888">${{data.skipped_old || 0}}행</b> &nbsp;
+          품번 없어 제외: <b style="color:#888">${{data.excluded_no_code || 0}}행</b>
           ${{data.date_from ? '<br>기간: <b>' + data.date_from + ' ~ ' + data.date_to + '</b> (' + data.date_count + '일)' : ''}}
           ${{hasErr ? '<ul>' + data.errors.map(e=>`<li style="color:#EF4444;font-size:12px;">${{e}}</li>`).join('') + '</ul>' : ''}}`;
         }} catch(e) {{
@@ -15508,6 +15509,11 @@ async def master_stocktake_result_export(session_token: str = Cookie(default=Non
 # ── 판매내역(유비플러스) 일일 적재 크론 ─────────────────────────
 SALES_S3_BASE_URL = "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/sale/"
 SALES_RETENTION_DAYS = 100
+# True : 품번이 없는 판매 행(장례 서비스·소모품 묶음 등)은 DB에 저장하지 않는다.
+# False: 품번 유무와 관계없이 모두 저장한다(원복). 원복 후에는 과거 데이터를 유비에서 다시 받아 업로드해야 한다.
+# 제외된 행은 sales_excluded_summary에 날짜·상품명별 건수/수량으로 남기고,
+# 처음 보는 제외 상품명이 나오면 크론이 경고 알림을 보낸다(조용한 누락 방지).
+SALES_DROP_NO_CODE = True
 
 
 def _sales_http_get(url: str, timeout: int = 25) -> bytes:
@@ -15573,10 +15579,90 @@ def _parse_sales_csv(raw: bytes):
     return rows, skipped
 
 
+def _split_sales_rows(rows: list):
+    """품번 없는 행을 걸러낸다.
+    반환: (kept_rows, excluded)  excluded = {(sale_date, item_name): [행수, 수량합]}
+    SALES_DROP_NO_CODE가 False면 아무것도 거르지 않는다.
+    """
+    if not SALES_DROP_NO_CODE:
+        return rows, {}
+    kept = []
+    excluded = {}
+    for r in rows:
+        if r[5]:
+            kept.append(r)
+        else:
+            agg = excluded.setdefault((r[0], r[4]), [0, 0])
+            agg[0] += 1
+            agg[1] += r[6]
+    return kept, excluded
+
+
+def _known_excluded_names() -> set:
+    """지금까지 제외 기록(sales_excluded_summary)에 한 번이라도 나온 상품명 집합"""
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT DISTINCT item_name FROM sales_excluded_summary").fetchall()
+    finally:
+        conn.close()
+    return {r["item_name"] for r in rows}
+
+
+def _save_sales_excluded(excluded: dict, dates: list, now_iso: str) -> None:
+    """제외된 상품(품번 없음)의 날짜·상품명별 건수/수량을 sales_excluded_summary에 교체 저장한다."""
+    conn = get_conn()
+    try:
+        for d in dates:
+            conn.execute("DELETE FROM sales_excluded_summary WHERE sale_date=?", (d,))
+        items = list(excluded.items())
+        for start in range(0, len(items), 500):
+            chunk = items[start:start + 500]
+            placeholders = ",".join(["(?, ?, ?, ?, ?)"] * len(chunk))
+            params = []
+            for (d, name), (cnt, qty) in chunk:
+                params.extend([d, name, cnt, qty, now_iso])
+            conn.execute(
+                "INSERT INTO sales_excluded_summary (sale_date, item_name, row_cnt, qty_sum, created_at) "
+                "VALUES " + placeholders,
+                tuple(params)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_sales_rows(rows: list, now_iso: str, dates: Optional[list] = None) -> list:
+    """sales_records에 날짜 단위로 교체 저장한다(해당 날짜의 기존 행은 모두 지우고 다시 넣음).
+    dates를 주면 그 날짜들을, 없으면 rows에 있는 날짜들을 교체 대상으로 한다. 반환: 교체된 날짜 목록
+    """
+    target_dates = sorted(set(dates)) if dates else sorted({r[0] for r in rows})
+    conn = get_conn()
+    try:
+        for d in target_dates:
+            conn.execute("DELETE FROM sales_records WHERE sale_date=?", (d,))
+        for start in range(0, len(rows), 1000):
+            chunk = rows[start:start + 1000]
+            placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+            params = []
+            for r in chunk:
+                params.extend(list(r) + [now_iso])
+            conn.execute(
+                "INSERT INTO sales_records "
+                "(sale_date, sale_datetime, branch_name, customer_name, item_name, item_code, quantity, created_at) "
+                "VALUES " + placeholders,
+                tuple(params)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return target_dates
+
+
 async def _sync_sales_records(target_date: str = "") -> dict:
     """전날(또는 지정일) 판매내역 CSV를 받아 sales_records에 적재하고, 100일 지난 데이터를 삭제한다.
     - 같은 날짜를 다시 실행하면 그 날짜 행을 지우고 다시 넣는다(중복 없음).
-    - 파일이 없거나 비어 있으면 아무것도 지우지 않고 실패로 알린다.
+    - 품번 없는 행은 저장하지 않고(SALES_DROP_NO_CODE) 제외 내역을 기록하며, 새 제외 상품명이 나오면 알린다.
+    - 파일이 없거나 품번 있는 행이 하나도 없으면 아무것도 지우지 않고 실패로 알린다.
     - 적재와 보관기간 삭제는 서로 독립적으로 실행하고 각각 실패 알림을 보낸다.
     """
     import asyncio
@@ -15602,30 +15688,35 @@ async def _sync_sales_records(target_date: str = "") -> dict:
             raise ValueError(f"유효한 판매 행이 없습니다 (건너뜀 {len(skipped)}건): {url}")
 
         now_iso = kst_now.strftime("%Y-%m-%d %H:%M:%S")
-        dates = sorted({r[0] for r in rows})
-        conn = get_conn()
-        try:
-            for d in dates:
-                conn.execute("DELETE FROM sales_records WHERE sale_date=?", (d,))
-            for start in range(0, len(rows), 200):
-                chunk = rows[start:start + 200]
-                placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
-                params = []
-                for r in chunk:
-                    params.extend(list(r) + [now_iso])
-                conn.execute(
-                    "INSERT INTO sales_records "
-                    "(sale_date, sale_datetime, branch_name, customer_name, item_name, item_code, quantity, created_at) "
-                    "VALUES " + placeholders,
-                    tuple(params)
-                )
-            conn.commit()
-        finally:
-            conn.close()
+        all_dates = sorted({r[0] for r in rows})
+        kept, excluded = _split_sales_rows(rows)
+        if not kept:
+            raise ValueError(f"품번이 있는 판매 행이 없습니다 (전체 {len(rows)}행): {url}")
 
-        result["inserted"] = len(rows)
-        result["dates"] = dates
+        _save_sales_rows(kept, now_iso, all_dates)
+
+        result["inserted"] = len(kept)
+        result["dates"] = all_dates
         result["skipped"] = len(skipped)
+
+        # 제외 내역 기록 + 새 제외 상품명 알림 (조용한 누락 방지)
+        known = _known_excluded_names() if excluded else set()
+        new_names = sorted({name for (d, name) in excluded if name not in known})
+        _save_sales_excluded(excluded, all_dates, now_iso)
+        if excluded:
+            top = sorted(excluded.items(), key=lambda kv: -kv[1][0])[:10]
+            result["excluded_no_code"] = {
+                "rows": sum(v[0] for v in excluded.values()),
+                "qty": sum(v[1] for v in excluded.values()),
+                "top": [f"{name}: {v[0]}건" for (d, name), v in top],
+            }
+        if new_names:
+            result["new_excluded_names"] = new_names[:20]
+            report_cron_failure(
+                "sync-sales-records(경고)",
+                f"{target_date} 품번 없는 새 상품명 {len(new_names)}종이 제외되었습니다. "
+                f"재고 상품이면 유비에서 품번 확인이 필요합니다: {new_names[:10]}"
+            )
         if skipped:
             result["skipped_samples"] = [f"{ln}행: {why}" for ln, why in skipped[:5]]
             report_cron_failure(
@@ -15640,6 +15731,7 @@ async def _sync_sales_records(target_date: str = "") -> dict:
     # 2) 보관기간(100일) 지난 데이터 삭제 — 적재 성공 여부와 무관하게 실행
     try:
         cutoff = (kst_now - timedelta(days=SALES_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        old_cnt = 0
         conn = get_conn()
         try:
             cnt_row = conn.execute(
@@ -15648,7 +15740,8 @@ async def _sync_sales_records(target_date: str = "") -> dict:
             old_cnt = int(cnt_row["c"]) if cnt_row else 0
             if old_cnt > 0:
                 conn.execute("DELETE FROM sales_records WHERE sale_date < ?", (cutoff,))
-                conn.commit()
+            conn.execute("DELETE FROM sales_excluded_summary WHERE sale_date < ?", (cutoff,))
+            conn.commit()
         finally:
             conn.close()
         result["retention_cutoff"] = cutoff
@@ -15659,6 +15752,7 @@ async def _sync_sales_records(target_date: str = "") -> dict:
         report_cron_failure("cleanup-sales-records", err_msg)
 
     return result
+
 
 def _parse_sales_xlsx(contents: bytes):
     """판매내역 엑셀(.xlsx) -> (rows, skipped, header_row)
@@ -15755,33 +15849,6 @@ def _parse_sales_xlsx(contents: bytes):
     return rows, skipped, header_row
 
 
-def _save_sales_rows(rows: list, now_iso: str) -> list:
-    """sales_records에 날짜 단위로 교체 저장한다(해당 날짜의 기존 행은 모두 지우고 다시 넣음).
-    반환: 교체된 날짜 목록
-    """
-    dates = sorted({r[0] for r in rows})
-    conn = get_conn()
-    try:
-        for d in dates:
-            conn.execute("DELETE FROM sales_records WHERE sale_date=?", (d,))
-        for start in range(0, len(rows), 1000):
-            chunk = rows[start:start + 1000]
-            placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
-            params = []
-            for r in chunk:
-                params.extend(list(r) + [now_iso])
-            conn.execute(
-                "INSERT INTO sales_records "
-                "(sale_date, sale_datetime, branch_name, customer_name, item_name, item_code, quantity, created_at) "
-                "VALUES " + placeholders,
-                tuple(params)
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return dates
-
-
 @app.post("/master/purchase-tracking/upload-sales")
 async def purchase_tracking_upload_sales(session_token: str = Cookie(default=None), file: UploadFile = File(...)):
     from datetime import timedelta
@@ -15798,21 +15865,35 @@ async def purchase_tracking_upload_sales(session_token: str = Cookie(default=Non
         rows, skipped, header_row = _parse_sales_xlsx(contents)
         kst_now = _kst_now()
         cutoff = (kst_now - timedelta(days=SALES_RETENTION_DAYS)).strftime("%Y-%m-%d")
-        kept = [r for r in rows if r[0] >= cutoff]
-        old_cnt = len(rows) - len(kept)
-        if not kept:
+        in_range = [r for r in rows if r[0] >= cutoff]
+        old_cnt = len(rows) - len(in_range)
+        if not in_range:
             return JSONResponse(status_code=400, content={
                 "success": 0, "skipped": len(skipped), "skipped_old": old_cnt,
                 "errors": [f"보관기간({SALES_RETENTION_DAYS}일, {cutoff} 이후) 안의 판매 행이 없습니다. 전체 {len(rows)}행 중 {old_cnt}행이 기간 밖, {len(skipped)}행이 형식 오류입니다."]
             })
-        dates = _save_sales_rows(kept, kst_now.strftime("%Y-%m-%d %H:%M:%S"))
+
+        all_dates = sorted({r[0] for r in in_range})
+        kept, excluded = _split_sales_rows(in_range)
+        if not kept:
+            return JSONResponse(status_code=400, content={
+                "success": 0, "skipped": len(skipped), "skipped_old": old_cnt,
+                "errors": [f"품번이 있는 판매 행이 없습니다. 보관기간 안의 {len(in_range)}행이 모두 품번 없음입니다. 저장하지 않았습니다."]
+            })
+
+        now_iso = kst_now.strftime("%Y-%m-%d %H:%M:%S")
+        _save_sales_rows(kept, now_iso, all_dates)
+        _save_sales_excluded(excluded, all_dates, now_iso)
+        top = sorted(excluded.items(), key=lambda kv: -kv[1][0])[:5]
         return JSONResponse(content={
             "success": len(kept),
             "skipped": len(skipped),
             "skipped_old": old_cnt,
-            "date_from": dates[0],
-            "date_to": dates[-1],
-            "date_count": len(dates),
+            "excluded_no_code": sum(v[0] for v in excluded.values()),
+            "excluded_top": [f"{name}: {v[0]}건" for (d, name), v in top],
+            "date_from": all_dates[0],
+            "date_to": all_dates[-1],
+            "date_count": len(all_dates),
             "errors": [f"{ln}행: {why}" for ln, why in skipped[:10]],
         })
     except Exception as e:
