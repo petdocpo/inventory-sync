@@ -17927,9 +17927,12 @@ SAFETY_COMPARE_STATUSES = [
 ]
 
 
-def _compute_safety_recommendations(start_date: str, end_date: str, factor: float, min_qty: int) -> list:
+def _compute_safety_recommendations(start_date: str, end_date: str, factor: float, min_qty: int, moq_mode: str = "show") -> list:
     """판매내역 기준 안전재고 추천값 계산(읽기 전용).
     추천 안전재고 = max(min_qty, 올림(기간 일평균 순판매량 x 리드타임 x 안전계수))
+    moq_mode: "show"  = 추천값은 그대로 두고 MOQ 적용 발주 수량만 따로 표시
+              "round" = 추천값을 MOQ 배수로 올림
+              "floor" = 추천값이 MOQ보다 작으면 MOQ로 올림
     본사는 판매 지점이 아니므로 제외한다. 현재값과 판매가 모두 0인 조합은 목록에서 뺀다.
     """
     import math
@@ -17946,6 +17949,7 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
         ).fetchall()
         pm_rows = conn.execute(
             "SELECT item_code, MAX(item_name) AS item_name, MIN(NULLIF(lead_time_days, 0)) AS lead_time_days, "
+            "MAX(COALESCE(NULLIF(moq, 0), 1)) AS moq, "
             "BOOL_OR(COALESCE(is_consumable, FALSE)) AS is_consumable, "
             "BOOL_OR(COALESCE(order_excluded, FALSE)) AS order_excluded "
             "FROM product_master WHERE item_code IS NOT NULL AND item_code <> '' GROUP BY item_code"
@@ -17965,6 +17969,7 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
     def _make_row(row_id, branch, name, code, cur, sold):
         p = pm.get(code)
         lead = int(p["lead_time_days"]) if p and p["lead_time_days"] else 0
+        moq = int(p["moq"]) if p and p["moq"] else 1
         avg = sold / days
         rec = None
         if p is None:
@@ -17979,6 +17984,10 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
             status = "판매 없음(유지)"
         else:
             rec = max(min_qty, math.ceil(round(avg * lead * factor, 6)))
+            if moq_mode == "round":
+                rec = math.ceil(rec / moq) * moq
+            elif moq_mode == "floor":
+                rec = max(rec, moq)
             if cur <= 0:
                 status = "신규 후보"
             elif rec > cur:
@@ -17987,10 +17996,12 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
                 status = "하향"
             else:
                 status = "동일"
+        order_qty = (math.ceil(rec / moq) * moq) if rec is not None else None
         return {
             "id": row_id, "branch_name": branch, "item_name": name, "item_code": code,
-            "lead_time": lead, "sold": sold, "avg_daily": avg, "current": cur,
-            "recommended": rec, "diff": (rec - cur) if rec is not None else None, "status": status,
+            "lead_time": lead, "moq": moq, "sold": sold, "avg_daily": avg, "current": cur,
+            "recommended": rec, "order_qty": order_qty,
+            "diff": (rec - cur) if rec is not None else None, "status": status,
         }
 
     out = []
@@ -18026,7 +18037,8 @@ async def safety_stock_compare_page(
     filter_branch: str = "",
     filter_status: str = "",
     search_item: str = "",
-    sort: str = "name"
+    sort: str = "name",
+    moq_mode: str = "show"
 ):
     from html import escape as _esc
     from datetime import date as _date, timedelta
@@ -18068,7 +18080,8 @@ async def safety_stock_compare_page(
     except ValueError:
         min_v = 1
 
-    all_rows = _compute_safety_recommendations(start_v, end_v, factor_v, min_v)
+    moq_mode_v = moq_mode if moq_mode in ("show", "round", "floor") else "show"
+    all_rows = _compute_safety_recommendations(start_v, end_v, factor_v, min_v, moq_mode_v)
     days = (_date.fromisoformat(end_v) - _date.fromisoformat(start_v)).days + 1
 
     counts = collections.Counter(r["status"] for r in all_rows)
@@ -18102,11 +18115,11 @@ async def safety_stock_compare_page(
     def _preset(label: str, n_days: int) -> str:
         e = _date.fromisoformat(data_end)
         s = max(_date.fromisoformat(data_start), e - timedelta(days=n_days - 1))
-        return (f'<a href="?start={s.isoformat()}&end={e.isoformat()}&factor={factor_v}&min_qty={min_v}" '
+        return (f'<a href="?start={s.isoformat()}&end={e.isoformat()}&factor={factor_v}&min_qty={min_v}&moq_mode={moq_mode_v}" '
                 f'style="font-size:12px;color:#1E2761;margin-right:10px;">{label}</a>')
 
     presets = (_preset("최근 28일", 28) + _preset("최근 56일", 56)
-               + f'<a href="?start={data_start}&end={data_end}&factor={factor_v}&min_qty={min_v}" '
+               + f'<a href="?start={data_start}&end={data_end}&factor={factor_v}&min_qty={min_v}&moq_mode={moq_mode_v}" '
                  f'style="font-size:12px;color:#1E2761;">전체 보관기간</a>')
 
     body = ""
@@ -18115,6 +18128,7 @@ async def safety_stock_compare_page(
         diff_cls = "sc-up" if (diff is not None and diff > 0) else ("sc-down" if (diff is not None and diff < 0) else "")
         diff_txt = "-" if diff is None else f"{diff:+d}"
         rec_txt = "-" if r["recommended"] is None else str(r["recommended"])
+        ord_txt = "-" if r["order_qty"] is None else str(r["order_qty"])
         body += (
             "<tr>"
             f"<td>{_esc(r['branch_name'])}</td>"
@@ -18123,14 +18137,16 @@ async def safety_stock_compare_page(
             f"<td class=\"sc-num\">{r['lead_time'] or '-'}</td>"
             f"<td class=\"sc-num\">{r['sold']}</td>"
             f"<td class=\"sc-num\">{r['avg_daily']:.2f}</td>"
+            f"<td class=\"sc-num\">{r['moq']}</td>"
             f"<td class=\"sc-num\">{r['current']}</td>"
             f"<td class=\"sc-num\"><b>{rec_txt}</b></td>"
+            f"<td class=\"sc-num\">{ord_txt}</td>"
             f"<td class=\"sc-num {diff_cls}\">{diff_txt}</td>"
             f"<td><span class=\"sc-chip\">{_esc(r['status'])}</span></td>"
             "</tr>"
         )
     if not body:
-        body = '<tr><td colspan="10" style="text-align:center;padding:20px;color:#888;">조건에 맞는 항목이 없습니다.</td></tr>'
+        body = '<tr><td colspan="12" style="text-align:center;padding:20px;color:#888;">조건에 맞는 항목이 없습니다.</td></tr>'
 
     chips = "".join(f'<div>{_esc(s)} <b>{counts.get(s, 0)}</b></div>' for s in SAFETY_COMPARE_STATUSES)
 
@@ -18143,6 +18159,7 @@ async def safety_stock_compare_page(
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">
         추천 안전재고 = 올림(기간 일평균 순판매량 × 리드타임 × 안전계수), 최소값 적용. 리드타임에 발주 주기가 포함돼 있다고 보고 별도로 더하지 않습니다.
+        발주 시 수량은 추천값을 MOQ 배수로 올린 값으로, 발주 계산과 같은 방식입니다.
         이 화면은 비교만 하며 안전재고 값은 바뀌지 않습니다. 소모품·발주 제외·본사는 계산에서 제외하고 기존 값을 유지합니다.
       </p>
     </div>
@@ -18152,6 +18169,12 @@ async def safety_stock_compare_page(
         <div><label style="font-size:12px;color:#888;">종료일</label><input type="date" name="end" value="{end_v}"></div>
         <div><label style="font-size:12px;color:#888;">안전계수</label><input type="number" step="0.01" name="factor" value="{factor_v}" style="width:90px;"></div>
         <div><label style="font-size:12px;color:#888;">최소값</label><input type="number" name="min_qty" value="{min_v}" style="width:80px;"></div>
+        <div><label style="font-size:12px;color:#888;">MOQ 반영</label>
+          <select name="moq_mode">
+            <option value="show" {"selected" if moq_mode_v == "show" else ""}>표시만 (추천은 그대로)</option>
+            <option value="round" {"selected" if moq_mode_v == "round" else ""}>추천을 MOQ 배수로 올림</option>
+            <option value="floor" {"selected" if moq_mode_v == "floor" else ""}>추천 최소값을 MOQ로</option>
+          </select></div>
         <div><label style="font-size:12px;color:#888;">지점</label><select name="filter_branch">{branch_opts}</select></div>
         <div><label style="font-size:12px;color:#888;">상태</label><select name="filter_status">{status_opts}</select></div>
         <div><label style="font-size:12px;color:#888;">검색</label><input type="text" name="search_item" value="{_esc(search_item or '')}" placeholder="상품명/품번"></div>
@@ -18173,7 +18196,7 @@ async def safety_stock_compare_page(
         <table class="sc-table">
           <thead><tr>
             <th>지점</th><th>상품명</th><th>품번</th><th class="sc-num">리드타임</th><th class="sc-num">기간 판매</th>
-            <th class="sc-num">일평균</th><th class="sc-num">현재</th><th class="sc-num">추천</th><th class="sc-num">증감</th><th>상태</th>
+            <th class="sc-num">일평균</th><th class="sc-num">MOQ</th><th class="sc-num">현재</th><th class="sc-num">추천</th><th class="sc-num">발주 시 수량</th><th class="sc-num">증감</th><th>상태</th>
           </tr></thead>
           <tbody>{body}</tbody>
         </table>
