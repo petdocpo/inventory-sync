@@ -17907,15 +17907,17 @@ SAFETY_STOCK_EXTRA_CSS = """
 SAFETY_COMPARE_CSS = """
 <style>
 .sc-wrap { overflow-x: auto; }
-.sc-table { border-collapse: collapse; width: 100%; font-size: 13px; }
-.sc-table th, .sc-table td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; white-space: nowrap; }
-.sc-table th { background: #F8FAFC; }
+.sc-table { border-collapse: collapse !important; width: 100%; table-layout: auto !important; font-size: 13px; color: #1F2937 !important; background: #FFFFFF !important; }
+.sc-table th, .sc-table td { border: 1px solid #CBD5E1 !important; padding: 6px 10px !important; text-align: left; white-space: nowrap !important; width: auto !important; min-width: 0 !important; max-width: none !important; overflow: visible !important; text-overflow: clip !important; }
+.sc-table th { background: #1E2761 !important; color: #FFFFFF !important; font-weight: bold; resize: none !important; position: static !important; }
+.sc-table td { background: #FFFFFF !important; color: #1F2937 !important; }
+.sc-table tbody tr:nth-child(even) td { background: #F8FAFC !important; }
 .sc-num { text-align: right !important; }
-.sc-up { color: #B91C1C; font-weight: bold; }
-.sc-down { color: #1D4ED8; font-weight: bold; }
-.sc-chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #E2E8F0; color: #334155; }
+.sc-table td.sc-up { color: #B91C1C !important; font-weight: bold; }
+.sc-table td.sc-down { color: #1D4ED8 !important; font-weight: bold; }
+.sc-chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #E2E8F0 !important; color: #334155 !important; }
 .sc-sum { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-.sc-sum div { background: #F1F5F9; border-radius: 8px; padding: 8px 12px; font-size: 12px; }
+.sc-sum div { background: #F1F5F9; color: #1F2937; border-radius: 8px; padding: 8px 12px; font-size: 12px; }
 </style>
 """
 
