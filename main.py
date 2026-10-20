@@ -12790,6 +12790,7 @@ async def purchase_order_product_settings_page(
               <td class="pm-col-tax">{r['tax_setting'] or ''}</td>
               <td class="pm-col-leadtime"><input type="number" class="pm-leadtime" data-id="{r['id']}" value="{r['lead_time_days'] or 0}"></td>
               <td class="pm-col-moq"><input type="number" class="pm-moq" data-id="{r['id']}" value="{r['moq'] or 1}"></td>
+              <td class="pm-col-minsafe"><input type="number" class="pm-minsafe" data-id="{r['id']}" value="{r['min_safety_qty'] if r['min_safety_qty'] is not None else ''}" min="0" placeholder="공통" style="width:80px;"></td>
               <td class="pm-col-consumable" style="text-align:center;"><input type="checkbox" class="pm-consumable" data-id="{r['id']}" {consumable_checked} style="width:18px;height:18px;"></td>
               <td class="pm-col-category"><input type="text" class="pm-category" data-id="{r['id']}" value="{r['category'] or ''}"></td>
               <td class="pm-col-ptype"><input type="text" class="pm-ptype" data-id="{r['id']}" value="{r['product_type'] or ''}"></td>
@@ -12869,6 +12870,7 @@ async def purchase_order_product_settings_page(
           <span id="pmCheckedCount" style="font-size:13px;color:#555;">선택됨: 0건</span>
           <input type="number" id="pmBulkLeadTime" placeholder="리드타임 일괄값" style="width:130px;">
           <input type="number" id="pmBulkMoq" placeholder="MOQ 일괄값" style="width:110px;">
+          <input type="number" id="pmBulkMin" placeholder="최소 안전재고 일괄값" min="0" style="width:150px;">
           <button class="btn" type="button" onclick="applyBulkToChecked()" style="background:#8B5CF6;">✓ 체크 항목에 적용</button>
         </div>
       </div>
@@ -12884,6 +12886,7 @@ async def purchase_order_product_settings_page(
           <th class="pm-col-tax">과세설정</th>
           <th class="pm-col-leadtime" style="cursor:pointer;" onclick="sortPm('lead_time_days')">리드타임(일) {'▲' if sort_by=='lead_time_days' and sort_dir=='asc' else ('▼' if sort_by=='lead_time_days' else '')}</th>
           <th class="pm-col-moq" style="cursor:pointer;" onclick="sortPm('moq')">MOQ {'▲' if sort_by=='moq' and sort_dir=='asc' else ('▼' if sort_by=='moq' else '')}</th>
+          <th class="pm-col-minsafe" title="상품별 최소 안전재고. 비워두면 안전재고 판매 기반 비교의 공통 최소값을 씁니다.">최소 안전재고</th>
           <th class="pm-col-consumable" style="cursor:pointer;" onclick="sortPm('is_consumable')">소모품 {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
           <th class="pm-col-category">품류</th>
           <th class="pm-col-ptype">종류</th>
@@ -12929,6 +12932,7 @@ async def purchase_order_product_settings_page(
         {{ key: 'tax', label: '과세설정', locked: false }},
         {{ key: 'leadtime', label: '리드타임(일)', locked: false }},
         {{ key: 'moq', label: 'MOQ', locked: false }},
+        {{ key: 'minsafe', label: '최소 안전재고', locked: false }},
         {{ key: 'consumable', label: '소모품', locked: false }},
         {{ key: 'category', label: '품류', locked: false }},
         {{ key: 'ptype', label: '종류', locked: false }},
@@ -13050,6 +13054,7 @@ async def purchase_order_product_settings_page(
         const priceEl = document.querySelector('.pm-price[data-id="' + id + '"]');
         const leadTimeEl = document.querySelector('.pm-leadtime[data-id="' + id + '"]');
         const moqEl = document.querySelector('.pm-moq[data-id="' + id + '"]');
+        const minEl = document.querySelector('.pm-minsafe[data-id="' + id + '"]');
         const consumableEl = document.querySelector('.pm-consumable[data-id="' + id + '"]');
         const categoryEl = document.querySelector('.pm-category[data-id="' + id + '"]');
         const ptypeEl = document.querySelector('.pm-ptype[data-id="' + id + '"]');
@@ -13061,6 +13066,7 @@ async def purchase_order_product_settings_page(
             purchase_price: parseFloat(priceEl.value) || 0,
             lead_time_days: parseInt(leadTimeEl.value) || 0,
             moq: parseInt(moqEl.value) || 1,
+            min_safety_qty: (minEl && minEl.value.trim() !== '') ? Math.max(0, parseInt(minEl.value) || 0) : null,
             is_consumable: consumableEl.checked,
             category: categoryEl.value.trim(),
             product_type: ptypeEl.value.trim(),
@@ -13120,6 +13126,7 @@ async def purchase_order_product_settings_page(
           const priceEl = document.querySelector('.pm-price[data-id="' + id + '"]');
           const leadTimeEl = document.querySelector('.pm-leadtime[data-id="' + id + '"]');
           const moqEl = document.querySelector('.pm-moq[data-id="' + id + '"]');
+        const minEl = document.querySelector('.pm-minsafe[data-id="' + id + '"]');
           const consumableEl = document.querySelector('.pm-consumable[data-id="' + id + '"]');
           const categoryEl = document.querySelector('.pm-category[data-id="' + id + '"]');
           const ptypeEl = document.querySelector('.pm-ptype[data-id="' + id + '"]');
@@ -13129,6 +13136,7 @@ async def purchase_order_product_settings_page(
             purchase_price: parseFloat(priceEl.value) || 0,
             lead_time_days: parseInt(leadTimeEl.value) || 0,
             moq: parseInt(moqEl.value) || 1,
+            min_safety_qty: (minEl && minEl.value.trim() !== '') ? Math.max(0, parseInt(minEl.value) || 0) : null,
             is_consumable: consumableEl.checked,
             category: categoryEl.value.trim(),
             product_type: ptypeEl.value.trim(),
@@ -13154,10 +13162,12 @@ async def purchase_order_product_settings_page(
         if (!ids.length) {{ alert('체크된 품목이 없습니다.'); return; }}
         const leadTimeVal = document.getElementById('pmBulkLeadTime').value;
         const moqVal = document.getElementById('pmBulkMoq').value;
-        if (!leadTimeVal && !moqVal) {{ alert('리드타임 또는 MOQ 값을 입력하세요.'); return; }}
+        const minVal = document.getElementById('pmBulkMin').value;
+        if (!leadTimeVal && !moqVal && !minVal) {{ alert('리드타임, MOQ, 최소 안전재고 중 하나 이상을 입력하세요.'); return; }}
         const payload = {{ ids: ids }};
         if (leadTimeVal) payload.lead_time_days = parseInt(leadTimeVal);
         if (moqVal) payload.moq = parseInt(moqVal);
+        if (minVal) payload.min_safety_qty = Math.max(0, parseInt(minVal) || 0);
         if (!confirm(ids.length + '건에 값을 일괄 적용하시겠습니까? (즉시 DB에 저장됩니다)')) return;
         const res = await fetch('/master/purchase-order/product-master/bulk-apply', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
@@ -13453,6 +13463,47 @@ async def purchase_order_product_master_register_new(request: Request, session_t
     conn.close()
     return {"success": True}
 
+def _parse_min_safety_qty(v):
+    """상품별 최소 안전재고 입력값 변환. 비어 있으면 None(= 공통 최소값 사용), 아니면 0 이상 정수. 잘못된 값이면 ValueError."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        if v == "":
+            return None
+    n = int(float(v))
+    if n < 0:
+        raise ValueError("min_safety_qty must be >= 0")
+    return n
+
+
+def _set_min_safety_qty(conn, row_ids, value, now):
+    """선택한 행과 품번이 같은 모든 지점 행에 상품별 최소 안전재고를 함께 저장한다.
+    (비교 계산이 품번 단위로 지점 간 MAX를 쓰기 때문에, 일부 행만 바꾸면 값을 낮출 수 없다.)
+    품번이 없는 행은 그 행만 바꾼다. value가 None이면 값을 비운다."""
+    ids = [int(i) for i in row_ids]
+    if not ids:
+        return
+    ph = ",".join("?" for _ in ids)
+    found = conn.execute(
+        f"SELECT id, item_code FROM product_master WHERE id IN ({ph})", ids
+    ).fetchall()
+    codes = sorted({r["item_code"] for r in found if (r["item_code"] or "").strip()})
+    no_code_ids = [int(r["id"]) for r in found if not (r["item_code"] or "").strip()]
+    if codes:
+        cph = ",".join("?" for _ in codes)
+        conn.execute(
+            f"UPDATE product_master SET min_safety_qty=?, updated_at=? WHERE item_code IN ({cph})",
+            [value, now] + codes
+        )
+    if no_code_ids:
+        nph = ",".join("?" for _ in no_code_ids)
+        conn.execute(
+            f"UPDATE product_master SET min_safety_qty=?, updated_at=? WHERE id IN ({nph})",
+            [value, now] + no_code_ids
+        )
+
+
 @app.post("/master/purchase-order/product-master/save")
 async def purchase_order_product_master_save(request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -13474,6 +13525,15 @@ async def purchase_order_product_master_save(request: Request, session_token: st
     product_type = (data.get("product_type") or "").strip() or None
     consumable_type = (data.get("consumable_type") or "").strip() or None
 
+    # 최소 안전재고는 요청에 키가 있을 때만 반영한다(키가 없으면 기존 값 유지)
+    min_provided = "min_safety_qty" in data
+    min_safety_qty = None
+    if min_provided:
+        try:
+            min_safety_qty = _parse_min_safety_qty(data.get("min_safety_qty"))
+        except (ValueError, TypeError):
+            return JSONResponse(status_code=400, content={"detail": "최소 안전재고는 0 이상의 정수로 입력하세요."})
+
     now = datetime.now().isoformat()
     conn = get_conn()
     if row_id:
@@ -13485,6 +13545,8 @@ async def purchase_order_product_master_save(request: Request, session_token: st
             (purchase_price, lead_time_days, moq, is_consumable,
              category, product_type, consumable_type, now, row_id)
         )
+        if min_provided:
+            _set_min_safety_qty(conn, [row_id], min_safety_qty, now)
     else:
         if not branch_name or not item_name:
             conn.close()
@@ -13505,6 +13567,11 @@ async def purchase_order_product_master_save(request: Request, session_token: st
         """, (branch_name, item_name, item_code, purchase_price, supplier,
               tax_setting, lead_time_days, moq, is_consumable,
               category, product_type, consumable_type, now))
+        if min_provided and item_code:
+            conn.execute(
+                "UPDATE product_master SET min_safety_qty=?, updated_at=? WHERE item_code=?",
+                (min_safety_qty, now, item_code)
+            )
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
@@ -13522,8 +13589,25 @@ async def purchase_order_product_master_bulk_save(request: Request, session_toke
 
     now = datetime.now().isoformat()
     conn = get_conn()
+
+    # 최소 안전재고는 저장 전 DB 값과 비교해 '바뀐 행'만 반영한다
+    # (화면에 같은 품번의 행이 여러 개일 때 바뀌지 않은 행이 새 값을 덮어쓰지 않도록)
+    snap = {}
+    try:
+        id_list = [int(r.get("id")) for r in rows if r.get("id")]
+    except (ValueError, TypeError):
+        conn.close()
+        return JSONResponse(status_code=400, content={"detail": "잘못된 id가 포함되어 있습니다."})
+    if id_list:
+        sph = ",".join("?" for _ in id_list)
+        for s in conn.execute(
+            f"SELECT id, min_safety_qty FROM product_master WHERE id IN ({sph})", id_list
+        ).fetchall():
+            snap[int(s["id"])] = s["min_safety_qty"]
+
     updated = 0
     errors = []
+    min_changes = {}
     for r in rows:
         row_id = r.get("id")
         if not row_id:
@@ -13546,6 +13630,21 @@ async def purchase_order_product_master_bulk_save(request: Request, session_toke
             updated += 1
         except Exception as e:
             errors.append(f"id={row_id}: {str(e)}")
+            continue
+        if "min_safety_qty" in r:
+            try:
+                new_min = _parse_min_safety_qty(r.get("min_safety_qty"))
+            except (ValueError, TypeError):
+                errors.append(f"id={row_id}: 최소 안전재고는 0 이상의 정수여야 합니다")
+                continue
+            if new_min != snap.get(int(row_id)):
+                min_changes[int(row_id)] = new_min
+
+    for rid, val in min_changes.items():
+        try:
+            _set_min_safety_qty(conn, [rid], val, now)
+        except Exception as e:
+            errors.append(f"id={rid} 최소 안전재고: {str(e)}")
 
     conn.commit()
     conn.close()
@@ -13554,7 +13653,7 @@ async def purchase_order_product_master_bulk_save(request: Request, session_toke
 
 @app.post("/master/purchase-order/product-master/bulk-apply")
 async def purchase_order_product_master_bulk_apply(request: Request, session_token: str = Cookie(default=None)):
-    """체크된 품목들에 리드타임/MOQ 값을 일괄 적용"""
+    """체크된 품목들에 리드타임/MOQ/최소 안전재고 값을 일괄 적용"""
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
@@ -13563,31 +13662,44 @@ async def purchase_order_product_master_bulk_apply(request: Request, session_tok
     ids = data.get("ids", [])
     lead_time_days = data.get("lead_time_days")
     moq = data.get("moq")
+    min_provided = data.get("min_safety_qty") is not None
+    min_safety_qty = None
+    if min_provided:
+        try:
+            min_safety_qty = _parse_min_safety_qty(data.get("min_safety_qty"))
+        except (ValueError, TypeError):
+            return JSONResponse(status_code=400, content={"detail": "최소 안전재고는 0 이상의 정수로 입력하세요."})
+        if min_safety_qty is None:
+            min_provided = False
 
     if not ids:
         return JSONResponse(status_code=400, content={"detail": "선택된 품목이 없습니다."})
-    if lead_time_days is None and moq is None:
+    if lead_time_days is None and moq is None and not min_provided:
         return JSONResponse(status_code=400, content={"detail": "변경할 값을 입력하세요."})
+    try:
+        id_list = [int(i) for i in ids]
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"detail": "잘못된 id가 포함되어 있습니다."})
 
     now = datetime.now().isoformat()
     conn = get_conn()
-    placeholders = ",".join("?" for _ in ids)
 
-    if lead_time_days is not None and moq is not None:
+    sets = []
+    vals = []
+    if lead_time_days is not None:
+        sets.append("lead_time_days=?")
+        vals.append(lead_time_days)
+    if moq is not None:
+        sets.append("moq=?")
+        vals.append(moq)
+    if sets:
+        placeholders = ",".join("?" for _ in id_list)
         conn.execute(
-            f"UPDATE product_master SET lead_time_days=?, moq=?, updated_at=? WHERE id IN ({placeholders})",
-            [lead_time_days, moq, now] + [int(i) for i in ids]
+            f"UPDATE product_master SET {', '.join(sets)}, updated_at=? WHERE id IN ({placeholders})",
+            vals + [now] + id_list
         )
-    elif lead_time_days is not None:
-        conn.execute(
-            f"UPDATE product_master SET lead_time_days=?, updated_at=? WHERE id IN ({placeholders})",
-            [lead_time_days, now] + [int(i) for i in ids]
-        )
-    else:
-        conn.execute(
-            f"UPDATE product_master SET moq=?, updated_at=? WHERE id IN ({placeholders})",
-            [moq, now] + [int(i) for i in ids]
-        )
+    if min_provided:
+        _set_min_safety_qty(conn, id_list, min_safety_qty, now)
 
     conn.commit()
     conn.close()
