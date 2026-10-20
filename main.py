@@ -3622,11 +3622,30 @@ def adjust_quantity(branch_code: str, item_code: str, delta: int, absolute: bool
     conn.close()
     return new_qty
 
+BOT_USER_AGENT_PATTERNS = [
+    "facebookexternalhit", "Facebot", "Twitterbot",
+    "NAVER(inapp", "Blueno", "Googlebot", "bingbot",
+    "KAKAOTALK", "SkypeUriPreview", "WhatsApp", "TelegramBot",
+    "Discordbot", "LinkedInBot", "Slackbot", "vkShare",
+]
+
+def is_bot_user_agent(user_agent: str) -> bool:
+    """메신저/SNS의 링크 미리보기 봇(facebookexternalhit, NAVER 인앱 스크랩 등) 여부 판별.
+    실제 QR 스캐너(카메라 앱 → 모바일 브라우저)는 이런 문자열을 포함하지 않음."""
+    if not user_agent:
+        return False
+    ua_lower = user_agent.lower()
+    return any(pattern.lower() in ua_lower for pattern in BOT_USER_AGENT_PATTERNS)
+
 
 @app.get("/scan", response_class=HTMLResponse)
 async def scan_get(request: Request, branch_code: str, item_code: str, scan_type: str):
-    conn = get_conn()
+    user_agent = request.headers.get("user-agent", "")
+    if is_bot_user_agent(user_agent):
+        return HTMLResponse(content="OK", status_code=200)
 
+    conn = get_conn()
+    
     # ── 1분 내 동일 지점+품번+구분 중복 여부 확인 ──
     recent_dup = conn.execute(
         "SELECT id, scanned_at FROM scan_log "
