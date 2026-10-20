@@ -18051,35 +18051,17 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
     return out
 
 
-@app.get("/master/purchase-order/safety-stock/compare", response_class=HTMLResponse)
-async def safety_stock_compare_page(
-    session_token: str = Cookie(default=None),
-    start: str = "",
-    end: str = "",
-    factor: str = "1.05",
-    min_qty: str = "1",
-    filter_branch: str = "",
-    filter_status: str = "",
-    search_item: str = "",
-    sort: str = "name",
-    moq_mode: str = "show"
-):
-    from html import escape as _esc
-    from datetime import date as _date, timedelta
+def _safety_compare_load(start, end, factor, min_qty, moq_mode, filter_branch, filter_status, search_item, sort):
+    """판매 기반 비교 화면과 엑셀 다운로드가 함께 쓰는 조회·필터 처리.
+    판매내역 데이터가 없으면 None을 돌려준다. rows는 필터·정렬을 적용한 결과(건수 제한 없음)."""
     import collections
-
-    user = get_session(session_token)
-    if not user or user["role"] != "master":
-        return RedirectResponse(url="/login", status_code=303)
-    if not has_menu_permission(user["login_id"], "safety-stock"):
-        return RedirectResponse(url="/master", status_code=303)
+    from datetime import date as _date
 
     conn = get_conn()
     rng = conn.execute("SELECT MIN(sale_date) AS d0, MAX(sale_date) AS d1 FROM sales_records").fetchone()
     conn.close()
     if not rng or not rng["d0"]:
-        content = '<div class="card"><p>판매내역 데이터가 없습니다. 먼저 판매내역을 적재해 주세요.</p></div>'
-        return HTMLResponse(content=render_page(content, user, "master"))
+        return None
     data_start, data_end = rng["d0"], rng["d1"]
 
     def _valid_date(s: str, default: str) -> str:
@@ -18124,8 +18106,66 @@ async def safety_stock_compare_page(
         rows = sorted(rows, key=lambda r: -abs(r["diff"]) if r["diff"] is not None else 0)
     else:
         rows = sorted(rows, key=lambda r: (r["branch_name"], r["item_name"] or ""))
+
+    return {
+        "start_v": start_v, "end_v": end_v, "factor_v": factor_v, "min_v": min_v,
+        "moq_mode_v": moq_mode_v, "data_start": data_start, "data_end": data_end,
+        "days": days, "all_rows": all_rows, "rows": rows, "counts": counts,
+        "cur_total": cur_total, "rec_total": rec_total,
+    }
+
+
+@app.get("/master/purchase-order/safety-stock/compare", response_class=HTMLResponse)
+async def safety_stock_compare_page(
+    session_token: str = Cookie(default=None),
+    start: str = "",
+    end: str = "",
+    factor: str = "1.05",
+    min_qty: str = "1",
+    filter_branch: str = "",
+    filter_status: str = "",
+    search_item: str = "",
+    sort: str = "name",
+    moq_mode: str = "show"
+):
+    from html import escape as _esc
+    from datetime import date as _date, timedelta
+    from urllib.parse import urlencode
+
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "safety-stock"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    res = _safety_compare_load(start, end, factor, min_qty, moq_mode, filter_branch, filter_status, search_item, sort)
+    if res is None:
+        content = '<div class="card"><p>판매내역 데이터가 없습니다. 먼저 판매내역을 적재해 주세요.</p></div>'
+        return HTMLResponse(content=render_page(content, user, "master"))
+
+    start_v = res["start_v"]
+    end_v = res["end_v"]
+    factor_v = res["factor_v"]
+    min_v = res["min_v"]
+    moq_mode_v = res["moq_mode_v"]
+    data_start = res["data_start"]
+    data_end = res["data_end"]
+    days = res["days"]
+    all_rows = res["all_rows"]
+    counts = res["counts"]
+    cur_total = res["cur_total"]
+    rec_total = res["rec_total"]
+
+    rows = res["rows"]
     total_rows = len(rows)
     rows = rows[:2000]
+
+    export_qs = urlencode({
+        "start": start_v, "end": end_v, "factor": factor_v, "min_qty": min_v,
+        "moq_mode": moq_mode_v, "filter_branch": filter_branch or "",
+        "filter_status": filter_status or "", "search_item": search_item or "", "sort": sort,
+    })
+    export_url = _esc("/master/purchase-order/safety-stock/compare/export?" + export_qs)
 
     branch_names = sorted({r["branch_name"] for r in all_rows})
     branch_opts = '<option value="">전체 지점</option>' + "".join(
@@ -18153,24 +18193,29 @@ async def safety_stock_compare_page(
         diff_txt = "-" if diff is None else f"{diff:+d}"
         rec_txt = "-" if r["recommended"] is None else str(r["recommended"])
         ord_txt = "-" if r["order_qty"] is None else str(r["order_qty"])
+        if r["recommended"] is None:
+            min_txt = "-"
+        else:
+            min_txt = str(r["min_used"]) + ("★" if r["min_custom"] else "")
         body += (
             "<tr>"
-            f"<td>{_esc(r['branch_name'])}</td>"
-            f"<td>{_esc(r['item_name'] or '')}</td>"
-            f"<td>{_esc(r['item_code'] or '')}</td>"
-            f"<td class=\"sc-num\">{r['lead_time'] or '-'}</td>"
-            f"<td class=\"sc-num\">{r['sold']}</td>"
-            f"<td class=\"sc-num\">{r['avg_daily']:.2f}</td>"
-            f"<td class=\"sc-num\">{r['moq']}</td>"
-            f"<td class=\"sc-num\">{r['current']}</td>"
-            f"<td class=\"sc-num\"><b>{rec_txt}</b></td>"
-            f"<td class=\"sc-num\">{ord_txt}</td>"
-            f"<td class=\"sc-num {diff_cls}\">{diff_txt}</td>"
-            f"<td><span class=\"sc-chip\">{_esc(r['status'])}</span></td>"
+            f'<td>{_esc(r["branch_name"])}</td>'
+            f'<td>{_esc(r["item_name"] or "")}</td>'
+            f'<td>{_esc(r["item_code"] or "")}</td>'
+            f'<td class="sc-num">{r["lead_time"] or "-"}</td>'
+            f'<td class="sc-num">{r["sold"]}</td>'
+            f'<td class="sc-num">{r["avg_daily"]:.2f}</td>'
+            f'<td class="sc-num">{r["moq"]}</td>'
+            f'<td class="sc-num">{min_txt}</td>'
+            f'<td class="sc-num">{r["current"]}</td>'
+            f'<td class="sc-num"><b>{rec_txt}</b></td>'
+            f'<td class="sc-num">{ord_txt}</td>'
+            f'<td class="sc-num {diff_cls}">{diff_txt}</td>'
+            f'<td><span class="sc-chip">{_esc(r["status"])}</span></td>'
             "</tr>"
         )
     if not body:
-        body = '<tr><td colspan="12" style="text-align:center;padding:20px;color:#888;">조건에 맞는 항목이 없습니다.</td></tr>'
+        body = '<tr><td colspan="13" style="text-align:center;padding:20px;color:#888;">조건에 맞는 항목이 없습니다.</td></tr>'
 
     chips = "".join(f'<div>{_esc(s)} <b>{counts.get(s, 0)}</b></div>' for s in SAFETY_COMPARE_STATUSES)
 
@@ -18184,6 +18229,7 @@ async def safety_stock_compare_page(
       <p style="font-size:13px;color:#1E40AF;">
         추천 안전재고 = 올림(기간 일평균 순판매량 × 리드타임 × 안전계수), 최소값 적용. 리드타임에 발주 주기가 포함돼 있다고 보고 별도로 더하지 않습니다.
         발주 시 수량은 추천값을 MOQ 배수로 올린 값으로, 발주 계산과 같은 방식입니다.
+        최소 열의 ★는 상품 설정에서 상품별 최소값을 입력한 행이고, 표시가 없는 행은 위 입력창의 공통 최소값을 씁니다.
         이 화면은 비교만 하며 안전재고 값은 바뀌지 않습니다. 소모품·발주 제외·본사는 계산에서 제외하고 기존 값을 유지합니다.
       </p>
     </div>
@@ -18192,7 +18238,7 @@ async def safety_stock_compare_page(
         <div><label style="font-size:12px;color:#888;">시작일</label><input type="date" name="start" value="{start_v}"></div>
         <div><label style="font-size:12px;color:#888;">종료일</label><input type="date" name="end" value="{end_v}"></div>
         <div><label style="font-size:12px;color:#888;">안전계수</label><input type="number" step="0.01" name="factor" value="{factor_v}" style="width:90px;"></div>
-        <div><label style="font-size:12px;color:#888;">최소값</label><input type="number" name="min_qty" value="{min_v}" style="width:80px;"></div>
+        <div><label style="font-size:12px;color:#888;">공통 최소값</label><input type="number" name="min_qty" value="{min_v}" style="width:80px;"></div>
         <div><label style="font-size:12px;color:#888;">MOQ 반영</label>
           <select name="moq_mode">
             <option value="show" {"selected" if moq_mode_v == "show" else ""}>표시만 (추천은 그대로)</option>
@@ -18205,22 +18251,23 @@ async def safety_stock_compare_page(
         <div><label style="font-size:12px;color:#888;">정렬</label>
           <select name="sort"><option value="name" {"selected" if sort != "diff" else ""}>지점·상품명</option><option value="diff" {"selected" if sort == "diff" else ""}>변화 큰 순</option></select></div>
         <button class="btn" type="submit">조회</button>
+        <a href="{export_url}" class="btn" style="background:#22C55E;text-decoration:none;display:inline-block;">📥 엑셀 다운로드</a>
       </form>
       <p style="margin-top:8px;">{presets}</p>
       <p style="font-size:12px;color:#666;margin-top:6px;">
-        적용 기간 {start_v} ~ {end_v} ({days}일) · 보관 데이터 {data_start} ~ {data_end}
+        적용 기간 {start_v} ~ {end_v} ({days}일) · 보관 데이터 {data_start} ~ {data_end} · 엑셀은 마지막으로 조회한 조건 그대로 내려받습니다(조건을 바꿨다면 먼저 조회를 누르세요).
       </p>
     </div>
     <div class="sc-sum">{chips}
       <div>계산 대상 현재 합계 <b>{cur_total}</b></div><div>추천 합계 <b>{rec_total}</b></div>
     </div>
     <div class="card">
-      <p style="font-size:12px;color:#666;margin-bottom:8px;">표시 {len(rows)}건 / 조건 일치 {total_rows}건{' (상위 2000건만 표시)' if total_rows > 2000 else ''}</p>
+      <p style="font-size:12px;color:#666;margin-bottom:8px;">표시 {len(rows)}건 / 조건 일치 {total_rows}건{' (상위 2000건만 표시, 엑셀은 전체)' if total_rows > 2000 else ''}</p>
       <div class="sc-wrap">
         <table class="sc-table">
           <thead><tr>
             <th>지점</th><th>상품명</th><th>품번</th><th class="sc-num">리드타임</th><th class="sc-num">기간 판매</th>
-            <th class="sc-num">일평균</th><th class="sc-num">MOQ</th><th class="sc-num">현재</th><th class="sc-num">추천</th><th class="sc-num">발주 시 수량</th><th class="sc-num">증감</th><th>상태</th>
+            <th class="sc-num">일평균</th><th class="sc-num">MOQ</th><th class="sc-num">최소</th><th class="sc-num">현재</th><th class="sc-num">추천</th><th class="sc-num">발주 시 수량</th><th class="sc-num">증감</th><th>상태</th>
           </tr></thead>
           <tbody>{body}</tbody>
         </table>
@@ -18228,6 +18275,110 @@ async def safety_stock_compare_page(
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.get("/master/purchase-order/safety-stock/compare/export")
+async def safety_stock_compare_export(
+    session_token: str = Cookie(default=None),
+    start: str = "",
+    end: str = "",
+    factor: str = "1.05",
+    min_qty: str = "1",
+    filter_branch: str = "",
+    filter_status: str = "",
+    search_item: str = "",
+    sort: str = "name",
+    moq_mode: str = "show"
+):
+    """판매 기반 비교 결과를 엑셀로 내려받는다(화면과 같은 조회·필터 조건, 건수 제한 없음)."""
+    from io import BytesIO
+    from urllib.parse import quote
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "safety-stock"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    res = _safety_compare_load(start, end, factor, min_qty, moq_mode, filter_branch, filter_status, search_item, sort)
+    if res is None:
+        return JSONResponse(status_code=404, content={"detail": "판매내역 데이터가 없습니다."})
+
+    def _txt(v):
+        s = "" if v is None else str(v)
+        return (" " + s) if s.startswith("=") else s
+
+    head_fill = PatternFill("solid", fgColor="1E2761")
+    head_font = Font(bold=True, color="FFFFFF")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "비교"
+    headers = ["지점", "상품명", "품번", "리드타임", "기간 판매", "일평균", "MOQ", "최소값", "최소값 구분",
+               "현재", "추천", "발주 시 수량", "증감", "상태"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.fill = head_fill
+        c.font = head_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    for r in res["rows"]:
+        has_rec = r["recommended"] is not None
+        min_val = r["min_used"] if has_rec else None
+        min_kind = ("상품별" if r["min_custom"] else "공통") if has_rec else ""
+        ws.append([
+            _txt(r["branch_name"]), _txt(r["item_name"]), _txt(r["item_code"]),
+            r["lead_time"] or None, r["sold"], round(r["avg_daily"], 4), r["moq"],
+            min_val, min_kind, r["current"], r["recommended"], r["order_qty"], r["diff"], r["status"],
+        ])
+    for row in ws.iter_rows(min_row=2, min_col=6, max_col=6):
+        for c in row:
+            c.number_format = "0.00"
+    widths = [14, 36, 16, 10, 10, 10, 8, 8, 12, 8, 8, 12, 8, 16]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    moq_labels = {"show": "표시만 (추천은 그대로)", "round": "추천을 MOQ 배수로 올림", "floor": "추천 최소값을 MOQ로"}
+    ws2 = wb.create_sheet("조회 조건")
+    info = [
+        ("시작일", res["start_v"]),
+        ("종료일", res["end_v"]),
+        ("적용 일수", res["days"]),
+        ("안전계수", res["factor_v"]),
+        ("공통 최소값", res["min_v"]),
+        ("MOQ 반영", moq_labels.get(res["moq_mode_v"], res["moq_mode_v"])),
+        ("지점 필터", filter_branch or "전체"),
+        ("상태 필터", filter_status or "전체"),
+        ("검색어", search_item or ""),
+        ("정렬", "변화 큰 순" if sort == "diff" else "지점·상품명"),
+        ("내려받은 행 수", len(res["rows"])),
+        ("계산 대상 현재 합계(전체 조건)", res["cur_total"]),
+        ("추천 합계(전체 조건)", res["rec_total"]),
+        ("생성 시각(KST)", str(_kst_now())[:19]),
+        ("", ""),
+        ("[상태별 건수 - 필터 적용 전 전체]", ""),
+    ]
+    for s in SAFETY_COMPARE_STATUSES:
+        info.append((s, res["counts"].get(s, 0)))
+    for k, v in info:
+        ws2.append([k, v])
+    ws2.column_dimensions["A"].width = 34
+    ws2.column_dimensions["B"].width = 30
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"안전재고_판매기반비교_{res['start_v']}_{res['end_v']}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"}
+    )
 
 
 @app.get("/master/purchase-order/safety-stock", response_class=HTMLResponse)
