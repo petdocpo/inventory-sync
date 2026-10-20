@@ -17948,7 +17948,8 @@ SAFETY_COMPARE_STATUSES = [
 
 def _compute_safety_recommendations(start_date: str, end_date: str, factor: float, min_qty: int, moq_mode: str = "show") -> list:
     """판매내역 기준 안전재고 추천값 계산(읽기 전용).
-    추천 안전재고 = max(min_qty, 올림(기간 일평균 순판매량 x 리드타임 x 안전계수))
+    추천 안전재고 = max(최소값, 올림(기간 일평균 순판매량 x 리드타임 x 안전계수))
+    최소값: 상품 마스터 min_safety_qty(품번 단위, 지점 간 MAX)가 있으면 그 값, 비어 있으면 화면의 공통 min_qty
     moq_mode: "show"  = 추천값은 그대로 두고 MOQ 적용 발주 수량만 따로 표시
               "round" = 추천값을 MOQ 배수로 올림
               "floor" = 추천값이 MOQ보다 작으면 MOQ로 올림
@@ -17969,6 +17970,7 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
         pm_rows = conn.execute(
             "SELECT item_code, MAX(item_name) AS item_name, MIN(NULLIF(lead_time_days, 0)) AS lead_time_days, "
             "MAX(COALESCE(NULLIF(moq, 0), 1)) AS moq, "
+            "MAX(min_safety_qty) AS min_safety_qty, "
             "BOOL_OR(COALESCE(is_consumable, FALSE)) AS is_consumable, "
             "BOOL_OR(COALESCE(order_excluded, FALSE)) AS order_excluded "
             "FROM product_master WHERE item_code IS NOT NULL AND item_code <> '' GROUP BY item_code"
@@ -17989,6 +17991,8 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
         p = pm.get(code)
         lead = int(p["lead_time_days"]) if p and p["lead_time_days"] else 0
         moq = int(p["moq"]) if p and p["moq"] else 1
+        item_min = int(p["min_safety_qty"]) if p and p["min_safety_qty"] is not None else None
+        min_used = item_min if item_min is not None else min_qty
         avg = sold / days
         rec = None
         if p is None:
@@ -18002,7 +18006,7 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
         elif sold <= 0:
             status = "판매 없음(유지)"
         else:
-            rec = max(min_qty, math.ceil(round(avg * lead * factor, 6)))
+            rec = max(min_used, math.ceil(round(avg * lead * factor, 6)))
             if moq_mode == "round":
                 rec = math.ceil(rec / moq) * moq
             elif moq_mode == "floor":
@@ -18019,6 +18023,7 @@ def _compute_safety_recommendations(start_date: str, end_date: str, factor: floa
         return {
             "id": row_id, "branch_name": branch, "item_name": name, "item_code": code,
             "lead_time": lead, "moq": moq, "sold": sold, "avg_daily": avg, "current": cur,
+            "min_used": min_used, "min_custom": item_min is not None,
             "recommended": rec, "order_qty": order_qty,
             "diff": (rec - cur) if rec is not None else None, "status": status,
         }
