@@ -18227,6 +18227,92 @@ def _safety_compare_load(start, end, factor, min_qty, moq_mode, filter_branch, f
     }
 
 
+SAFETY_COMPARE_APPLY_STATUSES = ("상향", "하향", "신규 후보")
+
+SAFETY_COMPARE_APPLY_JS = r"""
+const SC_PARAMS = __PARAMS__;
+
+function scPicked() {
+  return Array.from(document.querySelectorAll('.sc-pick:checked'));
+}
+
+function scUpdateCount() {
+  const els = scPicked();
+  let up = 0, down = 0, nw = 0;
+  els.forEach(function (e) {
+    const s = e.dataset.status;
+    if (s === '상향') up++;
+    else if (s === '하향') down++;
+    else nw++;
+  });
+  document.getElementById('scPickedCount').innerText =
+    '선택됨: ' + els.length + '건 (상향 ' + up + ' / 하향 ' + down + ' / 신규 ' + nw + ')';
+}
+
+document.addEventListener('change', function (e) {
+  if (e.target.classList && e.target.classList.contains('sc-pick')) scUpdateCount();
+});
+
+function scPickAll(mode) {
+  document.querySelectorAll('.sc-pick').forEach(function (cb) {
+    if (mode === 'none') cb.checked = false;
+    else if (mode === 'up' && cb.dataset.status === '상향') cb.checked = true;
+    else if (mode === 'down' && cb.dataset.status === '하향') cb.checked = true;
+  });
+  scUpdateCount();
+}
+
+async function scApply() {
+  const els = scPicked();
+  if (!els.length) { alert('선택된 항목이 없습니다.'); return; }
+  const maxDown = parseInt(document.getElementById('scMaxDown').value) || 0;
+  let up = 0, down = 0, nw = 0;
+  const items = els.map(function (e) {
+    const s = e.dataset.status;
+    if (s === '상향') up++;
+    else if (s === '하향') down++;
+    else nw++;
+    return { key: e.dataset.key, cur: parseInt(e.dataset.cur), rec: parseInt(e.dataset.rec) };
+  });
+  const msg = '안전재고를 실제로 변경합니다.\n\n상향 ' + up + '건 / 하향 ' + down + '건 / 신규 ' + nw + '건\n'
+    + '하향 1회 최대 폭: ' + (maxDown > 0 ? (maxDown + '%') : '제한 없음') + '\n\n'
+    + '계속하시겠습니까? (변경 이력이 기록됩니다)';
+  if (!confirm(msg)) return;
+  const btn = document.getElementById('scApplyBtn');
+  btn.disabled = true;
+  const payload = Object.assign({}, SC_PARAMS, { items: items, max_down_pct: maxDown });
+  let res, data = {};
+  try {
+    res = await fetch('/master/purchase-order/safety-stock/compare/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    try { data = await res.json(); } catch (err) { data = {}; }
+  } catch (err) {
+    alert('요청 실패: ' + err);
+    btn.disabled = false;
+    return;
+  }
+  if (res.ok) {
+    let text = '적용 완료: ' + data.applied + '건 (상향 ' + data.applied_up + ' / 하향 ' + data.applied_down + ' / 신규 ' + data.applied_new + ')\n배치 ID: ' + data.batch_id;
+    if (data.skipped && data.skipped.length) {
+      text += '\n\n건너뜀 ' + data.skipped.length + '건:\n';
+      text += data.skipped.slice(0, 10).map(function (s) { return '- ' + s.key.replace('||', ' / ') + ': ' + s.reason; }).join('\n');
+      if (data.skipped.length > 10) text += '\n... 외 ' + (data.skipped.length - 10) + '건';
+    }
+    alert(text);
+    location.reload();
+  } else {
+    alert('적용 실패: ' + (data.detail || '오류'));
+    btn.disabled = false;
+  }
+}
+
+scUpdateCount();
+"""
+
+
 @app.get("/master/purchase-order/safety-stock/compare", response_class=HTMLResponse)
 async def safety_stock_compare_page(
     session_token: str = Cookie(default=None),
@@ -18243,6 +18329,7 @@ async def safety_stock_compare_page(
     from html import escape as _esc
     from datetime import date as _date, timedelta
     from urllib.parse import urlencode
+    import json as _json
 
     user = get_session(session_token)
     if not user or user["role"] != "master":
@@ -18279,6 +18366,12 @@ async def safety_stock_compare_page(
     })
     export_url = _esc("/master/purchase-order/safety-stock/compare/export?" + export_qs)
 
+    apply_params = _json.dumps(
+        {"start": start_v, "end": end_v, "factor": factor_v, "min_qty": min_v, "moq_mode": moq_mode_v},
+        ensure_ascii=False
+    )
+    script_js = SAFETY_COMPARE_APPLY_JS.replace("__PARAMS__", apply_params)
+
     branch_names = sorted({r["branch_name"] for r in all_rows})
     branch_opts = '<option value="">전체 지점</option>' + "".join(
         f'<option value="{_esc(b)}" {"selected" if b == filter_branch else ""}>{_esc(b)}</option>' for b in branch_names
@@ -18309,8 +18402,20 @@ async def safety_stock_compare_page(
             min_txt = "-"
         else:
             min_txt = str(r["min_used"]) + ("★" if r["min_custom"] else "")
+        selectable = (r["status"] in SAFETY_COMPARE_APPLY_STATUSES) and (r["recommended"] is not None)
+        if selectable:
+            key_raw = (r["branch_name"] or "") + "||" + (r["item_code"] or "")
+            pick_td = (
+                '<td style="text-align:center;"><input type="checkbox" class="sc-pick" '
+                'data-key="' + _esc(key_raw) + '" data-cur="' + str(r["current"]) + '" '
+                'data-rec="' + str(r["recommended"]) + '" data-status="' + _esc(r["status"]) + '" '
+                'style="width:16px;height:16px;"></td>'
+            )
+        else:
+            pick_td = "<td></td>"
         body += (
             "<tr>"
+            + pick_td +
             f'<td>{_esc(r["branch_name"])}</td>'
             f'<td>{_esc(r["item_name"] or "")}</td>'
             f'<td>{_esc(r["item_code"] or "")}</td>'
@@ -18327,7 +18432,7 @@ async def safety_stock_compare_page(
             "</tr>"
         )
     if not body:
-        body = '<tr><td colspan="13" style="text-align:center;padding:20px;color:#888;">조건에 맞는 항목이 없습니다.</td></tr>'
+        body = '<tr><td colspan="14" style="text-align:center;padding:20px;color:#888;">조건에 맞는 항목이 없습니다.</td></tr>'
 
     chips = "".join(f'<div>{_esc(s)} <b>{counts.get(s, 0)}</b></div>' for s in SAFETY_COMPARE_STATUSES)
 
@@ -18342,7 +18447,8 @@ async def safety_stock_compare_page(
         추천 안전재고 = 올림(기간 일평균 순판매량 × 리드타임 × 안전계수), 최소값 적용. 리드타임에 발주 주기가 포함돼 있다고 보고 별도로 더하지 않습니다.
         발주 시 수량은 추천값을 MOQ 배수로 올린 값으로, 발주 계산과 같은 방식입니다.
         최소 열의 ★는 상품 설정에서 상품별 최소값을 입력한 행이고, 표시가 없는 행은 위 입력창의 공통 최소값을 씁니다.
-        이 화면은 비교만 하며 안전재고 값은 바뀌지 않습니다. 소모품·발주 제외·본사는 계산에서 제외하고 기존 값을 유지합니다.
+        표의 체크박스로 고른 행만 <b>선택 적용</b>으로 실제 안전재고에 반영할 수 있고, 반영 내역은 변경 이력에 기록됩니다.
+        신규 후보(현재 안전재고 0)는 자동 선택되지 않으며 직접 체크한 경우에만 반영됩니다. 소모품·발주 제외·본사는 계산에서 제외하고 기존 값을 유지합니다.
       </p>
     </div>
     <div class="card">
@@ -18367,26 +18473,186 @@ async def safety_stock_compare_page(
       </form>
       <p style="margin-top:8px;">{presets}</p>
       <p style="font-size:12px;color:#666;margin-top:6px;">
-        적용 기간 {start_v} ~ {end_v} ({days}일) · 보관 데이터 {data_start} ~ {data_end} · 엑셀은 마지막으로 조회한 조건 그대로 내려받습니다(조건을 바꿨다면 먼저 조회를 누르세요).
+        적용 기간 {start_v} ~ {end_v} ({days}일) · 보관 데이터 {data_start} ~ {data_end} · 엑셀과 선택 적용은 마지막으로 조회한 조건 그대로 동작합니다(조건을 바꿨다면 먼저 조회를 누르세요).
       </p>
     </div>
     <div class="sc-sum">{chips}
       <div>계산 대상 현재 합계 <b>{cur_total}</b></div><div>추천 합계 <b>{rec_total}</b></div>
+    </div>
+    <div class="card" style="background:#FEF2F2;border:1px solid #FCA5A5;">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        <button type="button" class="btn" style="background:#64748B;" onclick="scPickAll('up')">상향 전체 선택</button>
+        <button type="button" class="btn" style="background:#64748B;" onclick="scPickAll('down')">하향 전체 선택</button>
+        <button type="button" class="btn" style="background:#94A3B8;" onclick="scPickAll('none')">선택 해제</button>
+        <span id="scPickedCount" style="font-size:13px;color:#555;">선택됨: 0건</span>
+        <label style="font-size:13px;color:#555;">하향 1회 최대 폭(%)
+          <input type="number" id="scMaxDown" value="30" min="0" max="100" style="width:70px;"></label>
+        <span style="font-size:12px;color:#888;">0이면 제한 없음. 예: 30이면 현재값의 70% 아래로는 한 번에 낮추지 않음</span>
+        <button type="button" class="btn" id="scApplyBtn" style="background:#EF4444;margin-left:auto;" onclick="scApply()">⚠️ 선택 적용</button>
+      </div>
     </div>
     <div class="card">
       <p style="font-size:12px;color:#666;margin-bottom:8px;">표시 {len(rows)}건 / 조건 일치 {total_rows}건{' (상위 2000건만 표시, 엑셀은 전체)' if total_rows > 2000 else ''}</p>
       <div class="sc-wrap">
         <table class="sc-table">
           <thead><tr>
-            <th>지점</th><th>상품명</th><th>품번</th><th class="sc-num">리드타임</th><th class="sc-num">기간 판매</th>
+            <th>선택</th><th>지점</th><th>상품명</th><th>품번</th><th class="sc-num">리드타임</th><th class="sc-num">기간 판매</th>
             <th class="sc-num">일평균</th><th class="sc-num">MOQ</th><th class="sc-num">최소</th><th class="sc-num">현재</th><th class="sc-num">추천</th><th class="sc-num">발주 시 수량</th><th class="sc-num">증감</th><th>상태</th>
           </tr></thead>
           <tbody>{body}</tbody>
         </table>
       </div>
     </div>
+    <script>{script_js}</script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/purchase-order/safety-stock/compare/apply")
+async def safety_stock_compare_apply(request: Request, session_token: str = Cookie(default=None)):
+    """선택한 추천값을 실제 안전재고에 반영한다.
+    - 화면 숫자는 믿지 않고 서버가 같은 조건으로 다시 계산한다.
+    - 화면에서 본 현재값·추천값과 서버 값이 다르면 그 행은 건너뛴다.
+    - 하향은 max_down_pct가 있으면 현재값의 (100-N)% 아래로 한 번에 낮추지 않는다.
+    - 반영 결과는 safety_stock_change_log에 batch_id로 묶어 기록한다. 중간 오류가 나면 아무것도 반영하지 않는다."""
+    import math
+    import uuid
+    from datetime import date as _date
+
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    if not has_menu_permission(user["login_id"], "safety-stock"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    items = data.get("items") or []
+    if not items:
+        return JSONResponse(status_code=400, content={"detail": "선택된 항목이 없습니다."})
+    if len(items) > 1000:
+        return JSONResponse(status_code=400, content={"detail": "한 번에 1000건까지만 적용할 수 있습니다."})
+
+    try:
+        start_v = str(data.get("start") or "")
+        end_v = str(data.get("end") or "")
+        d0 = _date.fromisoformat(start_v)
+        d1 = _date.fromisoformat(end_v)
+        factor_v = float(data.get("factor"))
+        min_v = max(0, int(data.get("min_qty")))
+        max_down = int(data.get("max_down_pct") or 0)
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"detail": "조회 조건 값이 올바르지 않습니다."})
+    if d0 > d1 or factor_v <= 0 or factor_v > 10 or max_down < 0 or max_down > 100:
+        return JSONResponse(status_code=400, content={"detail": "조회 조건 값이 올바르지 않습니다."})
+    moq_mode_v = data.get("moq_mode")
+    if moq_mode_v not in ("show", "round", "floor"):
+        moq_mode_v = "show"
+
+    live_rows = _compute_safety_recommendations(start_v, end_v, factor_v, min_v, moq_mode_v)
+    live = {}
+    for r in live_rows:
+        live.setdefault((r["branch_name"], r["item_code"] or ""), []).append(r)
+
+    skipped = []
+    changes = []
+    for it in items:
+        key = str(it.get("key") or "")
+        if "||" not in key:
+            skipped.append({"key": key, "reason": "선택 값이 올바르지 않음"})
+            continue
+        branch, code = key.split("||", 1)
+        lst = live.get((branch, code))
+        if not lst:
+            skipped.append({"key": key, "reason": "계산 대상에서 사라짐"})
+            continue
+        if len(lst) > 1:
+            skipped.append({"key": key, "reason": "같은 품번의 안전재고 행이 여러 개라 수동 확인 필요"})
+            continue
+        r = lst[0]
+        if r["recommended"] is None or r["status"] not in SAFETY_COMPARE_APPLY_STATUSES:
+            skipped.append({"key": key, "reason": "변경 대상이 아님(" + str(r["status"]) + ")"})
+            continue
+        try:
+            cur_client = int(it.get("cur"))
+            rec_client = int(it.get("rec"))
+        except (ValueError, TypeError):
+            skipped.append({"key": key, "reason": "화면 값이 올바르지 않음"})
+            continue
+        if cur_client != r["current"] or rec_client != r["recommended"]:
+            skipped.append({"key": key, "reason": "화면을 본 뒤 값이 바뀜(새로고침 후 다시 선택)"})
+            continue
+        cur = r["current"]
+        rec = r["recommended"]
+        new_qty = rec
+        note = ""
+        if rec < cur and max_down > 0:
+            floor_v = math.ceil(cur * (100 - max_down) / 100)
+            if new_qty < floor_v:
+                new_qty = floor_v
+                note = "하향 " + str(max_down) + "% 제한 적용(추천 " + str(rec) + ")"
+        if new_qty == cur:
+            skipped.append({"key": key, "reason": "변경 없음"})
+            continue
+        if r["status"] == "신규 후보":
+            ctype = "신규"
+        elif new_qty > cur:
+            ctype = "상향"
+        else:
+            ctype = "하향"
+        changes.append({
+            "id": r["id"], "branch": r["branch_name"], "item_name": r["item_name"] or "",
+            "code": r["item_code"] or "", "cur": cur, "rec": rec, "new": new_qty,
+            "ctype": ctype, "min_used": r["min_used"], "note": note,
+        })
+
+    if not changes:
+        return JSONResponse(content={
+            "status": "ok", "batch_id": "-", "applied": 0, "applied_up": 0, "applied_down": 0,
+            "applied_new": 0, "skipped": skipped
+        })
+
+    now_ss = datetime.now().isoformat()
+    kst = str(_kst_now())[:19]
+    batch_id = kst.replace("-", "").replace(":", "").replace(" ", "-") + "-" + uuid.uuid4().hex[:6]
+
+    conn = get_conn()
+    try:
+        for c in changes:
+            if c["id"]:
+                conn.execute(
+                    "UPDATE safety_stock SET qty=?, safety_qty=?, updated_at=? WHERE id=?",
+                    (c["new"], c["new"], now_ss, c["id"])
+                )
+            else:
+                conn.execute("""
+                    INSERT INTO safety_stock (branch_name, item_name, item_code, qty, safety_qty, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (branch_name, item_name) DO UPDATE SET
+                        item_code=excluded.item_code, qty=excluded.qty,
+                        safety_qty=excluded.safety_qty, updated_at=excluded.updated_at
+                """, (c["branch"], c["item_name"], c["code"], c["new"], c["new"], now_ss))
+            conn.execute("""
+                INSERT INTO safety_stock_change_log
+                    (batch_id, applied_at, applied_by, branch_name, item_name, item_code,
+                     old_qty, new_qty, recommended_qty, change_type, period_start, period_end,
+                     factor, min_used, moq_mode, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (batch_id, kst, user["login_id"], c["branch"], c["item_name"], c["code"],
+                  c["cur"], c["new"], c["rec"], c["ctype"], start_v, end_v,
+                  factor_v, c["min_used"], moq_mode_v, c["note"] or None))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"detail": "적용 실패(변경 없음): " + str(e)})
+    conn.close()
+
+    return JSONResponse(content={
+        "status": "ok", "batch_id": batch_id, "applied": len(changes),
+        "applied_up": sum(1 for c in changes if c["ctype"] == "상향"),
+        "applied_down": sum(1 for c in changes if c["ctype"] == "하향"),
+        "applied_new": sum(1 for c in changes if c["ctype"] == "신규"),
+        "skipped": skipped
+    })
 
 
 @app.get("/master/purchase-order/safety-stock/compare/export")
