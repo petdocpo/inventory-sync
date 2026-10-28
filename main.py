@@ -16291,6 +16291,7 @@ async def cron_sync_payment_records(request: Request, slot: str = "", date: str 
 
 # =====================================================================
 # 일 마감: 매출 마감 조회 화면(/closing) — payment_records 기반 카드사별 집계
+# 슬롯(21/22/24시)은 00시부터의 누적 파일이라 합치지 않고, 해당 일자의 가장 늦은 슬롯 1개만 사용한다.
 # 취소 건은 음수로 상계한다(정상 +1건/+금액, 취소 -1건/-금액).
 # =====================================================================
 CLOSING_CARD_ROWS = (
@@ -16298,7 +16299,6 @@ CLOSING_CARD_ROWS = (
     "NH농협카드", "롯데카드", "우리카드", "현금", "기타(해외)카드",
     "소비자소득공제", "사업자지출증빙", "카드명 누락",
 )
-CLOSING_SLOTS = ("21", "22", "24")
 CLOSING_SLOT_LABELS = {"21": "00~21시", "22": "00~22시", "24": "00~24시"}
 # 마감 조회에서 제외할 지점(공백 제거 기준). 데이터는 payment_records에 그대로 저장되고 조회에서만 빠진다.
 CLOSING_EXCLUDED_BRANCHES = ("남양주점",)
@@ -16310,131 +16310,155 @@ def _closing_excluded_sql():
     return "REPLACE(branch_name, ' ', '') NOT IN (" + ph + ")", list(CLOSING_EXCLUDED_BRANCHES)
 
 
+def _closing_fmt_ts(ts: str) -> str:
+    """'YYYY-MM-DD HH:MM:SS' -> 'MM/DD HH:MM'"""
+    if not ts or len(ts) < 16:
+        return "-"
+    return ts[5:7] + "/" + ts[8:10] + " " + ts[11:16]
+
+
+def _closing_status_card(label: str, value: str) -> str:
+    from html import escape as _esc
+    return (
+        '<div class="card" style="flex:1;text-align:center;padding:12px;margin-bottom:0;">'
+        '<div style="font-size:12px;color:#888;">' + _esc(label) + '</div>'
+        '<div style="font-size:16px;font-weight:bold;color:#1E2761;margin-top:4px;">' + _esc(value) + '</div>'
+        '</div>'
+    )
+
+
 def _closing_load(conn, pay_date: str, branch_norm: str, with_branch: bool):
-    """카드사별 집계(+ 전지점일 때 지점별 집계). 취소는 음수로 상계한다.
-    반환: (by_card, by_branch)
-      by_card[(slot, card_company)] = (순건수, 순금액, 취소건수, 취소금액)
-      by_branch[branch_name][slot]  = (순건수, 순금액)
+    """해당 일자의 가장 늦은 슬롯 1개만 집계한다. 취소는 음수로 상계한다.
+    반환: (latest_slot, received_at, received_rows, by_card, by_branch)
+      by_card[card_company] = (순건수, 순금액, 취소건수, 취소금액)
+      by_branch[branch_name] = (순건수, 순금액)
     """
+    meta = conn.execute(
+        "SELECT MAX(snapshot_slot) AS slot FROM payment_records WHERE pay_date=?", (pay_date,)
+    ).fetchone()
+    latest_slot = (meta["slot"] if meta else None) or ""
+    if not latest_slot:
+        return "", "", 0, {}, {}
+
+    info = conn.execute(
+        "SELECT MAX(created_at) AS received_at, COUNT(*) AS rows_cnt FROM payment_records "
+        "WHERE pay_date=? AND snapshot_slot=?",
+        (pay_date, latest_slot)
+    ).fetchone()
+    received_at = (info["received_at"] if info else None) or ""
+    received_rows = int(info["rows_cnt"] or 0) if info else 0
+
     ex_sql, ex_params = _closing_excluded_sql()
-    where = "pay_date=? AND " + ex_sql
-    params = [pay_date] + ex_params
+    where = "pay_date=? AND snapshot_slot=? AND " + ex_sql
+    params = [pay_date, latest_slot] + ex_params
     if branch_norm:
         where += " AND REPLACE(branch_name, ' ', '') = ?"
         params.append(branch_norm)
     cnt_expr = "CASE WHEN pay_status='취소' THEN -1 ELSE 1 END"
     amt_expr = "CASE WHEN pay_status='취소' THEN -approve_amount ELSE approve_amount END"
     rows = conn.execute(
-        "SELECT snapshot_slot, card_company, "
+        "SELECT card_company, "
         "SUM(" + cnt_expr + ") AS net_cnt, SUM(" + amt_expr + ") AS net_amt, "
         "SUM(CASE WHEN pay_status='취소' THEN 1 ELSE 0 END) AS cancel_cnt, "
         "SUM(CASE WHEN pay_status='취소' THEN approve_amount ELSE 0 END) AS cancel_amt "
-        "FROM payment_records WHERE " + where + " GROUP BY snapshot_slot, card_company",
+        "FROM payment_records WHERE " + where + " GROUP BY card_company",
         tuple(params)
     ).fetchall()
     by_card = {}
     for r in rows:
-        by_card[(r["snapshot_slot"], r["card_company"])] = (
+        by_card[r["card_company"]] = (
             int(r["net_cnt"] or 0), int(r["net_amt"] or 0),
             int(r["cancel_cnt"] or 0), int(r["cancel_amt"] or 0),
         )
     by_branch = {}
     if with_branch:
         brows = conn.execute(
-            "SELECT branch_name, snapshot_slot, "
-            "SUM(" + cnt_expr + ") AS net_cnt, SUM(" + amt_expr + ") AS net_amt "
-            "FROM payment_records WHERE " + where + " GROUP BY branch_name, snapshot_slot",
+            "SELECT branch_name, SUM(" + cnt_expr + ") AS net_cnt, SUM(" + amt_expr + ") AS net_amt "
+            "FROM payment_records WHERE " + where + " GROUP BY branch_name",
             tuple(params)
         ).fetchall()
         for r in brows:
-            by_branch.setdefault(r["branch_name"], {})[r["snapshot_slot"]] = (
-                int(r["net_cnt"] or 0), int(r["net_amt"] or 0)
-            )
-    return by_card, by_branch
+            by_branch[r["branch_name"]] = (int(r["net_cnt"] or 0), int(r["net_amt"] or 0))
+    return latest_slot, received_at, received_rows, by_card, by_branch
 
 
-def _closing_card_table_html(by_card: dict) -> str:
-    """카드사별 표(슬롯 3개 × 건수/금액) + 합계 + 취소 행"""
+def _closing_card_table_html(by_card: dict, receipt: Optional[dict] = None) -> str:
+    """카드사별 표: 결제내역(건수/금액) | 단말기 영수증 입력 값(건수/금액) + 합계 + 취소 행.
+    receipt가 None이면 영수증 칸은 '-'로 표시한다(영수증 기능 연결 전).
+    receipt[card_company] = (건수, 금액)
+    """
     from html import escape as _esc
-    slot_has = {s: any(k[0] == s for k in by_card) for s in CLOSING_SLOTS}
     cards = list(CLOSING_CARD_ROWS)
-    cards += sorted({k[1] for k in by_card if k[1] not in CLOSING_CARD_ROWS})
+    cards += sorted({c for c in by_card if c not in CLOSING_CARD_ROWS})
+    dash = '<td style="text-align:right;color:#bbb;">-</td>'
+    num = 'style="text-align:right;"'
 
-    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:640px;">']
-    h.append('<thead><tr><th rowspan="2" style="min-width:110px;">카드사</th>')
-    for s in CLOSING_SLOTS:
-        label = CLOSING_SLOT_LABELS[s] + ("" if slot_has[s] else " (미수신)")
-        h.append('<th colspan="2" style="text-align:center;">' + label + '</th>')
-    h.append('</tr><tr>')
-    for s in CLOSING_SLOTS:
-        h.append('<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>')
-    h.append('</tr></thead><tbody>')
+    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:520px;">']
+    h.append(
+        '<thead><tr><th rowspan="2" style="min-width:110px;">카드사</th>'
+        '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
+        '<th colspan="2" style="text-align:center;">단말기 영수증 입력 값</th></tr><tr>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th></tr></thead><tbody>'
+    )
 
-    tot = {s: [0, 0, 0, 0] for s in CLOSING_SLOTS}
+    tot_cnt = tot_amt = canc_cnt = canc_amt = rc_cnt = rc_amt = 0
     for card in cards:
-        h.append('<tr><td>' + _esc(card) + '</td>')
-        for s in CLOSING_SLOTS:
-            if not slot_has[s]:
-                h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
-                continue
-            v = by_card.get((s, card), (0, 0, 0, 0))
-            for i in range(4):
-                tot[s][i] += v[i]
-            h.append('<td style="text-align:right;">' + f"{v[0]:,}" + '</td><td style="text-align:right;">' + f"{v[1]:,}" + '</td>')
+        v = by_card.get(card, (0, 0, 0, 0))
+        tot_cnt += v[0]
+        tot_amt += v[1]
+        canc_cnt += v[2]
+        canc_amt += v[3]
+        h.append('<tr><td>' + _esc(card) + '</td>'
+                 '<td ' + num + '>' + f"{v[0]:,}" + '</td><td ' + num + '>' + f"{v[1]:,}" + '</td>')
+        if receipt is None:
+            h.append(dash + dash)
+        else:
+            r = receipt.get(card, (0, 0))
+            rc_cnt += r[0]
+            rc_amt += r[1]
+            h.append('<td ' + num + '>' + f"{r[0]:,}" + '</td><td ' + num + '>' + f"{r[1]:,}" + '</td>')
         h.append('</tr>')
 
-    h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>')
-    for s in CLOSING_SLOTS:
-        if slot_has[s]:
-            h.append('<td style="text-align:right;">' + f"{tot[s][0]:,}" + '</td><td style="text-align:right;">' + f"{tot[s][1]:,}" + '</td>')
-        else:
-            h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
+    h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>'
+             '<td ' + num + '>' + f"{tot_cnt:,}" + '</td><td ' + num + '>' + f"{tot_amt:,}" + '</td>')
+    if receipt is None:
+        h.append(dash + dash)
+    else:
+        h.append('<td ' + num + '>' + f"{rc_cnt:,}" + '</td><td ' + num + '>' + f"{rc_amt:,}" + '</td>')
     h.append('</tr>')
 
-    h.append('<tr style="color:#991B1B;"><td>└ 취소(합계에 상계 반영)</td>')
-    for s in CLOSING_SLOTS:
-        if slot_has[s]:
-            h.append('<td style="text-align:right;">' + f"{-tot[s][2]:,}" + '</td><td style="text-align:right;">' + f"{-tot[s][3]:,}" + '</td>')
-        else:
-            h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
-    h.append('</tr></tbody></table></div>')
+    h.append('<tr style="color:#991B1B;"><td>└ 취소(합계에 상계 반영)</td>'
+             '<td ' + num + '>' + f"{-canc_cnt:,}" + '</td><td ' + num + '>' + f"{-canc_amt:,}" + '</td>'
+             + dash + dash + '</tr></tbody></table></div>')
     return "".join(h)
 
 
 def _closing_branch_table_html(by_branch: dict) -> str:
-    """지점별 합계 표(전지점 조회 시): 슬롯 3개 × 건수/금액"""
+    """지점별 합계 표(전지점 조회 시): 결제내역(건수/금액) | 단말기 영수증 입력 값(건수/금액, 연결 전 '-')"""
     from html import escape as _esc
-    slot_has = {s: any(s in v for v in by_branch.values()) for s in CLOSING_SLOTS}
-    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:640px;">']
-    h.append('<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>')
-    for s in CLOSING_SLOTS:
-        label = CLOSING_SLOT_LABELS[s] + ("" if slot_has[s] else " (미수신)")
-        h.append('<th colspan="2" style="text-align:center;">' + label + '</th>')
-    h.append('</tr><tr>')
-    for s in CLOSING_SLOTS:
-        h.append('<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>')
-    h.append('</tr></thead><tbody>')
+    dash = '<td style="text-align:right;color:#bbb;">-</td>'
+    num = 'style="text-align:right;"'
 
-    tot = {s: [0, 0] for s in CLOSING_SLOTS}
+    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:520px;">']
+    h.append(
+        '<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>'
+        '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
+        '<th colspan="2" style="text-align:center;">단말기 영수증 입력 값</th></tr><tr>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th></tr></thead><tbody>'
+    )
+    tot_cnt = tot_amt = 0
     for name in sorted(by_branch):
-        h.append('<tr><td>' + _esc(name) + '</td>')
-        for s in CLOSING_SLOTS:
-            if not slot_has[s]:
-                h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
-                continue
-            v = by_branch[name].get(s, (0, 0))
-            tot[s][0] += v[0]
-            tot[s][1] += v[1]
-            h.append('<td style="text-align:right;">' + f"{v[0]:,}" + '</td><td style="text-align:right;">' + f"{v[1]:,}" + '</td>')
-        h.append('</tr>')
-
-    h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>')
-    for s in CLOSING_SLOTS:
-        if slot_has[s]:
-            h.append('<td style="text-align:right;">' + f"{tot[s][0]:,}" + '</td><td style="text-align:right;">' + f"{tot[s][1]:,}" + '</td>')
-        else:
-            h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
-    h.append('</tr></tbody></table></div>')
+        v = by_branch[name]
+        tot_cnt += v[0]
+        tot_amt += v[1]
+        h.append('<tr><td>' + _esc(name) + '</td>'
+                 '<td ' + num + '>' + f"{v[0]:,}" + '</td><td ' + num + '>' + f"{v[1]:,}" + '</td>'
+                 + dash + dash + '</tr>')
+    h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>'
+             '<td ' + num + '>' + f"{tot_cnt:,}" + '</td><td ' + num + '>' + f"{tot_amt:,}" + '</td>'
+             + dash + dash + '</tr></tbody></table></div>')
     return "".join(h)
 
 
@@ -16459,6 +16483,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             return HTMLResponse(content=render_page(
                 '<div class="card">지점 정보가 없어 마감 내역을 조회할 수 없습니다.</div>', user, "closing"))
 
+    latest_slot, received_at, received_rows, by_card, by_branch = "", "", 0, {}, {}
     conn = get_conn()
     try:
         ex_sql, ex_params = _closing_excluded_sql()
@@ -16484,9 +16509,10 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             branch_sel = ""
             branch_norm = branch_norm_user
 
-        by_card, by_branch = ({}, {})
         if date:
-            by_card, by_branch = _closing_load(conn, date, branch_norm, is_all and not branch_sel)
+            latest_slot, received_at, received_rows, by_card, by_branch = _closing_load(
+                conn, date, branch_norm, is_all and not branch_sel
+            )
     finally:
         conn.close()
 
@@ -16507,6 +16533,15 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
         parts.append('<div class="card">수신된 결제내역이 없습니다.</div>')
         return HTMLResponse(content=render_page("".join(parts), user, "closing"))
 
+    if latest_slot:
+        parts.append(
+            '<div style="display:flex;gap:10px;margin-bottom:12px;">'
+            + _closing_status_card("마지막 수신", _closing_fmt_ts(received_at))
+            + _closing_status_card("반영된 시간대", CLOSING_SLOT_LABELS.get(latest_slot, latest_slot))
+            + _closing_status_card("수신 행 수", f"{received_rows:,}건")
+            + '</div>'
+        )
+
     scope = (branch_sel or "전지점") if is_all else (user.get("branch_code") or "")
     parts.append('<div style="font-size:13px;color:#555;margin-bottom:8px;">조회 대상: <b>' + _esc(scope) + '</b> · <b>' + _esc(date) + '</b></div>')
 
@@ -16519,11 +16554,13 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             parts.append('<div class="card">' + _closing_branch_table_html(by_branch) + '</div>')
         parts.append(
             '<div style="font-size:12px;color:#888;margin-top:4px;">'
-            '※ 취소 건은 음수로 상계한 순 건수/금액입니다. 남양주점은 마감 조회에서 제외됩니다. '
-            '미수신 슬롯은 해당 시간대 결제내역이 아직 수신되지 않은 것입니다.</div>'
+            '※ 해당 일자의 가장 늦은 시간대 파일 기준이며, 취소 건은 음수로 상계한 순 건수/금액입니다. '
+            '남양주점은 마감 조회에서 제외됩니다. 단말기 영수증 입력 값은 영수증 업로드 기능 연결 후 표시됩니다.</div>'
         )
 
     return HTMLResponse(content=render_page("".join(parts), user, "closing"))
+
+
 
 @app.get("/api/cron/sync-sales-records")
 async def cron_sync_sales_records(request: Request, date: str = ""):
