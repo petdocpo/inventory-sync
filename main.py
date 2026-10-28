@@ -101,6 +101,7 @@ MENU_DEFINITIONS = {
     "stocktake-result": "재고실사(결과)",
     "notice-manage": "공지사항 관리",
     "qna-manage": "Q&A 게시판 관리",
+    "closing": "매출 마감",
 }
 
 from auth.login import (  # noqa: E402
@@ -2127,6 +2128,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     # submenu가 있으면 href는 무시되고 클릭 시 소메뉴가 토글됩니다.
     menus = [
         ("dashboard", "/", "⚠️", "대시보드", None),
+        ("closing", "/closing", "🧾", "마감", None),
         ("stock-group", None, "📦", "재고&발주", [
             ("재고현황", "/inventory"),
             ("발주내역", "/purchase-history"),
@@ -16285,6 +16287,243 @@ async def cron_sync_payment_records(request: Request, slot: str = "", date: str 
     result = await _sync_payment_records(slot, date)
     failed = bool(result.get("error") or result.get("retention_error"))
     return JSONResponse(status_code=500 if failed else 200, content=result)
+
+
+# =====================================================================
+# 일 마감: 매출 마감 조회 화면(/closing) — payment_records 기반 카드사별 집계
+# 취소 건은 음수로 상계한다(정상 +1건/+금액, 취소 -1건/-금액).
+# =====================================================================
+CLOSING_CARD_ROWS = (
+    "KB국민카드", "신한카드", "현대카드", "삼성카드", "BC카드", "계좌", "하나카드",
+    "NH농협카드", "롯데카드", "우리카드", "현금", "기타(해외)카드",
+    "소비자소득공제", "사업자지출증빙", "카드명 누락",
+)
+CLOSING_SLOTS = ("21", "22", "24")
+CLOSING_SLOT_LABELS = {"21": "00~21시", "22": "00~22시", "24": "00~24시"}
+# 마감 조회에서 제외할 지점(공백 제거 기준). 데이터는 payment_records에 그대로 저장되고 조회에서만 빠진다.
+CLOSING_EXCLUDED_BRANCHES = ("남양주점",)
+
+
+def _closing_excluded_sql():
+    """제외 지점 SQL 조각과 파라미터(공백 제거 기준 비교)"""
+    ph = ",".join(["?"] * len(CLOSING_EXCLUDED_BRANCHES))
+    return "REPLACE(branch_name, ' ', '') NOT IN (" + ph + ")", list(CLOSING_EXCLUDED_BRANCHES)
+
+
+def _closing_load(conn, pay_date: str, branch_norm: str, with_branch: bool):
+    """카드사별 집계(+ 전지점일 때 지점별 집계). 취소는 음수로 상계한다.
+    반환: (by_card, by_branch)
+      by_card[(slot, card_company)] = (순건수, 순금액, 취소건수, 취소금액)
+      by_branch[branch_name][slot]  = (순건수, 순금액)
+    """
+    ex_sql, ex_params = _closing_excluded_sql()
+    where = "pay_date=? AND " + ex_sql
+    params = [pay_date] + ex_params
+    if branch_norm:
+        where += " AND REPLACE(branch_name, ' ', '') = ?"
+        params.append(branch_norm)
+    cnt_expr = "CASE WHEN pay_status='취소' THEN -1 ELSE 1 END"
+    amt_expr = "CASE WHEN pay_status='취소' THEN -approve_amount ELSE approve_amount END"
+    rows = conn.execute(
+        "SELECT snapshot_slot, card_company, "
+        "SUM(" + cnt_expr + ") AS net_cnt, SUM(" + amt_expr + ") AS net_amt, "
+        "SUM(CASE WHEN pay_status='취소' THEN 1 ELSE 0 END) AS cancel_cnt, "
+        "SUM(CASE WHEN pay_status='취소' THEN approve_amount ELSE 0 END) AS cancel_amt "
+        "FROM payment_records WHERE " + where + " GROUP BY snapshot_slot, card_company",
+        tuple(params)
+    ).fetchall()
+    by_card = {}
+    for r in rows:
+        by_card[(r["snapshot_slot"], r["card_company"])] = (
+            int(r["net_cnt"] or 0), int(r["net_amt"] or 0),
+            int(r["cancel_cnt"] or 0), int(r["cancel_amt"] or 0),
+        )
+    by_branch = {}
+    if with_branch:
+        brows = conn.execute(
+            "SELECT branch_name, snapshot_slot, "
+            "SUM(" + cnt_expr + ") AS net_cnt, SUM(" + amt_expr + ") AS net_amt "
+            "FROM payment_records WHERE " + where + " GROUP BY branch_name, snapshot_slot",
+            tuple(params)
+        ).fetchall()
+        for r in brows:
+            by_branch.setdefault(r["branch_name"], {})[r["snapshot_slot"]] = (
+                int(r["net_cnt"] or 0), int(r["net_amt"] or 0)
+            )
+    return by_card, by_branch
+
+
+def _closing_card_table_html(by_card: dict) -> str:
+    """카드사별 표(슬롯 3개 × 건수/금액) + 합계 + 취소 행"""
+    from html import escape as _esc
+    slot_has = {s: any(k[0] == s for k in by_card) for s in CLOSING_SLOTS}
+    cards = list(CLOSING_CARD_ROWS)
+    cards += sorted({k[1] for k in by_card if k[1] not in CLOSING_CARD_ROWS})
+
+    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:640px;">']
+    h.append('<thead><tr><th rowspan="2" style="min-width:110px;">카드사</th>')
+    for s in CLOSING_SLOTS:
+        label = CLOSING_SLOT_LABELS[s] + ("" if slot_has[s] else " (미수신)")
+        h.append('<th colspan="2" style="text-align:center;">' + label + '</th>')
+    h.append('</tr><tr>')
+    for s in CLOSING_SLOTS:
+        h.append('<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>')
+    h.append('</tr></thead><tbody>')
+
+    tot = {s: [0, 0, 0, 0] for s in CLOSING_SLOTS}
+    for card in cards:
+        h.append('<tr><td>' + _esc(card) + '</td>')
+        for s in CLOSING_SLOTS:
+            if not slot_has[s]:
+                h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
+                continue
+            v = by_card.get((s, card), (0, 0, 0, 0))
+            for i in range(4):
+                tot[s][i] += v[i]
+            h.append('<td style="text-align:right;">' + f"{v[0]:,}" + '</td><td style="text-align:right;">' + f"{v[1]:,}" + '</td>')
+        h.append('</tr>')
+
+    h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>')
+    for s in CLOSING_SLOTS:
+        if slot_has[s]:
+            h.append('<td style="text-align:right;">' + f"{tot[s][0]:,}" + '</td><td style="text-align:right;">' + f"{tot[s][1]:,}" + '</td>')
+        else:
+            h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
+    h.append('</tr>')
+
+    h.append('<tr style="color:#991B1B;"><td>└ 취소(합계에 상계 반영)</td>')
+    for s in CLOSING_SLOTS:
+        if slot_has[s]:
+            h.append('<td style="text-align:right;">' + f"{-tot[s][2]:,}" + '</td><td style="text-align:right;">' + f"{-tot[s][3]:,}" + '</td>')
+        else:
+            h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
+    h.append('</tr></tbody></table></div>')
+    return "".join(h)
+
+
+def _closing_branch_table_html(by_branch: dict) -> str:
+    """지점별 합계 표(전지점 조회 시): 슬롯 3개 × 건수/금액"""
+    from html import escape as _esc
+    slot_has = {s: any(s in v for v in by_branch.values()) for s in CLOSING_SLOTS}
+    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:640px;">']
+    h.append('<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>')
+    for s in CLOSING_SLOTS:
+        label = CLOSING_SLOT_LABELS[s] + ("" if slot_has[s] else " (미수신)")
+        h.append('<th colspan="2" style="text-align:center;">' + label + '</th>')
+    h.append('</tr><tr>')
+    for s in CLOSING_SLOTS:
+        h.append('<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>')
+    h.append('</tr></thead><tbody>')
+
+    tot = {s: [0, 0] for s in CLOSING_SLOTS}
+    for name in sorted(by_branch):
+        h.append('<tr><td>' + _esc(name) + '</td>')
+        for s in CLOSING_SLOTS:
+            if not slot_has[s]:
+                h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
+                continue
+            v = by_branch[name].get(s, (0, 0))
+            tot[s][0] += v[0]
+            tot[s][1] += v[1]
+            h.append('<td style="text-align:right;">' + f"{v[0]:,}" + '</td><td style="text-align:right;">' + f"{v[1]:,}" + '</td>')
+        h.append('</tr>')
+
+    h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>')
+    for s in CLOSING_SLOTS:
+        if slot_has[s]:
+            h.append('<td style="text-align:right;">' + f"{tot[s][0]:,}" + '</td><td style="text-align:right;">' + f"{tot[s][1]:,}" + '</td>')
+        else:
+            h.append('<td style="text-align:right;color:#bbb;">-</td><td style="text-align:right;color:#bbb;">-</td>')
+    h.append('</tr></tbody></table></div>')
+    return "".join(h)
+
+
+@app.get("/closing", response_class=HTMLResponse)
+async def closing_page(session_token: str = Cookie(default=None), branch: str = "", date: str = ""):
+    import re
+    from html import escape as _esc
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_all and not has_menu_permission(user["login_id"], "closing"):
+        return RedirectResponse(url="/", status_code=303)
+
+    if is_all:
+        branch_norm_user = ""
+    else:
+        branch_norm_user = (user.get("branch_code") or "").replace(" ", "")
+        if not branch_norm_user:
+            return HTMLResponse(content=render_page(
+                '<div class="card">지점 정보가 없어 마감 내역을 조회할 수 없습니다.</div>', user, "closing"))
+
+    conn = get_conn()
+    try:
+        ex_sql, ex_params = _closing_excluded_sql()
+        date_rows = conn.execute(
+            "SELECT DISTINCT pay_date FROM payment_records WHERE " + ex_sql + " ORDER BY pay_date DESC LIMIT 100",
+            tuple(ex_params)
+        ).fetchall()
+        dates = [r["pay_date"] for r in date_rows]
+        branch_rows = conn.execute(
+            "SELECT DISTINCT branch_name FROM payment_records WHERE " + ex_sql + " ORDER BY branch_name",
+            tuple(ex_params)
+        ).fetchall()
+        branch_options = [r["branch_name"] for r in branch_rows]
+
+        date = (date or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            date = dates[0] if dates else ""
+
+        if is_all:
+            branch_sel = branch if branch in branch_options else ""
+            branch_norm = branch_sel.replace(" ", "")
+        else:
+            branch_sel = ""
+            branch_norm = branch_norm_user
+
+        by_card, by_branch = ({}, {})
+        if date:
+            by_card, by_branch = _closing_load(conn, date, branch_norm, is_all and not branch_sel)
+    finally:
+        conn.close()
+
+    parts = ['<h2 style="margin-bottom:8px;">🧾 매출 마감</h2>']
+
+    form = ['<form method="get" action="/closing" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px;">']
+    if is_all:
+        form.append('<div><div style="font-size:12px;color:#666;">지점</div><select name="branch" style="width:auto;min-width:140px;">')
+        form.append('<option value=""' + ('' if branch_sel else ' selected') + '>전지점</option>')
+        for b in branch_options:
+            form.append('<option value="' + _esc(b) + '"' + (' selected' if b == branch_sel else '') + '>' + _esc(b) + '</option>')
+        form.append('</select></div>')
+    form.append('<div><div style="font-size:12px;color:#666;">일자</div><input type="date" name="date" value="' + _esc(date) + '" style="width:auto;"></div>')
+    form.append('<button class="btn" type="submit">조회</button></form>')
+    parts.append("".join(form))
+
+    if not dates:
+        parts.append('<div class="card">수신된 결제내역이 없습니다.</div>')
+        return HTMLResponse(content=render_page("".join(parts), user, "closing"))
+
+    scope = (branch_sel or "전지점") if is_all else (user.get("branch_code") or "")
+    parts.append('<div style="font-size:13px;color:#555;margin-bottom:8px;">조회 대상: <b>' + _esc(scope) + '</b> · <b>' + _esc(date) + '</b></div>')
+
+    if not by_card:
+        parts.append('<div class="card">해당 일자의 결제내역이 없습니다.</div>')
+    else:
+        parts.append('<div class="card">' + _closing_card_table_html(by_card) + '</div>')
+        if is_all and not branch_sel and by_branch:
+            parts.append('<h3 style="margin:16px 0 8px;">지점별 합계</h3>')
+            parts.append('<div class="card">' + _closing_branch_table_html(by_branch) + '</div>')
+        parts.append(
+            '<div style="font-size:12px;color:#888;margin-top:4px;">'
+            '※ 취소 건은 음수로 상계한 순 건수/금액입니다. 남양주점은 마감 조회에서 제외됩니다. '
+            '미수신 슬롯은 해당 시간대 결제내역이 아직 수신되지 않은 것입니다.</div>'
+        )
+
+    return HTMLResponse(content=render_page("".join(parts), user, "closing"))
 
 @app.get("/api/cron/sync-sales-records")
 async def cron_sync_sales_records(request: Request, date: str = ""):
