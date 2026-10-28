@@ -2123,32 +2123,38 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     notice_menu_href = "/master/notice" if is_master else "/notice"
     qna_menu_href = "/master/qna" if is_master else "/qna"
 
-    # menus: (key, href|None, icon, label, submenu|None)
+        # menus: (key, href|None, icon, label, submenu|None)
     # submenu가 있으면 href는 무시되고 클릭 시 소메뉴가 토글됩니다.
     menus = [
         ("dashboard", "/", "⚠️", "대시보드", None),
-        ("inventory", "/inventory", "📦", "재고현황", None),
+        ("stock-group", None, "📦", "재고&발주", [
+            ("재고현황", "/inventory"),
+            ("발주내역", "/purchase-history"),
+        ]),
         ("qr", "/qr", "📷", "QR생성", None),
         ("adjust", "/adjust", "✏️", "수기조정", None),
         ("scanlog", "/scan-log", "📜", "스캔이력", None),
-        ("survey-group", None, "📋", "설문", [
+        ("notice-group", None, "📢", "공지&설문", [
+            ("공지사항", notice_menu_href),
+            ("Q&A 게시판", qna_menu_href),
             ("설문 응답", survey_menu_href),
             ("거래처 평가", vendor_eval_href),
         ]),
-        ("notice-group", None, "📢", "공지", [
-            ("공지사항", notice_menu_href),
-            ("Q&A 게시판", qna_menu_href),
-        ]),
-        ("purchase-history", "/purchase-history", "📦", "발주내역", None),
     ]
     if is_master:
         menus.append(("teams-webhook", "/master/teams-webhook", "🔔", "팀즈웹훅", None))
         menus.append(("master", "/master", "⚙️", "마스터", None))
 
+    # 합쳐진 메뉴는 기존 각 페이지가 넘기는 active 값으로도 강조되도록 묶어 둔다
+    menu_active_keys = {
+        "stock-group": ("stock-group", "inventory", "purchase-history"),
+        "notice-group": ("notice-group", "survey-group", "notice", "qna", "survey", "vendor-eval"),
+    }
+
     menu_html = ""
     submenu_popups_html = ""
     for key, href, icon, label, submenu in menus:
-        is_active = "background:#1E2761;color:white;" if active == key else "color:#555;"
+        is_active = "background:#1E2761;color:white;" if (active == key or active in menu_active_keys.get(key, ())) else "color:#555;"
         if submenu:
             menu_html += f"""
         <div onclick="toggleSubmenu('{key}')" style="flex:1;text-align:center;padding:8px 0;
