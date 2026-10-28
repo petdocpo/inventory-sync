@@ -16030,6 +16030,255 @@ async def purchase_tracking_upload_sales(session_token: str = Cookie(default=Non
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": 0, "skipped": 0, "errors": [str(e)[:300]]})
 
+# =====================================================================
+# 일 마감 A단계: 결제내역(유비플러스) 수신 크론 — payment_records 적재
+# 하루 3회(21시·22시·24시 슬롯) 같은 파일이 덮어쓰기로 올라오므로, 호출 시점(slot)별로 스냅샷을 따로 저장한다.
+# =====================================================================
+PAYMENT_S3_BASE_URL = ""  # TODO: 결제내역 CSV가 올라오는 S3 폴더 주소 (끝에 / 포함)
+PAYMENT_RETENTION_DAYS = 100
+PAYMENT_SLOTS = ("21", "22", "24")
+
+
+def _normalize_payment_card(card_raw: str, pay_type: str):
+    """CSV 원본 카드사 값 -> (정규화된 분류, 알 수 없는 카드명 여부)
+    - 앞의 숫자 코드(0008, 0256 등)와 공백을 제거한다.
+    - 소비자소득공제 / 사업자지출증빙은 결제구분과 관계없이 그 값으로 분류한다.
+    - 카드사가 비어 있으면 결제구분(계좌/현금)으로, 그 외는 '카드명 누락'으로 분류한다.
+    - 목록에 없는 카드명은 '기타(해외)카드'로 분류하고 알 수 없는 카드명으로 표시한다.
+    """
+    import re
+    s = re.sub(r"^\d+", "", (card_raw or "").strip()).strip()
+    if "소비자소득공제" in s:
+        return "소비자소득공제", False
+    if "사업자지출증빙" in s or "사업자소득공제" in s:
+        return "사업자지출증빙", False
+    if not s:
+        if pay_type == "계좌":
+            return "계좌", False
+        if pay_type == "현금":
+            return "현금", False
+        return "카드명 누락", False
+    up = s.upper()
+    rules = [
+        ("BC카드", ("비씨", "BC")),
+        ("KB국민카드", ("국민", "KB")),
+        ("신한카드", ("신한",)),
+        ("현대카드", ("현대",)),
+        ("삼성카드", ("삼성",)),
+        ("하나카드", ("하나",)),
+        ("NH농협카드", ("농협", "NH")),
+        ("롯데카드", ("롯데",)),
+        ("우리카드", ("우리",)),
+    ]
+    for name, keys in rules:
+        if any(k in up for k in keys):
+            return name, False
+    return "기타(해외)카드", True
+
+
+def _parse_payment_csv(raw: bytes, target_date: str):
+    """결제내역 CSV bytes -> (rows, skipped, unknown_cards)
+    rows: [(pay_date, pay_datetime, branch_name, customer_name, pay_type, approve_amount,
+            card_company_raw, card_company, approval_no, card_no_masked, pay_status, receipt_no)]
+    target_date: 'YYYY-MM-DD' — 이 날짜가 아닌 결제 행은 건너뛴다.
+    """
+    import csv
+    import io
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp949")
+    reader = csv.DictReader(io.StringIO(text))
+    header = [(h or "").strip() for h in (reader.fieldnames or [])]
+    required = ["결제일시", "고객명", "결제구분", "승인금액", "카드사", "승인번호",
+                "카드번호", "결제상태", "영수증번호", "지점"]
+    missing = [h for h in required if h not in header]
+    if missing:
+        raise ValueError(f"CSV 헤더 불일치: 누락 {missing}, 실제 {header}")
+    reader.fieldnames = header
+
+    rows = []
+    skipped = []
+    unknown_cards = set()
+    for line_no, r in enumerate(reader, start=2):
+        dt_raw = (r.get("결제일시") or "").strip()
+        dt = None
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(dt_raw, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            skipped.append((line_no, f"결제일시 형식 오류: {dt_raw}"))
+            continue
+        pay_date = dt.strftime("%Y-%m-%d")
+        if pay_date != target_date:
+            skipped.append((line_no, f"대상 날짜({target_date})가 아닌 결제: {pay_date}"))
+            continue
+        branch_name = (r.get("지점") or "").strip()
+        if not branch_name:
+            skipped.append((line_no, "지점 비어 있음"))
+            continue
+        amt_raw = (r.get("승인금액") or "").strip()
+        try:
+            approve_amount = int(float(amt_raw))
+        except ValueError:
+            skipped.append((line_no, f"승인금액 형식 오류: {amt_raw}"))
+            continue
+        pay_type = (r.get("결제구분") or "").strip()
+        card_raw = (r.get("카드사") or "").strip()
+        card_company, is_unknown = _normalize_payment_card(card_raw, pay_type)
+        if is_unknown:
+            unknown_cards.add(card_raw)
+        rows.append((
+            pay_date,
+            dt.strftime("%Y-%m-%d %H:%M"),
+            branch_name,
+            (r.get("고객명") or "").strip(),
+            pay_type,
+            approve_amount,
+            card_raw,
+            card_company,
+            (r.get("승인번호") or "").strip(),
+            (r.get("카드번호") or "").strip(),
+            (r.get("결제상태") or "").strip(),
+            (r.get("영수증번호") or "").strip(),
+        ))
+    return rows, skipped, unknown_cards
+
+
+def _save_payment_rows(rows: list, target_date: str, slot: str, now_iso: str) -> None:
+    """payment_records에 (pay_date, snapshot_slot) 단위로 교체 저장한다(같은 슬롯 재실행해도 중복 없음)."""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "DELETE FROM payment_records WHERE pay_date=? AND snapshot_slot=?",
+            (target_date, slot)
+        )
+        for start in range(0, len(rows), 500):
+            chunk = rows[start:start + 500]
+            placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+            params = []
+            for r in chunk:
+                params.extend([r[0], slot] + list(r[1:]) + [now_iso])
+            conn.execute(
+                "INSERT INTO payment_records "
+                "(pay_date, snapshot_slot, pay_datetime, branch_name, customer_name, pay_type, "
+                "approve_amount, card_company_raw, card_company, approval_no, card_no_masked, "
+                "pay_status, receipt_no, created_at) "
+                "VALUES " + placeholders,
+                tuple(params)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
+    """결제내역 CSV를 받아 payment_records에 슬롯별 스냅샷으로 적재하고, 100일 지난 데이터를 삭제한다.
+    - slot: '21' / '22' / '24'. 24시 슬롯(00:10 호출)은 전날 파일을, 21·22시 슬롯은 당일 파일을 처리한다.
+    - 같은 (날짜, 슬롯)을 다시 실행하면 그 슬롯의 행을 지우고 다시 넣는다(중복 없음).
+    - 파일이 없거나 유효한 행이 하나도 없으면 아무것도 지우지 않고 실패로 알린다.
+    - 적재와 보관기간 삭제는 서로 독립적으로 실행하고 각각 실패 알림을 보낸다.
+    """
+    import asyncio
+    import urllib.parse
+    import urllib.error
+    from datetime import timedelta
+
+    kst_now = _kst_now()
+    if not target_date:
+        base_day = kst_now - timedelta(days=1) if slot == "24" else kst_now
+        target_date = base_day.strftime("%Y%m%d")
+    target_iso = f"{target_date[0:4]}-{target_date[4:6]}-{target_date[6:8]}"
+    filename = f"유비플러스_결제내역_{target_date}.csv"
+    url = PAYMENT_S3_BASE_URL + urllib.parse.quote(filename)
+    result = {"slot": slot, "target_date": target_date, "url": url}
+
+    # 1) 다운로드 + 적재
+    try:
+        if not PAYMENT_S3_BASE_URL:
+            raise RuntimeError("PAYMENT_S3_BASE_URL이 설정되지 않았습니다(main.py의 결제내역 S3 폴더 주소).")
+        try:
+            raw = await asyncio.to_thread(_sales_http_get, url)
+        except urllib.error.HTTPError as he:
+            raise RuntimeError(f"S3 다운로드 실패 HTTP {he.code} (파일 미업로드 가능성): {url}")
+        rows, skipped, unknown_cards = _parse_payment_csv(raw, target_iso)
+        if not rows:
+            raise ValueError(f"유효한 결제 행이 없습니다 (건너뜀 {len(skipped)}건): {url}")
+
+        now_iso = kst_now.strftime("%Y-%m-%d %H:%M:%S")
+        _save_payment_rows(rows, target_iso, slot, now_iso)
+
+        by_card = {}
+        for r in rows:
+            by_card[r[7]] = by_card.get(r[7], 0) + 1
+        result["inserted"] = len(rows)
+        result["skipped"] = len(skipped)
+        result["by_card"] = by_card
+
+        if unknown_cards:
+            result["unknown_cards"] = sorted(unknown_cards)[:20]
+            report_cron_failure(
+                "sync-payment-records(경고)",
+                f"{target_date} {slot}시 슬롯: 목록에 없는 카드사 값이 '기타(해외)카드'로 분류되었습니다. "
+                f"국내 카드라면 정규화 규칙 추가가 필요합니다: {sorted(unknown_cards)[:10]}"
+            )
+        if skipped:
+            result["skipped_samples"] = [f"{ln}행: {why}" for ln, why in skipped[:5]]
+            report_cron_failure(
+                "sync-payment-records(경고)",
+                f"{target_date} {slot}시 슬롯: {len(skipped)}행을 건너뛰었습니다. 예: {result['skipped_samples']}"
+            )
+    except Exception as e:
+        err_msg = str(e)[:500]
+        result["error"] = err_msg
+        report_cron_failure("sync-payment-records", err_msg)
+
+    # 2) 보관기간(100일) 지난 데이터 삭제 — 적재 성공 여부와 무관하게 실행
+    try:
+        cutoff = (kst_now - timedelta(days=PAYMENT_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        old_cnt = 0
+        conn = get_conn()
+        try:
+            cnt_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM payment_records WHERE pay_date < ?", (cutoff,)
+            ).fetchone()
+            old_cnt = int(cnt_row["c"]) if cnt_row else 0
+            if old_cnt > 0:
+                conn.execute("DELETE FROM payment_records WHERE pay_date < ?", (cutoff,))
+            conn.commit()
+        finally:
+            conn.close()
+        result["retention_cutoff"] = cutoff
+        result["deleted_old"] = old_cnt
+    except Exception as e:
+        err_msg = str(e)[:500]
+        result["retention_error"] = err_msg
+        report_cron_failure("cleanup-payment-records", err_msg)
+
+    return result
+
+
+@app.get("/api/cron/sync-payment-records")
+async def cron_sync_payment_records(request: Request, slot: str = "", date: str = ""):
+    import re
+    auth_header = request.headers.get("authorization", "")
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+    slot = (slot or "").strip()
+    if slot not in PAYMENT_SLOTS:
+        return JSONResponse(status_code=400, content={"detail": "slot은 21, 22, 24 중 하나여야 합니다."})
+    date = (date or "").strip()
+    if date and not re.fullmatch(r"\d{8}", date):
+        return JSONResponse(status_code=400, content={"detail": "date는 YYYYMMDD 형식이어야 합니다."})
+
+    result = await _sync_payment_records(slot, date)
+    failed = bool(result.get("error") or result.get("retention_error"))
+    return JSONResponse(status_code=500 if failed else 200, content=result)
 
 @app.get("/api/cron/sync-sales-records")
 async def cron_sync_sales_records(request: Request, date: str = ""):
