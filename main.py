@@ -16034,7 +16034,7 @@ async def purchase_tracking_upload_sales(session_token: str = Cookie(default=Non
 # 일 마감 A단계: 결제내역(유비플러스) 수신 크론 — payment_records 적재
 # 하루 3회(21시·22시·24시 슬롯) 같은 파일이 덮어쓰기로 올라오므로, 호출 시점(slot)별로 스냅샷을 따로 저장한다.
 # =====================================================================
-PAYMENT_S3_BASE_URL = ""  # TODO: 결제내역 CSV가 올라오는 S3 폴더 주소 (끝에 / 포함)
+PAYMENT_S3_BASE_URL = "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/payment/"  # 결제내역 CSV S3 폴더 주소 (끝에 / 포함)
 PAYMENT_RETENTION_DAYS = 100
 PAYMENT_SLOTS = ("21", "22", "24")
 
