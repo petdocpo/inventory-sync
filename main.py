@@ -16183,11 +16183,111 @@ def _save_payment_rows(rows: list, target_date: str, slot: str, now_iso: str) ->
         conn.close()
 
 
+def _payment_http_get_meta(url: str, timeout: int = 25):
+    """S3에서 파일을 받으면서 갱신 시각(Last-Modified)과 ETag도 함께 돌려준다. 반환: (bytes, meta dict)"""
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "inventory-sync/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+        meta = {
+            "last_modified": resp.headers.get("Last-Modified", "") or "",
+            "etag": (resp.headers.get("ETag", "") or "").strip('"'),
+            "size": len(body),
+        }
+    return body, meta
+
+
+def _payment_prev_success(target_iso: str, slot: str):
+    """같은 일자의 직전(더 이른) 시간대 성공 로그. 없거나 조회 실패하면 None"""
+    try:
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT slot, s3_etag, rows_inserted FROM payment_sync_log "
+                "WHERE target_date=? AND status='success' AND slot<? ORDER BY slot DESC, run_at DESC LIMIT 1",
+                (target_iso, slot)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return {"slot": row["slot"], "etag": row["s3_etag"] or "", "rows": row["rows_inserted"]}
+
+
+def _payment_freshness(slot: str, target_iso: str, meta: dict, rows_n: int, max_pay: str, prev):
+    """S3 파일이 이 시간대에 맞게 덮어쓰기된 최신 파일인지 판정한다.
+    반환: (freshness: 'ok'|'warn'|'unknown', note, S3 갱신 시각(KST 문자열))
+    - 갱신 시각이 이 시간대 생성 시각(21/22시 정각, 24시는 다음날 0시)보다 이전이면 이전 파일 의심
+    - 행 수가 직전 시간대보다 줄었거나, 이 시간대 마감 시각 이후의 결제가 들어 있으면 경고(누적 파일이므로)
+    """
+    from datetime import datetime as _dt, timedelta, timezone
+    from email.utils import parsedate_to_datetime
+
+    notes = []
+    warn = False
+    lm_str = ""
+    stale_by_time = False
+    lm_raw = (meta.get("last_modified") or "").strip()
+    if lm_raw:
+        try:
+            lm_kst = (parsedate_to_datetime(lm_raw).astimezone(timezone.utc) + timedelta(hours=9)).replace(tzinfo=None)
+            lm_str = lm_kst.strftime("%Y-%m-%d %H:%M:%S")
+            expected = _dt.strptime(target_iso, "%Y-%m-%d") + timedelta(hours=int(slot))
+            if lm_kst < expected:
+                stale_by_time = True
+                warn = True
+                notes.append("S3 파일 갱신 시각(" + lm_str[5:16] + ")이 이 시간대 생성 시각("
+                             + expected.strftime("%m-%d %H:%M") + ") 이전이라 이전 파일일 수 있습니다.")
+        except Exception:
+            lm_str = ""
+    if prev:
+        if prev["etag"] and prev["etag"] == (meta.get("etag") or ""):
+            if stale_by_time:
+                notes.append("직전 시간대(" + str(prev["slot"]) + "시) 파일과 동일합니다. 덮어쓰기 전 파일을 받은 것으로 보입니다.")
+            else:
+                notes.append("직전 시간대 파일과 내용이 같습니다(신규 결제 없음).")
+        if prev["rows"] is not None and rows_n < int(prev["rows"]):
+            warn = True
+            notes.append("행 수가 직전 시간대보다 줄었습니다(" + str(prev["rows"]) + " → " + str(rows_n) + ").")
+    if slot != "24" and max_pay and max_pay >= (target_iso + " " + slot + ":00"):
+        warn = True
+        notes.append("이 시간대(" + slot + "시) 이후 결제(" + max_pay[-5:] + ")가 포함되어 있어 다음 시간대 파일일 수 있습니다.")
+    if warn:
+        return "warn", " ".join(notes), lm_str
+    if not lm_str:
+        return "unknown", "S3 응답에서 갱신 시각을 확인하지 못했습니다. " + " ".join(notes), lm_str
+    return "ok", " ".join(notes), lm_str
+
+
+def _payment_log_insert(log: dict) -> None:
+    """수신 결과를 payment_sync_log에 남긴다. 로그 실패가 수신 자체를 막지 않도록 오류는 삼킨다."""
+    try:
+        conn = get_conn()
+        try:
+            conn.execute(
+                "INSERT INTO payment_sync_log (run_at, slot, target_date, source, status, rows_inserted, prev_slot_rows, "
+                "s3_last_modified, s3_etag, s3_size, max_pay_time, freshness, note, error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (log["run_at"], log["slot"], log["target_date"], log["source"], log["status"], log["rows"],
+                 log["prev_rows"], log["lm"], log["etag"], log["size"], log["max_pay"], log["freshness"],
+                 log["note"], log["error"])
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
 async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
     """결제내역 CSV를 받아 payment_records에 슬롯별 스냅샷으로 적재하고, 100일 지난 데이터를 삭제한다.
     - slot: '21' / '22' / '24'. 24시 슬롯(00:10 호출)은 전날 파일을, 21·22시 슬롯은 당일 파일을 처리한다.
+    - target_date를 직접 주면 수동 실행(source=manual), 안 주면 크론 실행(source=auto)으로 기록한다.
     - 같은 (날짜, 슬롯)을 다시 실행하면 그 슬롯의 행을 지우고 다시 넣는다(중복 없음).
     - 파일이 없거나 유효한 행이 하나도 없으면 아무것도 지우지 않고 실패로 알린다.
+    - 실행 결과(성공/실패, S3 갱신 시각, 덮어쓰기 최신 여부 판정)를 payment_sync_log에 남긴다.
     - 적재와 보관기간 삭제는 서로 독립적으로 실행하고 각각 실패 알림을 보낸다.
     """
     import asyncio
@@ -16196,6 +16296,7 @@ async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
     from datetime import timedelta
 
     kst_now = _kst_now()
+    manual = bool(target_date)
     if not target_date:
         base_day = kst_now - timedelta(days=1) if slot == "24" else kst_now
         target_date = base_day.strftime("%Y%m%d")
@@ -16203,13 +16304,18 @@ async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
     filename = f"유비플러스_결제내역_{target_date}.csv"
     url = PAYMENT_S3_BASE_URL + urllib.parse.quote(filename)
     result = {"slot": slot, "target_date": target_date, "url": url}
+    log = {
+        "run_at": kst_now.strftime("%Y-%m-%d %H:%M:%S"), "slot": slot, "target_date": target_iso,
+        "source": "manual" if manual else "auto", "status": "fail", "rows": None, "prev_rows": None,
+        "lm": "", "etag": "", "size": None, "max_pay": "", "freshness": "unknown", "note": "", "error": "",
+    }
 
     # 1) 다운로드 + 적재
     try:
         if not PAYMENT_S3_BASE_URL:
             raise RuntimeError("PAYMENT_S3_BASE_URL이 설정되지 않았습니다(main.py의 결제내역 S3 폴더 주소).")
         try:
-            raw = await asyncio.to_thread(_sales_http_get, url)
+            raw, meta = await asyncio.to_thread(_payment_http_get_meta, url)
         except urllib.error.HTTPError as he:
             raise RuntimeError(f"S3 다운로드 실패 HTTP {he.code} (파일 미업로드 가능성): {url}")
         rows, skipped, unknown_cards = _parse_payment_csv(raw, target_iso)
@@ -16219,13 +16325,32 @@ async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
         now_iso = kst_now.strftime("%Y-%m-%d %H:%M:%S")
         _save_payment_rows(rows, target_iso, slot, now_iso)
 
+        max_pay = max(r[1] for r in rows)
+        prev = _payment_prev_success(target_iso, slot)
+        freshness, note, lm_str = _payment_freshness(slot, target_iso, meta, len(rows), max_pay, prev)
+
         by_card = {}
         for r in rows:
             by_card[r[7]] = by_card.get(r[7], 0) + 1
         result["inserted"] = len(rows)
         result["skipped"] = len(skipped)
         result["by_card"] = by_card
+        result["freshness"] = freshness
+        result["note"] = note
+        result["s3_last_modified"] = lm_str
+        result["max_pay_time"] = max_pay
 
+        log.update({
+            "status": "success", "rows": len(rows), "prev_rows": (prev["rows"] if prev else None),
+            "lm": lm_str, "etag": meta.get("etag", ""), "size": meta.get("size"),
+            "max_pay": max_pay, "freshness": freshness, "note": note,
+        })
+
+        if freshness == "warn":
+            report_cron_failure(
+                "sync-payment-records(경고)",
+                f"{target_date} {slot}시 슬롯: 최신 파일이 아닐 수 있습니다. {note}"
+            )
         if unknown_cards:
             result["unknown_cards"] = sorted(unknown_cards)[:20]
             report_cron_failure(
@@ -16242,7 +16367,10 @@ async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
     except Exception as e:
         err_msg = str(e)[:500]
         result["error"] = err_msg
+        log["error"] = err_msg
         report_cron_failure("sync-payment-records", err_msg)
+
+    _payment_log_insert(log)
 
     # 2) 보관기간(100일) 지난 데이터 삭제 — 적재 성공 여부와 무관하게 실행
     try:
@@ -16256,6 +16384,7 @@ async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
             old_cnt = int(cnt_row["c"]) if cnt_row else 0
             if old_cnt > 0:
                 conn.execute("DELETE FROM payment_records WHERE pay_date < ?", (cutoff,))
+            conn.execute("DELETE FROM payment_sync_log WHERE target_date < ?", (cutoff,))
             conn.commit()
         finally:
             conn.close()
