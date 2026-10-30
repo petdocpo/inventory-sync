@@ -17445,10 +17445,8 @@ async function closingCompress(file) {
   return await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/jpeg', 0.8); });
 }
 
-async function closingUpload(btn) {
-  var input = document.getElementById('closing-photo');
+async function closingUploadFiles(files, btn) {
   var status = document.getElementById('closing-upload-status');
-  var files = input.files;
   if (!files || !files.length) { status.textContent = '사진을 선택해 주세요.'; return; }
   btn.disabled = true;
   var ok = 0, fail = 0, total = 0, lastErr = '';
@@ -17472,6 +17470,35 @@ async function closingUpload(btn) {
   btn.disabled = false;
   if (ok) { setTimeout(function () { location.reload(); }, 900); }
 }
+
+function closingUpload(btn) {
+  var input = document.getElementById('closing-photo');
+  return closingUploadFiles(input.files, btn);
+}
+
+(function () {
+  // 휴대폰 같은 터치 기기에서는 카메라를 바로 여는 [촬영하기] 버튼을 추가한다(PC에서는 추가하지 않음)
+  var btn = document.getElementById('closing-upload-btn');
+  if (!btn || !(navigator.maxTouchPoints > 0)) { return; }
+  var cam = document.createElement('input');
+  cam.type = 'file';
+  cam.accept = 'image/*';
+  cam.setAttribute('capture', 'environment');
+  cam.style.display = 'none';
+  cam.addEventListener('change', function () {
+    var picked = Array.prototype.slice.call(cam.files);
+    cam.value = '';
+    if (picked.length) { closingUploadFiles(picked, btn); }
+  });
+  var shoot = document.createElement('button');
+  shoot.type = 'button';
+  shoot.className = 'btn';
+  shoot.style.background = '#065F46';
+  shoot.textContent = '📷 촬영하기';
+  shoot.addEventListener('click', function () { cam.click(); });
+  btn.parentNode.insertBefore(shoot, btn.parentNode.firstChild);
+  btn.parentNode.appendChild(cam);
+})();
 </script>"""
 
 
