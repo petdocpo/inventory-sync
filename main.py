@@ -16854,12 +16854,10 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             return HTMLResponse(content=render_page(
                 '<div class="card">지점 정보가 없어 마감 내역을 조회할 수 없습니다.</div>', user, "closing"))
 
+    # 화면 맨 위에 보여 줄 안내(memo_required는 마감 저장 버튼 쪽에 따로 표시한다)
     banners = {
-        "ok": ("ok", "✅ 결제내역을 S3의 현재 파일로 다시 받아왔습니다."),
-        "fail": ("bad", "⚠️ 결제내역 다시 받아오기에 실패했습니다. 크론 실패 이력을 확인해 주세요."),
         "saved": ("ok", "✅ 영수증 값을 저장했습니다."),
         "memo_saved": ("ok", "✅ 메모를 저장했습니다."),
-        "memo_required": ("bad", "⚠️ 불일치 항목의 메모를 모두 입력해야 마감 저장할 수 있습니다. (입력한 메모는 저장되었습니다)"),
         "no_receipt": ("bad", "⚠️ 영수증 값을 먼저 입력해야 마감 저장할 수 있습니다."),
         "already": ("warn", "이미 마감 저장된 일자입니다."),
         "closed": ("ok", "✅ 마감 저장이 완료되었습니다."),
@@ -16916,13 +16914,27 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             + '</div>'
         )
 
-        if is_all:
-            refetch = ('<form method="post" action="/closing/refetch" style="margin-bottom:10px;" '
-                       'onsubmit="return confirm(\'S3의 현재 파일로 ' + _esc(date) + ' 결제내역을 다시 받아옵니다. 계속할까요?\');">'
-                       '<input type="hidden" name="date" value="' + _esc(date) + '">'
-                       '<input type="hidden" name="branch" value="' + _esc(branch_sel) + '">'
-                       '<button class="btn" type="submit" style="background:#6B7280;">결제내역 다시 받아오기</button></form>')
-            parts.append(refetch)
+        # 가장 최근 수신(크론/수동) 결과와 시각
+        try:
+            log_row = conn.execute(
+                "SELECT run_at, slot, source, status, rows_inserted, freshness, note, error FROM payment_sync_log "
+                "WHERE target_date=? ORDER BY id DESC LIMIT 1", (date,)
+            ).fetchone()
+        except Exception:
+            log_row = None
+        if log_row:
+            when = _closing_fmt_ts(log_row["run_at"] or "")
+            lab = CLOSING_SLOT_LABELS.get(log_row["slot"], log_row["slot"])
+            src = "수동" if log_row["source"] == "manual" else "자동"
+            if log_row["status"] != "success":
+                parts.append(_closing_box(["❌ 수신 실패 · " + when + " · " + lab + " · " + src,
+                                           (log_row["error"] or "")[:200]], "bad"))
+            elif log_row["freshness"] == "warn":
+                parts.append(_closing_box(["⚠️ 수신 확인 필요 · " + when + " · " + lab + " · " + src,
+                                           log_row["note"] or ""], "warn"))
+            else:
+                parts.append(_closing_box(["✅ 수신 정상 · " + when + " · " + lab + " · " + src + " · "
+                                           + f"{int(log_row['rows_inserted'] or 0):,}" + "행"], "ok"))
 
         scope = (branch_sel or "전지점") if is_all else (user.get("branch_code") or "")
         parts.append('<div style="font-size:13px;color:#555;margin-bottom:8px;">조회 대상: <b>' + _esc(scope) + '</b> · <b>' + _esc(date) + '</b></div>')
@@ -16988,8 +17000,21 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             pg = pay["groups"] if pay else {}
             rg = rc["groups"] if rc else {}
             branch_param = branch_sel if is_all else ""
-            receipt_link = "/closing/receipt?date=" + _q(date) + (("&branch=" + _q(branch_sel)) if is_all else "")
+            qs = "date=" + _q(date) + (("&branch=" + _q(branch_sel)) if is_all else "")
+            receipt_link = "/closing/receipt?" + qs
+            payments_link = "/closing/payments?" + qs
+            images_link = "/closing/receipt-view?" + qs
             saved = _closing_get_save(conn, view_key, date)
+            photo_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM receipt_images WHERE branch_key=? AND pay_date=?", (view_key, date)
+            ).fetchone()
+            photo_cnt = int(photo_row["c"] or 0) if photo_row else 0
+
+            def _lbtn(href, label, color):
+                return ('<a class="btn" href="' + _esc(href) + '" style="text-decoration:none;display:inline-block;background:'
+                        + color + ';">' + _esc(label) + '</a>')
+
+            images_label = "영수증 보기" + ((" (" + str(photo_cnt) + ")") if photo_cnt else "")
 
             if saved:
                 # 마감 저장 완료: 저장 당시의 값(snapshot)을 그대로 보여 준다(수정 불가)
@@ -17011,6 +17036,9 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                             else "영수증과 결제내역이 일치합니다.")
                 head.append("수정이 필요하면 마스터에게 요청해 주세요.")
                 parts.append(_closing_box(head, "info"))
+                parts.append('<div style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;">'
+                             + _lbtn(payments_link, "결제내역 보기", "#6B7280")
+                             + _lbtn(images_link, images_label, "#6B7280") + '</div>')
                 parts.append('<div class="card">' + _closing_compare_table_html(srows, True, "view", smemos) + '</div>')
             else:
                 if rc is None:
@@ -17023,27 +17051,54 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                         parts.append(_closing_box(["✅ 영수증과 결제내역이 일치합니다."], "ok"))
 
                 btn_label = "영수증 수정" if rc is not None else "영수증 입력"
-                parts.append('<div style="margin-bottom:10px;"><a class="btn" href="' + receipt_link
-                             + '" style="text-decoration:none;display:inline-block;">' + btn_label + '</a></div>')
+                parts.append('<div style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;">'
+                             + _lbtn(receipt_link, btn_label, "#1E2761")
+                             + _lbtn(payments_link, "결제내역 보기", "#6B7280")
+                             + _lbtn(images_link, images_label, "#6B7280") + '</div>')
+
+                parts.append(
+                    '<div class="card" style="padding:12px 14px;margin-bottom:10px;">'
+                    '<div style="font-size:13px;color:#555;margin-bottom:8px;">📷 영수증 사진 올리기 (여러 장 가능 · 올리기 전에 자동으로 크기를 줄여 보냅니다)'
+                    + ((' · 현재 ' + str(photo_cnt) + '장 업로드됨') if photo_cnt else '') + '</div>'
+                    + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">'
+                    + '<input type="file" id="closing-photo" accept="image/*" multiple style="width:auto;max-width:100%;">'
+                    + '<button type="button" class="btn" id="closing-upload-btn" data-date="' + _esc(date)
+                    + '" data-branch="' + _esc(branch_param) + '" onclick="closingUpload(this)">사진 올리기</button>'
+                    + '<span id="closing-upload-status" style="font-size:12px;color:#555;"></span></div></div>'
+                    + CLOSING_UPLOAD_JS
+                )
 
                 if not pay and rc is None:
                     parts.append('<div class="card">해당 일자의 결제내역이 없습니다.</div>')
                 elif rc is None:
                     parts.append('<div class="card">' + _closing_compare_table_html(_closing_compare(pg, rg), False) + '</div>')
                 else:
+                    cmp_rows = _closing_compare(pg, rg)
                     memos = _closing_get_memos(conn, view_key, date)
                     confirm_js = ("return confirm('마감 저장 후에는 수정할 수 없습니다.\\n영수증 값과 메모를 확인한 뒤 저장해 주세요.\\n\\n"
                                   "마감 저장할까요?');")
+                    bottom_box = ""
+                    if msg == "memo_required":
+                        miss = [r[0] for r in cmp_rows
+                                if (r[1] != r[3] or r[2] != r[4]) and not memos.get(r[0], "").strip()]
+                        lines_b = ["⚠️ 불일치 항목의 메모를 모두 입력해야 마감 저장할 수 있습니다. (입력한 메모는 저장되었습니다)"]
+                        if miss:
+                            lines_b.append("메모가 비어 있는 항목: " + ", ".join(miss))
+                        bottom_box = _closing_box(lines_b, "bad")
                     parts.append(
                         '<form method="post" action="/closing/save">'
                         '<input type="hidden" name="date" value="' + _esc(date) + '">'
                         '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
-                        '<div class="card">' + _closing_compare_table_html(_closing_compare(pg, rg), True, "edit", memos)
-                        + '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">'
+                        '<div class="card">' + _closing_compare_table_html(cmp_rows, True, "edit", memos)
+                        + '<div id="closing-actions" style="margin-top:12px;">' + bottom_box
+                        + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
                         '<button class="btn" type="submit" formaction="/closing/memo" style="background:#6B7280;">메모 저장</button>'
                         '<button class="btn" type="submit" formaction="/closing/save" onclick="' + confirm_js + '">마감 저장하기</button>'
-                        '</div></div></form>'
+                        '</div></div></div></form>'
                     )
+                    if bottom_box:
+                        parts.append("<script>var a=document.getElementById('closing-actions');"
+                                     "if(a){a.scrollIntoView({block:'center'});}</script>")
 
         parts.append(
             '<div style="font-size:12px;color:#888;margin-top:4px;">'
@@ -17351,9 +17406,251 @@ async def closing_save(request: Request, session_token: str = Cookie(default=Non
     return RedirectResponse(url=_closing_back_url(pay_date, branch_param, msg), status_code=303)
 
 
-@app.post("/closing/refetch")
-async def closing_refetch(request: Request, session_token: str = Cookie(default=None)):
-    """마스터 전용: 해당 일자의 결제내역을 S3의 현재 파일로 다시 받아온다(기존 슬롯 데이터를 교체)."""
+# =====================================================================
+# 일 마감: 영수증 사진 업로드/보기(비공개 Storage 버킷) + 결제내역 보기
+# - 사진은 브라우저에서 줄인 뒤 올린다(긴 변 1600px, JPEG 품질 0.8). 서버는 3MB 초과를 거부한다.
+# - 비공개 버킷이라 앱이 로그인·권한을 확인한 뒤 /closing/image로만 보여 준다.
+# - 마감 저장 후에는 사진 추가·삭제가 막힌다.
+# =====================================================================
+CLOSING_SUPABASE_URL = "https://fjznuesrbrwcqbdghegn.supabase.co"
+CLOSING_IMG_BUCKET = "closing-receipts"
+CLOSING_IMG_MAX_BYTES = 3 * 1024 * 1024
+CLOSING_IMG_MAX_PER_DAY = 10
+# 사진 압축/업로드 스크립트(f-string 아님: 중괄호 이스케이프 불필요)
+CLOSING_UPLOAD_JS = """<script>
+async function closingCompress(file) {
+  var max = 1600;
+  var source = null, w = 0, h = 0;
+  try {
+    source = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    w = source.width; h = source.height;
+  } catch (e) {
+    source = await new Promise(function (resolve, reject) {
+      var img = new Image();
+      var url = URL.createObjectURL(file);
+      img.onload = function () { URL.revokeObjectURL(url); resolve(img); };
+      img.onerror = reject;
+      img.src = url;
+    });
+    w = source.naturalWidth; h = source.naturalHeight;
+  }
+  var scale = Math.min(1, max / Math.max(w, h));
+  var cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+  var canvas = document.createElement('canvas');
+  canvas.width = cw; canvas.height = ch;
+  var ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, cw, ch);
+  ctx.drawImage(source, 0, 0, cw, ch);
+  return await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/jpeg', 0.8); });
+}
+
+async function closingUpload(btn) {
+  var input = document.getElementById('closing-photo');
+  var status = document.getElementById('closing-upload-status');
+  var files = input.files;
+  if (!files || !files.length) { status.textContent = '사진을 선택해 주세요.'; return; }
+  btn.disabled = true;
+  var ok = 0, fail = 0, total = 0, lastErr = '';
+  for (var i = 0; i < files.length; i++) {
+    status.textContent = (i + 1) + '/' + files.length + ' 올리는 중...';
+    try {
+      var blob = await closingCompress(files[i]);
+      var fd = new FormData();
+      fd.append('file', blob, 'receipt.jpg');
+      fd.append('date', btn.dataset.date);
+      fd.append('branch', btn.dataset.branch);
+      var res = await fetch('/closing/upload', { method: 'POST', body: fd });
+      var data = await res.json();
+      if (res.ok) { ok++; total += blob.size; } else { fail++; lastErr = data.detail || '업로드 실패'; }
+    } catch (e) {
+      fail++; lastErr = '사진을 처리하지 못했습니다.';
+    }
+  }
+  status.textContent = ok + '장 업로드 완료 (' + Math.round(total / 1024) + 'KB)'
+    + (fail ? ' / 실패 ' + fail + '장: ' + lastErr : '');
+  btn.disabled = false;
+  if (ok) { setTimeout(function () { location.reload(); }, 900); }
+}
+</script>"""
+
+
+def _closing_sniff_image(raw: bytes):
+    """파일 앞부분으로 이미지 종류를 판별한다. 반환: (확장자, content-type) 또는 None"""
+    if raw[:3] == b"\xff\xd8\xff":
+        return "jpg", "image/jpeg"
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png", "image/png"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp", "image/webp"
+    return None
+
+
+def _closing_storage_headers(content_type: str = "") -> dict:
+    key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
+    headers = {"Authorization": "Bearer " + key, "apikey": key}
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+@app.post("/closing/upload")
+async def closing_upload(request: Request, session_token: str = Cookie(default=None)):
+    """영수증 사진 1장 업로드(브라우저에서 줄여서 보낸 파일). 마감 저장 전에만 가능."""
+    import re
+    import uuid
+
+    user = get_session(session_token)
+    if not user:
+        return JSONResponse(status_code=401, content={"detail": "로그인이 필요합니다."})
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_all and not has_menu_permission(user["login_id"], "closing"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    form = await request.form()
+    pay_date = str(form.get("date") or "").strip()
+    branch_param = str(form.get("branch") or "").strip()
+    file = form.get("file")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", pay_date) or not file:
+        return JSONResponse(status_code=400, content={"detail": "요청이 올바르지 않습니다."})
+
+    raw = await file.read()
+    if len(raw) > CLOSING_IMG_MAX_BYTES:
+        return JSONResponse(status_code=400, content={"detail": "사진 크기가 너무 큽니다(3MB 이하)."})
+    kind = _closing_sniff_image(raw)
+    if not kind:
+        return JSONResponse(status_code=400, content={"detail": "이미지 파일(jpg/png/webp)만 올릴 수 있습니다."})
+    if not os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", ""):
+        return JSONResponse(status_code=500, content={"detail": "서버 설정 오류: 저장소 키가 없습니다."})
+
+    ext, ctype = kind
+    conn = get_conn()
+    try:
+        resolved = _closing_resolve_branch(conn, user, is_all, branch_param)
+        if not resolved:
+            return JSONResponse(status_code=403, content={"detail": "지점을 확인할 수 없습니다."})
+        key, name = resolved
+        if _closing_get_save(conn, key, pay_date):
+            return JSONResponse(status_code=403, content={"detail": "마감 저장된 일자는 사진을 추가할 수 없습니다."})
+        cnt_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM receipt_images WHERE branch_key=? AND pay_date=?", (key, pay_date)
+        ).fetchone()
+        if int(cnt_row["c"] or 0) >= CLOSING_IMG_MAX_PER_DAY:
+            return JSONResponse(status_code=400, content={"detail": "하루 최대 " + str(CLOSING_IMG_MAX_PER_DAY) + "장까지 올릴 수 있습니다."})
+
+        path = pay_date + "/" + uuid.uuid4().hex + "." + ext
+        upload_url = CLOSING_SUPABASE_URL + "/storage/v1/object/" + CLOSING_IMG_BUCKET + "/" + path
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.put(upload_url, content=raw, headers=_closing_storage_headers(ctype))
+        if resp.status_code >= 300:
+            return JSONResponse(status_code=502, content={
+                "detail": "사진 저장에 실패했습니다(" + str(resp.status_code) + "): " + resp.text[:120]})
+
+        now_iso = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            "INSERT INTO receipt_images (branch_key, branch_name, pay_date, storage_path, original_name, "
+            "content_type, size_bytes, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (key, name, pay_date, path, (getattr(file, "filename", "") or "")[:120], ctype, len(raw),
+             user["login_id"], now_iso)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse(content={"ok": True})
+
+
+@app.get("/closing/image")
+async def closing_image(id: int = 0, session_token: str = Cookie(default=None)):
+    """비공개 버킷의 영수증 사진을 로그인·권한 확인 후 내려 준다."""
+    from fastapi.responses import Response
+
+    user = get_session(session_token)
+    if not user:
+        return Response(status_code=401)
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_all and not has_menu_permission(user["login_id"], "closing"):
+        return Response(status_code=403)
+
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT branch_key, storage_path, content_type FROM receipt_images WHERE id=?", (id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return Response(status_code=404)
+    if not is_all and row["branch_key"] != _closing_norm(user.get("branch_code")):
+        return Response(status_code=403)
+
+    url = CLOSING_SUPABASE_URL + "/storage/v1/object/authenticated/" + CLOSING_IMG_BUCKET + "/" + row["storage_path"]
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=_closing_storage_headers())
+    if resp.status_code != 200:
+        return Response(status_code=404)
+    return Response(content=resp.content, media_type=row["content_type"] or "image/jpeg",
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.get("/closing/receipt-view", response_class=HTMLResponse)
+async def closing_receipt_view(session_token: str = Cookie(default=None), branch: str = "", date: str = ""):
+    """업로드된 영수증 사진 보기(마감 저장 전에는 삭제 가능)"""
+    import re
+    from html import escape as _esc
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_all and not has_menu_permission(user["login_id"], "closing"):
+        return RedirectResponse(url="/", status_code=303)
+
+    date = (date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return RedirectResponse(url="/closing", status_code=303)
+    branch_param = branch if is_all else ""
+
+    conn = get_conn()
+    try:
+        resolved = _closing_resolve_branch(conn, user, is_all, branch)
+        if not resolved:
+            return RedirectResponse(url="/closing", status_code=303)
+        key, name = resolved
+        locked = _closing_get_save(conn, key, date) is not None
+        imgs = conn.execute(
+            "SELECT id, original_name, size_bytes, uploaded_by, uploaded_at FROM receipt_images "
+            "WHERE branch_key=? AND pay_date=? ORDER BY id", (key, date)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    back = _closing_back_url(date, branch_param)
+    h = ['<h2 style="margin-bottom:8px;">📷 영수증 보기</h2>']
+    h.append('<div style="font-size:13px;color:#555;margin-bottom:10px;">지점: <b>' + _esc(name) + '</b> · 일자: <b>' + _esc(date) + '</b>'
+             + (' · <span style="color:#1E40AF;">🔒 마감 저장됨(삭제 불가)</span>' if locked else '') + '</div>')
+    h.append('<div style="margin-bottom:10px;"><a class="btn" href="' + _esc(back) + '" style="text-decoration:none;display:inline-block;background:#6B7280;">← 마감 화면</a></div>')
+    if not imgs:
+        h.append('<div class="card">업로드된 영수증 사진이 없습니다.</div>')
+    for r in imgs:
+        kb = int(round(int(r["size_bytes"] or 0) / 1024))
+        h.append('<div class="card"><div style="font-size:12px;color:#666;margin-bottom:6px;">'
+                 + _esc(_closing_fmt_ts(r["uploaded_at"] or "")) + ' · ' + _esc(r["uploaded_by"] or "-") + ' · ' + str(kb) + 'KB</div>'
+                 '<a href="/closing/image?id=' + str(r["id"]) + '" target="_blank">'
+                 '<img src="/closing/image?id=' + str(r["id"]) + '" style="max-width:100%;height:auto;border:1px solid #eee;border-radius:8px;"></a>')
+        if not locked:
+            h.append('<form method="post" action="/closing/image-delete" style="margin-top:8px;" '
+                     'onsubmit="return confirm(\'이 사진을 삭제할까요?\');">'
+                     '<input type="hidden" name="id" value="' + str(r["id"]) + '">'
+                     '<input type="hidden" name="date" value="' + _esc(date) + '">'
+                     '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
+                     '<button class="btn" type="submit" style="background:#DC2626;">삭제</button></form>')
+        h.append('</div>')
+    return HTMLResponse(content=render_page("".join(h), user, "closing"))
+
+
+@app.post("/closing/image-delete")
+async def closing_image_delete(request: Request, session_token: str = Cookie(default=None)):
+    """영수증 사진 삭제(마감 저장 전에만 가능)"""
     import re
     from urllib.parse import quote as _q
 
@@ -17361,30 +17658,132 @@ async def closing_refetch(request: Request, session_token: str = Cookie(default=
     if not user:
         return RedirectResponse(url="/login", status_code=303)
     is_all = user["role"] == "master" or user.get("branch_type") == "hq"
-    if not is_all or not has_menu_permission(user["login_id"], "closing"):
+    if is_all and not has_menu_permission(user["login_id"], "closing"):
         return RedirectResponse(url="/", status_code=303)
 
     form = await request.form()
+    try:
+        img_id = int(str(form.get("id") or "0"))
+    except ValueError:
+        img_id = 0
     pay_date = str(form.get("date") or "").strip()
-    branch = str(form.get("branch") or "").strip()
+    branch_param = str(form.get("branch") or "").strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", pay_date):
         return RedirectResponse(url="/closing", status_code=303)
 
+    back = "/closing/receipt-view?date=" + _q(pay_date) + (("&branch=" + _q(branch_param)) if branch_param else "")
     conn = get_conn()
     try:
+        resolved = _closing_resolve_branch(conn, user, is_all, branch_param)
+        if not resolved:
+            return RedirectResponse(url="/closing", status_code=303)
+        key, name = resolved
         row = conn.execute(
-            "SELECT MAX(snapshot_slot) AS slot FROM payment_records WHERE pay_date=?", (pay_date,)
+            "SELECT id, branch_key, pay_date, storage_path FROM receipt_images WHERE id=?", (img_id,)
         ).fetchone()
-        slot = (row["slot"] if row else None) or "24"
+        if row and row["branch_key"] == key and row["pay_date"] == pay_date and not _closing_get_save(conn, key, pay_date):
+            try:
+                url = CLOSING_SUPABASE_URL + "/storage/v1/object/" + CLOSING_IMG_BUCKET + "/" + row["storage_path"]
+                async with httpx.AsyncClient(timeout=20) as client:
+                    await client.delete(url, headers=_closing_storage_headers())
+            except Exception:
+                pass
+            conn.execute("DELETE FROM receipt_images WHERE id=?", (img_id,))
+            conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(url=back, status_code=303)
+
+
+@app.get("/closing/payments", response_class=HTMLResponse)
+async def closing_payments_page(session_token: str = Cookie(default=None), branch: str = "", date: str = "", grp: str = ""):
+    """결제내역 보기: 해당 지점·일자의 결제 건을 시간순으로 보여 준다(보관 기간 동안 조회 가능)."""
+    import re
+    from html import escape as _esc
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_all and not has_menu_permission(user["login_id"], "closing"):
+        return RedirectResponse(url="/", status_code=303)
+
+    date = (date or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return RedirectResponse(url="/closing", status_code=303)
+    branch_param = branch if is_all else ""
+
+    conn = get_conn()
+    try:
+        resolved = _closing_resolve_branch(conn, user, is_all, branch)
+        if not resolved:
+            return RedirectResponse(url="/closing", status_code=303)
+        key, name = resolved
+        meta = conn.execute(
+            "SELECT MAX(snapshot_slot) AS slot FROM payment_records WHERE pay_date=?", (date,)
+        ).fetchone()
+        slot = (meta["slot"] if meta else None) or ""
+        rows = []
+        if slot:
+            rows = conn.execute(
+                "SELECT pay_datetime, customer_name, pay_type, card_company, approve_amount, pay_status "
+                "FROM payment_records WHERE pay_date=? AND snapshot_slot=? AND REPLACE(branch_name, ' ', '')=? "
+                "ORDER BY pay_datetime, id", (date, slot, key)
+            ).fetchall()
     finally:
         conn.close()
 
-    result = await _sync_payment_records(slot, pay_date.replace("-", ""))
-    ok = not result.get("error")
-    url = "/closing?date=" + _q(pay_date) + "&msg=" + ("ok" if ok else "fail")
-    if branch:
-        url += "&branch=" + _q(branch)
-    return RedirectResponse(url=url, status_code=303)
+    sel = grp if grp in CLOSING_COMPARE_ROWS else ""
+    items = []
+    dup = {}
+    for r in rows:
+        g = _closing_group(r["card_company"])
+        if sel and g != sel:
+            continue
+        items.append((r, g))
+        if r["pay_status"] != "취소":
+            k = ((r["customer_name"] or "").strip(), int(r["approve_amount"] or 0), g)
+            dup[k] = dup.get(k, 0) + 1
+
+    back = _closing_back_url(date, branch_param)
+    h = ['<h2 style="margin-bottom:8px;">💳 결제내역 보기</h2>']
+    h.append('<div style="font-size:13px;color:#555;margin-bottom:8px;">지점: <b>' + _esc(name) + '</b> · 일자: <b>' + _esc(date)
+             + '</b> · 기준: <b>' + _esc(CLOSING_SLOT_LABELS.get(slot, slot or "-")) + '</b></div>')
+    h.append('<form method="get" action="/closing/payments" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px;">'
+             '<input type="hidden" name="date" value="' + _esc(date) + '">'
+             '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
+             '<div><div style="font-size:12px;color:#666;">구분</div><select name="grp" style="width:auto;min-width:160px;">'
+             '<option value=""' + ('' if sel else ' selected') + '>전체</option>'
+             + "".join('<option value="' + _esc(lb) + '"' + (' selected' if lb == sel else '') + '>' + _esc(lb) + '</option>'
+                       for lb in CLOSING_COMPARE_ROWS)
+             + '</select></div><button class="btn" type="submit">조회</button>'
+             '<a class="btn" href="' + _esc(back) + '" style="text-decoration:none;background:#6B7280;">← 마감 화면</a></form>')
+
+    if not items:
+        h.append('<div class="card">해당 조건의 결제내역이 없습니다.</div>')
+    else:
+        net_cnt = 0
+        net_amt = 0
+        h.append('<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:640px;"><thead><tr>'
+                 '<th>시각</th><th>보호자</th><th>결제구분</th><th>구분</th><th style="text-align:right;">금액</th><th>상태</th><th>비고</th>'
+                 '</tr></thead><tbody>')
+        for r, g in items:
+            cancel = r["pay_status"] == "취소"
+            amt = int(r["approve_amount"] or 0)
+            net_cnt += -1 if cancel else 1
+            net_amt += -amt if cancel else amt
+            cust = (r["customer_name"] or "").strip()
+            note = ""
+            if not cancel and dup.get((cust, amt, g), 0) >= 2:
+                note = "동일 보호자·동일 금액 " + str(dup[(cust, amt, g)]) + "회"
+            color = ' style="color:#DC2626;"' if cancel else ''
+            h.append('<tr' + color + '><td>' + _esc((r["pay_datetime"] or "")[-5:]) + '</td><td>' + _esc(cust) + '</td><td>'
+                     + _esc(r["pay_type"] or "") + '</td><td>' + _esc(g) + '</td><td style="text-align:right;">'
+                     + (("-" if cancel else "") + f"{amt:,}") + '</td><td>' + _esc(r["pay_status"] or "") + '</td><td style="color:#B45309;">'
+                     + _esc(note) + '</td></tr>')
+        h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td colspan="4">합계(취소 상계)</td><td style="text-align:right;">'
+                 + f"{net_amt:,}" + '</td><td colspan="2">' + f"{net_cnt:,}" + '건</td></tr></tbody></table></div></div>')
+    return HTMLResponse(content=render_page("".join(h), user, "closing"))
 
 
 
