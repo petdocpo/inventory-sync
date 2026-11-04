@@ -3646,15 +3646,156 @@ def is_bot_user_agent(user_agent: str) -> bool:
     return any(pattern.lower() in ua_lower for pattern in BOT_USER_AGENT_PATTERNS)
 
 
+SCAN_VIEW_HEADER_KEYS = [
+    "user-agent", "accept", "accept-language", "accept-encoding", "referer", "origin",
+    "purpose", "sec-purpose", "x-purpose", "sec-fetch-dest", "sec-fetch-mode",
+    "sec-fetch-site", "sec-fetch-user", "sec-ch-ua", "sec-ch-ua-mobile",
+    "sec-ch-ua-platform", "cache-control", "pragma", "if-none-match",
+    "if-modified-since", "upgrade-insecure-requests", "priority",
+    "service-worker-navigation-preload", "x-forwarded-for", "x-real-ip",
+    "x-vercel-forwarded-for", "x-vercel-ip-country", "x-vercel-id",
+]
+
+
+def _scan_clean(value, max_len: int) -> str:
+    """Postgres가 거부하는 NUL 문자를 제거하고 길이를 제한한다."""
+    return (value or "").replace("\x00", "")[:max_len]
+
+
+def _scan_get_or_make_cid(request: Request):
+    """익명 브라우저 식별 쿠키(scan_cid). 로그인/인증 용도가 아니다."""
+    import uuid
+    cid = request.cookies.get("scan_cid", "")
+    if cid and len(cid) <= 64 and cid.isalnum():
+        return cid, False
+    return uuid.uuid4().hex, True
+
+
+def _scan_attach_cid(response, request: Request, cid: str, is_new: bool):
+    if is_new:
+        response.set_cookie(
+            key="scan_cid", value=cid, max_age=31536000, httponly=True,
+            samesite="lax", secure=(request.url.scheme == "https"), path="/"
+        )
+    return response
+
+
+def _scan_log_view(request: Request, request_id: str, branch_code: str, item_code: str,
+                   scan_type: str, outcome: str, scan_cid: str) -> None:
+    """모든 /scan 요청을 scan_view_log에 기록한다. 실패해도 스캔 흐름에 영향 없음."""
+    import json as _json
+    conn = None
+    try:
+        h = request.headers
+        hd = {}
+        for k in SCAN_VIEW_HEADER_KEYS:
+            v = h.get(k)
+            if v is not None:
+                hd[k] = _scan_clean(v, 300)
+        hd["_cookie_names"] = list(request.cookies.keys())[:20]  # 값은 저장하지 않음
+        hd["_raw_query"] = _scan_clean(request.scope.get("query_string", b"").decode("latin-1"), 400)
+        hd["_method"] = request.method
+        hd["_path"] = request.url.path
+        client_ip = request.client.host if request.client else ""
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO scan_view_log (request_id, branch_code, item_code, scan_type, client_ip, user_agent, headers_json, outcome, scan_cid) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                request_id,
+                _scan_clean(branch_code, 200),
+                _scan_clean(item_code, 200),
+                _scan_clean(scan_type, 50),
+                _scan_clean(client_ip, 100),
+                _scan_clean(h.get("user-agent", ""), 500),
+                _scan_clean(_json.dumps(hd, ensure_ascii=False), 4000),
+                outcome,
+                scan_cid,
+            )
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[scan_view_log 기록 실패] {e}")
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _scan_reject_page(title: str, message: str) -> HTMLResponse:
+    return HTMLResponse(content=f"""
+    <html><head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>{title}</title>
+    </head>
+    <body style="font-family:-apple-system,sans-serif;background:#f5f7fa;
+                 display:flex;justify-content:center;align-items:center;
+                 min-height:100vh;margin:0;">
+      <div style="background:white;max-width:340px;width:90%;padding:32px;
+                  border-radius:20px;box-shadow:0 4px 20px rgba(0,0,0,0.1);
+                  text-align:center;">
+        <div style="font-size:36px;margin-bottom:8px;">⚠️</div>
+        <div style="font-size:18px;font-weight:bold;color:#92400E;margin-bottom:12px;">{title}</div>
+        <p style="font-size:14px;color:#555;line-height:1.6;margin:0 0 20px 0;">{message}</p>
+        <button onclick="window.close()" style="width:100%;background:#1E2761;color:white;
+                border:none;padding:14px;border-radius:12px;font-size:15px;
+                font-weight:bold;cursor:pointer;">확인</button>
+      </div>
+    </body></html>
+    """, status_code=400)
+
+
 @app.get("/scan", response_class=HTMLResponse)
 async def scan_get(request: Request, branch_code: str, item_code: str, scan_type: str):
+    import uuid
+    request_id = uuid.uuid4().hex
+    scan_cid, is_new_cid = _scan_get_or_make_cid(request)
+    resp = _scan_get_core(request, request_id, scan_cid, branch_code, item_code, scan_type)
+    return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
+
+
+def _scan_get_core(request: Request, request_id: str, scan_cid: str,
+                   branch_code: str, item_code: str, scan_type: str) -> HTMLResponse:
+    import uuid
     user_agent = request.headers.get("user-agent", "")
+
+    # 1) 알려진 미리보기/봇 UA: 기존 동작 유지(OK만 반환) + 관측 기록
     if is_bot_user_agent(user_agent):
+        _scan_log_view(request, request_id, branch_code, item_code, scan_type, "BOT_UA", scan_cid)
         return HTMLResponse(content="OK", status_code=200)
 
+    # 2) 비정상 파라미터 거부 (재고 변경 없음)
+    if (not branch_code.strip()) or (not item_code.strip()) or scan_type not in ("IN", "OUT"):
+        _scan_log_view(request, request_id, branch_code, item_code, scan_type, "REJECT_BAD_PARAM", scan_cid)
+        return _scan_reject_page(
+            "QR 인식 오류",
+            "QR 정보가 올바르게 인식되지 않았습니다.<br>휴대폰 기본 카메라로 다시 스캔해주세요.<br>계속 안 되면 관리자에게 문의해주세요."
+        )
+
     conn = get_conn()
-    
-    # ── 1분 내 동일 지점+품번+구분 중복 여부 확인 ──
+
+    # 3) items에 없는 지점(깨진 지점 코드 등) 거부 (재고 변경 없음)
+    branch_row = conn.execute(
+        "SELECT 1 AS ok FROM items WHERE branch_code=? LIMIT 1",
+        (branch_code,)
+    ).fetchone()
+    if not branch_row:
+        conn.close()
+        _scan_log_view(request, request_id, branch_code, item_code, scan_type, "REJECT_NO_BRANCH", scan_cid)
+        return _scan_reject_page(
+            "지점 인식 오류",
+            "지점 정보가 올바르게 인식되지 않았습니다.<br>휴대폰 기본 카메라로 다시 스캔해주세요.<br>계속 안 되면 관리자에게 문의해주세요."
+        )
+
+    item = conn.execute(
+        "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
+        (branch_code, item_code)
+    ).fetchone()
+
+    # ── 1분 내 동일 지점+품번+구분 중복 여부 확인 (기존 로직 그대로) ──
     recent_dup = conn.execute(
         "SELECT id, scanned_at FROM scan_log "
         "WHERE branch_code=? AND item_code=? AND scan_type=? "
@@ -3662,17 +3803,12 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
         "ORDER BY scanned_at DESC LIMIT 1",
         (branch_code, item_code, scan_type)
     ).fetchone()
+    conn.close()
 
     if recent_dup:
-        item = conn.execute(
-            "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
-            (branch_code, item_code)
-        ).fetchone()
         item_name = item["item_name"] if item else item_code
         branch_name = item["branch_name"] if item else branch_code
-        conn.close()
 
-        import uuid
         token = uuid.uuid4().hex
         conn2 = get_conn()
         conn2.execute(
@@ -3682,6 +3818,7 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
         conn2.commit()
         conn2.close()
 
+        _scan_log_view(request, request_id, branch_code, item_code, scan_type, "DUP_PROMPT", scan_cid)
         action_label = "입고" if scan_type == "IN" else "출고"
 
         return HTMLResponse(content=f"""
@@ -3725,10 +3862,10 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
             <div id="choiceButtons" style="display:flex;gap:8px;">
               <button onclick="chooseOne()" style="flex:1;background:#f0f0f0;color:#555;
                       border:none;padding:14px;border-radius:12px;font-size:13px;
-                      font-weight:bold;cursor:pointer;">아니요<br><span style="font-weight:normal;font-size:11px;">1개만 제출</span></button>
+                      font-weight:bold;cursor:pointer;">아니요<br><span style="font-weight:normal;font-size:11px;">1개만 제 출</span></button>
               <button onclick="chooseTwo()" id="confirmBtn" style="flex:1;background:#1E2761;color:white;
                       border:none;padding:14px;border-radius:12px;font-size:13px;
-                      font-weight:bold;cursor:pointer;">맞습니다<br><span style="font-weight:normal;font-size:11px;">2개(중복) 제출</span></button>
+                      font-weight:bold;cursor:pointer;">맞습니다<br><span style="font-weight:normal;font-size:11px;">2개(중 복) 제출</span></button>
             </div>
             <div id="closingMsg" style="display:none;font-size:14px;color:#888;padding:10px 0;">
               처리되었습니다. 창을 닫아주세요.
@@ -3749,12 +3886,18 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
         </body></html>
         """)
 
-    conn.close()
-    return _do_scan_and_log(request, branch_code, item_code, scan_type)
+    # 4) 정상 처리. 품번만 items에 없으면 기존처럼 반영하되 경고로 기록
+    outcome = "APPLY" if item else "WARN_UNKNOWN_ITEM"
+    _scan_log_view(request, request_id, branch_code, item_code, scan_type, outcome, scan_cid)
+    return _do_scan_and_log(request, branch_code, item_code, scan_type, request_id)
 
 
 @app.get("/scan/confirm", response_class=HTMLResponse)
 async def scan_confirm(request: Request, token: str):
+    import uuid
+    request_id = uuid.uuid4().hex
+    scan_cid, is_new_cid = _scan_get_or_make_cid(request)
+
     conn = get_conn()
     pending = conn.execute(
         "SELECT * FROM scan_pending_confirm WHERE token=?", (token,)
@@ -3762,6 +3905,7 @@ async def scan_confirm(request: Request, token: str):
 
     if not pending:
         conn.close()
+        _scan_log_view(request, request_id, "", "", "", "CONFIRM_INVALID_TOKEN", scan_cid)
         return HTMLResponse(content="<h3 style='text-align:center;margin-top:80px;'>❌ 유효하지 않거나 만료된 요청입니다.</h3>", status_code=404)
 
     branch_code = pending["branch_code"]
@@ -3772,11 +3916,13 @@ async def scan_confirm(request: Request, token: str):
     conn.commit()
     conn.close()
 
-    return _do_scan_and_log(request, branch_code, item_code, scan_type)
+    _scan_log_view(request, request_id, branch_code, item_code, scan_type, "CONFIRM_APPLY", scan_cid)
+    resp = _do_scan_and_log(request, branch_code, item_code, scan_type, request_id)
+    return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
 
 
-def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_type: str) -> HTMLResponse:
-    """실제 재고 반영 + scan_log 기록 + 완료 화면 렌더링 (기존 scan_get의 처리부를 분리)"""
+def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_type: str, request_id: str = "") -> HTMLResponse:
+    """실제 재고 반영 + scan_log 기록 + 완료 화면 렌더링 (request_id 연결 및 관측 프로브 추가)"""
     delta = 1 if scan_type == "IN" else -1
     new_qty = adjust_quantity(branch_code, item_code, delta)
 
@@ -3792,8 +3938,8 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
     branch_name = item["branch_name"] if item else branch_code
     now = datetime.now().isoformat()
     conn.execute(
-        "INSERT INTO scan_log (branch_code, branch_name, item_name, item_code, scan_type, result_quantity, scanned_at, device_info, client_ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (branch_code, branch_name, item_name, item_code, scan_type, new_qty, now, device_info, client_ip)
+        "INSERT INTO scan_log (branch_code, branch_name, item_name, item_code, scan_type, result_quantity, scanned_at, device_info, client_ip, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (branch_code, branch_name, item_name, item_code, scan_type, new_qty, now, device_info, client_ip, request_id or None)
     )
     conn.commit()
     conn.close()
@@ -3847,8 +3993,94 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
                 border:none;padding:14px;border-radius:12px;font-size:15px;
                 font-weight:bold;cursor:pointer;">확인</button>
       </div>
+      <script>
+        (function() {{
+          var rid = '{request_id}';
+          var sent = 0;
+          var t0 = Date.now();
+          function navType() {{
+            try {{
+              var e = performance.getEntriesByType('navigation')[0];
+              return e ? e.type : 'unknown';
+            }} catch (x) {{ return 'err'; }}
+          }}
+          function send(ev, extra) {{
+            if (sent >= 6) return;
+            sent++;
+            try {{
+              var d = {{
+                rid: rid,
+                ev: ev,
+                vis: document.visibilityState,
+                focus: document.hasFocus ? document.hasFocus() : null,
+                nav: navType(),
+                prerender: !!document.prerendering,
+                touch: navigator.maxTouchPoints || 0,
+                sw: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+                standalone: !!(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || !!navigator.standalone,
+                sec: Math.round((Date.now() - t0) / 100) / 10,
+                w: window.innerWidth,
+                h: window.innerHeight,
+                hist: history.length,
+                tz: (Intl.DateTimeFormat().resolvedOptions().timeZone || '')
+              }};
+              if (extra) {{ for (var k in extra) {{ d[k] = extra[k]; }} }}
+              var body = JSON.stringify(d);
+              if (navigator.sendBeacon) {{
+                navigator.sendBeacon('/scan/probe', new Blob([body], {{type: 'text/plain'}}));
+              }} else {{
+                fetch('/scan/probe', {{method: 'POST', body: body, headers: {{'Content-Type': 'text/plain'}}}});
+              }}
+            }} catch (x) {{}}
+          }}
+          send('load');
+          window.addEventListener('pageshow', function(e) {{
+            if (e.persisted) {{ send('pageshow', {{persisted: true}}); }}
+          }});
+          document.addEventListener('visibilitychange', function() {{
+            send('vis_' + document.visibilityState);
+          }});
+        }})();
+      </script>
     </body></html>
     """)
+
+
+@app.post("/scan/probe")
+async def scan_probe(request: Request):
+    """관측 전용: 완료 화면의 JS 실행 여부/상태를 기록한다. 재고는 절대 변경하지 않는다."""
+    from fastapi.responses import Response
+    import json as _json
+    conn = None
+    try:
+        raw = await request.body()
+        if len(raw) > 2000:
+            return Response(status_code=204)
+        text = _scan_clean(raw.decode("utf-8", errors="replace"), 2000)
+        try:
+            d = _json.loads(text)
+        except Exception:
+            d = {}
+        rid = _scan_clean(str(d.get("rid", "")), 64)
+        ev = _scan_clean(str(d.get("ev", "")), 30)
+        if len(rid) != 32:
+            return Response(status_code=204)
+        client_ip = request.client.host if request.client else ""
+        conn = get_conn()
+        conn.execute(
+            "INSERT INTO scan_probe_log (request_id, event, client_ip, user_agent, payload) VALUES (?, ?, ?, ?, ?)",
+            (rid, ev, _scan_clean(client_ip, 100), _scan_clean(request.headers.get("user-agent", ""), 500), text)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[scan_probe_log 기록 실패] {e}")
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+    return Response(status_code=204)
 
 
 @app.post("/scan")
