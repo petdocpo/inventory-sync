@@ -2124,11 +2124,14 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     notice_menu_href = "/master/notice" if is_master else "/notice"
     qna_menu_href = "/master/qna" if is_master else "/qna"
 
-        # menus: (key, href|None, icon, label, submenu|None)
+    # menus: (key, href|None, icon, label, submenu|None)
     # submenu가 있으면 href는 무시되고 클릭 시 소메뉴가 토글됩니다.
     menus = [
         ("dashboard", "/", "⚠️", "대시보드", None),
-        ("closing", "/closing", "🧾", "마감", None),
+        ("closing-group", None, "🧾", "마감", [
+            ("재고 마감", "/stock-closing"),
+            ("매출 마감", "/closing"),
+        ]),
         ("stock-group", None, "📦", "재고&발주", [
             ("재고현황", "/inventory"),
             ("발주내역", "/purchase-history"),
@@ -2149,10 +2152,12 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
 
     # 합쳐진 메뉴는 기존 각 페이지가 넘기는 active 값으로도 강조되도록 묶어 둔다
     menu_active_keys = {
+        "closing-group": ("closing-group", "closing", "stock-closing"),
         "stock-group": ("stock-group", "inventory", "purchase-history"),
         "notice-group": ("notice-group", "survey-group", "notice", "qna", "survey", "vendor-eval"),
     }
 
+    
     menu_html = ""
     submenu_popups_html = ""
     for key, href, icon, label, submenu in menus:
@@ -2673,6 +2678,26 @@ def fetch_raw_inventory() -> List[Dict[str, Any]]:
         if key not in merged:
             merged[key] = dict(r)
     return list(merged.values())
+
+# ── 재고 마감 (1단계: 하단 메뉴 연결용 임시 화면) ────────────
+
+@app.get("/stock-closing", response_class=HTMLResponse)
+async def stock_closing_page(
+    session_token: str = Cookie(default=None)
+):
+    """재고 마감 — 1단계: 하단 메뉴 연결 확인용 임시 화면"""
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    content = (
+        '<h2 style="margin:0 0 8px 0;">📦 재고 마감</h2>'
+        '<p style="color:#888;font-size:13px;margin-bottom:16px;">'
+        '금일 출고 목록·실사 수량 입력 기능이 이곳에 추가될 예정입니다.</p>'
+        '<div class="card" style="text-align:center;color:#888;padding:32px;">'
+        '🚧 준비 중입니다</div>'
+    )
+    return HTMLResponse(render_page(content, user, active="stock-closing"))
 
 
 # ── 대시보드 ────────────────────────────────────────────
