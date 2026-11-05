@@ -2679,14 +2679,15 @@ def fetch_raw_inventory() -> List[Dict[str, Any]]:
             merged[key] = dict(r)
     return list(merged.values())
 
-# ── 재고 마감 (2단계: 금일 입·출고 스캔 목록 + 실사 수량 입력) ──────────
+# ── 재고 마감 (3단계 중 1: 날짜 필터 — 날짜별 입·출고 스캔 목록 + 실사 수량 입력) ──────────
 
 @app.get("/stock-closing", response_class=HTMLResponse)
 async def stock_closing_page(
     session_token: str = Cookie(default=None),
-    filter_branch: str = ""
+    filter_branch: str = "",
+    date: str = ""
 ):
-    """재고 마감 — 금일(KST 00~24시) QR 입고+출고 스캔 합계, 유비플러스 재고, 실사 수량 입력, 오차"""
+    """재고 마감 — 선택 날짜(KST 00~24시) QR 입고+출고 스캔 합계, 유비플러스 재고(오늘만), 실사 수량 입력, 오차"""
     import html as _html
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
@@ -2697,10 +2698,24 @@ async def stock_closing_page(
     is_master_user = user["role"] == "master"
     target_branch = filter_branch if is_master_user else user["branch_code"]
 
-    # 한국시간 오늘 00:00~24:00 → UTC 문자열 구간 (scan_log.scanned_at 은 UTC 저장)
+    # 한국시간 기준 조회 날짜 (기본 오늘, 미래 날짜는 오늘로 보정)
     kst = _tz(_td(hours=9))
     now_kst = _dt.now(kst)
-    start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_kst = now_kst.date()
+    sel_date = today_kst
+    if date:
+        try:
+            sel_date = _dt.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            sel_date = today_kst
+    if sel_date > today_kst:
+        sel_date = today_kst
+    is_today = (sel_date == today_kst)
+    sel_date_str = sel_date.strftime("%Y-%m-%d")
+    today_str = today_kst.strftime("%Y-%m-%d")
+
+    # 선택 날짜 00:00~24:00(KST) → UTC 문자열 구간 (scan_log.scanned_at 은 UTC 저장)
+    start_kst = _dt(sel_date.year, sel_date.month, sel_date.day, tzinfo=kst)
     end_kst = start_kst + _td(days=1)
     start_utc = start_kst.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S")
     end_utc = end_kst.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -2769,9 +2784,16 @@ async def stock_closing_page(
 
     rows_html = ""
     for it in items:
-        ups = raw_map.get(it["key"])
-        ups_attr = "" if ups is None else str(ups or 0)
-        ups_disp = "-" if ups is None else str(ups or 0)
+        if is_today:
+            ups = raw_map.get(it["key"])
+            ups_attr = "" if ups is None else str(ups or 0)
+            ups_disp = "-" if ups is None else str(ups or 0)
+            input_extra = ""
+        else:
+            # 과거 날짜: 유비플러스 재고는 현재 값만 있어 비교 불가 → 표시/입력 비활성
+            ups_attr = ""
+            ups_disp = "-"
+            input_extra = " disabled"
         rows_html += (
             "<tr>"
             f"<td>{_html.escape(str(it['branch_code']))}</td>"
@@ -2780,7 +2802,7 @@ async def stock_closing_page(
             f"<td>{it['cnt']}</td>"
             f"<td>{ups_disp}</td>"
             f'<td><input type="number" class="sc-input" data-ups="{ups_attr}" '
-            'placeholder="실사" oninput="scUpdateDiff(this)" '
+            f'placeholder="실사" oninput="scUpdateDiff(this)"{input_extra} '
             'style="width:70px;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
             '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
             "</tr>"
@@ -2788,10 +2810,11 @@ async def stock_closing_page(
     if not rows_html:
         rows_html = (
             '<tr><td colspan="7" style="text-align:center;padding:24px;color:#888;">'
-            "오늘 스캔된 QR 등록 상품이 없습니다</td></tr>"
+            "해당 날짜에 스캔된 QR 등록 상품이 없습니다</td></tr>"
         )
 
-    branch_filter_html = ""
+    # 지점 필터(마스터) + 날짜 필터를 한 폼으로 묶어 서로의 선택값이 유지되도록 함
+    branch_select_html = ""
     if is_master_user:
         branch_options = '<option value="">전체 지점</option>'
         for b in get_branches():
@@ -2800,20 +2823,26 @@ async def stock_closing_page(
                 f'<option value="{_html.escape(str(b["branch_code"]))}" {sel}>'
                 f'{_html.escape(str(b["branch_name"]))}</option>'
             )
-        branch_filter_html = (
-            '<form method="get" action="/stock-closing" style="margin-bottom:16px;">'
-            '<div style="display:flex;gap:8px;align-items:flex-end;">'
+        branch_select_html = (
             '<div style="flex:1;max-width:220px;">'
             '<label style="font-size:12px;color:#888;">지점 필터</label>'
             f'<select name="filter_branch" style="margin-top:4px;">{branch_options}</select>'
             "</div>"
-            '<button class="btn" type="submit">선택</button>'
-            '<a href="/stock-closing" style="padding:10px 14px;background:#eee;'
-            'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>'
-            "</div></form>"
         )
+    filter_html = (
+        '<form method="get" action="/stock-closing" style="margin-bottom:16px;">'
+        '<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
+        + branch_select_html
+        + '<div style="flex:1;max-width:170px;">'
+        '<label style="font-size:12px;color:#888;">날짜</label>'
+        f'<input type="date" name="date" value="{sel_date_str}" max="{today_str}" style="margin-top:4px;">'
+        "</div>"
+        '<button class="btn" type="submit">조회</button>'
+        '<a href="/stock-closing" style="padding:10px 14px;background:#eee;'
+        'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">오늘로</a>'
+        "</div></form>"
+    )
 
-    today_label = start_kst.strftime("%Y-%m-%d")
     cards_html = (
         '<div style="display:flex;gap:8px;margin-bottom:16px;">'
         '<div class="card" style="flex:1;text-align:center;margin-bottom:0;">'
@@ -2824,6 +2853,14 @@ async def stock_closing_page(
         f'<div style="font-size:13px;font-weight:bold;">{_fmt_kst(raw_last["t"] if raw_last else None)}</div></div>'
         "</div>"
     )
+
+    past_notice_html = ""
+    if not is_today:
+        past_notice_html = (
+            '<div class="card" style="font-size:12px;color:#92400E;background:#FFFBEB;">'
+            "과거 날짜는 그날의 스캔 수량만 표시됩니다. 유비플러스 재고는 현재 값만 있어 "
+            "비교할 수 없어서 실사 입력과 오차는 오늘 날짜에서만 사용할 수 있습니다.</div>"
+        )
 
     script = """
     <script>
@@ -2850,11 +2887,12 @@ async def stock_closing_page(
 
     content = (
         '<h2 style="margin:0 0 8px 0;">📦 재고 마감</h2>'
-        f'<p style="color:#888;font-size:13px;margin-bottom:4px;">금일({today_label}, 00시~24시) QR 스캔 기준</p>'
+        f'<p style="color:#888;font-size:13px;margin-bottom:4px;">{sel_date_str} (00시~24시) QR 스캔 기준</p>'
         '<p style="color:#888;font-size:12px;margin-bottom:16px;">'
         "금일 출고 수량 = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − 유비플러스 재고</p>"
-        + branch_filter_html
+        + filter_html
         + cards_html
+        + past_notice_html
         + '<div class="card"><div class="table-scroll-wrap"><table>'
         "<thead><tr>"
         "<th>지점</th><th>상품명</th><th>상품코드</th><th>금일 출고 수량</th>"
