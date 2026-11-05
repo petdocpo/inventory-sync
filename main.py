@@ -2679,7 +2679,7 @@ def fetch_raw_inventory() -> List[Dict[str, Any]]:
             merged[key] = dict(r)
     return list(merged.values())
 
-# ── 재고 마감 (3단계 중 1: 날짜 필터 — 날짜별 입·출고 스캔 목록 + 실사 수량 입력) ──────────
+# ── 재고 마감 (3단계 중 1: 날짜 필터 + QR 재고 칼럼 — 날짜별 입·출고 스캔 목록 + 실사 수량 입력) ──────────
 
 @app.get("/stock-closing", response_class=HTMLResponse)
 async def stock_closing_page(
@@ -2687,7 +2687,7 @@ async def stock_closing_page(
     filter_branch: str = "",
     date: str = ""
 ):
-    """재고 마감 — 선택 날짜(KST 00~24시) QR 입고+출고 스캔 합계, 유비플러스 재고(오늘만), 실사 수량 입력, 오차"""
+    """재고 마감 — 선택 날짜(KST 00~24시) QR 입고+출고 스캔 합계, QR 재고, 유비플러스 재고(오늘만), 실사 수량 입력, 오차"""
     import html as _html
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
 
@@ -2734,7 +2734,7 @@ async def stock_closing_page(
     ).fetchall()
     if target_branch:
         inv_rows = conn.execute(
-            "SELECT branch_code, item_code, item_name FROM inventory WHERE branch_code=?",
+            "SELECT branch_code, item_code, item_name, quantity FROM inventory WHERE branch_code=?",
             (target_branch,)
         ).fetchall()
         scan_last = conn.execute(
@@ -2747,7 +2747,7 @@ async def stock_closing_page(
         ).fetchone()
     else:
         inv_rows = conn.execute(
-            "SELECT branch_code, item_code, item_name FROM inventory"
+            "SELECT branch_code, item_code, item_name, quantity FROM inventory"
         ).fetchall()
         scan_last = conn.execute("SELECT MAX(scanned_at) as t FROM scan_log").fetchone()
         raw_last = conn.execute("SELECT MAX(uploaded_at) as t FROM raw_inventory").fetchone()
@@ -2764,7 +2764,10 @@ async def stock_closing_page(
         except Exception:
             return str(v)[:16]
 
-    inv_map = {f"{r['branch_code']}|{r['item_code']}": r["item_name"] for r in inv_rows}
+    inv_map = {
+        f"{r['branch_code']}|{r['item_code']}": {"name": r["item_name"], "qty": r["quantity"]}
+        for r in inv_rows
+    }
     raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in fetch_raw_inventory()}
 
     # QR DB(inventory)에 등록된 상품만 노출
@@ -2777,7 +2780,8 @@ async def stock_closing_page(
             "key": key,
             "branch_code": r["branch_code"],
             "item_code": r["item_code"],
-            "item_name": inv_map[key],
+            "item_name": inv_map[key]["name"],
+            "qr_qty": inv_map[key]["qty"],
             "cnt": r["cnt"],
         })
     items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
@@ -2785,12 +2789,14 @@ async def stock_closing_page(
     rows_html = ""
     for it in items:
         if is_today:
+            qr_disp = str(it["qr_qty"] or 0)
             ups = raw_map.get(it["key"])
             ups_attr = "" if ups is None else str(ups or 0)
             ups_disp = "-" if ups is None else str(ups or 0)
             input_extra = ""
         else:
-            # 과거 날짜: 유비플러스 재고는 현재 값만 있어 비교 불가 → 표시/입력 비활성
+            # 과거 날짜: QR 재고·유비플러스 재고는 현재 값만 있어 비교 불가 → 표시/입력 비활성
+            qr_disp = "-"
             ups_attr = ""
             ups_disp = "-"
             input_extra = " disabled"
@@ -2800,6 +2806,7 @@ async def stock_closing_page(
             f"<td>{_html.escape(str(it['item_name']))}</td>"
             f"<td>{_html.escape(str(it['item_code']))}</td>"
             f"<td>{it['cnt']}</td>"
+            f"<td>{qr_disp}</td>"
             f"<td>{ups_disp}</td>"
             f'<td><input type="number" class="sc-input" data-ups="{ups_attr}" '
             f'placeholder="실사" oninput="scUpdateDiff(this)"{input_extra} '
@@ -2809,7 +2816,7 @@ async def stock_closing_page(
         )
     if not rows_html:
         rows_html = (
-            '<tr><td colspan="7" style="text-align:center;padding:24px;color:#888;">'
+            '<tr><td colspan="8" style="text-align:center;padding:24px;color:#888;">'
             "해당 날짜에 스캔된 QR 등록 상품이 없습니다</td></tr>"
         )
 
@@ -2858,7 +2865,7 @@ async def stock_closing_page(
     if not is_today:
         past_notice_html = (
             '<div class="card" style="font-size:12px;color:#92400E;background:#FFFBEB;">'
-            "과거 날짜는 그날의 스캔 수량만 표시됩니다. 유비플러스 재고는 현재 값만 있어 "
+            "과거 날짜는 그날의 스캔 수량만 표시됩니다. QR 재고와 유비플러스 재고는 현재 값만 있어 "
             "비교할 수 없어서 실사 입력과 오차는 오늘 날짜에서만 사용할 수 있습니다.</div>"
         )
 
@@ -2896,14 +2903,13 @@ async def stock_closing_page(
         + '<div class="card"><div class="table-scroll-wrap"><table>'
         "<thead><tr>"
         "<th>지점</th><th>상품명</th><th>상품코드</th><th>금일 출고 수량</th>"
-        "<th>유비플러스 재고 수량</th><th>실사 수량</th><th>오차</th>"
+        "<th>QR 재고 수량</th><th>유비플러스 재고 수량</th><th>실사 수량</th><th>오차</th>"
         "</tr></thead><tbody>"
         + rows_html
         + "</tbody></table></div></div>"
         + script
     )
     return HTMLResponse(render_page(content, user, active="stock-closing"))
-
 
 # ── 대시보드 ────────────────────────────────────────────
 
