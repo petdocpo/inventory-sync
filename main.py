@@ -2679,23 +2679,190 @@ def fetch_raw_inventory() -> List[Dict[str, Any]]:
             merged[key] = dict(r)
     return list(merged.values())
 
-# ── 재고 마감 (1단계: 하단 메뉴 연결용 임시 화면) ────────────
+# ── 재고 마감 (2단계: 금일 입·출고 스캔 목록 + 실사 수량 입력) ──────────
 
 @app.get("/stock-closing", response_class=HTMLResponse)
 async def stock_closing_page(
-    session_token: str = Cookie(default=None)
+    session_token: str = Cookie(default=None),
+    filter_branch: str = ""
 ):
-    """재고 마감 — 1단계: 하단 메뉴 연결 확인용 임시 화면"""
+    """재고 마감 — 금일(KST 00~24시) QR 입고+출고 스캔 합계, 유비플러스 재고, 실사 수량 입력, 오차"""
+    import html as _html
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
     user = get_session(session_token)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
 
+    is_master_user = user["role"] == "master"
+    target_branch = filter_branch if is_master_user else user["branch_code"]
+
+    # 한국시간 오늘 00:00~24:00 → UTC 문자열 구간 (scan_log.scanned_at 은 UTC 저장)
+    kst = _tz(_td(hours=9))
+    now_kst = _dt.now(kst)
+    start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_kst = start_kst + _td(days=1)
+    start_utc = start_kst.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    end_utc = end_kst.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    conn = get_conn()
+    params = [start_utc, end_utc]
+    branch_cond = ""
+    if target_branch:
+        branch_cond = " AND branch_code=?"
+        params.append(target_branch)
+    scan_rows = conn.execute(
+        "SELECT branch_code, item_code, COUNT(*) AS cnt FROM scan_log "
+        "WHERE scan_type IN ('OUT','IN') AND scanned_at >= ? AND scanned_at < ?"
+        + branch_cond + " GROUP BY branch_code, item_code",
+        tuple(params)
+    ).fetchall()
+    if target_branch:
+        inv_rows = conn.execute(
+            "SELECT branch_code, item_code, item_name FROM inventory WHERE branch_code=?",
+            (target_branch,)
+        ).fetchall()
+        scan_last = conn.execute(
+            "SELECT MAX(scanned_at) as t FROM scan_log WHERE branch_code=?",
+            (target_branch,)
+        ).fetchone()
+        raw_last = conn.execute(
+            "SELECT MAX(uploaded_at) as t FROM raw_inventory WHERE branch_code=?",
+            (target_branch,)
+        ).fetchone()
+    else:
+        inv_rows = conn.execute(
+            "SELECT branch_code, item_code, item_name FROM inventory"
+        ).fetchall()
+        scan_last = conn.execute("SELECT MAX(scanned_at) as t FROM scan_log").fetchone()
+        raw_last = conn.execute("SELECT MAX(uploaded_at) as t FROM raw_inventory").fetchone()
+    conn.close()
+
+    def _fmt_kst(v):
+        if not v:
+            return "기록 없음"
+        try:
+            d = _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=_tz.utc)
+            return d.astimezone(kst).strftime("%m/%d %H:%M")
+        except Exception:
+            return str(v)[:16]
+
+    inv_map = {f"{r['branch_code']}|{r['item_code']}": r["item_name"] for r in inv_rows}
+    raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in fetch_raw_inventory()}
+
+    # QR DB(inventory)에 등록된 상품만 노출
+    items = []
+    for r in scan_rows:
+        key = f"{r['branch_code']}|{r['item_code']}"
+        if key not in inv_map:
+            continue
+        items.append({
+            "key": key,
+            "branch_code": r["branch_code"],
+            "item_code": r["item_code"],
+            "item_name": inv_map[key],
+            "cnt": r["cnt"],
+        })
+    items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
+
+    rows_html = ""
+    for it in items:
+        ups = raw_map.get(it["key"])
+        ups_attr = "" if ups is None else str(ups or 0)
+        ups_disp = "-" if ups is None else str(ups or 0)
+        rows_html += (
+            "<tr>"
+            f"<td>{_html.escape(str(it['branch_code']))}</td>"
+            f"<td>{_html.escape(str(it['item_name']))}</td>"
+            f"<td>{_html.escape(str(it['item_code']))}</td>"
+            f"<td>{it['cnt']}</td>"
+            f"<td>{ups_disp}</td>"
+            f'<td><input type="number" class="sc-input" data-ups="{ups_attr}" '
+            'placeholder="실사" oninput="scUpdateDiff(this)" '
+            'style="width:70px;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
+            '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
+            "</tr>"
+        )
+    if not rows_html:
+        rows_html = (
+            '<tr><td colspan="7" style="text-align:center;padding:24px;color:#888;">'
+            "오늘 스캔된 QR 등록 상품이 없습니다</td></tr>"
+        )
+
+    branch_filter_html = ""
+    if is_master_user:
+        branch_options = '<option value="">전체 지점</option>'
+        for b in get_branches():
+            sel = "selected" if filter_branch == b["branch_code"] else ""
+            branch_options += (
+                f'<option value="{_html.escape(str(b["branch_code"]))}" {sel}>'
+                f'{_html.escape(str(b["branch_name"]))}</option>'
+            )
+        branch_filter_html = (
+            '<form method="get" action="/stock-closing" style="margin-bottom:16px;">'
+            '<div style="display:flex;gap:8px;align-items:flex-end;">'
+            '<div style="flex:1;max-width:220px;">'
+            '<label style="font-size:12px;color:#888;">지점 필터</label>'
+            f'<select name="filter_branch" style="margin-top:4px;">{branch_options}</select>'
+            "</div>"
+            '<button class="btn" type="submit">선택</button>'
+            '<a href="/stock-closing" style="padding:10px 14px;background:#eee;'
+            'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>'
+            "</div></form>"
+        )
+
+    today_label = start_kst.strftime("%Y-%m-%d")
+    cards_html = (
+        '<div style="display:flex;gap:8px;margin-bottom:16px;">'
+        '<div class="card" style="flex:1;text-align:center;margin-bottom:0;">'
+        '<div style="font-size:11px;color:#888;">QR 마지막 스캔</div>'
+        f'<div style="font-size:13px;font-weight:bold;">{_fmt_kst(scan_last["t"] if scan_last else None)}</div></div>'
+        '<div class="card" style="flex:1;text-align:center;margin-bottom:0;">'
+        '<div style="font-size:11px;color:#888;">RAW 마지막 확인</div>'
+        f'<div style="font-size:13px;font-weight:bold;">{_fmt_kst(raw_last["t"] if raw_last else None)}</div></div>'
+        "</div>"
+    )
+
+    script = """
+    <script>
+      function scUpdateDiff(inp) {
+        var tr = inp.closest('tr');
+        var cell = tr.querySelector('.sc-diff');
+        var ups = inp.getAttribute('data-ups');
+        if (inp.value === '' || ups === '') {
+          cell.textContent = '-';
+          cell.style.color = '#888';
+          return;
+        }
+        var diff = parseInt(inp.value, 10) - parseInt(ups, 10);
+        if (isNaN(diff)) {
+          cell.textContent = '-';
+          cell.style.color = '#888';
+          return;
+        }
+        cell.textContent = (diff > 0 ? '+' : '') + diff;
+        cell.style.color = diff === 0 ? '#22C55E' : (diff < 0 ? '#EF4444' : '#F59E0B');
+      }
+    </script>
+    """
+
     content = (
         '<h2 style="margin:0 0 8px 0;">📦 재고 마감</h2>'
-        '<p style="color:#888;font-size:13px;margin-bottom:16px;">'
-        '금일 출고 목록·실사 수량 입력 기능이 이곳에 추가될 예정입니다.</p>'
-        '<div class="card" style="text-align:center;color:#888;padding:32px;">'
-        '🚧 준비 중입니다</div>'
+        f'<p style="color:#888;font-size:13px;margin-bottom:4px;">금일({today_label}, 00시~24시) QR 스캔 기준</p>'
+        '<p style="color:#888;font-size:12px;margin-bottom:16px;">'
+        "금일 출고 수량 = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − 유비플러스 재고</p>"
+        + branch_filter_html
+        + cards_html
+        + '<div class="card"><div class="table-scroll-wrap"><table>'
+        "<thead><tr>"
+        "<th>지점</th><th>상품명</th><th>상품코드</th><th>금일 출고 수량</th>"
+        "<th>유비플러스 재고 수량</th><th>실사 수량</th><th>오차</th>"
+        "</tr></thead><tbody>"
+        + rows_html
+        + "</tbody></table></div></div>"
+        + script
     )
     return HTMLResponse(render_page(content, user, active="stock-closing"))
 
