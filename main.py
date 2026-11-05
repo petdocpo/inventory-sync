@@ -2981,7 +2981,7 @@ async def stock_closing_page(
     # 상태 안내 문구
     notice_style = 'class="card" style="font-size:12px;margin-bottom:12px;'
     notices_html = ""
-i   f view_mode in ("live", "past_live") and items:
+    if view_mode in ("live", "past_live") and items:
         basis_text = ", ".join(sorted({it["basis_label"] for it in items}))
         notices_html += (
             f'<div {notice_style}color:#475569;background:#F8FAFC;">'
@@ -3245,6 +3245,194 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
         msg = "저장되었습니다. (임시저장 — 마감 전까지 수정할 수 있습니다)"
     return JSONResponse({"ok": True, "mode": mode, "message": msg})
 
+# 재고 마감 "제출 요청" 테스트 수신 채널(teams_webhook의 branch_code). 목록에 '테스트용지점' 행이 없어서 우선 유한서 채널로 지정 — 바꾸려면 이 한 줄만 수정
+STOCK_CLOSING_TEST_BRANCH_CODE = "admin_hs"
+
+_SC_NOTIFY_JS = """<script>
+  async function scToggle(cb) {
+    var key = cb.getAttribute('data-key');
+    try {
+      var res = await fetch('/stock-closing/notify-toggle', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: key, enabled: cb.checked})
+      });
+      var data = await res.json();
+      if (!res.ok) {
+        alert(data.detail || '설정 저장에 실패했습니다.');
+        cb.checked = !cb.checked;
+        return;
+      }
+      document.getElementById('scNotifyResult').textContent = data.message || '';
+    } catch (e) {
+      alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+      cb.checked = !cb.checked;
+    }
+  }
+
+  async function scRequest(btn) {
+    var code = btn.getAttribute('data-branch');
+    var name = btn.getAttribute('data-name');
+    var date = document.getElementById('scMeta').getAttribute('data-date');
+    if (!confirm(name + ' 재고 마감 제출 요청을 보낼까요?')) return;
+    btn.disabled = true;
+    try {
+      var res = await fetch('/stock-closing/request', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({branch_code: code, date: date})
+      });
+      var data = await res.json();
+      alert(data.message || data.detail || (res.ok ? '완료되었습니다.' : '처리에 실패했습니다.'));
+    } catch (e) {
+      alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+    }
+    btn.disabled = false;
+  }
+</script>"""
+
+
+def _sc_setting_on(key: str) -> bool:
+    """system_settings 값이 'on'일 때만 True (없으면 False = 기본 꺼짐)"""
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return bool(row and str(row["value"]).strip().lower() == "on")
+
+
+def _sc_request_button(code, name, status) -> str:
+    import html as _html
+    if status == "closed":
+        return "-"
+    return (
+        '<button class="btn" type="button" style="font-size:12px;padding:4px 10px;" '
+        f'data-branch="{_html.escape(str(code))}" data-name="{_html.escape(str(name))}" '
+        'onclick="scRequest(this)">제출 요청</button>'
+    )
+
+
+def _sc_notify_panel(sel_date_str: str) -> str:
+    branch_on = _sc_setting_on("stock_closing_notify_branch")
+    test_on = _sc_setting_on("stock_closing_notify_test")
+
+    def _row(key, label, desc, on):
+        checked = " checked" if on else ""
+        return (
+            '<label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:13px;">'
+            f'<input type="checkbox" style="width:auto;margin:0;" data-key="{key}" onchange="scToggle(this)"{checked}>'
+            f'<span><b>{label}</b> <span style="color:#888;font-size:12px;">{desc}</span></span></label>'
+        )
+
+    return (
+        '<div class="card" style="margin-bottom:12px;">'
+        '<div style="font-size:13px;font-weight:bold;margin-bottom:8px;">📨 제출 요청 발송 설정 (기본 꺼짐)</div>'
+        + _row("branch", "지점 발송", "켜면 해당 지점 팀즈 채널로 실제 발송", branch_on)
+        + _row("test", "테스트 발송", f"켜면 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로만 발송", test_on)
+        + f'<div id="scMeta" data-date="{sel_date_str}" style="display:none;"></div>'
+        + '<div id="scNotifyResult" style="font-size:12px;color:#475569;margin-top:6px;"></div>'
+        "</div>"
+        + _SC_NOTIFY_JS
+    )
+
+
+@app.post("/stock-closing/notify-toggle")
+async def stock_closing_notify_toggle(request: Request, session_token: str = Cookie(default=None)):
+    """제출 요청 발송 스위치(지점 발송/테스트 발송) 저장 — 마스터 전용"""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not (user.get("role") == "master" or user.get("branch_type") == "hq"):
+        raise HTTPException(status_code=403, detail="마스터 계정만 설정할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    key = str(body.get("key", "")).strip()
+    enabled = bool(body.get("enabled"))
+    setting_key = {"branch": "stock_closing_notify_branch", "test": "stock_closing_notify_test"}.get(key)
+    if not setting_key:
+        raise HTTPException(status_code=400, detail="설정 키가 올바르지 않습니다.")
+    value = "on" if enabled else "off"
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (setting_key,)).fetchone()
+        if row:
+            conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?", (value, setting_key))
+        else:
+            conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)", (setting_key, value))
+        conn.commit()
+    finally:
+        conn.close()
+    label = "지점 발송" if key == "branch" else "테스트 발송"
+    return JSONResponse({"ok": True, "message": label + (" 켜짐" if enabled else " 꺼짐")})
+
+
+@app.post("/stock-closing/request")
+async def stock_closing_request(request: Request, session_token: str = Cookie(default=None)):
+    """재고 마감 제출 요청 팀즈 발송 — 마스터 전용. 발송 스위치가 모두 꺼져 있으면 아무것도 보내지 않는다."""
+    from datetime import datetime as _dt
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not (user.get("role") == "master" or user.get("branch_type") == "hq"):
+        raise HTTPException(status_code=403, detail="마스터 계정만 요청할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    branch_code = str(body.get("branch_code", "")).strip()
+    date_str = str(body.get("date", "")).strip()
+    try:
+        _dt.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+
+    branch = next((b for b in get_branches() if b["branch_code"] == branch_code), None)
+    if (not branch or branch_code in STOCK_CLOSING_EXCLUDED_BRANCHES
+            or "테스트" in str(branch_code) or "테스트" in str(branch["branch_name"])):
+        raise HTTPException(status_code=400, detail="요청 대상 지점이 아닙니다.")
+
+    conn = get_conn()
+    save = conn.execute(
+        "SELECT status FROM stock_closing_saves WHERE branch_code=? AND close_date=?",
+        (branch_code, date_str)
+    ).fetchone()
+    conn.close()
+    if save and (save["status"] or "draft") == "closed":
+        raise HTTPException(status_code=400, detail="이미 마감이 제출된 지점입니다.")
+
+    branch_on = _sc_setting_on("stock_closing_notify_branch")
+    test_on = _sc_setting_on("stock_closing_notify_test")
+    if not branch_on and not test_on:
+        return JSONResponse({"ok": False, "message": "발송 스위치(지점 발송/테스트 발송)가 모두 꺼져 있어 발송하지 않았습니다."})
+
+    base = str(request.base_url).rstrip("/")
+    if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
+        base = "https://" + base[len("http://"):]
+    link = base + "/stock-closing?date=" + date_str
+    title = "📦 재고 마감 제출 요청"
+    msg = f"{branch['branch_name']} {date_str} 재고 마감이 아직 제출되지 않았습니다. 실사 수량을 입력하고 마감해주세요."
+    sent_by = "stock_closing_request_by_" + str(user.get("login_id") or "")
+
+    results = []
+    if branch_on:
+        ok, detail = send_teams_notification(branch_code, title, msg, link, "재고 마감 열기", sent_by)
+        results.append("지점 발송: " + ("성공" if ok else "실패(" + str(detail)[:80] + ")"))
+    if test_on:
+        ok, detail = send_teams_notification(
+            STOCK_CLOSING_TEST_BRANCH_CODE, "[테스트] " + title,
+            "[테스트 발송 — 대상: " + str(branch["branch_name"]) + "] " + msg,
+            link, "재고 마감 열기", sent_by
+        )
+        results.append("테스트 발송: " + ("성공" if ok else "실패(" + str(detail)[:80] + ")"))
+    return JSONResponse({"ok": True, "message": " / ".join(results)})
+
 STOCK_CLOSING_EXCLUDED_BRANCHES = ("남양주점", "본사", "테스트용지점")
 
 
@@ -3323,10 +3511,11 @@ async def stock_closing_status_page(
             f"<td>{mm_html}</td>"
             f"<td>{by}</td>"
             f"<td>{at}</td>"
+            f"<td>{_sc_request_button(e['code'], e['name'], e['status'])}</td>"
             "</tr>"
         )
     if not rows_html:
-        rows_html = '<tr><td colspan="6" style="text-align:center;padding:24px;color:#888;">표시할 지점이 없습니다</td></tr>'
+        rows_html = '<tr><td colspan="7" style="text-align:center;padding:24px;color:#888;">표시할 지점이 없습니다</td></tr>'
 
     summary_html = (
         '<div style="display:flex;gap:8px;margin-bottom:16px;">'
@@ -3357,6 +3546,7 @@ async def stock_closing_status_page(
     content = (
         '<h2 style="margin:0 0 8px 0;">📋 재고 마감 현황</h2>'
         f'<p style="color:#888;font-size:13px;margin-bottom:16px;">{sel_date_str} 기준 · 지점을 누르면 세부 내역을 볼 수 있습니다</p>'
+        + _sc_notify_panel(sel_date_str)
         + filter_html
         + summary_html
         + '<div class="card"><div class="table-scroll-wrap"><table>'
