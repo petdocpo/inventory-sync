@@ -2131,7 +2131,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("closing-group", None, "🧾", "마감", [
             ("재고 마감", "/stock-closing"),
             ("매출 마감", "/closing"),
-        ]),
+        ] + ([("재고 마감 현황", "/stock-closing/status")] if is_master else [])),
         ("stock-group", None, "📦", "재고&발주", [
             ("재고현황", "/inventory"),
             ("발주내역", "/purchase-history"),
@@ -2963,7 +2963,8 @@ async def stock_closing_page(
         if is_master_user:
             notices_html += (
                 f'<div {notice_style}color:#475569;background:#F8FAFC;">'
-                "마스터 계정은 조회만 가능합니다. 지점을 선택하면 해당 지점의 저장/마감 내용이 표시됩니다.</div>"
+                "마스터 계정은 조회만 가능합니다. 지점을 선택하면 해당 지점의 저장/마감 내용이 표시됩니다. "
+                '<a href="/stock-closing/status" style="color:#1E2761;font-weight:bold;">→ 지점별 마감 현황 보기</a></div>'
             )
     elif view_mode == "draft_snapshot":
         notices_html += (
@@ -3194,6 +3195,126 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
     else:
         msg = "저장되었습니다. (임시저장 — 마감 전까지 수정할 수 있습니다)"
     return JSONResponse({"ok": True, "mode": mode, "message": msg})
+
+STOCK_CLOSING_EXCLUDED_BRANCHES = ("남양주점", "본사", "경기김포점", "경기화성1호점")
+
+
+@app.get("/stock-closing/status", response_class=HTMLResponse)
+async def stock_closing_status_page(
+    session_token: str = Cookie(default=None),
+    date: str = ""
+):
+    """재고 마감 현황 — 마스터가 일자를 선택해 지점별 제출/미제출 확인, 지점을 누르면 세부 내역(/stock-closing)으로 이동"""
+    import html as _html
+    from datetime import datetime as _dt
+    from urllib.parse import quote as _quote
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if not (user.get("role") == "master" or user.get("branch_type") == "hq"):
+        return RedirectResponse(url="/stock-closing", status_code=303)
+
+    today_kst, _editable = _stock_closing_editable_dates()
+    sel_date = today_kst
+    if date:
+        try:
+            sel_date = _dt.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            sel_date = today_kst
+    if sel_date > today_kst:
+        sel_date = today_kst
+    sel_date_str = sel_date.strftime("%Y-%m-%d")
+    today_str = today_kst.strftime("%Y-%m-%d")
+
+    conn = get_conn()
+    saves = conn.execute(
+        "SELECT * FROM stock_closing_saves WHERE close_date=?", (sel_date_str,)
+    ).fetchall()
+    conn.close()
+    save_map = {s["branch_code"]: s for s in saves}
+
+    entries = []
+    for b in get_branches():
+        code = b["branch_code"]
+        if code in STOCK_CLOSING_EXCLUDED_BRANCHES:
+            continue
+        s = save_map.get(code)
+        status = ((s["status"] or "draft") if s else "none")
+        entries.append({"code": code, "name": b["branch_name"], "save": s, "status": status})
+    order = {"none": 0, "draft": 1, "closed": 2}
+    entries.sort(key=lambda e: (order[e["status"]], str(e["name"])))
+
+    cnt = {"closed": 0, "draft": 0, "none": 0}
+    rows_html = ""
+    for e in entries:
+        cnt[e["status"]] += 1
+        s = e["save"]
+        if e["status"] == "closed":
+            chip = '<span style="color:#166534;font-weight:bold;">✅ 마감 완료</span>'
+        elif e["status"] == "draft":
+            chip = '<span style="color:#1E40AF;font-weight:bold;">💾 임시저장</span>'
+        else:
+            chip = '<span style="color:#DC2626;font-weight:bold;">⛔ 미제출</span>'
+        if s:
+            mm = s["mismatch_count"] or 0
+            mm_html = f'<span style="color:{"#DC2626" if mm > 0 else "#22C55E"};font-weight:bold;">{mm}</span>'
+            item_cnt = s["item_count"] or 0
+            by = _html.escape(str(s["closed_by"] or s["saved_by"] or "-"))
+            at = _html.escape(str(s["closed_at"] or s["saved_at"] or "-"))
+        else:
+            mm_html, item_cnt, by, at = "-", "-", "-", "-"
+        link = "/stock-closing?filter_branch=" + _quote(str(e["code"])) + "&date=" + sel_date_str
+        rows_html += (
+            "<tr>"
+            f'<td><a href="{link}" style="color:#1E2761;font-weight:bold;text-decoration:underline;">'
+            f'{_html.escape(str(e["name"]))}</a></td>'
+            f"<td>{chip}</td>"
+            f"<td>{item_cnt}</td>"
+            f"<td>{mm_html}</td>"
+            f"<td>{by}</td>"
+            f"<td>{at}</td>"
+            "</tr>"
+        )
+    if not rows_html:
+        rows_html = '<tr><td colspan="6" style="text-align:center;padding:24px;color:#888;">표시할 지점이 없습니다</td></tr>'
+
+    summary_html = (
+        '<div style="display:flex;gap:8px;margin-bottom:16px;">'
+        '<div class="card" style="flex:1;text-align:center;margin-bottom:0;">'
+        '<div style="font-size:11px;color:#888;">마감 완료</div>'
+        f'<div style="font-size:20px;font-weight:bold;color:#166534;">{cnt["closed"]}</div></div>'
+        '<div class="card" style="flex:1;text-align:center;margin-bottom:0;">'
+        '<div style="font-size:11px;color:#888;">임시저장</div>'
+        f'<div style="font-size:20px;font-weight:bold;color:#1E40AF;">{cnt["draft"]}</div></div>'
+        '<div class="card" style="flex:1;text-align:center;margin-bottom:0;">'
+        '<div style="font-size:11px;color:#888;">미제출</div>'
+        f'<div style="font-size:20px;font-weight:bold;color:#DC2626;">{cnt["none"]}</div></div>'
+        "</div>"
+    )
+    filter_html = (
+        '<form method="get" action="/stock-closing/status" style="margin-bottom:16px;">'
+        '<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
+        '<div style="flex:1;max-width:170px;">'
+        '<label style="font-size:12px;color:#888;">날짜</label>'
+        f'<input type="date" name="date" value="{sel_date_str}" max="{today_str}" style="margin-top:4px;">'
+        "</div>"
+        '<button class="btn" type="submit">조회</button>'
+        '<a href="/stock-closing/status" style="padding:10px 14px;background:#eee;'
+        'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">오늘로</a>'
+        "</div></form>"
+    )
+
+    content = (
+        '<h2 style="margin:0 0 8px 0;">📋 재고 마감 현황</h2>'
+        f'<p style="color:#888;font-size:13px;margin-bottom:16px;">{sel_date_str} 기준 · 지점을 누르면 세부 내역을 볼 수 있습니다</p>'
+        + filter_html
+        + summary_html
+        + '<div class="card"><div class="table-scroll-wrap"><table>'
+        "<thead><tr><th>지점</th><th>상태</th><th>상품 수</th><th>오차 건수</th><th>제출자</th><th>제출 시각</th></tr></thead>"
+        "<tbody>" + rows_html + "</tbody></table></div></div>"
+    )
+    return HTMLResponse(render_page(content, user, active="stock-closing"))
 
 
 # ── 대시보드 ────────────────────────────────────────────
