@@ -4629,6 +4629,9 @@ def _scan_reject_page(title: str, message: str) -> HTMLResponse:
     """, status_code=400)
 
 
+SCAN_AUTOCLOSE_SECONDS = 5
+
+
 @app.get("/scan", response_class=HTMLResponse)
 async def scan_get(request: Request, branch_code: str, item_code: str, scan_type: str):
     import uuid
@@ -4639,7 +4642,7 @@ async def scan_get(request: Request, branch_code: str, item_code: str, scan_type
 
 
 def _scan_get_core(request: Request, request_id: str, scan_cid: str,
-                   branch_code: str, item_code: str, scan_type: str) -> HTMLResponse:
+                   branch_code: str, item_code: str, scan_type: str):
     import uuid
     user_agent = request.headers.get("user-agent", "")
 
@@ -4658,7 +4661,7 @@ def _scan_get_core(request: Request, request_id: str, scan_cid: str,
 
     conn = get_conn()
 
-    # 3) items에 없는 지점(깨진 지점 코드 등) 거부 (재고 변경 없음)
+    # 3) items에 없는 지점 거부 (재고 변경 없음)
     branch_row = conn.execute(
         "SELECT 1 AS ok FROM items WHERE branch_code=? LIMIT 1",
         (branch_code,)
@@ -4676,7 +4679,7 @@ def _scan_get_core(request: Request, request_id: str, scan_cid: str,
         (branch_code, item_code)
     ).fetchone()
 
-    # ── 1분 내 동일 지점+품번+구분 중복 여부 확인 (기존 로직 그대로) ──
+    # 4) 1분 내 동일 지점+품번+구분 중복 여부 (기존 로직 그대로)
     recent_dup = conn.execute(
         "SELECT id, scanned_at FROM scan_log "
         "WHERE branch_code=? AND item_code=? AND scan_type=? "
@@ -4687,9 +4690,7 @@ def _scan_get_core(request: Request, request_id: str, scan_cid: str,
     conn.close()
 
     if recent_dup:
-        item_name = item["item_name"] if item else item_code
-        branch_name = item["branch_name"] if item else branch_code
-
+        # 중복 확인 화면은 읽기 전용 주소(/scan/dup)로 넘긴다 (새로고침/복원이 새 스캔이 되지 않도록)
         token = uuid.uuid4().hex
         conn2 = get_conn()
         conn2.execute(
@@ -4698,79 +4699,120 @@ def _scan_get_core(request: Request, request_id: str, scan_cid: str,
         )
         conn2.commit()
         conn2.close()
-
         _scan_log_view(request, request_id, branch_code, item_code, scan_type, "DUP_PROMPT", scan_cid)
-        action_label = "입고" if scan_type == "IN" else "출고"
+        return RedirectResponse(url=f"/scan/dup?token={token}", status_code=303)
 
-        return HTMLResponse(content=f"""
-        <html><head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>중복 확인</title>
-        </head>
-        <body style="font-family:-apple-system,sans-serif;background:#f5f7fa;
-                     display:flex;justify-content:center;align-items:center;
-                     min-height:100vh;margin:0;">
-          <div style="background:white;max-width:340px;width:90%;padding:32px;
-                      border-radius:20px;box-shadow:0 4px 20px rgba(0,0,0,0.1);
-                      text-align:center;">
-            <div style="background:#FEF3C7;border-radius:12px;padding:16px;
-                        margin-bottom:20px;">
-              <div style="font-size:36px;margin-bottom:4px;">⚠️</div>
-              <div style="font-size:18px;font-weight:bold;color:#92400E;">
-                중복 제출 의심
-              </div>
-            </div>
-            <div style="text-align:left;background:#f8fafc;border-radius:10px;
-                        padding:16px;margin-bottom:20px;">
-              <div style="margin-bottom:10px;">
-                <div style="font-size:11px;color:#888;margin-bottom:2px;">지점</div>
-                <div style="font-size:15px;font-weight:bold;">{branch_name}</div>
-              </div>
-              <div style="margin-bottom:10px;">
-                <div style="font-size:11px;color:#888;margin-bottom:2px;">상품명</div>
-                <div style="font-size:15px;font-weight:bold;">{item_name}</div>
-              </div>
-              <div>
-                <div style="font-size:11px;color:#888;margin-bottom:2px;">구분</div>
-                <div style="font-size:15px;font-weight:bold;">{action_label}</div>
-              </div>
-            </div>
-            <p style="font-size:14px;color:#555;margin-bottom:20px;line-height:1.5;">
-              1분 이내 같은 상품을 이미 {action_label} 처리하셨습니다.<br>
-              <b>정말 또 {action_label} 처리하시겠습니까?</b>
-            </p>
-            <div id="choiceButtons" style="display:flex;gap:8px;">
-              <button onclick="chooseOne()" style="flex:1;background:#f0f0f0;color:#555;
-                      border:none;padding:14px;border-radius:12px;font-size:13px;
-                      font-weight:bold;cursor:pointer;">아니요<br><span style="font-weight:normal;font-size:11px;">1개만 제 출</span></button>
-              <button onclick="chooseTwo()" id="confirmBtn" style="flex:1;background:#1E2761;color:white;
-                      border:none;padding:14px;border-radius:12px;font-size:13px;
-                      font-weight:bold;cursor:pointer;">맞습니다<br><span style="font-weight:normal;font-size:11px;">2개(중 복) 제출</span></button>
-            </div>
-            <div id="closingMsg" style="display:none;font-size:14px;color:#888;padding:10px 0;">
-              처리되었습니다. 창을 닫아주세요.
-            </div>
-          </div>
-          <script>
-            function chooseOne() {{
-              document.getElementById('choiceButtons').style.display = 'none';
-              document.getElementById('closingMsg').style.display = 'block';
-              setTimeout(function() {{ window.close(); }}, 600);
-            }}
-            function chooseTwo() {{
-              document.getElementById('confirmBtn').disabled = true;
-              document.getElementById('confirmBtn').innerText = '처리 중...';
-              window.location.href = '/scan/confirm?token={token}';
-            }}
-          </script>
-        </body></html>
-        """)
-
-    # 4) 정상 처리. 품번만 items에 없으면 기존처럼 반영하되 경고로 기록
+    # 5) 정상 처리. 품번만 items에 없으면 기존처럼 반영하되 경고로 기록
     outcome = "APPLY" if item else "WARN_UNKNOWN_ITEM"
     _scan_log_view(request, request_id, branch_code, item_code, scan_type, outcome, scan_cid)
     return _do_scan_and_log(request, branch_code, item_code, scan_type, request_id)
+
+
+@app.get("/scan/dup", response_class=HTMLResponse)
+async def scan_dup(request: Request, token: str):
+    """중복 확인 화면 (읽기 전용). 이 주소를 새로고침해도 재고는 변경되지 않는다."""
+    import uuid
+    import html as _html
+    request_id = uuid.uuid4().hex
+    scan_cid, is_new_cid = _scan_get_or_make_cid(request)
+
+    pending = None
+    item = None
+    if len(token) == 32 and token.isalnum():
+        conn = get_conn()
+        pending = conn.execute(
+            "SELECT branch_code, item_code, scan_type FROM scan_pending_confirm "
+            "WHERE token=? AND created_at > (NOW() - INTERVAL '10 minutes')",
+            (token,)
+        ).fetchone()
+        if pending:
+            item = conn.execute(
+                "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
+                (pending["branch_code"], pending["item_code"])
+            ).fetchone()
+        conn.close()
+
+    if not pending:
+        _scan_log_view(request, request_id, "", "", "", "DUP_VIEW_EXPIRED", scan_cid)
+        resp = _scan_reject_page(
+            "만료된 요청",
+            "이미 처리되었거나 만료된 요청입니다.<br>다시 처리하려면 QR을 기본 카메라로 다시 인식해주세요."
+        )
+        return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
+
+    branch_code = pending["branch_code"]
+    item_code = pending["item_code"]
+    scan_type = pending["scan_type"]
+    item_name = _html.escape(item["item_name"] if item else item_code)
+    branch_name = _html.escape(item["branch_name"] if item else branch_code)
+    action_label = "입고" if scan_type == "IN" else "출고"
+    _scan_log_view(request, request_id, branch_code, item_code, scan_type, "DUP_VIEW", scan_cid)
+
+    resp = HTMLResponse(content=f"""
+    <html><head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>중복 확인</title>
+    </head>
+    <body style="font-family:-apple-system,sans-serif;background:#f5f7fa;
+                 display:flex;justify-content:center;align-items:center;
+                 min-height:100vh;margin:0;">
+      <div style="background:white;max-width:340px;width:90%;padding:32px;
+                  border-radius:20px;box-shadow:0 4px 20px rgba(0,0,0,0.1);
+                  text-align:center;">
+        <div style="background:#FEF3C7;border-radius:12px;padding:16px;
+                    margin-bottom:20px;">
+          <div style="font-size:36px;margin-bottom:4px;">⚠️</div>
+          <div style="font-size:18px;font-weight:bold;color:#92400E;">
+            중복 제출 의심
+          </div>
+        </div>
+        <div style="text-align:left;background:#f8fafc;border-radius:10px;
+                    padding:16px;margin-bottom:20px;">
+          <div style="margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;margin-bottom:2px;">지점</div>
+            <div style="font-size:15px;font-weight:bold;">{branch_name}</div>
+          </div>
+          <div style="margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;margin-bottom:2px;">상품명</div>
+            <div style="font-size:15px;font-weight:bold;">{item_name}</div>
+          </div>
+          <div>
+            <div style="font-size:11px;color:#888;margin-bottom:2px;">구분</div>
+            <div style="font-size:15px;font-weight:bold;">{action_label}</div>
+          </div>
+        </div>
+        <p style="font-size:14px;color:#555;margin-bottom:20px;line-height:1.5;">
+          1분 이내 같은 상품을 이미 {action_label} 처리하셨습니다.<br>
+          <b>정말 또 {action_label} 처리하시겠습니까?</b>
+        </p>
+        <div id="choiceButtons" style="display:flex;gap:8px;">
+          <button onclick="chooseOne()" style="flex:1;background:#f0f0f0;color:#555;
+                  border:none;padding:14px;border-radius:12px;font-size:13px;
+                  font-weight:bold;cursor:pointer;">아니요<br><span style="font-weight:normal;font-size:11px;">1개만 제출</span></button>
+          <button onclick="chooseTwo()" id="confirmBtn" style="flex:1;background:#1E2761;color:white;
+                  border:none;padding:14px;border-radius:12px;font-size:13px;
+                  font-weight:bold;cursor:pointer;">맞습니다<br><span style="font-weight:normal;font-size:11px;">2개(중복) 제출</span></button>
+        </div>
+        <div id="closingMsg" style="display:none;font-size:14px;color:#888;padding:10px 0;">
+          처리되었습니다. 창을 닫아주세요.
+        </div>
+      </div>
+      <script>
+        function chooseOne() {{
+          document.getElementById('choiceButtons').style.display = 'none';
+          document.getElementById('closingMsg').style.display = 'block';
+          setTimeout(function() {{ window.close(); }}, 600);
+        }}
+        function chooseTwo() {{
+          document.getElementById('confirmBtn').disabled = true;
+          document.getElementById('confirmBtn').innerText = '처리 중...';
+          window.location.replace('/scan/confirm?token={token}');
+        }}
+      </script>
+    </body></html>
+    """)
+    return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
 
 
 @app.get("/scan/confirm", response_class=HTMLResponse)
@@ -4779,31 +4821,42 @@ async def scan_confirm(request: Request, token: str):
     request_id = uuid.uuid4().hex
     scan_cid, is_new_cid = _scan_get_or_make_cid(request)
 
-    conn = get_conn()
-    pending = conn.execute(
-        "SELECT * FROM scan_pending_confirm WHERE token=?", (token,)
-    ).fetchone()
+    pending = None
+    if len(token) == 32 and token.isalnum():
+        conn = get_conn()
+        # 토큰은 1회용: DELETE ... RETURNING으로 원자적으로 소진한다 (동시 요청이 와도 1건만 통과)
+        pending = conn.execute(
+            "DELETE FROM scan_pending_confirm "
+            "WHERE token=? AND created_at > (NOW() - INTERVAL '10 minutes') "
+            "RETURNING branch_code, item_code, scan_type",
+            (token,)
+        ).fetchone()
+        conn.commit()
+        conn.close()
 
     if not pending:
-        conn.close()
         _scan_log_view(request, request_id, "", "", "", "CONFIRM_INVALID_TOKEN", scan_cid)
-        return HTMLResponse(content="<h3 style='text-align:center;margin-top:80px;'>❌ 유효하지 않거나 만료된 요청입니다.</h3>", status_code=404)
+        resp = _scan_reject_page(
+            "만료된 요청",
+            "이미 처리되었거나 만료된 요청입니다.<br>다시 처리하려면 QR을 기본 카메라로 다시 인식해주세요."
+        )
+        return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
 
     branch_code = pending["branch_code"]
     item_code = pending["item_code"]
     scan_type = pending["scan_type"]
-
-    conn.execute("DELETE FROM scan_pending_confirm WHERE token=?", (token,))
-    conn.commit()
-    conn.close()
 
     _scan_log_view(request, request_id, branch_code, item_code, scan_type, "CONFIRM_APPLY", scan_cid)
     resp = _do_scan_and_log(request, branch_code, item_code, scan_type, request_id)
     return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
 
 
-def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_type: str, request_id: str = "") -> HTMLResponse:
-    """실제 재고 반영 + scan_log 기록 + 완료 화면 렌더링 (request_id 연결 및 관측 프로브 추가)"""
+def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_type: str, request_id: str = ""):
+    """실제 재고 반영 + scan_log 기록. 결과 화면은 /scan/done(읽기 전용)으로 리다이렉트한다."""
+    import uuid
+    if not request_id:
+        request_id = uuid.uuid4().hex
+
     delta = 1 if scan_type == "IN" else -1
     new_qty = adjust_quantity(branch_code, item_code, delta)
 
@@ -4820,16 +4873,72 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
     now = datetime.now().isoformat()
     conn.execute(
         "INSERT INTO scan_log (branch_code, branch_name, item_name, item_code, scan_type, result_quantity, scanned_at, device_info, client_ip, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (branch_code, branch_name, item_name, item_code, scan_type, new_qty, now, device_info, client_ip, request_id or None)
+        (branch_code, branch_name, item_name, item_code, scan_type, new_qty, now, device_info, client_ip, request_id)
     )
     conn.commit()
     conn.close()
 
+    return RedirectResponse(url=f"/scan/done?rid={request_id}", status_code=303)
+
+
+@app.get("/scan/done", response_class=HTMLResponse)
+async def scan_done(request: Request, rid: str):
+    """스캔 완료 화면 (읽기 전용). scan_log를 조회만 하며 재고를 절대 변경하지 않는다."""
+    import html as _html
+    scan_cid, is_new_cid = _scan_get_or_make_cid(request)
+    rid_clean = _scan_clean(rid, 64)
+
+    row = None
+    if len(rid_clean) == 32 and rid_clean.isalnum():
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT branch_code, branch_name, item_name, item_code, scan_type, result_quantity, scanned_at "
+            "FROM scan_log WHERE request_id=?",
+            (rid_clean,)
+        ).fetchone()
+        conn.close()
+
+    if not row:
+        _scan_log_view(request, rid_clean, "", "", "", "DONE_NOT_FOUND", scan_cid)
+        resp = _scan_reject_page(
+            "처리 기록 없음",
+            "이 스캔의 처리 기록을 찾을 수 없습니다.<br>재고는 변경되지 않았습니다. 필요하면 QR을 다시 스캔해주세요."
+        )
+        return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
+
+    # 처리 후 30초가 지나서 다시 열린 화면이면 '재조회'로 구분한다 (탭 복원/새로고침 추적용)
+    review = False
+    try:
+        age = (datetime.now() - datetime.fromisoformat(str(row["scanned_at"]))).total_seconds()
+        review = age > 30
+    except Exception:
+        review = False
+
+    scan_type = row["scan_type"]
+    _scan_log_view(request, rid_clean, row["branch_code"], row["item_code"], scan_type,
+                   "DONE_REVIEW" if review else "DONE_VIEW", scan_cid)
+
+    branch_name = _html.escape(str(row["branch_name"] or row["branch_code"]))
+    item_name = _html.escape(str(row["item_name"] or row["item_code"]))
+    item_code_txt = _html.escape(str(row["item_code"]))
+    qty = row["result_quantity"]
+    time_text = _html.escape(str(row["scanned_at"])[:19].replace("T", " "))
+
     action_label = "입고 ✅" if scan_type == "IN" else "출고 📤"
+    type_text = "입고" if scan_type == "IN" else "출고"
     bg_color = "#D1FAE5" if scan_type == "IN" else "#FEE2E2"
     text_color = "#065F46" if scan_type == "IN" else "#991B1B"
+    qty_label = "처리 당시 재고" if review else "현재 재고"
+    review_js = "true" if review else "false"
+    review_html = ""
+    if review:
+        review_html = (
+            '<div style="background:#FEF3C7;color:#92400E;border-radius:10px;padding:10px;'
+            'margin-bottom:16px;font-size:13px;font-weight:bold;line-height:1.5;">'
+            '이미 처리된 스캔입니다.<br>이 화면을 다시 열어도 재고는 변경되지 않습니다.</div>'
+        )
 
-    return HTMLResponse(content=f"""
+    resp = HTMLResponse(content=f"""
     <html><head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -4845,9 +4954,10 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
                     margin-bottom:20px;">
           <div style="font-size:36px;margin-bottom:4px;">{action_label}</div>
           <div style="font-size:20px;font-weight:bold;color:{text_color};">
-            {'입고' if scan_type == 'IN' else '출고'} 처리 완료
+            {type_text} 처리 완료
           </div>
         </div>
+        {review_html}
         <div style="text-align:left;background:#f8fafc;border-radius:10px;
                     padding:16px;margin-bottom:16px;">
           <div style="margin-bottom:10px;">
@@ -4860,15 +4970,18 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
           </div>
           <div style="margin-bottom:10px;">
             <div style="font-size:11px;color:#888;margin-bottom:2px;">품번</div>
-            <div style="font-size:14px;color:#64748B;">{item_code}</div>
+            <div style="font-size:14px;color:#64748B;">{item_code_txt}</div>
           </div>
           <div>
-            <div style="font-size:11px;color:#888;margin-bottom:2px;">현재 재고</div>
-            <div style="font-size:28px;font-weight:bold;color:#1E2761;">{new_qty}개</div>
+            <div style="font-size:11px;color:#888;margin-bottom:2px;">{qty_label}</div>
+            <div style="font-size:28px;font-weight:bold;color:#1E2761;">{qty}개</div>
           </div>
         </div>
-        <div style="font-size:12px;color:#aaa;margin-bottom:16px;">
-          {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        <div style="font-size:12px;color:#aaa;margin-bottom:8px;">
+          {time_text}
+        </div>
+        <div id="autoCloseMsg" style="font-size:12px;color:#888;margin-bottom:12px;">
+          {SCAN_AUTOCLOSE_SECONDS}초 후 자동으로 닫힙니다
         </div>
         <button onclick="window.close()" style="width:100%;background:#1E2761;color:white;
                 border:none;padding:14px;border-radius:12px;font-size:15px;
@@ -4876,7 +4989,24 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
       </div>
       <script>
         (function() {{
-          var rid = '{request_id}';
+          var left = {SCAN_AUTOCLOSE_SECONDS};
+          var msg = document.getElementById('autoCloseMsg');
+          var timer = setInterval(function() {{
+            left -= 1;
+            if (left > 0) {{
+              msg.innerText = left + '초 후 자동으로 닫힙니다';
+            }} else {{
+              clearInterval(timer);
+              window.close();
+              setTimeout(function() {{
+                msg.innerText = '처리가 완료되었습니다. 화면을 닫아주세요.';
+              }}, 400);
+            }}
+          }}, 1000);
+        }})();
+        (function() {{
+          var rid = '{rid_clean}';
+          var isReview = {review_js};
           var sent = 0;
           var t0 = Date.now();
           function navType() {{
@@ -4892,6 +5022,7 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
               var d = {{
                 rid: rid,
                 ev: ev,
+                rv: isReview,
                 vis: document.visibilityState,
                 focus: document.hasFocus ? document.hasFocus() : null,
                 nav: navType(),
@@ -4925,6 +5056,7 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
       </script>
     </body></html>
     """)
+    return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
 
 
 @app.post("/scan/probe")
