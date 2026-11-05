@@ -2689,13 +2689,15 @@ def _stock_closing_editable_dates():
 
 
 def _stock_closing_live_items(target_branch: str, sel_date) -> list:
-    """선택 날짜(KST 00~24시)의 QR 입·출고 스캔 합계 + QR 재고 + 유비플러스 재고. QR DB(inventory) 등록 상품만."""
+    """선택 날짜(KST 00~24시)의 QR 입·출고 스캔 합계 + QR 재고 + 유비플러스 재고. QR DB(inventory) 등록 상품만.
+    재고 값은 해당 날짜의 가장 늦은 슬롯(24→22→21) 스냅샷을 쓰고, 스냅샷이 없으면 현재 값을 쓴다."""
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     kst = _tz(_td(hours=9))
     start_kst = _dt(sel_date.year, sel_date.month, sel_date.day, tzinfo=kst)
     end_kst = start_kst + _td(days=1)
     start_utc = start_kst.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S")
     end_utc = end_kst.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    snap_date = sel_date.strftime("%Y-%m-%d")
 
     conn = get_conn()
     params = [start_utc, end_utc]
@@ -2714,9 +2716,19 @@ def _stock_closing_live_items(target_branch: str, sel_date) -> list:
             "SELECT branch_code, item_code, item_name, quantity FROM inventory WHERE branch_code=?",
             (target_branch,)
         ).fetchall()
+        snap_rows = conn.execute(
+            "SELECT slot, branch_code, item_code, qr_qty, ups_qty FROM stock_daily_snapshot "
+            "WHERE snap_date=? AND branch_code=?",
+            (snap_date, target_branch)
+        ).fetchall()
     else:
         inv_rows = conn.execute(
             "SELECT branch_code, item_code, item_name, quantity FROM inventory"
+        ).fetchall()
+        snap_rows = conn.execute(
+            "SELECT slot, branch_code, item_code, qr_qty, ups_qty FROM stock_daily_snapshot "
+            "WHERE snap_date=?",
+            (snap_date,)
         ).fetchall()
     conn.close()
 
@@ -2726,18 +2738,49 @@ def _stock_closing_live_items(target_branch: str, sel_date) -> list:
     }
     raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in fetch_raw_inventory()}
 
+    # 지점별로 해당 날짜에서 가장 늦은 슬롯(24 > 22 > 21)의 스냅샷만 사용
+    slot_rank = {"21": 1, "22": 2, "24": 3}
+    best_rank = {}
+    for s in snap_rows:
+        rk = slot_rank.get(str(s["slot"]), 0)
+        if rk > best_rank.get(s["branch_code"], 0):
+            best_rank[s["branch_code"]] = rk
+    snap_map = {}
+    for s in snap_rows:
+        if slot_rank.get(str(s["slot"]), 0) == best_rank.get(s["branch_code"]):
+            snap_map[f"{s['branch_code']}|{s['item_code']}"] = s
+
+    def _basis_label(s):
+        slot = str(s["slot"])
+        if slot == "24":
+            return "스냅샷 " + (sel_date + _td(days=1)).strftime("%m/%d") + " 00:15"
+        return "스냅샷 " + sel_date.strftime("%m/%d") + " " + slot + ":15"
+
     items = []
     for r in scan_rows:
         key = f"{r['branch_code']}|{r['item_code']}"
         if key not in inv_map:
             continue
+        snap = snap_map.get(key)
+        if snap is not None:
+            qr_qty = snap["qr_qty"] or 0
+            ups = snap["ups_qty"]
+            basis = "snap"
+            basis_label = _basis_label(snap)
+        else:
+            qr_qty = inv_map[key]["qty"] or 0
+            ups = (raw_map[key] or 0) if key in raw_map else None
+            basis = "live"
+            basis_label = "현재 값(스냅샷 없음)"
         items.append({
             "branch_code": r["branch_code"],
             "item_code": r["item_code"],
             "item_name": inv_map[key]["name"],
-            "qr_qty": inv_map[key]["qty"] or 0,
-            "ups": (raw_map[key] or 0) if key in raw_map else None,
+            "qr_qty": qr_qty,
+            "ups": ups,
             "cnt": r["cnt"],
+            "basis": basis,
+            "basis_label": basis_label,
         })
     items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
     return items
@@ -2859,7 +2902,7 @@ async def stock_closing_page(
     else:
         items = _stock_closing_live_items(target_branch, sel_date)
         for it in items:
-            if can_edit_date:
+            if can_edit_date or it["basis"] == "snap":
                 qr_disp = _fmt_num(it["qr_qty"])
                 ups = it["ups"]
                 ups_disp = _fmt_num(ups)
@@ -2938,6 +2981,12 @@ async def stock_closing_page(
     # 상태 안내 문구
     notice_style = 'class="card" style="font-size:12px;margin-bottom:12px;'
     notices_html = ""
+i   f view_mode in ("live", "past_live") and items:
+        basis_text = ", ".join(sorted({it["basis_label"] for it in items}))
+        notices_html += (
+            f'<div {notice_style}color:#475569;background:#F8FAFC;">'
+            "QR 재고·유비플러스 재고 기준: " + basis_text + "</div>"
+        )
     if view_mode == "closed":
         notices_html += (
             f'<div {notice_style}color:#166534;background:#F0FDF4;">'
@@ -2975,7 +3024,7 @@ async def stock_closing_page(
     else:
         notices_html += (
             f'<div {notice_style}color:#92400E;background:#FFFBEB;">'
-            "마감 가능 기간이 지난 날짜입니다. 저장된 내용이 없어 그날의 스캔 수량만 표시됩니다.</div>"
+            "전일 날짜 마감입니다. 재고 값은 위에 표시된 기준 시각을 따릅니다.</div>"
         )
 
     buttons_html = ""
@@ -17326,7 +17375,7 @@ def _take_stock_snapshot(slot: str) -> dict:
         return {"error": err}
     finally:
         conn.close()
-        
+
 
 @app.get("/api/cron/sync-payment-records")
 async def cron_sync_payment_records(request: Request, slot: str = "", date: str = ""):
