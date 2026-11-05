@@ -2679,42 +2679,19 @@ def fetch_raw_inventory() -> List[Dict[str, Any]]:
             merged[key] = dict(r)
     return list(merged.values())
 
-# ── 재고 마감 (3단계 중 1: 날짜 필터 + QR 재고 칼럼 — 날짜별 입·출고 스캔 목록 + 실사 수량 입력) ──────────
+# ── 재고 마감 (3단계 중 2: 저장/마감 — 마감 가능 기간은 해당 일자 + 익일) ──────────
 
-@app.get("/stock-closing", response_class=HTMLResponse)
-async def stock_closing_page(
-    session_token: str = Cookie(default=None),
-    filter_branch: str = "",
-    date: str = ""
-):
-    """재고 마감 — 선택 날짜(KST 00~24시) QR 입고+출고 스캔 합계, QR 재고, 유비플러스 재고(오늘만), 실사 수량 입력, 오차"""
-    import html as _html
+def _stock_closing_editable_dates():
+    """KST 기준 오늘 날짜와 저장/마감 가능한 날짜 목록 (오늘, 어제 — 11/5 마감은 11/5~6에 가능)"""
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    today = _dt.now(_tz(_td(hours=9))).date()
+    return today, [today, today - _td(days=1)]
 
-    user = get_session(session_token)
-    if not user:
-        return RedirectResponse(url="/login", status_code=303)
 
-    is_master_user = user["role"] == "master"
-    target_branch = filter_branch if is_master_user else user["branch_code"]
-
-    # 한국시간 기준 조회 날짜 (기본 오늘, 미래 날짜는 오늘로 보정)
+def _stock_closing_live_items(target_branch: str, sel_date) -> list:
+    """선택 날짜(KST 00~24시)의 QR 입·출고 스캔 합계 + QR 재고 + 유비플러스 재고. QR DB(inventory) 등록 상품만."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     kst = _tz(_td(hours=9))
-    now_kst = _dt.now(kst)
-    today_kst = now_kst.date()
-    sel_date = today_kst
-    if date:
-        try:
-            sel_date = _dt.strptime(date, "%Y-%m-%d").date()
-        except ValueError:
-            sel_date = today_kst
-    if sel_date > today_kst:
-        sel_date = today_kst
-    is_today = (sel_date == today_kst)
-    sel_date_str = sel_date.strftime("%Y-%m-%d")
-    today_str = today_kst.strftime("%Y-%m-%d")
-
-    # 선택 날짜 00:00~24:00(KST) → UTC 문자열 구간 (scan_log.scanned_at 은 UTC 저장)
     start_kst = _dt(sel_date.year, sel_date.month, sel_date.day, tzinfo=kst)
     end_kst = start_kst + _td(days=1)
     start_utc = start_kst.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -2737,6 +2714,82 @@ async def stock_closing_page(
             "SELECT branch_code, item_code, item_name, quantity FROM inventory WHERE branch_code=?",
             (target_branch,)
         ).fetchall()
+    else:
+        inv_rows = conn.execute(
+            "SELECT branch_code, item_code, item_name, quantity FROM inventory"
+        ).fetchall()
+    conn.close()
+
+    inv_map = {
+        f"{r['branch_code']}|{r['item_code']}": {"name": r["item_name"], "qty": r["quantity"]}
+        for r in inv_rows
+    }
+    raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in fetch_raw_inventory()}
+
+    items = []
+    for r in scan_rows:
+        key = f"{r['branch_code']}|{r['item_code']}"
+        if key not in inv_map:
+            continue
+        items.append({
+            "branch_code": r["branch_code"],
+            "item_code": r["item_code"],
+            "item_name": inv_map[key]["name"],
+            "qr_qty": inv_map[key]["qty"] or 0,
+            "ups": (raw_map[key] or 0) if key in raw_map else None,
+            "cnt": r["cnt"],
+        })
+    items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
+    return items
+
+
+@app.get("/stock-closing", response_class=HTMLResponse)
+async def stock_closing_page(
+    session_token: str = Cookie(default=None),
+    filter_branch: str = "",
+    date: str = ""
+):
+    """재고 마감 — 날짜별 QR 입·출고 스캔 목록, QR 재고, 유비플러스 재고, 실사 수량 저장/마감, 오차"""
+    import html as _html
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    is_master_user = user["role"] == "master"
+    target_branch = filter_branch if is_master_user else user["branch_code"]
+
+    # 한국시간 기준 조회 날짜 (기본 오늘, 미래 날짜는 오늘로 보정)
+    kst = _tz(_td(hours=9))
+    today_kst, editable_dates = _stock_closing_editable_dates()
+    sel_date = today_kst
+    if date:
+        try:
+            sel_date = _dt.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            sel_date = today_kst
+    if sel_date > today_kst:
+        sel_date = today_kst
+    can_edit_date = sel_date in editable_dates
+    sel_date_str = sel_date.strftime("%Y-%m-%d")
+    today_str = today_kst.strftime("%Y-%m-%d")
+    window_end_str = (sel_date + _td(days=1)).strftime("%Y-%m-%d")
+
+    # 지점이 정해진 경우에만 저장/마감 내역 조회
+    save = None
+    snap_lines = []
+    conn = get_conn()
+    if target_branch:
+        save = conn.execute(
+            "SELECT * FROM stock_closing_saves WHERE branch_code=? AND close_date=?",
+            (target_branch, sel_date_str)
+        ).fetchone()
+        if save:
+            snap_lines = conn.execute(
+                "SELECT * FROM stock_closing_lines WHERE save_id=? ORDER BY item_code",
+                (save["id"],)
+            ).fetchall()
         scan_last = conn.execute(
             "SELECT MAX(scanned_at) as t FROM scan_log WHERE branch_code=?",
             (target_branch,)
@@ -2746,12 +2799,24 @@ async def stock_closing_page(
             (target_branch,)
         ).fetchone()
     else:
-        inv_rows = conn.execute(
-            "SELECT branch_code, item_code, item_name, quantity FROM inventory"
-        ).fetchall()
         scan_last = conn.execute("SELECT MAX(scanned_at) as t FROM scan_log").fetchone()
         raw_last = conn.execute("SELECT MAX(uploaded_at) as t FROM raw_inventory").fetchone()
     conn.close()
+
+    save_status = ((save["status"] or "draft") if save else "")
+    if save and save_status == "closed":
+        view_mode = "closed"
+    elif can_edit_date:
+        view_mode = "live"
+    elif save:
+        view_mode = "draft_snapshot"
+    else:
+        view_mode = "past_live"
+    can_write = (view_mode == "live") and (not is_master_user)
+
+    draft_counts = {}
+    if save and view_mode == "live":
+        draft_counts = {l["item_code"]: l["counted_qty"] for l in snap_lines}
 
     def _fmt_kst(v):
         if not v:
@@ -2764,60 +2829,69 @@ async def stock_closing_page(
         except Exception:
             return str(v)[:16]
 
-    inv_map = {
-        f"{r['branch_code']}|{r['item_code']}": {"name": r["item_name"], "qty": r["quantity"]}
-        for r in inv_rows
-    }
-    raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in fetch_raw_inventory()}
+    def _fmt_num(v):
+        return "-" if v is None else str(v)
 
-    # QR DB(inventory)에 등록된 상품만 노출
-    items = []
-    for r in scan_rows:
-        key = f"{r['branch_code']}|{r['item_code']}"
-        if key not in inv_map:
-            continue
-        items.append({
-            "key": key,
-            "branch_code": r["branch_code"],
-            "item_code": r["item_code"],
-            "item_name": inv_map[key]["name"],
-            "qr_qty": inv_map[key]["qty"],
-            "cnt": r["cnt"],
-        })
-    items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
+    def _diff_html(d):
+        if d is None:
+            return '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
+        color = "#22C55E" if d == 0 else ("#EF4444" if d < 0 else "#F59E0B")
+        txt = ("+" if d > 0 else "") + str(d)
+        return f'<td class="sc-diff" style="font-weight:bold;color:{color};">{txt}</td>'
 
     rows_html = ""
-    for it in items:
-        if is_today:
-            qr_disp = str(it["qr_qty"] or 0)
-            ups = raw_map.get(it["key"])
-            ups_attr = "" if ups is None else str(ups or 0)
-            ups_disp = "-" if ups is None else str(ups or 0)
-            input_extra = ""
-        else:
-            # 과거 날짜: QR 재고·유비플러스 재고는 현재 값만 있어 비교 불가 → 표시/입력 비활성
-            qr_disp = "-"
-            ups_attr = ""
-            ups_disp = "-"
-            input_extra = " disabled"
-        rows_html += (
-            "<tr>"
-            f"<td>{_html.escape(str(it['branch_code']))}</td>"
-            f"<td>{_html.escape(str(it['item_name']))}</td>"
-            f"<td>{_html.escape(str(it['item_code']))}</td>"
-            f"<td>{it['cnt']}</td>"
-            f"<td>{qr_disp}</td>"
-            f"<td>{ups_disp}</td>"
-            f'<td><input type="number" class="sc-input" data-ups="{ups_attr}" '
-            f'placeholder="실사" oninput="scUpdateDiff(this)"{input_extra} '
-            'style="width:70px;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
-            '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
-            "</tr>"
-        )
+    if view_mode in ("closed", "draft_snapshot"):
+        # 저장된 값 그대로 표시
+        for l in snap_lines:
+            rows_html += (
+                "<tr>"
+                f"<td>{_html.escape(str(l['branch_code']))}</td>"
+                f"<td>{_html.escape(str(l['item_name'] or ''))}</td>"
+                f"<td>{_html.escape(str(l['item_code']))}</td>"
+                f"<td>{_fmt_num(l['scan_qty'])}</td>"
+                f"<td>{_fmt_num(l['qr_qty'])}</td>"
+                f"<td>{_fmt_num(l['ups_qty'])}</td>"
+                f"<td>{_fmt_num(l['counted_qty'])}</td>"
+                + _diff_html(l["diff_qty"])
+                + "</tr>"
+            )
+        empty_msg = "저장된 상품이 없습니다 (해당 날짜에 스캔된 QR 등록 상품이 없었습니다)"
+    else:
+        items = _stock_closing_live_items(target_branch, sel_date)
+        for it in items:
+            if can_edit_date:
+                qr_disp = _fmt_num(it["qr_qty"])
+                ups = it["ups"]
+                ups_disp = _fmt_num(ups)
+                ups_attr = "" if ups is None else str(ups)
+            else:
+                # 과거 날짜(저장값 없음): QR/유비플러스 재고는 현재 값만 있어 비교 불가
+                qr_disp = "-"
+                ups_disp = "-"
+                ups_attr = ""
+            cv = draft_counts.get(it["item_code"])
+            val_attr = "" if cv is None else f' value="{cv}"'
+            dis = "" if can_write else " disabled"
+            rows_html += (
+                "<tr>"
+                f"<td>{_html.escape(str(it['branch_code']))}</td>"
+                f"<td>{_html.escape(str(it['item_name']))}</td>"
+                f"<td>{_html.escape(str(it['item_code']))}</td>"
+                f"<td>{it['cnt']}</td>"
+                f"<td>{qr_disp}</td>"
+                f"<td>{ups_disp}</td>"
+                f'<td><input type="number" min="0" class="sc-input" '
+                f'data-code="{_html.escape(str(it["item_code"]))}" data-ups="{ups_attr}"{val_attr} '
+                f'placeholder="실사" oninput="scUpdateDiff(this)"{dis} '
+                'style="width:70px;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
+                '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
+                "</tr>"
+            )
+        empty_msg = "해당 날짜에 스캔된 QR 등록 상품이 없습니다"
     if not rows_html:
         rows_html = (
             '<tr><td colspan="8" style="text-align:center;padding:24px;color:#888;">'
-            "해당 날짜에 스캔된 QR 등록 상품이 없습니다</td></tr>"
+            + empty_msg + "</td></tr>"
         )
 
     # 지점 필터(마스터) + 날짜 필터를 한 폼으로 묶어 서로의 선택값이 유지되도록 함
@@ -2861,12 +2935,58 @@ async def stock_closing_page(
         "</div>"
     )
 
-    past_notice_html = ""
-    if not is_today:
-        past_notice_html = (
-            '<div class="card" style="font-size:12px;color:#92400E;background:#FFFBEB;">'
-            "과거 날짜는 그날의 스캔 수량만 표시됩니다. QR 재고와 유비플러스 재고는 현재 값만 있어 "
-            "비교할 수 없어서 실사 입력과 오차는 오늘 날짜에서만 사용할 수 있습니다.</div>"
+    # 상태 안내 문구
+    notice_style = 'class="card" style="font-size:12px;margin-bottom:12px;'
+    notices_html = ""
+    if view_mode == "closed":
+        notices_html += (
+            f'<div {notice_style}color:#166534;background:#F0FDF4;">'
+            f'✅ 마감 완료 — {_html.escape(str(save["closed_by"] or "-"))} · '
+            f'{_html.escape(str(save["closed_at"] or "-"))} · 마감 후에는 수정할 수 없습니다.</div>'
+        )
+    elif view_mode == "live":
+        notices_html += (
+            f'<div {notice_style}color:#475569;background:#F8FAFC;">'
+            f'마감 가능 기간: {sel_date_str} ~ {window_end_str}</div>'
+        )
+        if save:
+            notices_html += (
+                f'<div {notice_style}color:#1E40AF;background:#EFF6FF;">'
+                f'💾 임시저장됨 — {_html.escape(str(save["saved_by"] or "-"))} · '
+                f'{_html.escape(str(save["saved_at"] or "-"))} (마감 전까지 수정할 수 있습니다)</div>'
+            )
+        if sel_date != today_kst:
+            notices_html += (
+                f'<div {notice_style}color:#92400E;background:#FFFBEB;">'
+                "전일 날짜 마감입니다. QR 재고와 유비플러스 재고는 현재 시점 값입니다.</div>"
+            )
+        if is_master_user:
+            notices_html += (
+                f'<div {notice_style}color:#475569;background:#F8FAFC;">'
+                "마스터 계정은 조회만 가능합니다. 지점을 선택하면 해당 지점의 저장/마감 내용이 표시됩니다.</div>"
+            )
+    elif view_mode == "draft_snapshot":
+        notices_html += (
+            f'<div {notice_style}color:#92400E;background:#FFFBEB;">'
+            f'임시저장 값입니다(마감되지 않음) — 마지막 저장 {_html.escape(str(save["saved_at"] or "-"))}. '
+            "마감 가능 기간이 지나 더 이상 수정할 수 없습니다.</div>"
+        )
+    else:
+        notices_html += (
+            f'<div {notice_style}color:#92400E;background:#FFFBEB;">'
+            "마감 가능 기간이 지난 날짜입니다. 저장된 내용이 없어 그날의 스캔 수량만 표시됩니다.</div>"
+        )
+
+    buttons_html = ""
+    if can_write:
+        buttons_html = (
+            f'<div id="scMeta" data-date="{sel_date_str}" style="display:none;"></div>'
+            '<div style="display:flex;gap:8px;margin-top:12px;">'
+            '<button class="btn" type="button" style="flex:1;background:#64748B;" onclick="scSubmit(\'draft\')">💾 저장</button>'
+            '<button class="btn" type="button" style="flex:1;" onclick="scSubmit(\'close\')">✅ 마감</button>'
+            "</div>"
+            '<p style="font-size:12px;color:#888;margin-top:8px;">'
+            "저장은 마감 전까지 수정할 수 있습니다. 마감하면 수정할 수 없으니 확인 후 눌러주세요.</p>"
         )
 
     script = """
@@ -2889,6 +3009,55 @@ async def stock_closing_page(
         cell.textContent = (diff > 0 ? '+' : '') + diff;
         cell.style.color = diff === 0 ? '#22C55E' : (diff < 0 ? '#EF4444' : '#F59E0B');
       }
+
+      function scCollect() {
+        var counts = {};
+        document.querySelectorAll('.sc-input').forEach(function(inp) {
+          counts[inp.getAttribute('data-code')] = inp.value;
+        });
+        return counts;
+      }
+
+      async function scSubmit(mode) {
+        var meta = document.getElementById('scMeta');
+        if (!meta) return;
+        var date = meta.getAttribute('data-date');
+        if (mode === 'close') {
+          var empty = 0;
+          document.querySelectorAll('.sc-input').forEach(function(inp) {
+            if (inp.value === '') empty++;
+          });
+          if (empty > 0) {
+            alert('실사 수량이 입력되지 않은 상품이 ' + empty + '개 있습니다.\\n모든 상품에 입력한 뒤 마감해주세요.');
+            return;
+          }
+          if (!confirm('마감 후에는 수정할 수 없습니다.\\n입력한 내용을 확인했다면 [확인]을 눌러 마감해주세요.')) {
+            return;
+          }
+        }
+        try {
+          var res = await fetch('/stock-closing/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({date: date, mode: mode, counts: scCollect()})
+          });
+          var data = await res.json();
+          if (!res.ok) {
+            alert(data.detail || '처리에 실패했습니다.');
+            return;
+          }
+          alert(data.message || '완료되었습니다.');
+          location.reload();
+        } catch (e) {
+          alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+        }
+      }
+
+      window.addEventListener('load', function() {
+        document.querySelectorAll('.sc-input').forEach(function(inp) {
+          if (inp.value !== '') scUpdateDiff(inp);
+        });
+      });
     </script>
     """
 
@@ -2899,17 +3068,133 @@ async def stock_closing_page(
         "금일 출고 수량 = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − 유비플러스 재고</p>"
         + filter_html
         + cards_html
-        + past_notice_html
+        + notices_html
         + '<div class="card"><div class="table-scroll-wrap"><table>'
         "<thead><tr>"
         "<th>지점</th><th>상품명</th><th>상품코드</th><th>금일 출고 수량</th>"
         "<th>QR 재고 수량</th><th>유비플러스 재고 수량</th><th>실사 수량</th><th>오차</th>"
         "</tr></thead><tbody>"
         + rows_html
-        + "</tbody></table></div></div>"
+        + "</tbody></table></div>"
+        + buttons_html
+        + "</div>"
         + script
     )
     return HTMLResponse(render_page(content, user, active="stock-closing"))
+
+
+@app.post("/stock-closing/save")
+async def stock_closing_save(request: Request, session_token: str = Cookie(default=None)):
+    """재고 마감 저장(임시저장)/마감 — 스캔·QR재고·유비플러스 재고는 서버가 다시 계산, 화면에서는 실사 수량만 받음"""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if user["role"] == "master":
+        raise HTTPException(status_code=403, detail="마스터 계정은 조회만 가능합니다. 지점 계정에서 저장/마감해주세요.")
+    branch_code = user["branch_code"]
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    date_str = str(body.get("date", "")).strip()
+    mode = str(body.get("mode", "")).strip()
+    counts = body.get("counts") or {}
+    if mode not in ("draft", "close"):
+        raise HTTPException(status_code=400, detail="저장 방식이 올바르지 않습니다.")
+    if not isinstance(counts, dict):
+        raise HTTPException(status_code=400, detail="실사 수량 형식이 올바르지 않습니다.")
+    try:
+        sel_date = _dt.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+
+    today_kst, editable_dates = _stock_closing_editable_dates()
+    if sel_date not in editable_dates:
+        raise HTTPException(status_code=400, detail="저장/마감 가능한 기간(해당 일자 + 익일)이 지났습니다.")
+
+    # 서버에서 현재 값을 다시 계산
+    items = _stock_closing_live_items(branch_code, sel_date)
+    lines = []
+    missing = 0
+    mismatch = 0
+    for it in items:
+        raw_val = counts.get(it["item_code"])
+        counted = None
+        if raw_val is not None and str(raw_val).strip() != "":
+            try:
+                counted = int(str(raw_val).strip())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="실사 수량이 숫자가 아닙니다: " + str(it["item_code"]))
+            if counted < 0:
+                raise HTTPException(status_code=400, detail="실사 수량은 0 이상이어야 합니다: " + str(it["item_code"]))
+        if counted is None:
+            missing += 1
+        ups = it["ups"]
+        diff = (counted - ups) if (counted is not None and ups is not None) else None
+        if diff is not None and diff != 0:
+            mismatch += 1
+        lines.append((it["item_code"], it["item_name"], it["cnt"], it["qr_qty"], ups, counted, diff))
+
+    if mode == "close" and missing > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="실사 수량이 입력되지 않은 상품이 " + str(missing) + "개 있습니다. 화면을 새로고침한 뒤 모두 입력하고 마감해주세요."
+        )
+
+    now_str = _dt.now(_tz(_td(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
+    login = user.get("login_id") or branch_code
+    status = "closed" if mode == "close" else "draft"
+    closed_by = login if mode == "close" else None
+    closed_at = now_str if mode == "close" else None
+
+    conn = get_conn()
+    try:
+        existing = conn.execute(
+            "SELECT id, status FROM stock_closing_saves WHERE branch_code=? AND close_date=?",
+            (branch_code, date_str)
+        ).fetchone()
+        if existing and (existing["status"] or "draft") == "closed":
+            raise HTTPException(status_code=400, detail="이미 마감된 날짜입니다. 마감 후에는 수정할 수 없습니다.")
+        if existing:
+            save_id = existing["id"]
+            conn.execute(
+                "UPDATE stock_closing_saves SET status=?, saved_by=?, saved_at=?, closed_by=?, closed_at=?, "
+                "item_count=?, mismatch_count=? WHERE id=?",
+                (status, login, now_str, closed_by, closed_at, len(lines), mismatch, save_id)
+            )
+            conn.execute("DELETE FROM stock_closing_lines WHERE save_id=?", (save_id,))
+        else:
+            conn.execute(
+                "INSERT INTO stock_closing_saves (branch_code, close_date, status, saved_by, saved_at, "
+                "closed_by, closed_at, item_count, mismatch_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (branch_code, date_str, status, login, now_str, closed_by, closed_at, len(lines), mismatch)
+            )
+            row = conn.execute(
+                "SELECT id FROM stock_closing_saves WHERE branch_code=? AND close_date=?",
+                (branch_code, date_str)
+            ).fetchone()
+            save_id = row["id"]
+        for ln in lines:
+            conn.execute(
+                "INSERT INTO stock_closing_lines (save_id, branch_code, close_date, item_code, item_name, "
+                "scan_qty, qr_qty, ups_qty, counted_qty, diff_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (save_id, branch_code, date_str) + ln
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if mode == "close":
+        msg = "마감되었습니다. 마감 후에는 수정할 수 없습니다."
+    else:
+        msg = "저장되었습니다. (임시저장 — 마감 전까지 수정할 수 있습니다)"
+    return JSONResponse({"ok": True, "mode": mode, "message": msg})
+
 
 # ── 대시보드 ────────────────────────────────────────────
 
