@@ -17272,6 +17272,62 @@ async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
     return result
 
 
+def _take_stock_snapshot(slot: str) -> dict:
+    """재고 마감용 스냅샷 — QR 재고(inventory)와 유비플러스 재고(raw_inventory)를 stock_daily_snapshot에 저장.
+    slot 21/22는 오늘 날짜, slot 24(00:16 실행)는 전날 날짜로 저장. 100일 지난 스냅샷/재고 마감 데이터는 삭제."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    now_kst = _dt.now(_tz(_td(hours=9)))
+    snap_day = (now_kst.date() - _td(days=1)) if slot == "24" else now_kst.date()
+    snap_date = snap_day.strftime("%Y-%m-%d")
+    snapped_at = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+    cutoff = (snap_day - _td(days=100)).strftime("%Y-%m-%d")
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO stock_daily_snapshot "
+            "(snap_date, slot, branch_code, item_code, item_name, qr_qty, ups_qty, snapped_at) "
+            "SELECT DISTINCT ON (i.branch_code, i.item_code) "
+            "CAST(? AS TEXT), CAST(? AS TEXT), i.branch_code, i.item_code, i.item_name, "
+            "i.quantity, r.quantity, CAST(? AS TEXT) "
+            "FROM inventory i "
+            "LEFT JOIN ("
+            "SELECT DISTINCT ON (branch_code, item_code) branch_code, item_code, quantity "
+            "FROM raw_inventory ORDER BY branch_code, item_code, source DESC"
+            ") r ON r.branch_code = i.branch_code AND r.item_code = i.item_code "
+            "ORDER BY i.branch_code, i.item_code "
+            "ON CONFLICT (snap_date, slot, branch_code, item_code) DO UPDATE SET "
+            "item_name = EXCLUDED.item_name, qr_qty = EXCLUDED.qr_qty, "
+            "ups_qty = EXCLUDED.ups_qty, snapped_at = EXCLUDED.snapped_at",
+            (snap_date, slot, snapped_at)
+        )
+        conn.execute("DELETE FROM stock_daily_snapshot WHERE snap_date < ?", (cutoff,))
+        conn.execute("DELETE FROM stock_closing_saves WHERE close_date < ?", (cutoff,))
+        conn.commit()
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt, COUNT(ups_qty) AS ups_cnt FROM stock_daily_snapshot "
+            "WHERE snap_date=? AND slot=?",
+            (snap_date, slot)
+        ).fetchone()
+        total = row["cnt"] or 0
+        return {
+            "snap_date": snap_date,
+            "slot": slot,
+            "rows": total,
+            "ups_missing": total - (row["ups_cnt"] or 0),
+            "retention_cutoff": cutoff,
+        }
+    except Exception as e:
+        err = "재고 스냅샷 실패: " + str(e)
+        try:
+            report_cron_failure("stock-snapshot", err)
+        except Exception:
+            pass
+        return {"error": err}
+    finally:
+        conn.close()
+        
+
 @app.get("/api/cron/sync-payment-records")
 async def cron_sync_payment_records(request: Request, slot: str = "", date: str = ""):
     import re
@@ -17287,8 +17343,18 @@ async def cron_sync_payment_records(request: Request, slot: str = "", date: str 
     if date and not re.fullmatch(r"\d{8}", date):
         return JSONResponse(status_code=400, content={"detail": "date는 YYYYMMDD 형식이어야 합니다."})
 
+    snap = None
+    if not date:
+        # 재고 마감용 스냅샷(QR 재고/유비플러스 재고). 결제내역 재수신(date 지정) 요청에서는 실행하지 않는다.
+        snap = _take_stock_snapshot(slot)
+
     result = await _sync_payment_records(slot, date)
-    failed = bool(result.get("error") or result.get("retention_error"))
+    if snap is not None:
+        result["stock_snapshot"] = snap
+    failed = bool(
+        result.get("error") or result.get("retention_error")
+        or (snap is not None and snap.get("error"))
+    )
     return JSONResponse(status_code=500 if failed else 200, content=result)
 
 
