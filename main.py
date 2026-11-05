@@ -2129,9 +2129,9 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     menus = [
         ("dashboard", "/", "⚠️", "대시보드", None),
         ("closing-group", None, "🧾", "마감", [
-            ("재고 마감", "/stock-closing"),
+            ("재고 마감", "/stock-closing/status" if is_master else "/stock-closing"),
             ("매출 마감", "/closing"),
-        ] + ([("재고 마감 현황", "/stock-closing/status")] if is_master else [])),
+        ]),
         ("stock-group", None, "📦", "재고&발주", [
             ("재고현황", "/inventory"),
             ("발주내역", "/purchase-history"),
@@ -3196,7 +3196,7 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
         msg = "저장되었습니다. (임시저장 — 마감 전까지 수정할 수 있습니다)"
     return JSONResponse({"ok": True, "mode": mode, "message": msg})
 
-STOCK_CLOSING_EXCLUDED_BRANCHES = ("남양주점", "본사", "경기김포점", "경기화성1호점")
+STOCK_CLOSING_EXCLUDED_BRANCHES = ("남양주점", "본사", "테스트용지점")
 
 
 @app.get("/stock-closing/status", response_class=HTMLResponse)
@@ -3237,7 +3237,7 @@ async def stock_closing_status_page(
     entries = []
     for b in get_branches():
         code = b["branch_code"]
-        if code in STOCK_CLOSING_EXCLUDED_BRANCHES:
+        if code in STOCK_CLOSING_EXCLUDED_BRANCHES or "테스트" in str(code) or "테스트" in str(b["branch_name"]):
             continue
         s = save_map.get(code)
         status = ((s["status"] or "draft") if s else "none")
