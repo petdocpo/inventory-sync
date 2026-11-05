@@ -2157,7 +2157,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         "notice-group": ("notice-group", "survey-group", "notice", "qna", "survey", "vendor-eval"),
     }
 
-    
+
     menu_html = ""
     submenu_popups_html = ""
     for key, href, icon, label, submenu in menus:
@@ -3773,7 +3773,302 @@ def _scan_reject_page(title: str, message: str) -> HTMLResponse:
     """, status_code=400)
 
 
-Select-String -Path main.py -Pattern '@app\.(get|post)\("/scan' | ForEach-Object { "$($_.LineNumber): $($_.Line.Trim())" }
+@app.get("/scan", response_class=HTMLResponse)
+async def scan_get(request: Request, branch_code: str, item_code: str, scan_type: str):
+    import uuid
+    request_id = uuid.uuid4().hex
+    scan_cid, is_new_cid = _scan_get_or_make_cid(request)
+    resp = _scan_get_core(request, request_id, scan_cid, branch_code, item_code, scan_type)
+    return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
+
+
+def _scan_get_core(request: Request, request_id: str, scan_cid: str,
+                   branch_code: str, item_code: str, scan_type: str) -> HTMLResponse:
+    import uuid
+    user_agent = request.headers.get("user-agent", "")
+
+    # 1) 알려진 미리보기/봇 UA: 기존 동작 유지(OK만 반환) + 관측 기록
+    if is_bot_user_agent(user_agent):
+        _scan_log_view(request, request_id, branch_code, item_code, scan_type, "BOT_UA", scan_cid)
+        return HTMLResponse(content="OK", status_code=200)
+
+    # 2) 비정상 파라미터 거부 (재고 변경 없음)
+    if (not branch_code.strip()) or (not item_code.strip()) or scan_type not in ("IN", "OUT"):
+        _scan_log_view(request, request_id, branch_code, item_code, scan_type, "REJECT_BAD_PARAM", scan_cid)
+        return _scan_reject_page(
+            "QR 인식 오류",
+            "QR 정보가 올바르게 인식되지 않았습니다.<br>휴대폰 기본 카메라로 다시 스캔해주세요.<br>계속 안 되면 관리자에게 문의해주세요."
+        )
+
+    conn = get_conn()
+
+    # 3) items에 없는 지점(깨진 지점 코드 등) 거부 (재고 변경 없음)
+    branch_row = conn.execute(
+        "SELECT 1 AS ok FROM items WHERE branch_code=? LIMIT 1",
+        (branch_code,)
+    ).fetchone()
+    if not branch_row:
+        conn.close()
+        _scan_log_view(request, request_id, branch_code, item_code, scan_type, "REJECT_NO_BRANCH", scan_cid)
+        return _scan_reject_page(
+            "지점 인식 오류",
+            "지점 정보가 올바르게 인식되지 않았습니다.<br>휴대폰 기본 카메라로 다시 스캔해주세요.<br>계속 안 되면 관리자에게 문의해주세요."
+        )
+
+    item = conn.execute(
+        "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
+        (branch_code, item_code)
+    ).fetchone()
+
+    # ── 1분 내 동일 지점+품번+구분 중복 여부 확인 (기존 로직 그대로) ──
+    recent_dup = conn.execute(
+        "SELECT id, scanned_at FROM scan_log "
+        "WHERE branch_code=? AND item_code=? AND scan_type=? "
+        "AND scanned_at::timestamp > (NOW() - INTERVAL '1 minute') "
+        "ORDER BY scanned_at DESC LIMIT 1",
+        (branch_code, item_code, scan_type)
+    ).fetchone()
+    conn.close()
+
+    if recent_dup:
+        item_name = item["item_name"] if item else item_code
+        branch_name = item["branch_name"] if item else branch_code
+
+        token = uuid.uuid4().hex
+        conn2 = get_conn()
+        conn2.execute(
+            "INSERT INTO scan_pending_confirm (token, branch_code, item_code, scan_type) VALUES (?, ?, ?, ?)",
+            (token, branch_code, item_code, scan_type)
+        )
+        conn2.commit()
+        conn2.close()
+
+        _scan_log_view(request, request_id, branch_code, item_code, scan_type, "DUP_PROMPT", scan_cid)
+        action_label = "입고" if scan_type == "IN" else "출고"
+
+        return HTMLResponse(content=f"""
+        <html><head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>중복 확인</title>
+        </head>
+        <body style="font-family:-apple-system,sans-serif;background:#f5f7fa;
+                     display:flex;justify-content:center;align-items:center;
+                     min-height:100vh;margin:0;">
+          <div style="background:white;max-width:340px;width:90%;padding:32px;
+                      border-radius:20px;box-shadow:0 4px 20px rgba(0,0,0,0.1);
+                      text-align:center;">
+            <div style="background:#FEF3C7;border-radius:12px;padding:16px;
+                        margin-bottom:20px;">
+              <div style="font-size:36px;margin-bottom:4px;">⚠️</div>
+              <div style="font-size:18px;font-weight:bold;color:#92400E;">
+                중복 제출 의심
+              </div>
+            </div>
+            <div style="text-align:left;background:#f8fafc;border-radius:10px;
+                        padding:16px;margin-bottom:20px;">
+              <div style="margin-bottom:10px;">
+                <div style="font-size:11px;color:#888;margin-bottom:2px;">지점</div>
+                <div style="font-size:15px;font-weight:bold;">{branch_name}</div>
+              </div>
+              <div style="margin-bottom:10px;">
+                <div style="font-size:11px;color:#888;margin-bottom:2px;">상품명</div>
+                <div style="font-size:15px;font-weight:bold;">{item_name}</div>
+              </div>
+              <div>
+                <div style="font-size:11px;color:#888;margin-bottom:2px;">구분</div>
+                <div style="font-size:15px;font-weight:bold;">{action_label}</div>
+              </div>
+            </div>
+            <p style="font-size:14px;color:#555;margin-bottom:20px;line-height:1.5;">
+              1분 이내 같은 상품을 이미 {action_label} 처리하셨습니다.<br>
+              <b>정말 또 {action_label} 처리하시겠습니까?</b>
+            </p>
+            <div id="choiceButtons" style="display:flex;gap:8px;">
+              <button onclick="chooseOne()" style="flex:1;background:#f0f0f0;color:#555;
+                      border:none;padding:14px;border-radius:12px;font-size:13px;
+                      font-weight:bold;cursor:pointer;">아니요<br><span style="font-weight:normal;font-size:11px;">1개만 제 출</span></button>
+              <button onclick="chooseTwo()" id="confirmBtn" style="flex:1;background:#1E2761;color:white;
+                      border:none;padding:14px;border-radius:12px;font-size:13px;
+                      font-weight:bold;cursor:pointer;">맞습니다<br><span style="font-weight:normal;font-size:11px;">2개(중 복) 제출</span></button>
+            </div>
+            <div id="closingMsg" style="display:none;font-size:14px;color:#888;padding:10px 0;">
+              처리되었습니다. 창을 닫아주세요.
+            </div>
+          </div>
+          <script>
+            function chooseOne() {{
+              document.getElementById('choiceButtons').style.display = 'none';
+              document.getElementById('closingMsg').style.display = 'block';
+              setTimeout(function() {{ window.close(); }}, 600);
+            }}
+            function chooseTwo() {{
+              document.getElementById('confirmBtn').disabled = true;
+              document.getElementById('confirmBtn').innerText = '처리 중...';
+              window.location.href = '/scan/confirm?token={token}';
+            }}
+          </script>
+        </body></html>
+        """)
+
+    # 4) 정상 처리. 품번만 items에 없으면 기존처럼 반영하되 경고로 기록
+    outcome = "APPLY" if item else "WARN_UNKNOWN_ITEM"
+    _scan_log_view(request, request_id, branch_code, item_code, scan_type, outcome, scan_cid)
+    return _do_scan_and_log(request, branch_code, item_code, scan_type, request_id)
+
+
+@app.get("/scan/confirm", response_class=HTMLResponse)
+async def scan_confirm(request: Request, token: str):
+    import uuid
+    request_id = uuid.uuid4().hex
+    scan_cid, is_new_cid = _scan_get_or_make_cid(request)
+
+    conn = get_conn()
+    pending = conn.execute(
+        "SELECT * FROM scan_pending_confirm WHERE token=?", (token,)
+    ).fetchone()
+
+    if not pending:
+        conn.close()
+        _scan_log_view(request, request_id, "", "", "", "CONFIRM_INVALID_TOKEN", scan_cid)
+        return HTMLResponse(content="<h3 style='text-align:center;margin-top:80px;'>❌ 유효하지 않거나 만료된 요청입니다.</h3>", status_code=404)
+
+    branch_code = pending["branch_code"]
+    item_code = pending["item_code"]
+    scan_type = pending["scan_type"]
+
+    conn.execute("DELETE FROM scan_pending_confirm WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
+
+    _scan_log_view(request, request_id, branch_code, item_code, scan_type, "CONFIRM_APPLY", scan_cid)
+    resp = _do_scan_and_log(request, branch_code, item_code, scan_type, request_id)
+    return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
+
+
+def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_type: str, request_id: str = "") -> HTMLResponse:
+    """실제 재고 반영 + scan_log 기록 + 완료 화면 렌더링 (request_id 연결 및 관측 프로브 추가)"""
+    delta = 1 if scan_type == "IN" else -1
+    new_qty = adjust_quantity(branch_code, item_code, delta)
+
+    device_info = request.headers.get("user-agent", "")[:255]
+    client_ip = request.client.host if request.client else ""
+
+    conn = get_conn()
+    item = conn.execute(
+        "SELECT item_name, branch_name FROM items WHERE branch_code=? AND item_code=?",
+        (branch_code, item_code)
+    ).fetchone()
+    item_name = item["item_name"] if item else item_code
+    branch_name = item["branch_name"] if item else branch_code
+    now = datetime.now().isoformat()
+    conn.execute(
+        "INSERT INTO scan_log (branch_code, branch_name, item_name, item_code, scan_type, result_quantity, scanned_at, device_info, client_ip, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (branch_code, branch_name, item_name, item_code, scan_type, new_qty, now, device_info, client_ip, request_id or None)
+    )
+    conn.commit()
+    conn.close()
+
+    action_label = "입고 ✅" if scan_type == "IN" else "출고 📤"
+    bg_color = "#D1FAE5" if scan_type == "IN" else "#FEE2E2"
+    text_color = "#065F46" if scan_type == "IN" else "#991B1B"
+
+    return HTMLResponse(content=f"""
+    <html><head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>스캔 완료</title>
+    </head>
+    <body style="font-family:-apple-system,sans-serif;background:#f5f7fa;
+                 display:flex;justify-content:center;align-items:center;
+                 min-height:100vh;margin:0;">
+      <div style="background:white;max-width:340px;width:90%;padding:32px;
+                  border-radius:20px;box-shadow:0 4px 20px rgba(0,0,0,0.1);
+                  text-align:center;">
+        <div style="background:{bg_color};border-radius:12px;padding:16px;
+                    margin-bottom:20px;">
+          <div style="font-size:36px;margin-bottom:4px;">{action_label}</div>
+          <div style="font-size:20px;font-weight:bold;color:{text_color};">
+            {'입고' if scan_type == 'IN' else '출고'} 처리 완료
+          </div>
+        </div>
+        <div style="text-align:left;background:#f8fafc;border-radius:10px;
+                    padding:16px;margin-bottom:16px;">
+          <div style="margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;margin-bottom:2px;">지점</div>
+            <div style="font-size:15px;font-weight:bold;">{branch_name}</div>
+          </div>
+          <div style="margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;margin-bottom:2px;">상품명</div>
+            <div style="font-size:15px;font-weight:bold;">{item_name}</div>
+          </div>
+          <div style="margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;margin-bottom:2px;">품번</div>
+            <div style="font-size:14px;color:#64748B;">{item_code}</div>
+          </div>
+          <div>
+            <div style="font-size:11px;color:#888;margin-bottom:2px;">현재 재고</div>
+            <div style="font-size:28px;font-weight:bold;color:#1E2761;">{new_qty}개</div>
+          </div>
+        </div>
+        <div style="font-size:12px;color:#aaa;margin-bottom:16px;">
+          {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        </div>
+        <button onclick="window.close()" style="width:100%;background:#1E2761;color:white;
+                border:none;padding:14px;border-radius:12px;font-size:15px;
+                font-weight:bold;cursor:pointer;">확인</button>
+      </div>
+      <script>
+        (function() {{
+          var rid = '{request_id}';
+          var sent = 0;
+          var t0 = Date.now();
+          function navType() {{
+            try {{
+              var e = performance.getEntriesByType('navigation')[0];
+              return e ? e.type : 'unknown';
+            }} catch (x) {{ return 'err'; }}
+          }}
+          function send(ev, extra) {{
+            if (sent >= 6) return;
+            sent++;
+            try {{
+              var d = {{
+                rid: rid,
+                ev: ev,
+                vis: document.visibilityState,
+                focus: document.hasFocus ? document.hasFocus() : null,
+                nav: navType(),
+                prerender: !!document.prerendering,
+                touch: navigator.maxTouchPoints || 0,
+                sw: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+                standalone: !!(window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || !!navigator.standalone,
+                sec: Math.round((Date.now() - t0) / 100) / 10,
+                w: window.innerWidth,
+                h: window.innerHeight,
+                hist: history.length,
+                tz: (Intl.DateTimeFormat().resolvedOptions().timeZone || '')
+              }};
+              if (extra) {{ for (var k in extra) {{ d[k] = extra[k]; }} }}
+              var body = JSON.stringify(d);
+              if (navigator.sendBeacon) {{
+                navigator.sendBeacon('/scan/probe', new Blob([body], {{type: 'text/plain'}}));
+              }} else {{
+                fetch('/scan/probe', {{method: 'POST', body: body, headers: {{'Content-Type': 'text/plain'}}}});
+              }}
+            }} catch (x) {{}}
+          }}
+          send('load');
+          window.addEventListener('pageshow', function(e) {{
+            if (e.persisted) {{ send('pageshow', {{persisted: true}}); }}
+          }});
+          document.addEventListener('visibilitychange', function() {{
+            send('vis_' + document.visibilityState);
+          }});
+        }})();
+      </script>
+    </body></html>
+    """)
 
 
 @app.post("/scan/probe")
