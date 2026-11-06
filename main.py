@@ -4883,12 +4883,14 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
 
 @app.get("/scan/done", response_class=HTMLResponse)
 async def scan_done(request: Request, rid: str):
-    """스캔 완료 화면 (읽기 전용). scan_log를 조회만 하며 재고를 절대 변경하지 않는다."""
+    """스캔 완료 화면 (읽기 전용). scan_log를 조회만 하며 재고를 절대 변경하지 않는다.
+    같은 rid의 화면이 이미 한 번 열린 적이 있으면(새로고침/탭 복원/뒤로가기) '이미 처리된 스캔'으로 표시한다."""
     import html as _html
     scan_cid, is_new_cid = _scan_get_or_make_cid(request)
     rid_clean = _scan_clean(rid, 64)
 
     row = None
+    prior_views = 0
     if len(rid_clean) == 32 and rid_clean.isalnum():
         conn = get_conn()
         row = conn.execute(
@@ -4896,6 +4898,13 @@ async def scan_done(request: Request, rid: str):
             "FROM scan_log WHERE request_id=?",
             (rid_clean,)
         ).fetchone()
+        if row:
+            pv = conn.execute(
+                "SELECT COUNT(*) AS c FROM scan_view_log "
+                "WHERE request_id=? AND outcome IN ('DONE_VIEW','DONE_REVIEW')",
+                (rid_clean,)
+            ).fetchone()
+            prior_views = int(pv["c"]) if pv else 0
         conn.close()
 
     if not row:
@@ -4906,13 +4915,14 @@ async def scan_done(request: Request, rid: str):
         )
         return _scan_attach_cid(resp, request, scan_cid, is_new_cid)
 
-    # 처리 후 30초가 지나서 다시 열린 화면이면 '재조회'로 구분한다 (탭 복원/새로고침 추적용)
-    review = False
+    # 이미 한 번 열린 적이 있거나, 처리 후 30초가 지났으면 '재조회'로 본다
+    age_review = False
     try:
         age = (datetime.now() - datetime.fromisoformat(str(row["scanned_at"]))).total_seconds()
-        review = age > 30
+        age_review = age > 30
     except Exception:
-        review = False
+        age_review = False
+    review = age_review or prior_views >= 1
 
     scan_type = row["scan_type"]
     _scan_log_view(request, rid_clean, row["branch_code"], row["item_code"], scan_type,
@@ -4924,10 +4934,17 @@ async def scan_done(request: Request, rid: str):
     qty = row["result_quantity"]
     time_text = _html.escape(str(row["scanned_at"])[:19].replace("T", " "))
 
-    action_label = "입고 ✅" if scan_type == "IN" else "출고 📤"
     type_text = "입고" if scan_type == "IN" else "출고"
-    bg_color = "#D1FAE5" if scan_type == "IN" else "#FEE2E2"
-    text_color = "#065F46" if scan_type == "IN" else "#991B1B"
+    if review:
+        head_icon = "ℹ️"
+        head_text = f"이미 처리된 {type_text}입니다"
+        bg_color = "#FEF3C7"
+        text_color = "#92400E"
+    else:
+        head_icon = "입고 ✅" if scan_type == "IN" else "출고 📤"
+        head_text = f"{type_text} 처리 완료"
+        bg_color = "#D1FAE5" if scan_type == "IN" else "#FEE2E2"
+        text_color = "#065F46" if scan_type == "IN" else "#991B1B"
     qty_label = "처리 당시 재고" if review else "현재 재고"
     review_js = "true" if review else "false"
     review_html = ""
@@ -4935,7 +4952,7 @@ async def scan_done(request: Request, rid: str):
         review_html = (
             '<div style="background:#FEF3C7;color:#92400E;border-radius:10px;padding:10px;'
             'margin-bottom:16px;font-size:13px;font-weight:bold;line-height:1.5;">'
-            '이미 처리된 스캔입니다.<br>이 화면을 다시 열어도 재고는 변경되지 않습니다.</div>'
+            '이 화면을 다시 열어도 재고는 변경되지 않습니다.</div>'
         )
 
     resp = HTMLResponse(content=f"""
@@ -4952,9 +4969,9 @@ async def scan_done(request: Request, rid: str):
                   text-align:center;">
         <div style="background:{bg_color};border-radius:12px;padding:16px;
                     margin-bottom:20px;">
-          <div style="font-size:36px;margin-bottom:4px;">{action_label}</div>
+          <div style="font-size:36px;margin-bottom:4px;">{head_icon}</div>
           <div style="font-size:20px;font-weight:bold;color:{text_color};">
-            {type_text} 처리 완료
+            {head_text}
           </div>
         </div>
         {review_html}
