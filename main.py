@@ -3550,7 +3550,7 @@ async def stock_closing_status_page(
         + filter_html
         + summary_html
         + '<div class="card"><div class="table-scroll-wrap"><table>'
-        "<thead><tr><th>지점</th><th>상태</th><th>상품 수</th><th>오차 건수</th><th>제출자</th><th>제출 시각</th></tr></thead>"
+                "<thead><tr><th>지점</th><th>상태</th><th>상품 수</th><th>오차 건수</th><th>제출자</th><th>제출 시각</th><th>요청</th></tr></thead>"
         "<tbody>" + rows_html + "</tbody></table></div></div>"
     )
     return HTMLResponse(render_page(content, user, active="stock-closing"))
