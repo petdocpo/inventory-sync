@@ -3505,9 +3505,12 @@ def _sc_missing_branches(date_str: str) -> list:
     return missing
 
 
+STOCK_CLOSING_MAIL_TO = "hs.yu@petdoc.co.kr"
+
+
 def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> dict:
     """미제출 지점 알림. mode='auto'는 자동 발송 스위치(지점/테스트) 설정을 따르고,
-    mode='test'는 스위치와 무관하게 테스트 채널로만 요약 1건을 보낸다."""
+    mode='test'는 스위치와 무관하게 테스트 채널(+테스트 메일)로만 보낸다."""
     missing = _sc_missing_branches(date_str)
     if mode == "test":
         branch_on, test_on = False, True
@@ -3516,7 +3519,7 @@ def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
         test_on = _sc_setting_on("stock_closing_notify_test")
     result = {
         "date": date_str, "mode": mode, "missing": [m["name"] for m in missing],
-        "branch_sent": 0, "branch_failed": [], "test_sent": None,
+        "branch_sent": 0, "branch_failed": [], "test_sent": None, "mail_sent": None,
     }
     if not missing:
         return result
@@ -3532,15 +3535,34 @@ def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
                 result["branch_failed"].append(str(m["name"]) + "(" + str(detail)[:60] + ")")
     if test_on:
         prefix = "[테스트] " if mode == "test" else "[테스트 채널] "
+        status_link = base_url + "/stock-closing/status?date=" + date_str
         names = ", ".join(str(m["name"]) for m in missing)
         msg = date_str + " 재고 마감 미제출 지점 " + str(len(missing)) + "곳: " + names
         ok, detail = send_teams_notification(
-            STOCK_CLOSING_TEST_BRANCH_CODE, prefix + title, msg,
-            base_url + "/stock-closing/status?date=" + date_str, "재고 마감 현황 열기", sent_by
+            STOCK_CLOSING_TEST_BRANCH_CODE, prefix + title, msg, status_link, "재고 마감 현황 열기", sent_by
         )
         result["test_sent"] = bool(ok)
         if not ok:
             result["test_detail"] = str(detail)[:80]
+
+        # 테스트 메일 (기존 send_email 사용)
+        lines = [date_str + " 재고 마감 미제출 지점 " + str(len(missing)) + "곳", ""]
+        for m in missing:
+            lines.append("- " + str(m["name"]) + " (" + ("임시저장" if m["status"] == "draft" else "미제출") + ")")
+        lines += ["", "재고 마감 현황: " + status_link]
+        try:
+            res = send_email(
+                STOCK_CLOSING_MAIL_TO,
+                prefix + "재고 마감 미제출 지점 " + str(len(missing)) + "곳 (" + date_str + ")",
+                "\n".join(lines)
+            )
+            mail_ok = res[0] if isinstance(res, tuple) else bool(res)
+            mail_detail = res[1] if (isinstance(res, tuple) and len(res) > 1) else ""
+        except Exception as e:
+            mail_ok, mail_detail = False, str(e)
+        result["mail_sent"] = bool(mail_ok)
+        if not mail_ok:
+            result["mail_detail"] = str(mail_detail)[:80]
     return result
 
 
@@ -3611,9 +3633,11 @@ async def stock_closing_reminder_test(request: Request, session_token: str = Coo
     if not result["missing"]:
         text = date_str + " 미제출 지점이 없어 발송하지 않았습니다."
     else:
+        mail_txt = "성공" if result.get("mail_sent") else "실패(" + str(result.get("mail_detail", ""))[:60] + ")"
         text = ("테스트 발송 " + ("성공" if result["test_sent"] else "실패")
+                + " / 메일 " + mail_txt
                 + ": 미제출 " + str(len(result["missing"])) + "곳 (" + ", ".join(result["missing"])
-                + ") — 테스트 채널로만 발송됨")
+                + ") — 테스트 채널·테스트 메일로만 발송됨")
     return JSONResponse({"ok": True, "message": text})
 
 
@@ -3659,7 +3683,7 @@ async def cron_stock_closing_reminder(request: Request):
         finally:
             conn.close()
 
-        failed = bool(result["branch_failed"]) or (result["test_sent"] is False)
+        failed = bool(result["branch_failed"]) or (result["test_sent"] is False) or (result.get("mail_sent") is False)
         if failed:
             try:
                 report_cron_failure("stock-closing-reminder", "재고 마감 자동 알림 일부 실패: " + str(result)[:300])
