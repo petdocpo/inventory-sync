@@ -3300,14 +3300,55 @@ def _sc_setting_on(key: str) -> bool:
     return bool(row and str(row["value"]).strip().lower() == "on")
 
 
+_SC_TEST_JS = """<script>
+  async function scTestRequest(btn) {
+    var code = btn.getAttribute('data-branch');
+    var name = btn.getAttribute('data-name');
+    var date = document.getElementById('scMeta').getAttribute('data-date');
+    if (!confirm('[테스트] ' + name + ' 제출 요청을 테스트 채널로 보낼까요?\\n(지점 채널로는 발송되지 않습니다)')) return;
+    btn.disabled = true;
+    try {
+      var res = await fetch('/stock-closing/request-test', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({branch_code: code, date: date})
+      });
+      var data = await res.json();
+      alert(data.message || data.detail || (res.ok ? '완료되었습니다.' : '처리에 실패했습니다.'));
+    } catch (e) {
+      alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+    }
+    btn.disabled = false;
+  }
+
+  async function scReminderTest(btn) {
+    var date = document.getElementById('scMeta').getAttribute('data-date');
+    if (!confirm(date + ' 기준 미제출 지점 요약을 테스트 채널로만 보낼까요?')) return;
+    btn.disabled = true;
+    try {
+      var res = await fetch('/stock-closing/reminder-test', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({date: date})
+      });
+      var data = await res.json();
+      alert(data.message || data.detail || (res.ok ? '완료되었습니다.' : '처리에 실패했습니다.'));
+    } catch (e) {
+      alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+    }
+    btn.disabled = false;
+  }
+</script>"""
+
+
 def _sc_request_button(code, name, status) -> str:
     import html as _html
     if status == "closed":
         return "-"
+    attrs = f'data-branch="{_html.escape(str(code))}" data-name="{_html.escape(str(name))}"'
     return (
-        '<button class="btn" type="button" style="font-size:12px;padding:4px 10px;" '
-        f'data-branch="{_html.escape(str(code))}" data-name="{_html.escape(str(name))}" '
-        'onclick="scRequest(this)">제출 요청</button>'
+        f'<button class="btn" type="button" style="font-size:12px;padding:4px 10px;" {attrs} onclick="scRequest(this)">제출 요청</button> '
+        f'<button class="btn" type="button" style="font-size:12px;padding:4px 10px;background:#64748B;" {attrs} onclick="scTestRequest(this)">테스트</button>'
     )
 
 
@@ -3325,13 +3366,18 @@ def _sc_notify_panel(sel_date_str: str) -> str:
 
     return (
         '<div class="card" style="margin-bottom:12px;">'
-        '<div style="font-size:13px;font-weight:bold;margin-bottom:8px;">📨 제출 요청 발송 설정 (기본 꺼짐)</div>'
+        '<div style="font-size:13px;font-weight:bold;margin-bottom:4px;">📨 자동 발송 설정 (기본 꺼짐)</div>'
+        '<div style="font-size:12px;color:#888;margin-bottom:8px;">켜면 매일 오전 10시에 전일 미제출 지점에 자동 발송합니다. '
+        "수동 '제출 요청'도 이 스위치를 따르고, '테스트' 버튼은 스위치와 무관하게 테스트 채널로만 발송됩니다.</div>"
         + _row("branch", "지점 발송", "켜면 해당 지점 팀즈 채널로 실제 발송", branch_on)
         + _row("test", "테스트 발송", f"켜면 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로만 발송", test_on)
         + f'<div id="scMeta" data-date="{sel_date_str}" style="display:none;"></div>'
+        + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
+        'onclick="scReminderTest(this)">🧪 자동 알림 테스트 (테스트 채널로만 발송)</button>'
         + '<div id="scNotifyResult" style="font-size:12px;color:#475569;margin-top:6px;"></div>'
         "</div>"
         + _SC_NOTIFY_JS
+        + _SC_TEST_JS
     )
 
 
@@ -3432,6 +3478,202 @@ async def stock_closing_request(request: Request, session_token: str = Cookie(de
         )
         results.append("테스트 발송: " + ("성공" if ok else "실패(" + str(detail)[:80] + ")"))
     return JSONResponse({"ok": True, "message": " / ".join(results)})
+
+def _sc_base_url(request: Request) -> str:
+    base = str(request.base_url).rstrip("/")
+    if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
+        base = "https://" + base[len("http://"):]
+    return base
+
+
+def _sc_missing_branches(date_str: str) -> list:
+    """해당 날짜 재고 마감이 마감 완료가 아닌 지점(미제출/임시저장). 제외 지점·테스트 지점은 뺀다."""
+    conn = get_conn()
+    saves = conn.execute(
+        "SELECT branch_code, status FROM stock_closing_saves WHERE close_date=?", (date_str,)
+    ).fetchall()
+    conn.close()
+    status_map = {s["branch_code"]: (s["status"] or "draft") for s in saves}
+    missing = []
+    for b in get_branches():
+        code = b["branch_code"]
+        if code in STOCK_CLOSING_EXCLUDED_BRANCHES or "테스트" in str(code) or "테스트" in str(b["branch_name"]):
+            continue
+        st = status_map.get(code, "none")
+        if st != "closed":
+            missing.append({"code": code, "name": b["branch_name"], "status": st})
+    return missing
+
+
+def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> dict:
+    """미제출 지점 알림. mode='auto'는 자동 발송 스위치(지점/테스트) 설정을 따르고,
+    mode='test'는 스위치와 무관하게 테스트 채널로만 요약 1건을 보낸다."""
+    missing = _sc_missing_branches(date_str)
+    if mode == "test":
+        branch_on, test_on = False, True
+    else:
+        branch_on = _sc_setting_on("stock_closing_notify_branch")
+        test_on = _sc_setting_on("stock_closing_notify_test")
+    result = {
+        "date": date_str, "mode": mode, "missing": [m["name"] for m in missing],
+        "branch_sent": 0, "branch_failed": [], "test_sent": None,
+    }
+    if not missing:
+        return result
+    title = "📦 재고 마감 제출 요청"
+    if branch_on:
+        link = base_url + "/stock-closing?date=" + date_str
+        for m in missing:
+            msg = str(m["name"]) + " " + date_str + " 재고 마감이 아직 제출되지 않았습니다. 실사 수량을 입력하고 마감해주세요."
+            ok, detail = send_teams_notification(m["code"], title, msg, link, "재고 마감 열기", sent_by)
+            if ok:
+                result["branch_sent"] += 1
+            else:
+                result["branch_failed"].append(str(m["name"]) + "(" + str(detail)[:60] + ")")
+    if test_on:
+        prefix = "[테스트] " if mode == "test" else "[테스트 채널] "
+        names = ", ".join(str(m["name"]) for m in missing)
+        msg = date_str + " 재고 마감 미제출 지점 " + str(len(missing)) + "곳: " + names
+        ok, detail = send_teams_notification(
+            STOCK_CLOSING_TEST_BRANCH_CODE, prefix + title, msg,
+            base_url + "/stock-closing/status?date=" + date_str, "재고 마감 현황 열기", sent_by
+        )
+        result["test_sent"] = bool(ok)
+        if not ok:
+            result["test_detail"] = str(detail)[:80]
+    return result
+
+
+@app.post("/stock-closing/request-test")
+async def stock_closing_request_test(request: Request, session_token: str = Cookie(default=None)):
+    """제출 요청 테스트 — 발송 스위치와 무관하게 테스트 채널로만 발송 (마스터 전용)"""
+    from datetime import datetime as _dt
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not (user.get("role") == "master" or user.get("branch_type") == "hq"):
+        raise HTTPException(status_code=403, detail="마스터 계정만 사용할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    branch_code = str(body.get("branch_code", "")).strip()
+    date_str = str(body.get("date", "")).strip()
+    try:
+        _dt.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+    branch = next((b for b in get_branches() if b["branch_code"] == branch_code), None)
+    if not branch:
+        raise HTTPException(status_code=400, detail="지점을 찾을 수 없습니다.")
+
+    msg = (str(branch["branch_name"]) + " " + date_str
+           + " 재고 마감이 아직 제출되지 않았습니다. 실사 수량을 입력하고 마감해주세요.")
+    ok, detail = send_teams_notification(
+        STOCK_CLOSING_TEST_BRANCH_CODE, "[테스트] 📦 재고 마감 제출 요청",
+        "[테스트 발송 — 대상: " + str(branch["branch_name"]) + "] " + msg,
+        _sc_base_url(request) + "/stock-closing?date=" + date_str, "재고 마감 열기",
+        "stock_closing_request_test_by_" + str(user.get("login_id") or "")
+    )
+    text = "테스트 발송 성공 (테스트 채널로만 발송됨)" if ok else "테스트 발송 실패(" + str(detail)[:80] + ")"
+    return JSONResponse({"ok": bool(ok), "message": text})
+
+
+@app.post("/stock-closing/reminder-test")
+async def stock_closing_reminder_test(request: Request, session_token: str = Cookie(default=None)):
+    """자동 알림 테스트 — 스위치와 무관하게, 미제출 지점 요약 1건을 테스트 채널로만 발송 (마스터 전용)"""
+    from datetime import datetime as _dt
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not (user.get("role") == "master" or user.get("branch_type") == "hq"):
+        raise HTTPException(status_code=403, detail="마스터 계정만 사용할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    date_str = str(body.get("date", "")).strip()
+    try:
+        _dt.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+
+    result = _sc_run_reminder(
+        date_str, _sc_base_url(request), "test",
+        "stock_closing_reminder_test_by_" + str(user.get("login_id") or "")
+    )
+    if not result["missing"]:
+        text = date_str + " 미제출 지점이 없어 발송하지 않았습니다."
+    else:
+        text = ("테스트 발송 " + ("성공" if result["test_sent"] else "실패")
+                + ": 미제출 " + str(len(result["missing"])) + "곳 (" + ", ".join(result["missing"])
+                + ") — 테스트 채널로만 발송됨")
+    return JSONResponse({"ok": True, "message": text})
+
+
+@app.get("/api/cron/stock-closing-reminder")
+async def cron_stock_closing_reminder(request: Request):
+    """매일 10:00(KST) 실행 — 전일 날짜 재고 마감이 미제출인 지점에 자동 발송. 자동 발송 스위치가 모두 꺼져 있으면 아무것도 하지 않는다."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    auth_header = request.headers.get("authorization", "")
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+    target = (_dt.now(_tz(_td(hours=9))).date() - _td(days=1)).strftime("%Y-%m-%d")
+    try:
+        if not _sc_setting_on("stock_closing_notify_branch") and not _sc_setting_on("stock_closing_notify_test"):
+            return JSONResponse({"ok": True, "skipped": "자동 발송 스위치가 모두 꺼져 있습니다.", "date": target})
+
+        conn = get_conn()
+        last = conn.execute(
+            "SELECT value FROM system_settings WHERE key='stock_closing_reminder_last'"
+        ).fetchone()
+        conn.close()
+        if last and str(last["value"]) == target:
+            return JSONResponse({"ok": True, "skipped": "이미 발송했습니다.", "date": target})
+
+        result = _sc_run_reminder(target, _sc_base_url(request), "auto", "system_cron_stock_closing")
+
+        conn = get_conn()
+        try:
+            exist = conn.execute(
+                "SELECT value FROM system_settings WHERE key='stock_closing_reminder_last'"
+            ).fetchone()
+            if exist:
+                conn.execute(
+                    "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='stock_closing_reminder_last'",
+                    (target,)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO system_settings (key, value) VALUES ('stock_closing_reminder_last', ?)", (target,)
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        failed = bool(result["branch_failed"]) or (result["test_sent"] is False)
+        if failed:
+            try:
+                report_cron_failure("stock-closing-reminder", "재고 마감 자동 알림 일부 실패: " + str(result)[:300])
+            except Exception:
+                pass
+        return JSONResponse(status_code=500 if failed else 200, content=result)
+    except Exception as e:
+        err = "재고 마감 자동 알림 실패: " + str(e)
+        try:
+            report_cron_failure("stock-closing-reminder", err)
+        except Exception:
+            pass
+        return JSONResponse(status_code=500, content={"error": err, "date": target})
+
 
 STOCK_CLOSING_EXCLUDED_BRANCHES = ("남양주점", "본사", "테스트용지점")
 
