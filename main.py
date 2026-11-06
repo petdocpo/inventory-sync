@@ -2785,6 +2785,17 @@ def _stock_closing_live_items(target_branch: str, sel_date) -> list:
     items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
     return items
 
+def _sc_adjust_cell(branch_code, item_code, editable) -> str:
+    """재고 마감 목록의 'QR 수정' 칸 — 수기조정(/adjust)으로 해당 지점·상품을 미리 선택해서 이동"""
+    from urllib.parse import quote as _quote
+    if not editable:
+        return "<td>-</td>"
+    link = "/adjust?preset_branch=" + _quote(str(branch_code)) + "&preset_code=" + _quote(str(item_code))
+    return (
+        '<td><a href="' + link + '" style="background:#1E2761;color:white;padding:4px 10px;'
+        'border-radius:6px;font-size:12px;text-decoration:none;">수정</a></td>'
+    )
+
 
 @app.get("/stock-closing", response_class=HTMLResponse)
 async def stock_closing_page(
@@ -2896,6 +2907,7 @@ async def stock_closing_page(
                 f"<td>{_fmt_num(l['ups_qty'])}</td>"
                 f"<td>{_fmt_num(l['counted_qty'])}</td>"
                 + _diff_html(l["diff_qty"])
+                + "<td>-</td>"
                 + "</tr>"
             )
         empty_msg = "저장된 상품이 없습니다 (해당 날짜에 스캔된 QR 등록 상품이 없었습니다)"
@@ -2928,12 +2940,14 @@ async def stock_closing_page(
                 f'placeholder="실사" oninput="scUpdateDiff(this)"{dis} '
                 'style="width:70px;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
                 '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
+                + _sc_adjust_cell(it["branch_code"], it["item_code"], can_edit_date)
+                + "</tr>"
                 "</tr>"
             )
         empty_msg = "해당 날짜에 스캔된 QR 등록 상품이 없습니다"
     if not rows_html:
         rows_html = (
-            '<tr><td colspan="8" style="text-align:center;padding:24px;color:#888;">'
+            '<tr><td colspan="9" style="text-align:center;padding:24px;color:#888;">'
             + empty_msg + "</td></tr>"
         )
 
@@ -3122,7 +3136,7 @@ async def stock_closing_page(
         + '<div class="card"><div class="table-scroll-wrap"><table>'
         "<thead><tr>"
         "<th>지점</th><th>상품명</th><th>상품코드</th><th>금일 출고 수량</th>"
-        "<th>QR 재고 수량</th><th>유비플러스 재고 수량</th><th>실사 수량</th><th>오차</th>"
+        "<th>QR 재고 수량</th><th>유비플러스 재고 수량</th><th>실사 수량</th><th>오차</th><th>QR 수정</th>"
         "</tr></thead><tbody>"
         + rows_html
         + "</tbody></table></div>"
