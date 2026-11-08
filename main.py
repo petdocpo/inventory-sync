@@ -3432,11 +3432,14 @@ def _sc_notify_panel(sel_date_str: str) -> str:
         + f'<div id="scMeta" data-date="{sel_date_str}" style="display:none;"></div>'
         + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
         'onclick="scReminderTest(this)">🧪 자동 알림 테스트 (테스트 채널로만 발송)</button>'
+        + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;margin-top:6px;" onclick="scBranchAll(true)">지점 알림 전체 켜기</button>'
+        + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" onclick="scBranchAll(false)">지점 알림 전체 끄기</button>'
         + '<div id="scNotifyResult" style="font-size:12px;color:#475569;margin-top:6px;"></div>'
         "</div>"
         + _SC_NOTIFY_JS
         + _SC_TEST_JS
         + _SC_BRANCH_JS
+        + _SC_BRANCH_ALL_JS
     )
 
 
@@ -3507,6 +3510,71 @@ async def stock_closing_notify_toggle_branch(request: Request, session_token: st
     finally:
         conn.close()
     return JSONResponse({"ok": True, "message": str(branch["branch_name"]) + " 알림 " + ("켜짐" if enabled else "꺼짐")})
+
+_SC_BRANCH_ALL_JS = """<script>
+  async function scBranchAll(enabled) {
+    var msg = enabled
+      ? '전체 지점 알림을 켭니다.\\n(상단 지점 발송 스위치가 켜져 있으면 실제 발송 대상이 됩니다)'
+      : '전체 지점 알림을 끕니다.';
+    if (!confirm(msg)) return;
+    try {
+      var res = await fetch('/stock-closing/notify-toggle-branch-all', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled: enabled})
+      });
+      var data = await res.json();
+      if (!res.ok) {
+        alert(data.detail || '설정 저장에 실패했습니다.');
+        return;
+      }
+      document.querySelectorAll('input[type=checkbox][data-branch]').forEach(function(cb) {
+        cb.checked = enabled;
+      });
+      document.getElementById('scNotifyResult').textContent = data.message || '';
+    } catch (e) {
+      alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+    }
+  }
+</script>"""
+
+
+@app.post("/stock-closing/notify-toggle-branch-all")
+async def stock_closing_notify_toggle_branch_all(request: Request, session_token: str = Cookie(default=None)):
+    """지점별 알림 토글 전체 켜기/끄기 — 마스터 전용 (현황 목록에 보이는 지점 전체)"""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not (user.get("role") == "master" or user.get("branch_type") == "hq"):
+        raise HTTPException(status_code=403, detail="마스터 계정만 설정할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    enabled = bool(body.get("enabled"))
+    value = "on" if enabled else "off"
+    codes = []
+    for b in get_branches():
+        code = b["branch_code"]
+        if code in STOCK_CLOSING_EXCLUDED_BRANCHES or "테스트" in str(code) or "테스트" in str(b["branch_name"]):
+            continue
+        codes.append(str(code))
+    conn = get_conn()
+    try:
+        for code in codes:
+            setting_key = "stock_closing_notify_branch:" + code
+            row = conn.execute("SELECT value FROM system_settings WHERE key=?", (setting_key,)).fetchone()
+            if row:
+                conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?", (value, setting_key))
+            else:
+                conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)", (setting_key, value))
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True, "message": "전체 " + str(len(codes)) + "개 지점 알림 " + ("켜짐" if enabled else "꺼짐")})
 
 @app.post("/stock-closing/request")
 async def stock_closing_request(request: Request, session_token: str = Cookie(default=None)):
