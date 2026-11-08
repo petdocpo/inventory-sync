@@ -3355,14 +3355,58 @@ _SC_TEST_JS = """<script>
 </script>"""
 
 
+_SC_BRANCH_JS = """<script>
+  async function scBranchToggle(cb) {
+    var code = cb.getAttribute('data-branch');
+    try {
+      var res = await fetch('/stock-closing/notify-toggle-branch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({branch_code: code, enabled: cb.checked})
+      });
+      var data = await res.json();
+      if (!res.ok) {
+        alert(data.detail || '설정 저장에 실패했습니다.');
+        cb.checked = !cb.checked;
+        return;
+      }
+      document.getElementById('scNotifyResult').textContent = data.message || '';
+    } catch (e) {
+      alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+      cb.checked = !cb.checked;
+    }
+  }
+</script>"""
+
+
+def _sc_branch_on_set() -> set:
+    """지점별 알림 토글이 켜진 지점코드 집합 (system_settings 'stock_closing_notify_branch:<지점코드>' = 'on')"""
+    prefix = "stock_closing_notify_branch:"
+    conn = get_conn()
+    rows = conn.execute("SELECT key, value FROM system_settings WHERE key LIKE ?", (prefix + "%",)).fetchall()
+    conn.close()
+    return {str(r["key"])[len(prefix):] for r in rows if str(r["value"]).strip().lower() == "on"}
+
+
+def _sc_branch_on(branch_code: str) -> bool:
+    return str(branch_code) in _sc_branch_on_set()
+
+
 def _sc_request_button(code, name, status) -> str:
     import html as _html
+    esc_code = _html.escape(str(code))
+    checked = " checked" if _sc_branch_on(code) else ""
+    toggle = (
+        '<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;margin-right:6px;">'
+        f'<input type="checkbox" style="width:auto;margin:0;" data-branch="{esc_code}" onchange="scBranchToggle(this)"{checked}>알림</label>'
+    )
     if status == "closed":
-        return "-"
-    attrs = f'data-branch="{_html.escape(str(code))}" data-name="{_html.escape(str(name))}"'
+        return toggle
+    attrs = f'data-branch="{esc_code}" data-name="{_html.escape(str(name))}"'
     return (
-        f'<button class="btn" type="button" style="font-size:12px;padding:4px 10px;" {attrs} onclick="scRequest(this)">제출 요청</button> '
-        f'<button class="btn" type="button" style="font-size:12px;padding:4px 10px;background:#64748B;" {attrs} onclick="scTestRequest(this)">테스트</button>'
+        toggle
+        + f'<button class="btn" type="button" style="font-size:12px;padding:4px 10px;" {attrs} onclick="scRequest(this)">제출 요청</button> '
+        + f'<button class="btn" type="button" style="font-size:12px;padding:4px 10px;background:#64748B;" {attrs} onclick="scTestRequest(this)">테스트</button>'
     )
 
 
@@ -3392,6 +3436,7 @@ def _sc_notify_panel(sel_date_str: str) -> str:
         "</div>"
         + _SC_NOTIFY_JS
         + _SC_TEST_JS
+        + _SC_BRANCH_JS
     )
 
 
@@ -3429,6 +3474,39 @@ async def stock_closing_notify_toggle(request: Request, session_token: str = Coo
     label = "지점 발송" if key == "branch" else "테스트 발송"
     return JSONResponse({"ok": True, "message": label + (" 켜짐" if enabled else " 꺼짐")})
 
+@app.post("/stock-closing/notify-toggle-branch")
+async def stock_closing_notify_toggle_branch(request: Request, session_token: str = Cookie(default=None)):
+    """지점별 알림 토글 저장 — 마스터 전용 (기본 꺼짐)"""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not (user.get("role") == "master" or user.get("branch_type") == "hq"):
+        raise HTTPException(status_code=403, detail="마스터 계정만 설정할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    branch_code = str(body.get("branch_code", "")).strip()
+    enabled = bool(body.get("enabled"))
+    branch = next((b for b in get_branches() if b["branch_code"] == branch_code), None)
+    if not branch:
+        raise HTTPException(status_code=400, detail="지점을 찾을 수 없습니다.")
+    setting_key = "stock_closing_notify_branch:" + branch_code
+    value = "on" if enabled else "off"
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (setting_key,)).fetchone()
+        if row:
+            conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?", (value, setting_key))
+        else:
+            conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)", (setting_key, value))
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True, "message": str(branch["branch_name"]) + " 알림 " + ("켜짐" if enabled else "꺼짐")})
 
 @app.post("/stock-closing/request")
 async def stock_closing_request(request: Request, session_token: str = Cookie(default=None)):
@@ -3482,8 +3560,11 @@ async def stock_closing_request(request: Request, session_token: str = Cookie(de
 
     results = []
     if branch_on:
-        ok, detail = send_teams_notification(branch_code, title, msg, link, "재고 마감 열기", sent_by)
-        results.append("지점 발송: " + ("성공" if ok else "실패(" + str(detail)[:80] + ")"))
+        if not _sc_branch_on(branch_code):
+            results.append("지점 발송: 이 지점의 알림 토글이 꺼져 있어 보내지 않았습니다")
+        else:
+            ok, detail = send_teams_notification(branch_code, title, msg, link, "재고 마감 열기", sent_by)
+            results.append("지점 발송: " + ("성공" if ok else "실패(" + str(detail)[:80] + ")"))
     if test_on:
         ok, detail = send_teams_notification(
             STOCK_CLOSING_TEST_BRANCH_CODE, "[테스트] " + title,
@@ -3540,7 +3621,10 @@ def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
     title = "📦 재고 마감 제출 요청"
     if branch_on:
         link = base_url + "/stock-closing?date=" + date_str
+        enabled_branches = _sc_branch_on_set()
         for m in missing:
+            if str(m["code"]) not in enabled_branches:
+                continue
             msg = str(m["name"]) + " " + date_str + " 재고 마감이 아직 제출되지 않았습니다. 실사 수량을 입력하고 마감해주세요."
             ok, detail = send_teams_notification(m["code"], title, msg, link, "재고 마감 열기", sent_by)
             if ok:
