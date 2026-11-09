@@ -2246,32 +2246,33 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         }}
       </script>
       <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+                * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-               background: #f5f7fa; padding-bottom: 80px; }}
+               background: #f5f7fa; padding-bottom: 80px; font-size: 15px; }}
         .topbar {{ background: #1E2761; color: white; padding: 10px 14px;
                   display: flex; justify-content: space-between; align-items: center; }}
         .content {{ max-width: 960px; margin: 0 auto; padding: 10px 14px; }}
         .card {{ background: white; border-radius: 12px; padding: 16px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }}
         .btn {{ background: #1E2761; color: white; padding: 8px 14px;
-               border: none; border-radius: 8px; cursor: pointer; font-size: 14px; }}
+               border: none; border-radius: 8px; cursor: pointer; font-size: 13px; }}
         .btn:hover {{ background: #2a3580; }}
         .btn-red {{ background: #EF4444; }}
         input, select {{ width: 100%; padding: 8px; border: 1px solid #ddd;
-                        border-radius: 8px; font-size: 14px; margin-top: 4px; }}
+                        border-radius: 8px; font-size: 13px; margin-top: 4px; }}
         table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
         .table-scroll-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
-        th {{ background: #1E2761; color: white; padding: 6px 5px; text-align: left; font-size: 12px;
-             resize: horizontal; overflow: auto; position: relative;
-             min-width: 60px; white-space: nowrap; border-right: 1px solid rgba(255,255,255,0.2); }}
-        td {{ padding: 6px 5px; border-bottom: 1px solid #eee; font-size: 12px;
+        th {{ background: #1E2761; color: white; padding: 8px 6px; text-align: left; font-size: 11px;
+             resize: horizontal; overflow: hidden; position: relative;
+             min-width: 60px; height: 44px; line-height: 1.25; vertical-align: middle;
+             white-space: normal; word-break: keep-all; border-right: 1px solid rgba(255,255,255,0.2); }}
+        td {{ padding: 6px 5px; border-bottom: 1px solid #eee; font-size: 11px;
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
         {mobile_table_css}
         .badge-green {{ background:#D1FAE5;color:#065F46;padding:2px 8px;
-                       border-radius:10px;font-size:12px; }}
+                       border-radius:10px;font-size:11px; }}
         .badge-red {{ background:#FEE2E2;color:#991B1B;padding:2px 8px;
-                     border-radius:10px;font-size:12px; }}
+                     border-radius:10px;font-size:11px; }}
         .bottomnav {{ position:fixed;bottom:0;left:0;right:0;
                      background:white;border-top:1px solid #eee;
                      display:flex;padding:6px 8px;z-index:100; }}
