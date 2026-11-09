@@ -2797,6 +2797,30 @@ def _sc_adjust_cell(branch_code, item_code, editable) -> str:
         'border-radius:6px;font-size:12px;text-decoration:none;">수정</a></td>'
     )
 
+def _sc_closer_box(view_mode: str, save, can_write: bool) -> str:
+    """재고 마감 화면 맨 위의 '마감 담당자' 입력칸 (지점 계정과 무관한 사람 이름, 마감 시 필수)"""
+    import html as _html
+    name = ""
+    if save:
+        try:
+            name = str(save["closer_name"] or "")
+        except Exception:
+            name = ""
+    esc = _html.escape(name)
+    if can_write:
+        return (
+            '<div class="card" style="margin-bottom:12px;">'
+            '<label style="font-size:13px;font-weight:bold;">마감 담당자 <span style="color:#DC2626;">*</span></label>'
+            f'<input type="text" id="scCloser" maxlength="30" placeholder="마감 담당자 이름 (필수)" value="{esc}" style="margin-top:6px;max-width:260px;">'
+            '<div style="font-size:12px;color:#888;margin-top:4px;">지점 계정과 무관하게 실제 마감하는 사람의 이름을 입력해주세요. 마감할 때 필수입니다.</div>'
+            "</div>"
+        )
+    shown = esc if esc else "-"
+    return (
+        '<div class="card" style="margin-bottom:12px;font-size:13px;">'
+        f'<b>마감 담당자</b> {shown}</div>'
+    )
+
 
 @app.get("/stock-closing", response_class=HTMLResponse)
 async def stock_closing_page(
@@ -3087,6 +3111,13 @@ async def stock_closing_page(
         var meta = document.getElementById('scMeta');
         if (!meta) return;
         var date = meta.getAttribute('data-date');
+        var closerEl = document.getElementById('scCloser');
+        var closer = closerEl ? closerEl.value.trim() : '';
+        if (mode === 'close' && closer === '') {
+          alert('마감 담당자 이름을 입력해주세요. (마감 시 필수)');
+          if (closerEl) closerEl.focus();
+          return;
+        }
         if (mode === 'close') {
           var empty = 0;
           document.querySelectorAll('.sc-input').forEach(function(inp) {
@@ -3104,7 +3135,7 @@ async def stock_closing_page(
           var res = await fetch('/stock-closing/save', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({date: date, mode: mode, counts: scCollect()})
+            body: JSON.stringify({date: date, mode: mode, counts: scCollect(), closer_name: closer})
           });
           var data = await res.json();
           if (!res.ok) {
@@ -3128,7 +3159,8 @@ async def stock_closing_page(
 
     content = (
         '<h2 style="margin:0 0 8px 0;">📦 재고 마감</h2>'
-        f'<p style="color:#888;font-size:13px;margin-bottom:4px;">{sel_date_str} (00시~24시) QR 스캔 기준</p>'
+        + _sc_closer_box(view_mode, save, can_write)
+        + f'<p style="color:#888;font-size:13px;margin-bottom:4px;">{sel_date_str} (00시~24시) QR 스캔 기준</p>'
         '<p style="color:#888;font-size:12px;margin-bottom:16px;">'
         "금일 출고 수량 = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − 유비플러스 재고</p>"
         + filter_html
@@ -3169,6 +3201,9 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
     date_str = str(body.get("date", "")).strip()
     mode = str(body.get("mode", "")).strip()
     counts = body.get("counts") or {}
+    closer_name = str(body.get("closer_name", "")).strip()[:30]
+    if mode == "close" and not closer_name:
+        raise HTTPException(status_code=400, detail="마감 담당자 이름을 입력해주세요. (마감 시 필수)")
     if mode not in ("draft", "close"):
         raise HTTPException(status_code=400, detail="저장 방식이 올바르지 않습니다.")
     if not isinstance(counts, dict):
@@ -3244,8 +3279,9 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
                 (branch_code, date_str)
             ).fetchone()
             save_id = row["id"]
+        conn.execute("UPDATE stock_closing_saves SET closer_name=? WHERE id=?", (closer_name or None, save_id))
         for ln in lines:
-            conn.execute(
+        conn.execute(
                 "INSERT INTO stock_closing_lines (save_id, branch_code, close_date, item_code, item_name, "
                 "scan_qty, qr_qty, ups_qty, counted_qty, diff_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (save_id, branch_code, date_str) + ln
@@ -3930,7 +3966,7 @@ async def stock_closing_status_page(
             mm = s["mismatch_count"] or 0
             mm_html = f'<span style="color:{"#DC2626" if mm > 0 else "#22C55E"};font-weight:bold;">{mm}</span>'
             item_cnt = s["item_count"] or 0
-            by = _html.escape(str(s["closed_by"] or s["saved_by"] or "-"))
+            by = _html.escape(str(s["closer_name"] or s["closed_by"] or s["saved_by"] or "-"))
             at = _html.escape(str(s["closed_at"] or s["saved_at"] or "-"))
         else:
             mm_html, item_cnt, by, at = "-", "-", "-", "-"
