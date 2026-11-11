@@ -2375,8 +2375,10 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       }})();
       (function() {{
         var STORAGE_PREFIX = 'colWidths2_';
-        function storageKey(tIdx) {{
-          return STORAGE_PREFIX + window.location.pathname + '_' + tIdx;
+        function storageKey(table) {{
+          var tIdx = tableIndexOf(table);
+          var ver = table.getAttribute('data-colver') || '';
+          return STORAGE_PREFIX + window.location.pathname + '_' + tIdx + (ver ? '_' + ver : '');
         }}
         function tableIndexOf(table) {{
           var all = document.querySelectorAll('table');
@@ -2399,15 +2401,14 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             widths.push(Math.round(th.offsetWidth));
           }});
           try {{
-            localStorage.setItem(storageKey(tIdx), JSON.stringify(widths));
+            localStorage.setItem(storageKey(table), JSON.stringify(widths));
           }} catch (e) {{}}
         }}
         function restoreWidths() {{
           document.querySelectorAll('table').forEach(function(table) {{
             if (!isResizableTable(table)) return;
-            var tIdx = tableIndexOf(table);
             var saved = null;
-            try {{ saved = localStorage.getItem(storageKey(tIdx)); }} catch (e) {{}}
+            try {{ saved = localStorage.getItem(storageKey(table)); }} catch (e) {{}}
             if (!saved) return;
             try {{
               var widths = JSON.parse(saved);
@@ -3050,7 +3051,7 @@ async def stock_closing_page(
                 f'<td><input type="number" min="0" class="sc-input" '
                 f'data-code="{_html.escape(str(it["item_code"]))}" data-ups="{ups_attr}"{val_attr} '
                 f'placeholder="실사" oninput="scUpdateDiff(this)"{dis} '
-                'style="width:70px;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
+                'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
                 '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
                 + _sc_adjust_cell(it["branch_code"], it["item_code"], can_edit_date)
                 + "</tr>"
@@ -3253,10 +3254,12 @@ async def stock_closing_page(
         + filter_html
         + cards_html
         + notices_html
-        + '<div class="card"><div class="table-scroll-wrap"><table>'
+        + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11">'
         "<thead><tr>"
-        "<th>지점</th><th>상품명</th><th>상품코드</th><th>금일 출고 수량</th>"
-        "<th>QR 재고 수량</th><th>유비플러스 재고 수량</th><th>실사 수량</th><th>오차</th><th>QR 수정</th>"
+        '<th style="width:8%">지점</th><th style="width:25%">상품명</th>'
+        '<th style="width:10%">상품코드</th><th style="width:9%">금일 출고 수량</th>'
+        '<th style="width:9%">QR 재고 수량</th><th style="width:11%">유비플러스 재고 수량</th>'
+        '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:10%">QR 수정</th>'
         "</tr></thead><tbody>"
         + rows_html
         + "</tbody></table></div>"
@@ -3461,7 +3464,7 @@ _SC_TEST_JS = """<script>
 
   async function scReminderTest(btn) {
     var date = document.getElementById('scMeta').getAttribute('data-date');
-    if (!confirm(date + ' 기준 미제출 지점 요약을 테스트 채널로만 보낼까요?')) return;
+    if (!confirm(date + ' 기준 미제출 지점 요약을 테스트 채널·테스트 메일로만 보낼까요?')) return;
     btn.disabled = true;
     try {
       var res = await fetch('/stock-closing/reminder-test', {
@@ -3549,13 +3552,15 @@ def _sc_notify_panel(sel_date_str: str) -> str:
     return (
         '<div class="card" style="margin-bottom:12px;">'
         '<div style="font-size:13px;font-weight:bold;margin-bottom:4px;">📨 자동 발송 설정 (기본 꺼짐)</div>'
-        '<div style="font-size:12px;color:#888;margin-bottom:8px;">켜면 매일 오전 10시에 전일 미제출 지점에 자동 발송합니다. '
-        "수동 '제출 요청'도 이 스위치를 따르고, '테스트' 버튼은 스위치와 무관하게 테스트 채널로만 발송됩니다.</div>"
-        + _row("branch", "지점 발송", "켜면 해당 지점 팀즈 채널로 실제 발송", branch_on)
-        + _row("test", "테스트 발송", f"켜면 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로만 발송", test_on)
+        '<div style="font-size:12px;color:#888;margin-bottom:8px;">매일 오전 10시(KST) 전일 미제출 지점을 자동 발송합니다. '
+        "지점 채널 발송은 '지점 발송' 스위치와 해당 지점 '알림' 체크가 모두 켜져 있을 때만 나갑니다(자동·수동 '제출 요청' 공통). "
+        "'테스트 발송' 스위치가 켜져 있으면 테스트 채널 사본도 함께 발송됩니다. "
+        "'테스트'·'자동 알림 테스트' 버튼은 스위치와 무관하게 테스트 채널로만 발송됩니다(자동 알림 테스트는 테스트 메일도 발송).</div>"
+        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 실제 발송", branch_on)
+        + _row("test", "테스트 발송", f"켜면 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로 발송 · 자동 알림은 테스트 메일도 수신", test_on)
         + f'<div id="scMeta" data-date="{sel_date_str}" style="display:none;"></div>'
         + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
-        'onclick="scReminderTest(this)">🧪 자동 알림 테스트 (테스트 채널로만 발송)</button>'
+        'onclick="scReminderTest(this)">🧪 자동 알림 테스트 (테스트 채널·테스트 메일로만 발송)</button>'
         + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;margin-top:6px;" onclick="scBranchAll(true)">지점 알림 전체 켜기</button>'
         + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" onclick="scBranchAll(false)">지점 알림 전체 끄기</button>'
         + '<div id="scNotifyResult" style="font-size:12px;color:#475569;margin-top:6px;"></div>'
@@ -4067,7 +4072,7 @@ async def stock_closing_status_page(
             f"<td>{mm_html}</td>"
             f"<td>{by}</td>"
             f"<td>{at}</td>"
-            f"<td>{_sc_request_button(e['code'], e['name'], e['status'])}</td>"
+            f'<td style="white-space:normal;">{_sc_request_button(e["code"], e["name"], e["status"])}</td>'
             "</tr>"
         )
     if not rows_html:
@@ -4105,8 +4110,12 @@ async def stock_closing_status_page(
         + _sc_notify_panel(sel_date_str)
         + filter_html
         + summary_html
-        + '<div class="card"><div class="table-scroll-wrap"><table>'
-                "<thead><tr><th>지점</th><th>상태</th><th>상품 수</th><th>오차 건수</th><th>제출자</th><th>제출 시각</th><th>요청</th></tr></thead>"
+        + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11">'
+                '<thead><tr>'
+                '<th style="width:16%">지점</th><th style="width:11%">상태</th>'
+                '<th style="width:7%">상품 수</th><th style="width:8%">오차 건수</th>'
+                '<th style="width:12%">제출자</th><th style="width:13%">제출 시각</th>'
+                '<th style="width:33%">요청</th></tr></thead>'
         "<tbody>" + rows_html + "</tbody></table></div></div>"
     )
     return HTMLResponse(render_page(content, user, active="stock-closing"))
