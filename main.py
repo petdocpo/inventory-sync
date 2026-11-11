@@ -2374,32 +2374,119 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         }});
       }})();
       (function() {{
-        function saveColumnWidths() {{
-          document.querySelectorAll('table').forEach(function(table, tIdx) {{
-            var widths = [];
-            table.querySelectorAll('th').forEach(function(th) {{
-              widths.push(th.offsetWidth);
-            }});
-            localStorage.setItem('colWidths_' + window.location.pathname + '_' + tIdx, JSON.stringify(widths));
-          }});
+        var STORAGE_PREFIX = 'colWidths2_';
+        function storageKey(tIdx) {{
+          return STORAGE_PREFIX + window.location.pathname + '_' + tIdx;
         }}
-        function restoreColumnWidths() {{
-          document.querySelectorAll('table').forEach(function(table, tIdx) {{
-            var saved = localStorage.getItem('colWidths_' + window.location.pathname + '_' + tIdx);
+        function tableIndexOf(table) {{
+          var all = document.querySelectorAll('table');
+          for (var i = 0; i < all.length; i++) {{
+            if (all[i] === table) return i;
+          }}
+          return -1;
+        }}
+        function isResizableTable(table) {{
+          var ths = table.querySelectorAll('th');
+          if (ths.length === 0) return false;
+          if (window.getComputedStyle(table).tableLayout === 'auto') return false;
+          return window.getComputedStyle(ths[0]).resize !== 'none';
+        }}
+        function saveTable(table) {{
+          var tIdx = tableIndexOf(table);
+          if (tIdx < 0) return;
+          var widths = [];
+          table.querySelectorAll('th').forEach(function(th) {{
+            widths.push(Math.round(th.offsetWidth));
+          }});
+          try {{
+            localStorage.setItem(storageKey(tIdx), JSON.stringify(widths));
+          }} catch (e) {{}}
+        }}
+        function restoreWidths() {{
+          document.querySelectorAll('table').forEach(function(table) {{
+            if (!isResizableTable(table)) return;
+            var tIdx = tableIndexOf(table);
+            var saved = null;
+            try {{ saved = localStorage.getItem(storageKey(tIdx)); }} catch (e) {{}}
             if (!saved) return;
             try {{
               var widths = JSON.parse(saved);
               var ths = table.querySelectorAll('th');
-              ths.forEach(function(th, i) {{
-                if (widths[i]) th.style.width = widths[i] + 'px';
+              if (!Array.isArray(widths) || widths.length !== ths.length) return;
+              var sum = 0;
+              var valid = true;
+              widths.forEach(function(w) {{
+                if (typeof w !== 'number' || !isFinite(w) || w <= 0) valid = false;
+                else sum += w;
               }});
+              if (!valid) return;
+              ths.forEach(function(th, i) {{ th.style.width = widths[i] + 'px'; }});
+              table.style.width = sum + 'px';
             }} catch (e) {{}}
           }});
         }}
-        restoreColumnWidths();
-        document.querySelectorAll('th').forEach(function(th) {{
-          var observer = new ResizeObserver(function() {{ saveColumnWidths(); }});
-          observer.observe(th);
+        restoreWidths();
+        document.querySelectorAll('table').forEach(function(table) {{
+          if (!isResizableTable(table)) return;
+          var ths = null;
+          var widths = null;
+          var mins = null;
+          var dragIdx = -1;
+          var dragX0 = 0;
+          var dragW0 = 0;
+          var dirty = false;
+          function applyWidths() {{
+            var sum = 0;
+            ths.forEach(function(th, i) {{
+              th.style.width = widths[i] + 'px';
+              sum += widths[i];
+            }});
+            table.style.width = sum + 'px';
+          }}
+          function freezeTable() {{
+            ths = table.querySelectorAll('th');
+            widths = [];
+            mins = [];
+            ths.forEach(function(th) {{
+              widths.push(th.offsetWidth);
+              mins.push(parseFloat(window.getComputedStyle(th).minWidth) || 0);
+            }});
+            applyWidths();
+          }}
+          function endDrag() {{
+            if (dragIdx < 0) return;
+            dragIdx = -1;
+            if (dirty) saveTable(table);
+          }}
+          table.addEventListener('pointerdown', function(e) {{
+            if (e.button !== 0) return;
+            var th = e.target && e.target.closest ? e.target.closest('th') : null;
+            if (!th || !table.contains(th)) return;
+            var rect = th.getBoundingClientRect();
+            if (e.clientX < rect.right - 10 || e.clientX > rect.right + 4) return;
+            e.preventDefault();
+            if (!widths) freezeTable();
+            var idx = Array.prototype.indexOf.call(ths, th);
+            if (idx < 0) return;
+            dragIdx = idx;
+            dragX0 = e.clientX;
+            dragW0 = widths[idx];
+            dirty = false;
+          }});
+          document.addEventListener('pointermove', function(e) {{
+            if (dragIdx < 0 || !widths) return;
+            var w = dragW0 + (e.clientX - dragX0);
+            var min = Math.max(mins[dragIdx] || 0, 30);
+            if (w < min) w = min;
+            if (Math.abs(w - widths[dragIdx]) > 0.5) {{
+              widths[dragIdx] = w;
+              applyWidths();
+              dirty = true;
+              saveTable(table);
+            }}
+          }});
+          document.addEventListener('pointerup', endDrag);
+          document.addEventListener('pointercancel', endDrag);
         }});
       }})();
       (function() {{
