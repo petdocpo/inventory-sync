@@ -3281,7 +3281,7 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
             save_id = row["id"]
         conn.execute("UPDATE stock_closing_saves SET closer_name=? WHERE id=?", (closer_name or None, save_id))
         for ln in lines:
-        conn.execute(
+            conn.execute(
                 "INSERT INTO stock_closing_lines (save_id, branch_code, close_date, item_code, item_name, "
                 "scan_qty, qr_qty, ups_qty, counted_qty, diff_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (save_id, branch_code, date_str) + ln
