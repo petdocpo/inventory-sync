@@ -2375,6 +2375,29 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       }})();
       (function() {{
         var STORAGE_PREFIX = 'colWidths2_';
+        // ==COLW-BEGIN== 순수 함수 (DOM 무관 — node 단위 테스트 대상)
+        function colClampMin(w, min) {{
+          return w < min ? min : w;
+        }}
+        function colFrozenWidths(offsetWidths) {{
+          var out = [];
+          for (var i = 0; i < offsetWidths.length; i++) {{
+            out.push(Math.round(offsetWidths[i]));
+          }}
+          return out;
+        }}
+        function colDragWidths(widths, idx, delta, mins) {{
+          var out = widths.slice();
+          var min = Math.max((mins && mins[idx]) || 0, 30);
+          out[idx] = colClampMin(out[idx] + delta, min);
+          return out;
+        }}
+        function colWidthsSum(widths) {{
+          var s = 0;
+          for (var i = 0; i < widths.length; i++) s += widths[i];
+          return s;
+        }}
+        // ==COLW-END==
         function storageKey(table) {{
           var tIdx = tableIndexOf(table);
           var ver = table.getAttribute('data-colver') || '';
@@ -2391,7 +2414,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           var ths = table.querySelectorAll('th');
           if (ths.length === 0) return false;
           if (window.getComputedStyle(table).tableLayout === 'auto') return false;
-          return window.getComputedStyle(ths[0]).resize !== 'none';
+          return true;
         }}
         function saveTable(table) {{
           var tIdx = tableIndexOf(table);
@@ -2427,14 +2450,18 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           }});
         }}
         restoreWidths();
+        if (!document.getElementById('colWHandleStyle')) {{
+          var st = document.createElement('style');
+          st.id = 'colWHandleStyle';
+          st.textContent = '.col-w-handle{{position:absolute;right:1px;top:18%;height:64%;width:9px;cursor:col-resize;background:rgba(255,255,255,.45);border-radius:3px;z-index:5;touch-action:none;}}th:hover>.col-w-handle{{background:rgba(255,255,255,.85);}}';
+          document.head.appendChild(st);
+        }}
         document.querySelectorAll('table').forEach(function(table) {{
           if (!isResizableTable(table)) return;
-          var ths = null;
+          var ths = table.querySelectorAll('th');
+          ths.forEach(function(th) {{ th.style.resize = 'none'; }});
           var widths = null;
           var mins = null;
-          var dragIdx = -1;
-          var dragX0 = 0;
-          var dragW0 = 0;
           var dirty = false;
           function applyWidths() {{
             var sum = 0;
@@ -2446,48 +2473,44 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           }}
           function freezeTable() {{
             ths = table.querySelectorAll('th');
-            widths = [];
-            mins = [];
-            ths.forEach(function(th) {{
-              widths.push(th.offsetWidth);
-              mins.push(parseFloat(window.getComputedStyle(th).minWidth) || 0);
+            widths = colFrozenWidths(Array.prototype.map.call(ths, function(th) {{ return th.offsetWidth; }}));
+            mins = Array.prototype.map.call(ths, function(th) {{
+              return parseFloat(window.getComputedStyle(th).minWidth) || 0;
             }});
             applyWidths();
           }}
-          function endDrag() {{
-            if (dragIdx < 0) return;
-            dragIdx = -1;
-            if (dirty) saveTable(table);
-          }}
-          table.addEventListener('pointerdown', function(e) {{
-            if (e.button !== 0) return;
-            var th = e.target && e.target.closest ? e.target.closest('th') : null;
-            if (!th || !table.contains(th)) return;
-            var rect = th.getBoundingClientRect();
-            if (e.clientX < rect.right - 10 || e.clientX > rect.right + 4) return;
-            e.preventDefault();
-            if (!widths) freezeTable();
-            var idx = Array.prototype.indexOf.call(ths, th);
-            if (idx < 0) return;
-            dragIdx = idx;
-            dragX0 = e.clientX;
-            dragW0 = widths[idx];
-            dirty = false;
-          }});
-          document.addEventListener('pointermove', function(e) {{
-            if (dragIdx < 0 || !widths) return;
-            var w = dragW0 + (e.clientX - dragX0);
-            var min = Math.max(mins[dragIdx] || 0, 30);
-            if (w < min) w = min;
-            if (Math.abs(w - widths[dragIdx]) > 0.5) {{
-              widths[dragIdx] = w;
-              applyWidths();
-              dirty = true;
-              saveTable(table);
+          ths.forEach(function(th, idx) {{
+            var handle = document.createElement('span');
+            handle.className = 'col-w-handle';
+            th.appendChild(handle);
+            var drag = null;
+            handle.addEventListener('pointerdown', function(e) {{
+              if (e.button !== 0) return;
+              e.preventDefault();
+              e.stopPropagation();
+              if (!widths) freezeTable();
+              drag = {{ idx: idx, x0: e.clientX }};
+              dirty = false;
+              try {{ handle.setPointerCapture(e.pointerId); }} catch (err) {{}}
+            }});
+            handle.addEventListener('pointermove', function(e) {{
+              if (!drag || drag.idx !== idx || !widths) return;
+              var next = colDragWidths(widths, idx, e.clientX - drag.x0, mins);
+              if (Math.abs(next[idx] - widths[idx]) > 0.5) {{
+                widths = next;
+                applyWidths();
+                dirty = true;
+                saveTable(table);
+              }}
+            }});
+            function endDrag() {{
+              if (!drag) return;
+              drag = null;
+              if (dirty) saveTable(table);
             }}
+            handle.addEventListener('pointerup', endDrag);
+            handle.addEventListener('pointercancel', endDrag);
           }});
-          document.addEventListener('pointerup', endDrag);
-          document.addEventListener('pointercancel', endDrag);
         }});
       }})();
       (function() {{

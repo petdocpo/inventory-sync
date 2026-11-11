@@ -11,3 +11,7 @@ venv/
 __pycache__/
 
 bak*.py
+
+/_tmp_*.txt
+/function_dump.txt
+/test_patch.py
