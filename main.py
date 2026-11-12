@@ -5256,6 +5256,8 @@ SCAN_AUTOCLOSE_SECONDS = 5
 # 스캔 플로우 버전 마커: 새로 발급되는 QR URL과 완료 화면 URL에 sv=2를 붙여
 # scan_view_log.headers_json._raw_query에서 신/구 버전 트래픽을 구분한다.
 SCAN_SERVICE_MARKER = "2"
+# 레거시 POST /scan 관측 스위치: 14일간 LEGACY_POST_SCAN 로그가 0건이면 False로 바꿔 410 처리한다.
+LEGACY_POST_SCAN_ENABLED = True
 
 
 @app.get("/scan", response_class=HTMLResponse)
@@ -5740,7 +5742,18 @@ async def scan_probe(request: Request):
 
 
 @app.post("/scan")
-async def scan_post(data: Dict[str, str]):
+async def scan_post(request: Request, data: Dict[str, str]):
+    import uuid
+    # 관측 로그: 호출 여부만 기록하고 재고 로직은 건드리지 않는다.
+    # _scan_log_view는 내부에서 예외를 삼키므로 로그 실패가 재고 처리를 막지 않는다.
+    request_id = uuid.uuid4().hex
+    scan_cid, _ = _scan_get_or_make_cid(request)
+    outcome = "LEGACY_POST_SCAN" if LEGACY_POST_SCAN_ENABLED else "LEGACY_POST_SCAN_BLOCKED"
+    _scan_log_view(request, request_id,
+                   str(data.get("branch_code", "")), str(data.get("item_code", "")),
+                   str(data.get("scan_type", "")), outcome, scan_cid)
+    if not LEGACY_POST_SCAN_ENABLED:
+        return JSONResponse({"detail": "Gone"}, status_code=410)
     delta = 1 if data.get("scan_type") == "IN" else -1
     new_qty = adjust_quantity(data["branch_code"], data["item_code"], delta)
     return {"status": "scanned", "scan_type": data.get("scan_type"), "new_quantity": new_qty}
