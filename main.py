@@ -18999,6 +18999,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
         "saved": ("ok", "✅ 영수증 값을 저장했습니다."),
         "memo_saved": ("ok", "✅ 메모를 저장했습니다."),
         "no_receipt": ("bad", "⚠️ 영수증 값을 먼저 입력해야 마감 저장할 수 있습니다."),
+        "closer_required": ("warn", "⚠️ 마감 담당자 이름을 입력해야 마감 저장할 수 있습니다."),
         "already": ("warn", "이미 마감 저장된 일자입니다."),
         "closed": ("ok", "✅ 마감 저장이 완료되었습니다."),
         "locked": ("warn", "마감 저장된 일자는 수정할 수 없습니다."),
@@ -19182,7 +19183,9 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                                   int(r.get("rc_cnt", 0)), int(r.get("rc_amt", 0))))
                     smemos[lb] = r.get("memo", "") or ""
                 mc = int(saved["mismatch_count"] or 0)
+                closer_txt = snap.get("closer_name") or ""
                 head = ["🔒 마감 저장 완료 — v" + str(saved["version"]) + " · " + (saved["saved_by"] or "-")
+                        + (" · 담당 " + _esc(str(closer_txt)) if closer_txt else "")
                         + " · " + _closing_fmt_ts(saved["saved_at"] or "")]
                 head.append(("불일치 " + str(mc) + "건 — 마스터가 확인·처리합니다.") if mc > 0
                             else "영수증과 결제내역이 일치합니다.")
@@ -19233,7 +19236,11 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                 else:
                     cmp_rows = _closing_compare(pg, rg)
                     memos = _closing_get_memos(conn, view_key, date)
-                    confirm_js = ("return confirm('마감 저장 후에는 수정할 수 없습니다.\\n영수증 값과 메모를 확인한 뒤 저장해 주세요.\\n\\n"
+                    need_closer = user["role"] != "master"
+                    closer_check_js = ("var _c=document.getElementById('closingCloser');"
+                                       "if(!_c||!_c.value.trim()){alert('마감 담당자 이름을 입력해주세요. (마감 시 필수)');return false;}\n"
+                                       "return confirm(") if need_closer else "return confirm("
+                    confirm_js = (closer_check_js + "'마감 저장 후에는 수정할 수 없습니다.\\n영수증 값과 메모를 확인한 뒤 저장해 주세요.\\n\\n"
                                   "마감 저장할까요?');")
                     bottom_box = ""
                     if msg == "memo_required":
@@ -19249,6 +19256,11 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                         '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
                         '<div class="card">' + _closing_compare_table_html(cmp_rows, True, "edit", memos, True)
                         + '<div id="closing-actions" style="margin-top:12px;">' + bottom_box
+                        + ('<div style="margin-bottom:10px;max-width:280px;">'
+                           '<label style="font-size:13px;font-weight:bold;">마감 담당자 <span style="color:#DC2626;">*</span></label>'
+                           '<input type="text" id="closingCloser" maxlength="30" placeholder="마감 담당자 이름 (필수)" '
+                           'style="margin-top:6px;width:100%;box-sizing:border-box;">'
+                           '<div style="font-size:11px;color:#888;margin-top:3px;">마감 저장 시 반드시 입력해야 합니다.</div></div>' if need_closer else '')
                         + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
                         '<button class="btn" type="submit" formaction="/closing/receipt-groups" style="background:#6B7280;">영수증 저장</button>'
                         '<button class="btn" type="submit" formaction="/closing/memo" style="background:#6B7280;">메모 저장</button>'
@@ -19549,6 +19561,11 @@ async def closing_save(request: Request, session_token: str = Cookie(default=Non
             return RedirectResponse(url="/closing", status_code=303)
         key, name = resolved
 
+        # 지점 계정은 마감 담당자 이름 필수(stock closing의 closer_name과 같은 개념)
+        closer_name = str(form.get("closer_name") or "").strip()[:30]
+        if user["role"] != "master" and not closer_name:
+            return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "closer_required"), status_code=303)
+
         if _closing_get_save(conn, key, pay_date):
             return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "already"), status_code=303)
 
@@ -19584,6 +19601,7 @@ async def closing_save(request: Request, session_token: str = Cookie(default=Non
             "slot": data["slot"], "received_at": data["received_at"],
             "receipt_entry_id": rc["id"], "receipt_method": rc["method"],
             "receipt_lines": rc["lines"], "rows": snap_rows,
+            "closer_name": closer_name or None,
         }
         try:
             conn.execute(
@@ -21039,7 +21057,7 @@ def _cl_notify_panel(date_str: str) -> str:
         '지점 채널 발송은 "지점 발송" 스위치와 해당 지점 "알림" 체크가 모두 켜져 있을 때만 나갑니다. '
         '"테스트 발송" 스위치가 켜져 있으면 테스트 채널·테스트 메일 사본도 함께 발송됩니다. '
         '"자동 알림 테스트" 버튼은 스위치와 무관하게 테스트 채널·테스트 메일로만 발송됩니다.</div>'
-        '<div style="display:grid;grid-template-columns:minmax(320px,1fr) 2fr;gap:14px;align-items:start;">'
+        '<div style="display:grid;grid-template-columns:minmax(400px,1fr) 2fr;gap:14px;align-items:start;">'
         '<div>'
         + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
         + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점", _cl_setting_on("closing_notify_mismatch"))
