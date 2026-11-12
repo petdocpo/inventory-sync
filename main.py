@@ -2410,8 +2410,39 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           }}
           return -1;
         }}
+        // 마지막 헤더 행 기준으로 실제 컬럼 헤더 셀만 구한다.
+        // (2단 헤더의 colspan/rowspan 셀도 각 컬럼에 정확히 1개씩 매핑하기 위함)
+        function colHeaderCells(table) {{
+          var head = table.tHead;
+          if (!head || !head.rows.length) return [];
+          var hrows = head.rows;
+          var grid = [];
+          for (var r = 0; r < hrows.length; r++) {{
+            var cells = hrows[r].cells, col = 0;
+            grid[r] = grid[r] || [];
+            for (var c = 0; c < cells.length; c++) {{
+              var cell = cells[c];
+              while (grid[r][col]) col++;
+              var rs = cell.rowSpan || 1, cs = cell.colSpan || 1;
+              for (var dr = 0; dr < rs; dr++) {{
+                for (var dc = 0; dc < cs; dc++) {{
+                  grid[r + dr] = grid[r + dr] || [];
+                  grid[r + dr][col + dc] = cell;
+                }}
+              }}
+              col += cs;
+            }}
+          }}
+          var last = grid[hrows.length - 1] || [];
+          var out = [], seen = [];
+          for (var i = 0; i < last.length; i++) {{
+            var cell2 = last[i];
+            if (cell2 && seen.indexOf(cell2) < 0) {{ seen.push(cell2); out.push(cell2); }}
+          }}
+          return out;
+        }}
         function isResizableTable(table) {{
-          var ths = table.querySelectorAll('th');
+          var ths = colHeaderCells(table);
           if (ths.length === 0) return false;
           var layout = window.getComputedStyle(table).tableLayout;
           if (layout === 'auto' && !table.hasAttribute('data-colw')) return false;
@@ -2421,7 +2452,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           var tIdx = tableIndexOf(table);
           if (tIdx < 0) return;
           var widths = [];
-          table.querySelectorAll('th').forEach(function(th) {{
+          colHeaderCells(table).forEach(function(th) {{
             widths.push(Math.round(th.offsetWidth));
           }});
           try {{
@@ -2436,7 +2467,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             if (!saved) return;
             try {{
               var widths = JSON.parse(saved);
-              var ths = table.querySelectorAll('th');
+              var ths = colHeaderCells(table);
               if (!Array.isArray(widths) || widths.length !== ths.length) return;
               var sum = 0;
               var valid = true;
@@ -2454,13 +2485,13 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         if (!document.getElementById('colWHandleStyle')) {{
           var st = document.createElement('style');
           st.id = 'colWHandleStyle';
-          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;}}th:hover>.col-w-handle{{opacity:.55;}}.col-w-handle:hover{{opacity:.95 !important;}}';
+          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;pointer-events:none;}}th:hover>.col-w-handle,td:hover>.col-w-handle{{opacity:.55;pointer-events:auto;}}.col-w-handle:hover{{opacity:.95 !important;}}';
           document.head.appendChild(st);
         }}
         document.querySelectorAll('table').forEach(function(table) {{
           if (!isResizableTable(table)) return;
-          var ths = table.querySelectorAll('th');
-          ths.forEach(function(th) {{ th.style.resize = 'none'; }});
+          var ths = colHeaderCells(table);
+          ths.forEach(function(th) {{ th.style.resize = 'none'; th.style.position = 'relative'; }});
           var widths = null;
           var shown = null;
           var mins = null;
@@ -2474,7 +2505,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             table.style.width = sum + 'px';
           }}
           function freezeTable() {{
-            ths = table.querySelectorAll('th');
+            ths = colHeaderCells(table);
             widths = colFrozenWidths(Array.prototype.map.call(ths, function(th) {{ return th.offsetWidth; }}));
             shown = widths.slice();
             mins = Array.prototype.map.call(ths, function(th) {{
@@ -18876,17 +18907,15 @@ def _closing_branch_compare_html(rows: list, date: str, notify: bool = False) ->
     dash = '<td style="text-align:right;color:#bbb;">-</td>'
 
     h = ['<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:760px;">']
-    if notify:
-        h.append('<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>'
-                 '<th rowspan="2" style="text-align:center;min-width:52px;">알림</th>')
-    else:
-        h.append('<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>')
     h.append(
+        '<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>'
         '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
         '<th colspan="2" style="text-align:center;">단말기 영수증 입력 값</th>'
         '<th colspan="2" style="text-align:center;">차이(결제내역−영수증)</th>'
         '<th rowspan="2" style="text-align:center;">상태</th>'
-        '<th rowspan="2" style="text-align:center;">마감</th></tr><tr>'
+        '<th rowspan="2" style="text-align:center;">마감</th>'
+        + ('<th rowspan="2" style="text-align:center;min-width:52px;">알림</th>' if notify else '')
+        + '</tr><tr>'
         '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
         '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
         '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th></tr></thead><tbody>'
@@ -18895,11 +18924,6 @@ def _closing_branch_compare_html(rows: list, date: str, notify: bool = False) ->
         link = '/closing?date=' + _q(date) + '&branch=' + _q(r["name"])
         h.append('<tr><td><a href="' + link + '" style="color:#1E2761;font-weight:bold;text-decoration:none;">'
                  + _esc(r["name"]) + '</a></td>')
-        if notify:
-            on = " checked" if _cl_branch_on(str(r.get("key") or _closing_norm(r["name"]))) else ""
-            h.append('<td style="text-align:center;"><input type="checkbox" style="width:auto;margin:0;" '
-                     'data-bkey="' + _esc(str(r.get("key") or _closing_norm(r["name"]))) + '" '
-                     'onchange="clBranchToggle(this)"' + on + '></td>')
         h.append('<td ' + num + '>' + f"{r['pc']:,}" + '</td><td ' + num + '>' + f"{r['pa']:,}" + '</td>')
         if r["has_receipt"]:
             dc, da = r["pc"] - r["rc"], r["pa"] - r["ra"]
@@ -18913,7 +18937,13 @@ def _closing_branch_compare_html(rows: list, date: str, notify: bool = False) ->
         else:
             h.append(dash * 4)
             h.append('<td style="text-align:center;color:#B45309;">영수증 미입력</td>')
-        h.append('<td style="text-align:center;">' + _esc(r["saved"] or "-") + '</td></tr>')
+        h.append('<td style="text-align:center;">' + _esc(r["saved"] or "-") + '</td>')
+        if notify:
+            bkey = str(r.get("key") or _closing_norm(r["name"]))
+            on = " checked" if _cl_branch_on(bkey) else ""
+            h.append('<td style="text-align:center;"><input type="checkbox" style="width:auto;margin:0;" '
+                     'data-bkey="' + _esc(bkey) + '" onchange="clBranchToggle(this)"' + on + '></td>')
+        h.append('</tr>')
     h.append('</tbody></table></div>')
     return "".join(h)
 
@@ -19648,10 +19678,10 @@ function closingUpload(btn) {
 }
 
 // ---------- 영수증 촬영·스캔 (jscanify + OpenCV.js, 첫 사용 시 CDN 로드) ----------
-// 사용 요령: 평평한 곳에 단색 배경 위에 영수증을 놓고 촬영. 윤곽이 잡히면 자동으로 잘라 저장,
-// 못 잡으면 원본 그대로 저장한다.
+// 사용 요령: 평평한 곳에 단색 배경 위에 영수증을 놓고 촬영. 윤곽이 "충분히" 잡힐 때만 자동 크롭,
+// 아니면 원본 그대로 저장한다. 실시간 오버레이는 400px 축소 프레임으로 800ms마다 처리한다.
 var _clScan = {loading:false, queue:[], stream:null, scanner:null, video:null,
-               overlay:null, timer:null, tickBusy:false, busy:false};
+               overlay:null, timer:null, tickBusy:false, busy:false, found:false};
 
 function clScanEnsure(cb) {
   if (window.jscanify && window.cv) { cb(); return; }
@@ -19691,23 +19721,73 @@ function clScanFrame(maxW) {
   return c;
 }
 
-// 화면 위에 윤곽 오버레이를 그린다(포켓몬고 스타일). 500ms마다 축소 프레임으로 처리.
+// 윤곽 품질 판정: 면적 비율(8~95%)과 bounding box 채움률(40%↑)을 모두 만족해야 "인식됨"으로 본다.
+// (임의의 4점 윤곽을 문서로 오인해 이상하게 크롭되는 것을 막기 위함)
+function clScanContourOk(img, contour) {
+  if (!contour) { return false; }
+  var area = 0;
+  try { area = cv.contourArea(contour); } catch (e) { return false; }
+  var imgArea = img.rows * img.cols;
+  if (imgArea <= 0) { return false; }
+  var ratio = area / imgArea;
+  if (ratio < 0.08 || ratio > 0.95) { return false; }
+  var rect = null;
+  try { rect = cv.boundingRect(contour); } catch (e) { return false; }
+  var bbox = (rect && rect.width > 0 && rect.height > 0) ? rect.width * rect.height : 0;
+  if (bbox <= 0) { return false; }
+  return (area / bbox) > 0.4;
+}
+
+// 실시간 오버레이: 프레임에서 윤곽을 찾아 모서리 4점을 화면 좌표로 그린다.
+// object-fit:contain 기준으로 letterbox 오프셋을 계산해 정확히 맞춘다.
 function clScanTick() {
   if (!_clScan.scanner || !_clScan.video || !_clScan.overlay) { return; }
-  if (_clScan.tickBusy || _clScan.video.readyState < 2) { return; }
+  if (_clScan.tickBusy || _clScan.video.readyState < 2 || document.hidden) { return; }
   _clScan.tickBusy = true;
+  var img = null, contour = null;
   try {
-    var frame = clScanFrame(480);
-    var hc = _clScan.scanner.highlightPaper(frame, {color: '#7C3AED', thickness: 8});
-    var v = _clScan.video, ov = _clScan.overlay;
+    var frame = clScanFrame(400);
+    img = cv.imread(frame);
+    contour = _clScan.scanner.findPaperContour(img);
+    var ov = _clScan.overlay, v = _clScan.video;
     var dpr = window.devicePixelRatio || 1;
-    var w = Math.round(v.clientWidth * dpr), h = Math.round(v.clientHeight * dpr);
-    if (ov.width !== w || ov.height !== h) { ov.width = w; ov.height = h; }
+    var boxW = v.clientWidth, boxH = v.clientHeight;
+    var cw = Math.round(boxW * dpr), ch = Math.round(boxH * dpr);
+    if (ov.width !== cw || ov.height !== ch) { ov.width = cw; ov.height = ch; }
     var ctx = ov.getContext('2d');
     ctx.clearRect(0, 0, ov.width, ov.height);
-    if (hc) { ctx.drawImage(hc, 0, 0, ov.width, ov.height); }
+    var ok = clScanContourOk(img, contour);
+    _clScan.found = ok;
+    if (ok) {
+      var cp = _clScan.scanner.getCornerPoints(contour);
+      if (cp && cp.topLeftCorner && cp.topRightCorner && cp.bottomLeftCorner && cp.bottomRightCorner) {
+        var va = frame.width / frame.height, ba = boxW / boxH;
+        var drawW, drawH, offX, offY;
+        if (va > ba) { drawW = boxW; drawH = boxW / va; offX = 0; offY = (boxH - drawH) / 2; }
+        else { drawH = boxH; drawW = boxH * va; offX = (boxW - drawW) / 2; offY = 0; }
+        var sx = drawW / frame.width * dpr, sy = drawH / frame.height * dpr;
+        var ox = offX * dpr, oy = offY * dpr;
+        var pts = [cp.topLeftCorner, cp.topRightCorner, cp.bottomRightCorner, cp.bottomLeftCorner];
+        ctx.strokeStyle = '#7C3AED'; ctx.lineWidth = 5 * dpr;
+        ctx.shadowColor = 'rgba(0,0,0,.6)'; ctx.shadowBlur = 4 * dpr;
+        ctx.beginPath();
+        pts.forEach(function (p, i) {
+          var x = ox + p.x * sx, y = oy + p.y * sy;
+          if (i === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
+        });
+        ctx.closePath(); ctx.stroke();
+        ctx.shadowBlur = 0;
+      } else { ok = false; _clScan.found = false; }
+    }
+    clScanStatus(ok
+      ? '윤곽 감지됨 — "촬영·저장"을 누르세요.'
+      : '영수증 윤곽을 찾는 중... (단색 배경에 평평하게 놓아주세요)');
   } catch (e) { /* 프레임 처리 실패는 무시하고 다음 틱에 재시도 */ }
-  _clScan.tickBusy = false;
+  finally {
+    if (contour) { try { contour.delete(); } catch (e) {} }
+    if (img) { try { img.delete(); } catch (e) {} }
+    _clScan.tickBusy = false;
+  }
 }
 
 function clScanCapture(btn) {
@@ -19715,16 +19795,28 @@ function clScanCapture(btn) {
   _clScan.busy = true;
   btn.disabled = true;
   clScanStatus('촬영 중...');
+  var img = null, contour = null;
   try {
     var frame = clScanFrame(0);
     var w = frame.width, h = frame.height;
     var out = null, cropped = false;
     if (_clScan.scanner) {
       try {
-        var pw = 1200, ph = Math.max(200, Math.round(pw * h / w));
-        out = _clScan.scanner.extractPaper(frame, pw, ph);
-        cropped = !!out;
-      } catch (e) { out = null; }
+        img = cv.imread(frame);
+        contour = _clScan.scanner.findPaperContour(img);
+        if (clScanContourOk(img, contour)) {
+          var cp = _clScan.scanner.getCornerPoints(contour);
+          if (cp && cp.topLeftCorner && cp.bottomRightCorner) {
+            var pw = 1200, ph = Math.max(200, Math.round(pw * h / w));
+            out = _clScan.scanner.extractPaper(frame, pw, ph);
+            cropped = !!out;
+          }
+        }
+      } catch (e) { out = null; cropped = false; }
+      finally {
+        if (contour) { try { contour.delete(); } catch (e) {} }
+        if (img) { try { img.delete(); } catch (e) {} }
+      }
     }
     var src = out || frame;
     src.toBlob(function (blob) {
@@ -19732,7 +19824,7 @@ function clScanCapture(btn) {
       if (!blob) { clScanStatus('이미지 변환에 실패했습니다. 다시 시도하세요.'); return; }
       var file = new File([blob], cropped ? 'scanned-receipt.jpg' : 'receipt.jpg', {type: 'image/jpeg'});
       var upBtn = document.getElementById('closing-upload-btn');
-      clScanStatus(cropped ? '윤곽을 잡아 잘라냈습니다 — 업로드 중...' : '윤곽을 찾지 못해 원본 그대로 업로드 중...');
+      clScanStatus(cropped ? '윤곽을 잡아 잘라냈습니다 — 업로드 중...' : '윤곽이 확실하지 않아 원본 그대로 업로드 중...');
       closingUploadFiles([file], upBtn).then(function () { clScanClose(); });
     }, 'image/jpeg', 0.85);
   } catch (e) {
@@ -19749,7 +19841,7 @@ function clScanClose() {
   }
   var m = document.getElementById('cl-scan-modal');
   if (m) { m.remove(); }
-  _clScan.video = null; _clScan.overlay = null; _clScan.scanner = null;
+  _clScan.video = null; _clScan.overlay = null; _clScan.scanner = null; _clScan.found = false;
 }
 
 function clScanOpen() {
@@ -19762,7 +19854,7 @@ function clScanOpen() {
     + '<span style="font-size:14px;font-weight:bold;">📄 영수증 촬영·스캔</span>'
     + '<button type="button" id="cl-scan-x" class="btn" style="background:#6B7280;padding:4px 10px;">✕</button></div>'
     + '<div style="position:relative;flex:1 1 auto;min-height:0;background:#000;">'
-    + '<video id="cl-scan-video" autoplay playsinline muted style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"></video>'
+    + '<video id="cl-scan-video" autoplay playsinline muted style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;"></video>'
     + '<canvas id="cl-scan-overlay" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;"></canvas></div>'
     + '<div style="flex:0 0 auto;background:#111;color:#eee;padding:10px 12px;">'
     + '<div id="cl-scan-status" style="font-size:12px;min-height:16px;margin-bottom:8px;color:#DDD;"></div>'
@@ -19771,7 +19863,7 @@ function clScanOpen() {
     + '<button type="button" class="btn" id="cl-scan-reload" style="background:#334155;display:none;">다시 시도</button>'
     + '</div>'
     + '<div style="font-size:11px;color:#999;margin-top:6px;line-height:1.5;">평평한 곳에 <b>단색 배경</b>을 깔고 영수증을 놓아주세요. '
-    + '윤곽이 잡히면 자동으로 잘라서 저장하고, 못 잡으면 원본 그대로 저장합니다. '
+    + '윤곽이 확실히 잡힐 때만 잘라서 저장하고, 애매하면 원본 그대로 저장합니다. '
     + '(카메라가 없으면 파일 선택을 이용하세요)</div></div>';
   document.body.appendChild(modal);
   document.getElementById('cl-scan-x').addEventListener('click', clScanClose);
@@ -19788,7 +19880,6 @@ function clScanOpen() {
     }
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       clScanStatus('이 브라우저는 카메라를 지원하지 않습니다 — 파일 선택을 이용하세요.');
-      document.getElementById('cl-scan-reload').style.display = 'none';
       return;
     }
     navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment', width: {ideal: 1920}}})
@@ -19802,7 +19893,7 @@ function clScanOpen() {
         clScanStatus(_clScan.scanner
           ? '준비 완료 — 영수증을 비추고 "촬영·저장"을 누르세요.'
           : '스캐너 초기화 실패 — 촬영하면 원본 그대로 저장됩니다.');
-        _clScan.timer = setInterval(clScanTick, 500);
+        _clScan.timer = setInterval(clScanTick, 800);
       })
       .catch(function (e) {
         clScanStatus('카메라를 열 수 없습니다(' + e.message + ') — 파일 선택을 이용하세요.');
@@ -20498,11 +20589,20 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
                     applied = _closing_verify_apply_dates(by_date, eligible, user.get("login_id"))
                     # 결과를 일자별로 보여 준다(무엇이 반영/제외됐는지 확인 가능하게)
                     elig_set = set(eligible)
+                    parsed_total = sum(len(v) for v in by_date.values())
                     rh = ['<h2 style="margin-bottom:8px;">🧾 바로 반영 결과</h2>',
                           '<a class="btn" href="/closing/verify" style="text-decoration:none;background:#6B7280;display:inline-block;margin-bottom:10px;">← 업로드 화면</a>',
-                          '<div class="card" style="font-size:13px;">✅ <b>' + str(applied) + '개 일자</b>를 수정본(슬롯 M)으로 반영했습니다.</div>',
-                          '<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:520px;"><thead><tr>'
-                          '<th>일자</th><th>결과</th><th>사유</th></tr></thead><tbody>']
+                          '<div class="card" style="font-size:13px;">'
+                          + ('⚠️ 반영된 일자가 없습니다. 파일에서 파싱된 행 <b>' + str(parsed_total)
+                             + '건</b>, 발견된 일자 <b>' + str(len(days)) + '개</b> — '
+                             '모두 오늘(KST) 이후·차이 없음·90% 미만 경고 조건에 해당하거나 유효한 결제일시가 없을 수 있습니다. 미리보기로 확인하세요.'
+                             if not days or applied == 0 else
+                             '✅ <b>' + str(applied) + '개 일자</b>를 수정본(슬롯 M)으로 반영했습니다.')
+                          + '</div>']
+                    rh.append('<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:520px;"><thead><tr>'
+                          '<th>일자</th><th>결과</th><th>사유</th></tr></thead><tbody>')
+                    if not days:
+                        rh.append('<tr><td colspan="3" style="text-align:center;color:#888;">표시할 일자가 없습니다.</td></tr>')
                     for d in days:
                         if d["date"] in elig_set:
                             res, why = "✅ 반영", "수정본 행수 " + str(d["new_count"]) + "건"
@@ -20864,12 +20964,10 @@ def _cl_notify_panel(date_str: str) -> str:
         '지점 채널 발송은 "지점 발송" 스위치와 해당 지점 "알림" 체크가 모두 켜져 있을 때만 나갑니다. '
         '"테스트 발송" 스위치가 켜져 있으면 테스트 채널·테스트 메일 사본도 함께 발송됩니다. '
         '"자동 알림 테스트" 버튼은 스위치와 무관하게 테스트 채널·테스트 메일로만 발송됩니다.</div>'
-        '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 16px;">'
         + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
         + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점", _cl_setting_on("closing_notify_mismatch"))
         + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 실제 발송", _cl_setting_on("closing_notify_branch"))
         + _row("test", "테스트 발송", f"켜면 테스트 채널({CL_NOTIFY_TEST_BRANCH_CODE})·테스트 메일로 발송", _cl_setting_on("closing_notify_test"))
-        + '</div>'
         + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
         'onclick="clReminderTest(this)" data-date="' + date_str + '">🧪 자동 알림 테스트 (테스트 채널·테스트 메일로만)</button>'
         + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;margin-top:6px;" onclick="clBranchAll(true)">지점 알림 전체 켜기</button>'
