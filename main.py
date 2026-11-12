@@ -18791,7 +18791,8 @@ def _closing_mslot_groups(conn, pay_date: str, branch_keys=None) -> dict:
 def _closing_verify_compare_html(pay_groups: dict, rc_groups: dict, has_receipt: bool,
                                  m_groups: dict) -> str:
     """전지점 수정 데이터 비교 표: 구분 | 결제내역 | 단말기 영수증 입력 값 | 차이(결제−영수증)
-    | 수정 데이터(슬롯 M) | 차이(수정−결제). m_groups가 없으면 수정 열은 '-'로 표시."""
+    | 수정 데이터(슬롯 M) | 차이(수정−영수증). m_groups가 없으면 수정 열은 '-'로 표시.
+    영수증 미입력이면 수정 차이 열은 '-'로 둔다."""
     from html import escape as _esc
     num = 'style="text-align:right;"'
     bad_style = 'style="text-align:right;color:#DC2626;font-weight:bold;"'
@@ -18807,7 +18808,7 @@ def _closing_verify_compare_html(pay_groups: dict, rc_groups: dict, has_receipt:
         '<th colspan="2" style="text-align:center;">단말기 영수증 입력 값</th>'
         '<th colspan="2" style="text-align:center;">차이(결제−영수증)</th>'
         '<th colspan="2" style="text-align:center;background:#7C3AED;color:#fff;">수정 데이터(슬롯 M)</th>'
-        '<th colspan="2" style="text-align:center;">차이(수정−결제)</th></tr><tr>'
+        '<th colspan="2" style="text-align:center;">차이(수정−영수증)</th></tr><tr>'
         '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
         '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
         '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
@@ -18820,9 +18821,10 @@ def _closing_verify_compare_html(pay_groups: dict, rc_groups: dict, has_receipt:
         rc, ra = rc_groups.get(lb, (0, 0))
         mc, ma = m_groups.get(lb, (0, 0))
         dc1, da1 = pc - rc, pa - ra
-        dc2, da2 = mc - pc, ma - pa
+        dc2 = (mc - rc) if has_receipt else None
+        da2 = (ma - ra) if has_receipt else None
         has_m = bool(m_groups)
-        changed = has_m and (dc2 != 0 or da2 != 0)
+        changed = has_m and has_receipt and (dc2 != 0 or da2 != 0)
         h.append('<tr' + (' style="background:#F5F3FF;"' if changed else '') + '><td>' + _esc(lb) + '</td>'
                  '<td ' + num + '>' + f"{pc:,}" + '</td><td ' + num + '>' + f"{pa:,}" + '</td>')
         if has_receipt:
@@ -18832,9 +18834,12 @@ def _closing_verify_compare_html(pay_groups: dict, rc_groups: dict, has_receipt:
         else:
             h.append(dash * 4)
         if has_m:
-            h.append('<td ' + num + '>' + f"{mc:,}" + '</td><td ' + num + '>' + f"{ma:,}" + '</td>'
-                     '<td ' + (good_style if dc2 > 0 else (bad_style if dc2 < 0 else num)) + '>' + _closing_sgn(dc2) + '</td>'
-                     '<td ' + (good_style if da2 > 0 else (bad_style if da2 < 0 else num)) + '>' + _closing_sgn(da2) + '</td>')
+            h.append('<td ' + num + '>' + f"{mc:,}" + '</td><td ' + num + '>' + f"{ma:,}" + '</td>')
+            if has_receipt:
+                h.append('<td ' + (good_style if dc2 > 0 else (bad_style if dc2 < 0 else num)) + '>' + _closing_sgn(dc2) + '</td>'
+                         '<td ' + (good_style if da2 > 0 else (bad_style if da2 < 0 else num)) + '>' + _closing_sgn(da2) + '</td>')
+            else:
+                h.append(dash * 2)
         else:
             h.append(dash * 4)
         h.append('</tr>')
@@ -18848,17 +18853,21 @@ def _closing_verify_compare_html(pay_groups: dict, rc_groups: dict, has_receipt:
     else:
         h.append(dash * 4)
     if m_groups:
-        h.append('<td ' + num + '>' + f"{t[4]:,}" + '</td><td ' + num + '>' + f"{t[5]:,}" + '</td>'
-                 '<td ' + num + '>' + _closing_sgn(t[4]-t[0]) + '</td>'
-                 '<td ' + num + '>' + _closing_sgn(t[5]-t[1]) + '</td>')
+        h.append('<td ' + num + '>' + f"{t[4]:,}" + '</td><td ' + num + '>' + f"{t[5]:,}" + '</td>')
+        if has_receipt:
+            h.append('<td ' + num + '>' + _closing_sgn(t[4]-t[2]) + '</td>'
+                     '<td ' + num + '>' + _closing_sgn(t[5]-t[3]) + '</td>')
+        else:
+            h.append(dash * 2)
     else:
         h.append(dash * 4)
     h.append('</tr></tbody></table></div>')
     return "".join(h)
 
 
-def _closing_branch_compare_html(rows: list, date: str) -> str:
-    """전지점 조회: 지점별 합계 비교 표. rows: [{key,name,pc,pa,rc,ra,has_receipt,mismatch,saved}]"""
+def _closing_branch_compare_html(rows: list, date: str, notify: bool = False) -> str:
+    """전지점 조회: 지점별 합계 비교 표. rows: [{key,name,pc,pa,rc,ra,has_receipt,mismatch,saved}]
+    notify=True이면 맨 앞에 지점별 알림 체크박스를 추가한다(마스터 전용 화면에서만 사용)."""
     from html import escape as _esc
     from urllib.parse import quote as _q
     num = 'style="text-align:right;"'
@@ -18866,8 +18875,12 @@ def _closing_branch_compare_html(rows: list, date: str) -> str:
     dash = '<td style="text-align:right;color:#bbb;">-</td>'
 
     h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:760px;">']
+    if notify:
+        h.append('<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>'
+                 '<th rowspan="2" style="text-align:center;min-width:52px;">알림</th>')
+    else:
+        h.append('<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>')
     h.append(
-        '<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>'
         '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
         '<th colspan="2" style="text-align:center;">단말기 영수증 입력 값</th>'
         '<th colspan="2" style="text-align:center;">차이(결제내역−영수증)</th>'
@@ -18880,8 +18893,13 @@ def _closing_branch_compare_html(rows: list, date: str) -> str:
     for r in rows:
         link = '/closing?date=' + _q(date) + '&branch=' + _q(r["name"])
         h.append('<tr><td><a href="' + link + '" style="color:#1E2761;font-weight:bold;text-decoration:none;">'
-                 + _esc(r["name"]) + '</a></td>'
-                 '<td ' + num + '>' + f"{r['pc']:,}" + '</td><td ' + num + '>' + f"{r['pa']:,}" + '</td>')
+                 + _esc(r["name"]) + '</a></td>')
+        if notify:
+            on = " checked" if _cl_branch_on(str(r.get("key") or _closing_norm(r["name"]))) else ""
+            h.append('<td style="text-align:center;"><input type="checkbox" style="width:auto;margin:0;" '
+                     'data-bkey="' + _esc(str(r.get("key") or _closing_norm(r["name"]))) + '" '
+                     'onchange="clBranchToggle(this)"' + on + '></td>')
+        h.append('<td ' + num + '>' + f"{r['pc']:,}" + '</td><td ' + num + '>' + f"{r['pa']:,}" + '</td>')
         if r["has_receipt"]:
             dc, da = r["pc"] - r["rc"], r["pa"] - r["ra"]
             h.append('<td ' + num + '>' + f"{r['rc']:,}" + '</td><td ' + num + '>' + f"{r['ra']:,}" + '</td>')
@@ -18983,6 +19001,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
         if user.get("role") == "master":
             parts.append('<div style="margin-bottom:12px;"><a class="btn" href="/closing/verify" '
                          'style="text-decoration:none;display:inline-block;">마감 이후 검증 (수정 엑셀 업로드)</a></div>')
+            parts.append(_cl_notify_panel(date))
 
         if not dates:
             parts.append('<div class="card">수신된 결제내역이 없습니다.</div>')
@@ -19076,7 +19095,8 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             parts.append('<h3 style="margin:12px 0 8px;">구분별 (영수증 입력 지점 기준)</h3>')
             parts.append('<div class="card">' + _closing_compare_table_html(_closing_compare(sum_pay, sum_rc), entered > 0) + '</div>')
             parts.append('<h3 style="margin:16px 0 8px;">지점별 합계</h3>')
-            parts.append('<div class="card">' + _closing_branch_compare_html(rows_b, date) + '</div>')
+            parts.append('<div class="card">' + _closing_branch_compare_html(
+                rows_b, date, notify=(user.get("role") == "master")) + '</div>')
             # 슬롯 M(수동 수정본) 데이터가 있으면 같은 양식으로 수정 데이터 비교를 추가한다
             if entered > 0:
                 receipt_keys = {k for k in keys if data["receipts"].get(k) is not None}
@@ -19648,6 +19668,166 @@ function closingUpload(btn) {
   shoot.addEventListener('click', function () { cam.click(); });
   btn.parentNode.insertBefore(shoot, btn.parentNode.firstChild);
   btn.parentNode.appendChild(cam);
+})();
+
+// ---------- 문서 스캔 (jscanify + OpenCV.js, 첫 사용 시 CDN 로드) ----------
+// 사용 요령: 평평한 곳에 단색 배경 위에 영수증을 놓고 촬영할 것
+var _clScan = {loading: false, queue: [], stream: null, scanner: null, video: null, busy: false};
+
+function clScanEnsure(cb) {
+  if (window.jscanify && window.cv) { cb(); return; }
+  _clScan.queue.push(cb);
+  if (_clScan.loading) { return; }
+  _clScan.loading = true;
+  function done() {
+    _clScan.loading = false;
+    var q = _clScan.queue; _clScan.queue = [];
+    q.forEach(function (f) { f(); });
+  }
+  var s1 = document.createElement('script');
+  s1.src = 'https://cdn.jsdelivr.net/npm/jscanify@1.4.3/src/opencv.js';
+  s1.onload = function () {
+    var s2 = document.createElement('script');
+    s2.src = 'https://cdn.jsdelivr.net/npm/jscanify@1.4.3/src/jscanify.js';
+    s2.onload = done; s2.onerror = done;
+    document.head.appendChild(s2);
+  };
+  s1.onerror = done;
+  document.head.appendChild(s1);
+}
+
+function clScanStatus(t) {
+  var el = document.getElementById('cl-scan-status');
+  if (el) { el.textContent = t; }
+}
+
+function clScanFrame() {
+  var v = _clScan.video;
+  var c = document.createElement('canvas');
+  c.width = v.videoWidth || 640; c.height = v.videoHeight || 480;
+  c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+  return c;
+}
+
+function clScanHighlight() {
+  if (_clScan.busy || !_clScan.scanner) { return; }
+  _clScan.busaryGuard = true;
+  try {
+    var frame = clScanFrame();
+    var out = _clScan.scanner.highlightPaper(frame);
+    var box = document.getElementById('cl-scan-out');
+    box.innerHTML = '';
+    if (out && out.tagName === 'CANVAS') {
+      out.style.maxWidth = '100%'; out.style.border = '2px solid #7C3AED';
+      box.appendChild(out);
+      clScanStatus('윤곽을 찾았습니다. "잘라내어 업로드"를 누르세요.');
+    } else {
+      clScanStatus('윤곽을 찾지 못했습니다. 단색 배경 위에 영수증을 평평하게 놓고 다시 시도하세요.');
+    }
+  } catch (e) {
+    clScanStatus('윤곽 인식 실패: ' + e.message);
+  }
+  _clScan.busy = false;
+}
+
+function clScanExtract(btn) {
+  if (_clScan.busy || !_clScan.scanner) { return; }
+  _clScan.busy = true;
+  btn.disabled = true;
+  clScanStatus('영수증을 잘라내는 중...');
+  try {
+    var frame = clScanFrame();
+    var w = frame.width, h = frame.height;
+    var pw = 800, ph = Math.max(200, Math.round(pw * h / w));
+    var out = _clScan.scanner.extractPaper(frame, pw, ph);
+    if (!out || !out.toBlob) { throw new Error('추출 결과가 없습니다.'); }
+    out.toBlob(function (blob) {
+      _clScan.busy = false; btn.disabled = false;
+      if (!blob) { clScanStatus('이미지 변환에 실패했습니다.'); return; }
+      var file = new File([blob], 'scanned-receipt.jpg', {type: 'image/jpeg'});
+      var upBtn = document.getElementById('closing-upload-btn');
+      clScanStatus('스캔 완료 — 업로드 중...');
+      closingUploadFiles([file], upBtn).then(function () { clScanClose(); });
+    }, 'image/jpeg', 0.85);
+  } catch (e) {
+    _clScan.busy = false; btn.disabled = false;
+    clScanStatus('추출 실패: ' + e.message + ' — "촬영하기"로 일반 사진을 올려주세요.');
+  }
+}
+
+function clScanClose() {
+  var m = document.getElementById('cl-scan-modal');
+  if (m) { m.remove(); }
+  if (_clScan.stream) {
+    _clScan.stream.getTracks().forEach(function (t) { t.stop(); });
+    _clScan.stream = null;
+  }
+  _clScan.video = null; _clScan.scanner = null;
+}
+
+function clScanOpen() {
+  if (document.getElementById('cl-scan-modal')) { return; }
+  var modal = document.createElement('div');
+  modal.id = 'cl-scan-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;align-items:center;justify-content:center;padding:12px;';
+  modal.innerHTML =
+    '<div style="background:#fff;border-radius:12px;padding:14px;max-width:520px;width:100%;max-height:92vh;overflow:auto;">'
+    + '<div style="font-weight:bold;margin-bottom:6px;">📄 영수증 문서 스캔</div>'
+    + '<div style="font-size:12px;color:#B45309;margin-bottom:8px;">💡 평평한 곳에 <b>단색 배경</b>을 깔고 영수증을 놓은 뒤 촬영하세요. 기울어지거나 배경이 복잡하면 인식이 어렵습니다.</div>'
+    + '<video id="cl-scan-video" autoplay playsinline muted style="width:100%;background:#000;border-radius:8px;"></video>'
+    + '<div id="cl-scan-out" style="margin-top:8px;text-align:center;"></div>'
+    + '<div id="cl-scan-status" style="font-size:12px;color:#555;margin:8px 0;"></div>'
+    + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+    + '<button type="button" class="btn" id="cl-scan-hl" style="background:#7C3AED;">윤곽 표시</button>'
+    + '<button type="button" class="btn" id="cl-scan-ex" style="background:#065F46;">잘라내어 업로드</button>'
+    + '<button type="button" class="btn" id="cl-scan-close" style="background:#6B7280;">닫기</button>'
+    + '</div></div>';
+  document.body.appendChild(modal);
+  document.getElementById('cl-scan-close').addEventListener('click', clScanClose);
+  document.getElementById('cl-scan-hl').addEventListener('click', clScanHighlight);
+  document.getElementById('cl-scan-ex').addEventListener('click', function () { clScanExtract(this); });
+  modal.addEventListener('click', function (e) { if (e.target === modal) { clScanClose(); } });
+
+  clScanStatus('카메라를 여는 중... (OpenCV 로딩 시 최초 1회 수십 초 걸릴 수 있습니다)');
+  clScanEnsure(function () {
+    if (!window.jscanify || !window.cv) {
+      clScanStatus('스캔 라이브러리 로딩에 실패했습니다. 네트워크를 확인 후 다시 시도하세요.');
+      return;
+    }
+    navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment', width: {ideal: 1920}}})
+      .then(function (stream) {
+        _clScan.stream = stream;
+        var v = document.getElementById('cl-scan-video');
+        v.srcObject = stream;
+        _clScan.video = v;
+        v.addEventListener('loadeddata', function once() {
+          v.removeEventListener('loadeddata', once);
+          try {
+            _clScan.scanner = new jscanify();
+            _clScan.scanner.setVideo(v);
+            clScanStatus('준비 완료 — 영수증을 비추고 "윤곽 표시"를 누르세요.');
+          } catch (e) {
+            clScanStatus('스캐너 초기화 실패: ' + e.message);
+          }
+        });
+      })
+      .catch(function (e) {
+        clScanStatus('카메라를 열 수 없습니다: ' + e.message + ' — 파일 선택 또는 촬영하기를 이용하세요.');
+      });
+  });
+}
+
+(function () {
+  var btn = document.getElementById('closing-upload-btn');
+  if (!btn) { return; }
+  var scan = document.createElement('button');
+  scan.type = 'button';
+  scan.className = 'btn';
+  scan.style.background = '#7C3AED';
+  scan.textContent = '📄 문서 스캔';
+  scan.title = '평평한 곳에 단색 배경 위에 영수증을 놓고 촬영하면 자동으로 잘라 줍니다';
+  scan.addEventListener('click', clScanOpen);
+  btn.parentNode.insertBefore(scan, btn);
 })();
 </script>"""
 
@@ -20446,6 +20626,407 @@ async def closing_verify_apply(request: Request, session_token: str = Cookie(def
     by_date, _all_dates = _closing_verify_load_rows(csv_bytes)
     applied = _closing_verify_apply_dates(by_date, selected, user.get("login_id"))
     return RedirectResponse(url="/closing/verify?applied=" + str(applied), status_code=303)
+
+
+
+
+# =====================================================================
+# 매출 마감(/closing) 알림: 미제출·불일치 지점을 팀즈/메일로 발송
+# 재고 마감(stock-closing) 알림과 같은 구조 — system_settings 스위치, 테스트 채널, 10시 크론
+# =====================================================================
+CL_NOTIFY_TEST_BRANCH_CODE = STOCK_CLOSING_TEST_BRANCH_CODE  # 테스트 수신 채널은 재고 마감과 동일
+CL_NOTIFY_MAIL_TO = STOCK_CLOSING_MAIL_TO
+
+_CL_NOTIFY_JS = """<script>
+  async function clToggle(cb) {
+    var key = cb.getAttribute('data-key');
+    try {
+      var res = await fetch('/closing/notify-toggle', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: key, enabled: cb.checked})
+      });
+      var data = await res.json();
+      if (!res.ok) { alert(data.detail || '설정 저장에 실패했습니다.'); cb.checked = !cb.checked; return; }
+      document.getElementById('clNotifyResult').textContent = data.message || '';
+    } catch (e) { alert('오류가 발생했습니다.'); cb.checked = !cb.checked; }
+  }
+  async function clBranchToggle(cb) {
+    var key = cb.getAttribute('data-bkey');
+    try {
+      var res = await fetch('/closing/notify-toggle-branch', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({branch_key: key, enabled: cb.checked})
+      });
+      var data = await res.json();
+      if (!res.ok) { alert(data.detail || '설정 저장에 실패했습니다.'); cb.checked = !cb.checked; return; }
+      document.getElementById('clNotifyResult').textContent = data.message || '';
+    } catch (e) { alert('오류가 발생했습니다.'); cb.checked = !cb.checked; }
+  }
+  async function clBranchAll(enabled) {
+    if (!confirm(enabled ? '전체 지점 알림을 켭니다.' : '전체 지점 알림을 끕니다.')) return;
+    try {
+      var res = await fetch('/closing/notify-toggle-branch-all', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled: enabled})
+      });
+      var data = await res.json();
+      if (!res.ok) { alert(data.detail || '설정 저장에 실패했습니다.'); return; }
+      document.querySelectorAll('input[type=checkbox][data-bkey]').forEach(function(cb) { cb.checked = enabled; });
+      document.getElementById('clNotifyResult').textContent = data.message || '';
+    } catch (e) { alert('오류가 발생했습니다.'); }
+  }
+  async function clReminderTest(btn) {
+    var date = btn.getAttribute('data-date');
+    if (!confirm(date + ' 기준 미제출·불일치 요약을 테스트 채널·테스트 메일로만 보낼까요?')) return;
+    btn.disabled = true;
+    try {
+      var res = await fetch('/closing/reminder-test', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({date: date})
+      });
+      var data = await res.json();
+      alert(data.message || data.detail || (res.ok ? '완료되었습니다.' : '처리에 실패했습니다.'));
+    } catch (e) { alert('오류가 발생했습니다.'); }
+    btn.disabled = false;
+  }
+</script>"""
+
+
+def _cl_setting_on(key: str) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return bool(row and str(row["value"]).strip().lower() == "on")
+
+
+def _cl_setting_set(key: str, on: bool) -> None:
+    value = "on" if on else "off"
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+        if row:
+            conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?", (value, key))
+        else:
+            conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _cl_branch_on_set() -> set:
+    prefix = "closing_notify_branch:"
+    conn = get_conn()
+    rows = conn.execute("SELECT key, value FROM system_settings WHERE key LIKE ?", (prefix + "%",)).fetchall()
+    conn.close()
+    return {str(r["key"])[len(prefix):] for r in rows if str(r["value"]).strip().lower() == "on"}
+
+
+def _cl_branch_on(branch_key: str) -> bool:
+    return str(branch_key) in _cl_branch_on_set()
+
+
+def _cl_branch_code_map() -> dict:
+    """지점명(공백 제거) -> 지점코드"""
+    return {_closing_norm(b["branch_name"]): b["branch_code"] for b in get_branches()}
+
+
+def _cl_notify_targets(date_str: str) -> dict:
+    """해당 일자의 미제출 지점(결제내역은 있으나 마감 저장 없음)과 불일치 지점(마감 저장됐으나 불일치)을 구한다.
+    반환: {"missing":[{key,name,code}], "mismatch":[{key,name,code,count}]}"""
+    conn = get_conn()
+    pay_branches = conn.execute(
+        "SELECT DISTINCT branch_name FROM payment_records WHERE pay_date=? AND " + _closing_excluded_sql()[0],
+        tuple([date_str] + _closing_excluded_sql()[1])
+    ).fetchall()
+    saves = conn.execute(
+        "SELECT branch_key, branch_name, mismatch_count FROM closing_saves WHERE pay_date=?", (date_str,)
+    ).fetchall()
+    conn.close()
+    saved_keys = {s["branch_key"] for s in saves}
+    code_map = _cl_branch_code_map()
+    name_of = {}
+    for b in get_branches():
+        name_of[_closing_norm(b["branch_name"])] = b["branch_name"]
+    missing, mismatch = [], []
+    seen = set()
+    for r in pay_branches:
+        key = _closing_norm(r["branch_name"])
+        if key in saved_keys or key in seen:
+            continue
+        seen.add(key)
+        missing.append({"key": key, "name": name_of.get(key, r["branch_name"]),
+                        "code": code_map.get(key, "")})
+    for s in saves:
+        mc = int(s["mismatch_count"] or 0)
+        if mc > 0:
+            key = s["branch_key"]
+            mismatch.append({"key": key, "name": s["branch_name"] or name_of.get(key, key),
+                             "code": code_map.get(key, ""), "count": mc})
+    return {"missing": missing, "mismatch": mismatch}
+
+
+def _cl_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> dict:
+    """미제출·불일치 알림. mode='auto'는 스위치 설정을 따르고, 'test'는 스위치 무관 테스트 채널+메일만."""
+    targets = _cl_notify_targets(date_str)
+    if mode == "test":
+        miss_on = mis_on = False
+        branch_on, test_on = False, True
+    else:
+        miss_on = _cl_setting_on("closing_notify_missing")
+        mis_on = _cl_setting_on("closing_notify_mismatch")
+        branch_on = _cl_setting_on("closing_notify_branch")
+        test_on = _cl_setting_on("closing_notify_test")
+    result = {"date": date_str, "mode": mode,
+              "missing": [m["name"] for m in targets["missing"]],
+              "mismatch": [m["name"] for m in targets["mismatch"]],
+              "branch_sent": 0, "branch_failed": [], "test_sent": None, "mail_sent": None}
+    enabled_branches = _cl_branch_on_set() if branch_on else set()
+    link = base_url + "/closing?date=" + date_str
+
+    def _send_one(item, kind_label):
+        code = item.get("code") or ""
+        if not code:
+            result["branch_failed"].append(str(item["name"]) + "(지점코드 없음)")
+            return
+        if str(item["key"]) not in enabled_branches:
+            return
+        title = "🧾 매출 마감 " + kind_label
+        msg = (str(item["name"]) + " " + date_str + " 매출 마감 " + kind_label + " 건이 있습니다. 마감 화면에서 확인해주세요.")
+        ok, detail = send_teams_notification(code, title, msg, link, "매출 마감 열기", sent_by)
+        if ok:
+            result["branch_sent"] += 1
+        else:
+            result["branch_failed"].append(str(item["name"]) + "(" + str(detail)[:60] + ")")
+
+    if branch_on:
+        if miss_on:
+            for m in targets["missing"]:
+                _send_one(m, "미제출")
+        if mis_on:
+            for m in targets["mismatch"]:
+                _send_one(m, "불일치 " + str(m["count"]) + "건")
+
+    has_any = bool(targets["missing"] or targets["mismatch"])
+    if test_on and has_any:
+        prefix = "[테스트] " if mode == "test" else "[테스트 채널] "
+        lines = [date_str + " 매출 마감 알림 대상", ""]
+        if miss_on or mode == "test":
+            lines.append("■ 미제출 " + str(len(targets["missing"])) + "곳: "
+                         + (", ".join(m["name"] for m in targets["missing"]) or "없음"))
+        if mis_on or mode == "test":
+            lines.append("■ 불일치 " + str(len(targets["mismatch"])) + "곳: "
+                         + (", ".join(m["name"] + "(" + str(m["count"]) + "건)" for m in targets["mismatch"]) or "없음"))
+        lines += ["", "매출 마감: " + link]
+        body = "\n".join(lines)
+        ok, detail = send_teams_notification(
+            CL_NOTIFY_TEST_BRANCH_CODE, prefix + "🧾 매출 마감 미제출·불일치 알림",
+            body, link, "매출 마감 열기", sent_by)
+        result["test_sent"] = bool(ok)
+        if not ok:
+            result["test_detail"] = str(detail)[:80]
+        try:
+            res = send_email(CL_NOTIFY_MAIL_TO, prefix + "매출 마감 미제출·불일치 (" + date_str + ")", body)
+            mail_ok = res[0] if isinstance(res, tuple) else bool(res)
+            mail_detail = res[1] if (isinstance(res, tuple) and len(res) > 1) else ""
+        except Exception as e:
+            mail_ok, mail_detail = False, str(e)
+        result["mail_sent"] = bool(mail_ok)
+        if not mail_ok:
+            result["mail_detail"] = str(mail_detail)[:80]
+    return result
+
+
+def _cl_notify_panel(date_str: str) -> str:
+    def _row(key, label, desc, on):
+        checked = " checked" if on else ""
+        return (
+            '<label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:13px;">'
+            f'<input type="checkbox" style="width:auto;margin:0;" data-key="{key}" onchange="clToggle(this)"{checked}>'
+            f'<span><b>{label}</b> <span style="color:#888;font-size:12px;">{desc}</span></span></label>'
+        )
+    return (
+        '<div class="card" style="margin-bottom:12px;">'
+        '<div style="font-size:13px;font-weight:bold;margin-bottom:4px;">📨 마감 알림 설정 (기본 꺼짐)</div>'
+        '<div style="font-size:12px;color:#888;margin-bottom:8px;">매일 오전 10시(KST) 전일 기준 미제출·불일치 지점을 자동 발송합니다. '
+        '지점 채널 발송은 "지점 발송" 스위치와 해당 지점 "알림" 체크가 모두 켜져 있을 때만 나갑니다. '
+        '"테스트 발송" 스위치가 켜져 있으면 테스트 채널·테스트 메일 사본도 함께 발송됩니다. '
+        '"자동 알림 테스트" 버튼은 스위치와 무관하게 테스트 채널·테스트 메일로만 발송됩니다.</div>'
+        + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
+        + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점", _cl_setting_on("closing_notify_mismatch"))
+        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 실제 발송", _cl_setting_on("closing_notify_branch"))
+        + _row("test", "테스트 발송", f"켜면 테스트 채널({CL_NOTIFY_TEST_BRANCH_CODE})·테스트 메일로 발송", _cl_setting_on("closing_notify_test"))
+        + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
+        'onclick="clReminderTest(this)" data-date="' + date_str + '">🧪 자동 알림 테스트 (테스트 채널·테스트 메일로만)</button>'
+        + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;margin-top:6px;" onclick="clBranchAll(true)">지점 알림 전체 켜기</button>'
+        + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" onclick="clBranchAll(false)">지점 알림 전체 끄기</button>'
+        + '<div id="clNotifyResult" style="font-size:12px;color:#475569;margin-top:6px;"></div>'
+        '</div>' + _CL_NOTIFY_JS
+    )
+
+
+@app.post("/closing/notify-toggle")
+async def closing_notify_toggle(request: Request, session_token: str = Cookie(default=None)):
+    """마감 알림 스위치(미제출/불일치/지점 발송/테스트 발송) 저장 — 마스터 전용"""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if user.get("role") != "master":
+        raise HTTPException(status_code=403, detail="마스터 계정만 설정할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    key = str(body.get("key", "")).strip()
+    setting_key = {"missing": "closing_notify_missing", "mismatch": "closing_notify_mismatch",
+                   "branch": "closing_notify_branch", "test": "closing_notify_test"}.get(key)
+    if not setting_key:
+        raise HTTPException(status_code=400, detail="설정 키가 올바르지 않습니다.")
+    enabled = bool(body.get("enabled"))
+    _cl_setting_set(setting_key, enabled)
+    label = {"missing": "미제출 발송", "mismatch": "불일치 발송", "branch": "지점 발송", "test": "테스트 발송"}[key]
+    return JSONResponse({"ok": True, "message": label + (" 켜짐" if enabled else " 꺼짐")})
+
+
+@app.post("/closing/notify-toggle-branch")
+async def closing_notify_toggle_branch(request: Request, session_token: str = Cookie(default=None)):
+    """지점별 알림 토글 저장 — 마스터 전용 (기본 꺼짐). branch_key는 공백 제거 지점명."""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if user.get("role") != "master":
+        raise HTTPException(status_code=403, detail="마스터 계정만 설정할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    branch_key = str(body.get("branch_key", "")).strip()
+    if not branch_key or len(branch_key) > 60:
+        raise HTTPException(status_code=400, detail="지점을 찾을 수 없습니다.")
+    enabled = bool(body.get("enabled"))
+    _cl_setting_set("closing_notify_branch:" + branch_key, enabled)
+    return JSONResponse({"ok": True, "message": branch_key + " 알림 " + ("켜짐" if enabled else " 꺼짐")})
+
+
+@app.post("/closing/notify-toggle-branch-all")
+async def closing_notify_toggle_branch_all(request: Request, session_token: str = Cookie(default=None)):
+    """지점별 알림 토글 전체 켜기/끄기 — 마스터 전용"""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if user.get("role") != "master":
+        raise HTTPException(status_code=403, detail="마스터 계정만 설정할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    enabled = bool(body.get("enabled"))
+    keys = set()
+    for b in get_branches():
+        keys.add(_closing_norm(b["branch_name"]))
+    conn = get_conn()
+    try:
+        for k in keys:
+            sk = "closing_notify_branch:" + k
+            row = conn.execute("SELECT value FROM system_settings WHERE key=?", (sk,)).fetchone()
+            if row:
+                conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?",
+                             ("on" if enabled else "off", sk))
+            else:
+                conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)",
+                             (sk, "on" if enabled else "off"))
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True, "message": "전체 " + str(len(keys)) + "개 지점 알림 " + ("켜짐" if enabled else "꺼짐")})
+
+
+@app.post("/closing/reminder-test")
+async def closing_reminder_test(request: Request, session_token: str = Cookie(default=None)):
+    """자동 알림 테스트 — 스위치와 무관하게 테스트 채널·테스트 메일로만 발송 (마스터 전용)"""
+    from datetime import datetime as _dt
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if user.get("role") != "master":
+        raise HTTPException(status_code=403, detail="마스터 계정만 사용할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    date_str = str(body.get("date", "")).strip()
+    try:
+        _dt.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+    result = _cl_run_reminder(date_str, _sc_base_url(request), "test",
+                              "closing_reminder_test_by_" + str(user.get("login_id") or ""))
+    if not result["missing"] and not result["mismatch"]:
+        text = date_str + " 미제출·불일치 지점이 없어 발송하지 않았습니다."
+    else:
+        mail_txt = "성공" if result.get("mail_sent") else "실패(" + str(result.get("mail_detail", ""))[:60] + ")"
+        text = ("테스트 발송 " + ("성공" if result["test_sent"] else "실패") + " / 메일 " + mail_txt
+                + ": 미제출 " + str(len(result["missing"])) + "곳, 불일치 " + str(len(result["mismatch"])) + "곳 — 테스트 채널·테스트 메일로만 발송됨")
+    return JSONResponse({"ok": True, "message": text})
+
+
+@app.get("/api/cron/closing-reminder")
+async def cron_closing_reminder(request: Request):
+    """매일 10:00(KST) 실행 — 전일 매출 마감 미제출·불일치 지점 자동 발송.
+    스위치(미제출/불일치/지점 발송/테스트 발송)가 모두 꺼져 있으면 아무것도 하지 않는다.
+    기존 크론과 같은 인증(CRON_SECRET Bearer)과 dedup(system_settings 'closing_reminder_last')을 쓴다."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    auth_header = request.headers.get("authorization", "")
+    cron_secret = os.environ.get("CRON_SECRET", "")
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+    target = (_dt.now(_tz(_td(hours=9))).date() - _td(days=1)).strftime("%Y-%m-%d")
+    try:
+        if not any(_cl_setting_on(k) for k in
+                   ("closing_notify_missing", "closing_notify_mismatch",
+                    "closing_notify_branch", "closing_notify_test")):
+            return JSONResponse({"ok": True, "skipped": "자동 발송 스위치가 모두 꺼져 있습니다.", "date": target})
+
+        conn = get_conn()
+        last = conn.execute("SELECT value FROM system_settings WHERE key='closing_reminder_last'").fetchone()
+        conn.close()
+        if last and str(last["value"]) == target:
+            return JSONResponse({"ok": True, "skipped": "이미 발송했습니다.", "date": target})
+
+        result = _cl_run_reminder(target, _sc_base_url(request), "auto", "system_cron_closing")
+        if not result["missing"] and not result["mismatch"]:
+            return JSONResponse({"ok": True, "skipped": "대상 없음", "date": target})
+
+        conn = get_conn()
+        try:
+            exist = conn.execute("SELECT value FROM system_settings WHERE key='closing_reminder_last'").fetchone()
+            if exist:
+                conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='closing_reminder_last'",
+                             (target,))
+            else:
+                conn.execute("INSERT INTO system_settings (key, value) VALUES ('closing_reminder_last', ?)", (target,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        failed = result["branch_failed"] or (result["test_sent"] is False) or (result["mail_sent"] is False)
+        if failed:
+            report_cron_failure("closing-reminder",
+                                "일부 발송 실패: " + str(result["branch_failed"][:3])
+                                + " test=" + str(result["test_sent"]) + " mail=" + str(result["mail_sent"]))
+        return JSONResponse({"ok": True, "date": target, **{k: result[k] for k in
+                             ("missing", "mismatch", "branch_sent", "test_sent", "mail_sent")}})
+    except Exception as e:
+        report_cron_failure("closing-reminder", str(e)[:300])
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)[:300]})
 
 
 
