@@ -2413,7 +2413,8 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         function isResizableTable(table) {{
           var ths = table.querySelectorAll('th');
           if (ths.length === 0) return false;
-          if (window.getComputedStyle(table).tableLayout === 'auto') return false;
+          var layout = window.getComputedStyle(table).tableLayout;
+          if (layout === 'auto' && !table.hasAttribute('data-colw')) return false;
           return true;
         }}
         function saveTable(table) {{
@@ -18707,7 +18708,7 @@ def _closing_compare_table_html(rows: list, has_receipt: bool, memo_mode=None, m
     num = 'style="text-align:right;"'
     bad_style = 'style="text-align:right;color:#DC2626;font-weight:bold;"'
 
-    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:' + ('820' if memo_mode else '640') + 'px;">']
+    h = ['<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:' + ('820' if memo_mode else '640') + 'px;">']
     h.append(
         '<thead><tr><th rowspan="2" style="min-width:130px;">구분</th>'
         '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
@@ -18801,7 +18802,7 @@ def _closing_verify_compare_html(pay_groups: dict, rc_groups: dict, has_receipt:
 
     labels = list(CLOSING_COMPARE_ROWS) + sorted(
         (set(pay_groups) | set(rc_groups) | set(m_groups)) - set(CLOSING_COMPARE_ROWS))
-    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:980px;">']
+    h = ['<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:980px;">']
     h.append(
         '<thead><tr><th rowspan="2" style="min-width:130px;">구분</th>'
         '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
@@ -18874,7 +18875,7 @@ def _closing_branch_compare_html(rows: list, date: str, notify: bool = False) ->
     bad_style = 'style="text-align:right;color:#DC2626;font-weight:bold;"'
     dash = '<td style="text-align:right;color:#bbb;">-</td>'
 
-    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:760px;">']
+    h = ['<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:760px;">']
     if notify:
         h.append('<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>'
                  '<th rowspan="2" style="text-align:center;min-width:52px;">알림</th>')
@@ -19250,7 +19251,7 @@ def _closing_receipt_form_html(branch_name: str, branch_param: str, pay_date: st
              '단말기 영수증(일일마감집계)에 찍힌 값을 그대로 입력하세요. 영수증에 없는 카드사는 비워 두면 0으로 저장됩니다. '
              '지점·일자당 1건이며, 마감 저장 전에는 다시 저장해서 수정할 수 있습니다. '
              '※ "현금성"·"카드명 누락" 묶음은 마감 화면 비교표의 영수증 입력 값 칸에서 직접 입력합니다.</div>')
-    h.append('<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:640px;"><thead><tr>'
+    h.append('<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:640px;"><thead><tr>'
              '<th style="min-width:110px;">카드사</th><th>승인건수</th><th>취소건수</th><th>승인금액</th><th>취소금액</th>'
              '<th style="text-align:right;">순건수</th><th style="text-align:right;">순금액</th></tr></thead><tbody>')
     for i, card in enumerate(CLOSING_RECEIPT_ROWS):
@@ -19646,33 +19647,11 @@ function closingUpload(btn) {
   return closingUploadFiles(input.files, btn);
 }
 
-(function () {
-  // 휴대폰 같은 터치 기기에서는 카메라를 바로 여는 [촬영하기] 버튼을 추가한다(PC에서는 추가하지 않음)
-  var btn = document.getElementById('closing-upload-btn');
-  if (!btn || !(navigator.maxTouchPoints > 0)) { return; }
-  var cam = document.createElement('input');
-  cam.type = 'file';
-  cam.accept = 'image/*';
-  cam.setAttribute('capture', 'environment');
-  cam.style.display = 'none';
-  cam.addEventListener('change', function () {
-    var picked = Array.prototype.slice.call(cam.files);
-    cam.value = '';
-    if (picked.length) { closingUploadFiles(picked, btn); }
-  });
-  var shoot = document.createElement('button');
-  shoot.type = 'button';
-  shoot.className = 'btn';
-  shoot.style.background = '#065F46';
-  shoot.textContent = '📷 촬영하기';
-  shoot.addEventListener('click', function () { cam.click(); });
-  btn.parentNode.insertBefore(shoot, btn.parentNode.firstChild);
-  btn.parentNode.appendChild(cam);
-})();
-
-// ---------- 문서 스캔 (jscanify + OpenCV.js, 첫 사용 시 CDN 로드) ----------
-// 사용 요령: 평평한 곳에 단색 배경 위에 영수증을 놓고 촬영할 것
-var _clScan = {loading: false, queue: [], stream: null, scanner: null, video: null, busy: false};
+// ---------- 영수증 촬영·스캔 (jscanify + OpenCV.js, 첫 사용 시 CDN 로드) ----------
+// 사용 요령: 평평한 곳에 단색 배경 위에 영수증을 놓고 촬영. 윤곽이 잡히면 자동으로 잘라 저장,
+// 못 잡으면 원본 그대로 저장한다.
+var _clScan = {loading:false, queue:[], stream:null, scanner:null, video:null,
+               overlay:null, timer:null, tickBusy:false, busy:false};
 
 function clScanEnsure(cb) {
   if (window.jscanify && window.cv) { cb(); return; }
@@ -19701,97 +19680,115 @@ function clScanStatus(t) {
   if (el) { el.textContent = t; }
 }
 
-function clScanFrame() {
+function clScanFrame(maxW) {
   var v = _clScan.video;
+  var w = v.videoWidth || 640, h = v.videoHeight || 480;
+  var scale = maxW ? Math.min(1, maxW / w) : 1;
   var c = document.createElement('canvas');
-  c.width = v.videoWidth || 640; c.height = v.videoHeight || 480;
+  c.width = Math.max(1, Math.round(w * scale));
+  c.height = Math.max(1, Math.round(h * scale));
   c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
   return c;
 }
 
-function clScanHighlight() {
-  if (_clScan.busy || !_clScan.scanner) { return; }
-  _clScan.busaryGuard = true;
+// 화면 위에 윤곽 오버레이를 그린다(포켓몬고 스타일). 500ms마다 축소 프레임으로 처리.
+function clScanTick() {
+  if (!_clScan.scanner || !_clScan.video || !_clScan.overlay) { return; }
+  if (_clScan.tickBusy || _clScan.video.readyState < 2) { return; }
+  _clScan.tickBusy = true;
   try {
-    var frame = clScanFrame();
-    var out = _clScan.scanner.highlightPaper(frame);
-    var box = document.getElementById('cl-scan-out');
-    box.innerHTML = '';
-    if (out && out.tagName === 'CANVAS') {
-      out.style.maxWidth = '100%'; out.style.border = '2px solid #7C3AED';
-      box.appendChild(out);
-      clScanStatus('윤곽을 찾았습니다. "잘라내어 업로드"를 누르세요.');
-    } else {
-      clScanStatus('윤곽을 찾지 못했습니다. 단색 배경 위에 영수증을 평평하게 놓고 다시 시도하세요.');
-    }
-  } catch (e) {
-    clScanStatus('윤곽 인식 실패: ' + e.message);
-  }
-  _clScan.busy = false;
+    var frame = clScanFrame(480);
+    var hc = _clScan.scanner.highlightPaper(frame, {color: '#7C3AED', thickness: 8});
+    var v = _clScan.video, ov = _clScan.overlay;
+    var dpr = window.devicePixelRatio || 1;
+    var w = Math.round(v.clientWidth * dpr), h = Math.round(v.clientHeight * dpr);
+    if (ov.width !== w || ov.height !== h) { ov.width = w; ov.height = h; }
+    var ctx = ov.getContext('2d');
+    ctx.clearRect(0, 0, ov.width, ov.height);
+    if (hc) { ctx.drawImage(hc, 0, 0, ov.width, ov.height); }
+  } catch (e) { /* 프레임 처리 실패는 무시하고 다음 틱에 재시도 */ }
+  _clScan.tickBusy = false;
 }
 
-function clScanExtract(btn) {
-  if (_clScan.busy || !_clScan.scanner) { return; }
+function clScanCapture(btn) {
+  if (_clScan.busy || !_clScan.video) { return; }
   _clScan.busy = true;
   btn.disabled = true;
-  clScanStatus('영수증을 잘라내는 중...');
+  clScanStatus('촬영 중...');
   try {
-    var frame = clScanFrame();
+    var frame = clScanFrame(0);
     var w = frame.width, h = frame.height;
-    var pw = 800, ph = Math.max(200, Math.round(pw * h / w));
-    var out = _clScan.scanner.extractPaper(frame, pw, ph);
-    if (!out || !out.toBlob) { throw new Error('추출 결과가 없습니다.'); }
-    out.toBlob(function (blob) {
+    var out = null, cropped = false;
+    if (_clScan.scanner) {
+      try {
+        var pw = 1200, ph = Math.max(200, Math.round(pw * h / w));
+        out = _clScan.scanner.extractPaper(frame, pw, ph);
+        cropped = !!out;
+      } catch (e) { out = null; }
+    }
+    var src = out || frame;
+    src.toBlob(function (blob) {
       _clScan.busy = false; btn.disabled = false;
-      if (!blob) { clScanStatus('이미지 변환에 실패했습니다.'); return; }
-      var file = new File([blob], 'scanned-receipt.jpg', {type: 'image/jpeg'});
+      if (!blob) { clScanStatus('이미지 변환에 실패했습니다. 다시 시도하세요.'); return; }
+      var file = new File([blob], cropped ? 'scanned-receipt.jpg' : 'receipt.jpg', {type: 'image/jpeg'});
       var upBtn = document.getElementById('closing-upload-btn');
-      clScanStatus('스캔 완료 — 업로드 중...');
+      clScanStatus(cropped ? '윤곽을 잡아 잘라냈습니다 — 업로드 중...' : '윤곽을 찾지 못해 원본 그대로 업로드 중...');
       closingUploadFiles([file], upBtn).then(function () { clScanClose(); });
     }, 'image/jpeg', 0.85);
   } catch (e) {
     _clScan.busy = false; btn.disabled = false;
-    clScanStatus('추출 실패: ' + e.message + ' — "촬영하기"로 일반 사진을 올려주세요.');
+    clScanStatus('촬영 실패: ' + e.message);
   }
 }
 
 function clScanClose() {
-  var m = document.getElementById('cl-scan-modal');
-  if (m) { m.remove(); }
+  if (_clScan.timer) { clearInterval(_clScan.timer); _clScan.timer = null; }
   if (_clScan.stream) {
     _clScan.stream.getTracks().forEach(function (t) { t.stop(); });
     _clScan.stream = null;
   }
-  _clScan.video = null; _clScan.scanner = null;
+  var m = document.getElementById('cl-scan-modal');
+  if (m) { m.remove(); }
+  _clScan.video = null; _clScan.overlay = null; _clScan.scanner = null;
 }
 
 function clScanOpen() {
   if (document.getElementById('cl-scan-modal')) { return; }
   var modal = document.createElement('div');
   modal.id = 'cl-scan-modal';
-  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;align-items:center;justify-content:center;padding:12px;';
+  modal.style.cssText = 'position:fixed;inset:0;z-index:9999;background:#000;display:flex;flex-direction:column;';
   modal.innerHTML =
-    '<div style="background:#fff;border-radius:12px;padding:14px;max-width:520px;width:100%;max-height:92vh;overflow:auto;">'
-    + '<div style="font-weight:bold;margin-bottom:6px;">📄 영수증 문서 스캔</div>'
-    + '<div style="font-size:12px;color:#B45309;margin-bottom:8px;">💡 평평한 곳에 <b>단색 배경</b>을 깔고 영수증을 놓은 뒤 촬영하세요. 기울어지거나 배경이 복잡하면 인식이 어렵습니다.</div>'
-    + '<video id="cl-scan-video" autoplay playsinline muted style="width:100%;background:#000;border-radius:8px;"></video>'
-    + '<div id="cl-scan-out" style="margin-top:8px;text-align:center;"></div>'
-    + '<div id="cl-scan-status" style="font-size:12px;color:#555;margin:8px 0;"></div>'
-    + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
-    + '<button type="button" class="btn" id="cl-scan-hl" style="background:#7C3AED;">윤곽 표시</button>'
-    + '<button type="button" class="btn" id="cl-scan-ex" style="background:#065F46;">잘라내어 업로드</button>'
-    + '<button type="button" class="btn" id="cl-scan-close" style="background:#6B7280;">닫기</button>'
-    + '</div></div>';
+    '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;color:#fff;flex:0 0 auto;">'
+    + '<span style="font-size:14px;font-weight:bold;">📄 영수증 촬영·스캔</span>'
+    + '<button type="button" id="cl-scan-x" class="btn" style="background:#6B7280;padding:4px 10px;">✕</button></div>'
+    + '<div style="position:relative;flex:1 1 auto;min-height:0;background:#000;">'
+    + '<video id="cl-scan-video" autoplay playsinline muted style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"></video>'
+    + '<canvas id="cl-scan-overlay" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;"></canvas></div>'
+    + '<div style="flex:0 0 auto;background:#111;color:#eee;padding:10px 12px;">'
+    + '<div id="cl-scan-status" style="font-size:12px;min-height:16px;margin-bottom:8px;color:#DDD;"></div>'
+    + '<div style="display:flex;gap:8px;">'
+    + '<button type="button" class="btn" id="cl-scan-cap" style="flex:1;background:#10B981;">📷 촬영·저장</button>'
+    + '<button type="button" class="btn" id="cl-scan-reload" style="background:#334155;display:none;">다시 시도</button>'
+    + '</div>'
+    + '<div style="font-size:11px;color:#999;margin-top:6px;line-height:1.5;">평평한 곳에 <b>단색 배경</b>을 깔고 영수증을 놓아주세요. '
+    + '윤곽이 잡히면 자동으로 잘라서 저장하고, 못 잡으면 원본 그대로 저장합니다. '
+    + '(카메라가 없으면 파일 선택을 이용하세요)</div></div>';
   document.body.appendChild(modal);
-  document.getElementById('cl-scan-close').addEventListener('click', clScanClose);
-  document.getElementById('cl-scan-hl').addEventListener('click', clScanHighlight);
-  document.getElementById('cl-scan-ex').addEventListener('click', function () { clScanExtract(this); });
+  document.getElementById('cl-scan-x').addEventListener('click', clScanClose);
+  document.getElementById('cl-scan-cap').addEventListener('click', function () { clScanCapture(this); });
+  document.getElementById('cl-scan-reload').addEventListener('click', clScanOpen);
   modal.addEventListener('click', function (e) { if (e.target === modal) { clScanClose(); } });
 
-  clScanStatus('카메라를 여는 중... (OpenCV 로딩 시 최초 1회 수십 초 걸릴 수 있습니다)');
+  clScanStatus('카메라·스캔 라이브러리를 여는 중... (최초 1회 수십 초 걸릴 수 있습니다)');
   clScanEnsure(function () {
     if (!window.jscanify || !window.cv) {
-      clScanStatus('스캔 라이브러리 로딩에 실패했습니다. 네트워크를 확인 후 다시 시도하세요.');
+      clScanStatus('스캔 라이브러리 로딩 실패 — 네트워크 확인 후 "다시 시도"를 누르세요.');
+      document.getElementById('cl-scan-reload').style.display = '';
+      return;
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      clScanStatus('이 브라우저는 카메라를 지원하지 않습니다 — 파일 선택을 이용하세요.');
+      document.getElementById('cl-scan-reload').style.display = 'none';
       return;
     }
     navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment', width: {ideal: 1920}}})
@@ -19800,19 +19797,15 @@ function clScanOpen() {
         var v = document.getElementById('cl-scan-video');
         v.srcObject = stream;
         _clScan.video = v;
-        v.addEventListener('loadeddata', function once() {
-          v.removeEventListener('loadeddata', once);
-          try {
-            _clScan.scanner = new jscanify();
-            _clScan.scanner.setVideo(v);
-            clScanStatus('준비 완료 — 영수증을 비추고 "윤곽 표시"를 누르세요.');
-          } catch (e) {
-            clScanStatus('스캐너 초기화 실패: ' + e.message);
-          }
-        });
+        _clScan.overlay = document.getElementById('cl-scan-overlay');
+        try { _clScan.scanner = new jscanify(); } catch (e) { _clScan.scanner = null; }
+        clScanStatus(_clScan.scanner
+          ? '준비 완료 — 영수증을 비추고 "촬영·저장"을 누르세요.'
+          : '스캐너 초기화 실패 — 촬영하면 원본 그대로 저장됩니다.');
+        _clScan.timer = setInterval(clScanTick, 500);
       })
       .catch(function (e) {
-        clScanStatus('카메라를 열 수 없습니다: ' + e.message + ' — 파일 선택 또는 촬영하기를 이용하세요.');
+        clScanStatus('카메라를 열 수 없습니다(' + e.message + ') — 파일 선택을 이용하세요.');
       });
   });
 }
@@ -19823,9 +19816,9 @@ function clScanOpen() {
   var scan = document.createElement('button');
   scan.type = 'button';
   scan.className = 'btn';
-  scan.style.background = '#7C3AED';
-  scan.textContent = '📄 문서 스캔';
-  scan.title = '평평한 곳에 단색 배경 위에 영수증을 놓고 촬영하면 자동으로 잘라 줍니다';
+  scan.style.background = '#065F46';
+  scan.textContent = '📷 촬영·스캔';
+  scan.title = '카메라로 영수증을 비추면 윤곽을 자동 인식해 잘라 저장합니다';
   scan.addEventListener('click', clScanOpen);
   btn.parentNode.insertBefore(scan, btn);
 })();
@@ -20139,7 +20132,7 @@ async def closing_payments_page(session_token: str = Cookie(default=None), branc
     else:
         net_cnt = 0
         net_amt = 0
-        h.append('<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:'
+        h.append('<div class="card"><div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:'
                  + ('760' if all_branches else '640') + 'px;"><thead><tr>'
                  + ('<th>지점</th>' if all_branches else '')
                  + '<th>시각</th><th>보호자</th><th>결제구분</th><th>구분</th><th style="text-align:right;">금액</th><th>상태</th><th>비고</th>'
@@ -20503,7 +20496,27 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
                     eligible = [d["date"] for d in days
                                 if not d["future"] and not d["no_diff"] and not d["warn"]]
                     applied = _closing_verify_apply_dates(by_date, eligible, user.get("login_id"))
-                    return RedirectResponse(url="/closing/verify?applied=" + str(applied), status_code=303)
+                    # 결과를 일자별로 보여 준다(무엇이 반영/제외됐는지 확인 가능하게)
+                    elig_set = set(eligible)
+                    rh = ['<h2 style="margin-bottom:8px;">🧾 바로 반영 결과</h2>',
+                          '<a class="btn" href="/closing/verify" style="text-decoration:none;background:#6B7280;display:inline-block;margin-bottom:10px;">← 업로드 화면</a>',
+                          '<div class="card" style="font-size:13px;">✅ <b>' + str(applied) + '개 일자</b>를 수정본(슬롯 M)으로 반영했습니다.</div>',
+                          '<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:520px;"><thead><tr>'
+                          '<th>일자</th><th>결과</th><th>사유</th></tr></thead><tbody>']
+                    for d in days:
+                        if d["date"] in elig_set:
+                            res, why = "✅ 반영", "수정본 행수 " + str(d["new_count"]) + "건"
+                        elif d["future"]:
+                            res, why = "—", "오늘(KST) 이후 일자"
+                        elif d["no_diff"]:
+                            res, why = "—", "차이 없음"
+                        elif d["warn"]:
+                            res, why = "⚠️ 제외", "수정본 행수가 현재의 90% 미만"
+                        else:
+                            res, why = "—", "-"
+                        rh.append('<tr><td>' + _esc(d["date"]) + '</td><td>' + res + '</td><td style="font-size:12px;color:#888;">' + _esc(why) + '</td></tr>')
+                    rh.append('</tbody></table></div></div>')
+                    return HTMLResponse(content=render_page("".join(rh), user, "closing"))
 
     h = ['<h2 style="margin-bottom:8px;">🧾 마감 이후 검증 — 미리보기</h2>']
     h.append('<a class="btn" href="/closing/verify" style="text-decoration:none;background:#6B7280;display:inline-block;margin-bottom:10px;">← 업로드 화면</a>')
@@ -20530,7 +20543,7 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
 
         h.append('<form method="post" action="/closing/verify/apply">')
         h.append('<input type="hidden" name="payload" value="' + payload_b64 + '">')
-        h.append('<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:1080px;"><thead><tr>'
+        h.append('<div class="card"><div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:1080px;"><thead><tr>'
                  '<th style="width:34px;">반영</th><th>일자</th><th>현재(슬롯)</th><th style="text-align:right;">현재 행수</th>'
                  '<th style="text-align:right;">수정본 행수</th><th style="text-align:right;">추가</th><th style="text-align:right;">삭제</th>'
                  '<th>지점별 순건수·순금액 변화</th><th style="text-align:right;">마감 저장 지점</th><th>추가 예시</th><th>삭제 예시</th>'
@@ -20851,10 +20864,12 @@ def _cl_notify_panel(date_str: str) -> str:
         '지점 채널 발송은 "지점 발송" 스위치와 해당 지점 "알림" 체크가 모두 켜져 있을 때만 나갑니다. '
         '"테스트 발송" 스위치가 켜져 있으면 테스트 채널·테스트 메일 사본도 함께 발송됩니다. '
         '"자동 알림 테스트" 버튼은 스위치와 무관하게 테스트 채널·테스트 메일로만 발송됩니다.</div>'
+        '<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 16px;">'
         + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
         + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점", _cl_setting_on("closing_notify_mismatch"))
         + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 실제 발송", _cl_setting_on("closing_notify_branch"))
         + _row("test", "테스트 발송", f"켜면 테스트 채널({CL_NOTIFY_TEST_BRANCH_CODE})·테스트 메일로 발송", _cl_setting_on("closing_notify_test"))
+        + '</div>'
         + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
         'onclick="clReminderTest(this)" data-date="' + date_str + '">🧪 자동 알림 테스트 (테스트 채널·테스트 메일로만)</button>'
         + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;margin-top:6px;" onclick="clBranchAll(true)">지점 알림 전체 켜기</button>'
