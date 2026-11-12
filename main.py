@@ -19137,15 +19137,14 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             parts.append('<div class="card">' + _closing_compare_table_html(_closing_compare(sum_pay, sum_rc), entered > 0) + '</div>')
             parts.append('<h3 style="margin:16px 0 8px;">지점별 합계</h3>')
             parts.append('<div class="card">' + _closing_branch_compare_html(rows_b, date) + '</div>')
-            # 슬롯 M(수동 수정본) 데이터가 있으면 같은 양식으로 수정 데이터 비교를 추가한다
-            if entered > 0:
-                receipt_keys = {k for k in keys if data["receipts"].get(k) is not None}
-                m_groups = _closing_mslot_groups(conn, date, receipt_keys or None)
-                if m_groups:
-                    parts.append('<h3 style="margin:16px 0 8px;">수정 데이터 (슬롯 M · 영수증 입력 지점 기준)</h3>')
-                    parts.append('<div class="card">'
-                                 + _closing_verify_compare_html(sum_pay, sum_rc, True, m_groups)
-                                 + '</div>')
+            # 슬롯 M(수동 수정본) 데이터가 있으면 영수증 입력 여부와 무관하게 같은 양식으로 비교를 추가한다
+            receipt_keys = {k for k in keys if data["receipts"].get(k) is not None}
+            m_groups = _closing_mslot_groups(conn, date, receipt_keys or None)
+            if m_groups:
+                parts.append('<h3 style="margin:16px 0 8px;">수정 데이터 (슬롯 M · 영수증 입력 지점 기준)</h3>')
+                parts.append('<div class="card">'
+                             + _closing_verify_compare_html(sum_pay, sum_rc, entered > 0, m_groups)
+                             + '</div>')
         else:
             # ---------- 지점 1곳(지점 계정 또는 마스터가 지점 선택) ----------
             pay = data["pay"].get(view_key)
@@ -20626,6 +20625,44 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
                             res, why = "—", "-"
                         rh.append('<tr><td>' + _esc(d["date"]) + '</td><td>' + res + '</td><td style="font-size:12px;color:#888;">' + _esc(why) + '</td></tr>')
                     rh.append('</tbody></table></div></div>')
+                    # 반영된 일자들의 지점별 합계(기존 vs 수정본) 집계
+                    agg = {}
+                    for d in days:
+                        if d["date"] not in elig_set:
+                            continue
+                        for b in d["branches"]:
+                            a = agg.setdefault(b["key"], {"name": b["name"], "cc": 0, "ca": 0, "nc": 0, "na": 0})
+                            a["cc"] += b["cur_cnt"]; a["ca"] += b["cur_amt"]
+                            a["nc"] += b["new_cnt"]; a["na"] += b["new_amt"]
+                    if agg:
+                        rh.append('<h3 style="margin:16px 0 8px;">지점별 합계 (반영된 일자 합산)</h3>')
+                        rh.append('<div class="card"><div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:640px;"><thead><tr>'
+                                  '<th>지점</th><th colspan="2" style="text-align:center;">기존(현재 슬롯)</th>'
+                                  '<th colspan="2" style="text-align:center;">수정본(M)</th>'
+                                  '<th colspan="2" style="text-align:center;">차이(수정−기존)</th></tr><tr>'
+                                  '<th></th><th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
+                                  '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
+                                  '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th></tr></thead><tbody>')
+                        tn = [0, 0, 0, 0, 0, 0]
+                        for k in sorted(agg, key=lambda x: agg[x]["name"]):
+                            a = agg[k]
+                            dc, da = a["nc"] - a["cc"], a["na"] - a["ca"]
+                            rh.append('<tr><td>' + _esc(a["name"]) + '</td>'
+                                      '<td style="text-align:right;">' + f"{a['cc']:,}" + '</td>'
+                                      '<td style="text-align:right;">' + f"{a['ca']:,}" + '</td>'
+                                      '<td style="text-align:right;">' + f"{a['nc']:,}" + '</td>'
+                                      '<td style="text-align:right;">' + f"{a['na']:,}" + '</td>'
+                                      '<td style="text-align:right;color:' + ('#065F46' if dc >= 0 else '#DC2626') + ';font-weight:bold;">' + _closing_sgn(dc) + '</td>'
+                                      '<td style="text-align:right;color:' + ('#065F46' if da >= 0 else '#DC2626') + ';font-weight:bold;">' + _closing_sgn(da) + '</td></tr>')
+                            tn[0]+=a['cc']; tn[1]+=a['ca']; tn[2]+=a['nc']; tn[3]+=a['na']
+                        rh.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>'
+                                  '<td style="text-align:right;">' + f"{tn[0]:,}" + '</td><td style="text-align:right;">' + f"{tn[1]:,}" + '</td>'
+                                  '<td style="text-align:right;">' + f"{tn[2]:,}" + '</td><td style="text-align:right;">' + f"{tn[3]:,}" + '</td>'
+                                  '<td style="text-align:right;">' + _closing_sgn(tn[2]-tn[0]) + '</td><td style="text-align:right;">' + _closing_sgn(tn[3]-tn[1]) + '</td></tr>')
+                        rh.append('</tbody></table></div></div>')
+                    rh.append('<div class="card" style="display:flex;gap:8px;flex-wrap:wrap;">'
+                              '<a class="btn" href="/closing" style="text-decoration:none;">마감 화면으로</a>'
+                              '<a class="btn" href="/closing/verify" style="text-decoration:none;background:#6B7280;">← 업로드 화면</a></div>')
                     return HTMLResponse(content=render_page("".join(rh), user, "closing"))
 
     h = ['<h2 style="margin-bottom:8px;">🧾 마감 이후 검증 — 미리보기</h2>']
@@ -21002,7 +21039,7 @@ def _cl_notify_panel(date_str: str) -> str:
         '지점 채널 발송은 "지점 발송" 스위치와 해당 지점 "알림" 체크가 모두 켜져 있을 때만 나갑니다. '
         '"테스트 발송" 스위치가 켜져 있으면 테스트 채널·테스트 메일 사본도 함께 발송됩니다. '
         '"자동 알림 테스트" 버튼은 스위치와 무관하게 테스트 채널·테스트 메일로만 발송됩니다.</div>'
-        '<div style="display:grid;grid-template-columns:minmax(230px,1fr) 2fr;gap:14px;align-items:start;">'
+        '<div style="display:grid;grid-template-columns:minmax(320px,1fr) 2fr;gap:14px;align-items:start;">'
         '<div>'
         + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
         + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점", _cl_setting_on("closing_notify_mismatch"))
