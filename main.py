@@ -18731,11 +18731,11 @@ def _closing_compare_table_html(rows: list, has_receipt: bool, memo_mode=None, m
                  '<td ' + num + '>' + f"{pc:,}" + '</td><td ' + num + '>' + f"{pa:,}" + '</td>')
         if has_receipt or receipt_edit:
             if receipt_edit:
-                h.append('<td><input type="hidden" name="rgl_' + str(idx) + '" value="' + _esc(label) + '">'
+                h.append('<td style="text-align:right;"><input type="hidden" name="rgl_' + str(idx) + '" value="' + _esc(label) + '">'
                          '<input type="number" min="0" step="1" inputmode="numeric" name="rgc_' + str(idx)
-                         + '" value="' + str(rc) + '" style="width:62px;text-align:right;"></td>'
-                         '<td><input type="number" min="0" step="1" inputmode="numeric" name="rga_' + str(idx)
-                         + '" value="' + str(ra) + '" style="width:78px;text-align:right;"></td>')
+                         + '" value="' + str(rc) + '" style="width:100%;min-width:70px;text-align:right;"></td>'
+                         '<td style="text-align:right;"><input type="number" min="0" step="1" inputmode="numeric" name="rga_' + str(idx)
+                         + '" value="' + str(ra) + '" style="width:100%;min-width:90px;text-align:right;"></td>')
             else:
                 h.append('<td ' + num + '>' + f"{rc:,}" + '</td><td ' + num + '>' + f"{ra:,}" + '</td>')
             h.append('<td ' + (bad_style if dc != 0 else num) + '>' + _closing_sgn(dc) + '</td>'
