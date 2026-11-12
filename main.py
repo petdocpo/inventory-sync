@@ -2453,7 +2453,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         if (!document.getElementById('colWHandleStyle')) {{
           var st = document.createElement('style');
           st.id = 'colWHandleStyle';
-          st.textContent = '.col-w-handle{{position:absolute;right:1px;top:18%;height:64%;width:9px;cursor:col-resize;background:rgba(255,255,255,.45);border-radius:3px;z-index:5;touch-action:none;}}th:hover>.col-w-handle{{background:rgba(255,255,255,.85);}}';
+          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;}}th:hover>.col-w-handle{{opacity:.55;}}.col-w-handle:hover{{opacity:.95 !important;}}';
           document.head.appendChild(st);
         }}
         document.querySelectorAll('table').forEach(function(table) {{
@@ -2461,23 +2461,25 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           var ths = table.querySelectorAll('th');
           ths.forEach(function(th) {{ th.style.resize = 'none'; }});
           var widths = null;
+          var shown = null;
           var mins = null;
           var dirty = false;
-          function applyWidths() {{
+          function applyWidths(w) {{
             var sum = 0;
             ths.forEach(function(th, i) {{
-              th.style.width = widths[i] + 'px';
-              sum += widths[i];
+              th.style.width = w[i] + 'px';
+              sum += w[i];
             }});
             table.style.width = sum + 'px';
           }}
           function freezeTable() {{
             ths = table.querySelectorAll('th');
             widths = colFrozenWidths(Array.prototype.map.call(ths, function(th) {{ return th.offsetWidth; }}));
+            shown = widths.slice();
             mins = Array.prototype.map.call(ths, function(th) {{
               return parseFloat(window.getComputedStyle(th).minWidth) || 0;
             }});
-            applyWidths();
+            applyWidths(shown);
           }}
           ths.forEach(function(th, idx) {{
             var handle = document.createElement('span');
@@ -2496,9 +2498,9 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             handle.addEventListener('pointermove', function(e) {{
               if (!drag || drag.idx !== idx || !widths) return;
               var next = colDragWidths(widths, idx, e.clientX - drag.x0, mins);
-              if (Math.abs(next[idx] - widths[idx]) > 0.5) {{
-                widths = next;
-                applyWidths();
+              if (Math.abs(next[idx] - shown[idx]) > 0.5) {{
+                shown = next;
+                applyWidths(next);
                 dirty = true;
                 saveTable(table);
               }}
@@ -18341,7 +18343,7 @@ async def cron_sync_payment_records(request: Request, slot: str = "", date: str 
 # - 계좌·현금·소비자소득공제·사업자지출증빙은 한 묶음(현금성)으로 비교한다(단말기에는 소득공제로 찍힘).
 # - 마감 저장: 불일치 행은 메모 필수. 저장하면 그 시점의 값이 snapshot_json으로 고정되고 수정할 수 없다.
 # =====================================================================
-CLOSING_SLOT_LABELS = {"21": "00~21시", "22": "00~22시", "24": "00~24시"}
+CLOSING_SLOT_LABELS = {"21": "00~21시", "22": "00~22시", "24": "00~24시", "M": "수동 수정본"}
 # 마감 조회에서 제외할 지점(공백 제거 기준). 데이터는 payment_records에 그대로 저장되고 조회에서만 빠진다.
 CLOSING_EXCLUDED_BRANCHES = ("남양주점",)
 CLOSING_CASH_GROUP = "현금성(계좌·현금·소득공제)"
@@ -18815,6 +18817,9 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
         form.append('<div><div style="font-size:12px;color:#666;">일자</div><input type="date" name="date" value="' + _esc(date) + '" style="width:auto;"></div>')
         form.append('<button class="btn" type="submit">조회</button></form>')
         parts.append("".join(form))
+        if user.get("role") == "master":
+            parts.append('<div style="margin-bottom:12px;"><a class="btn" href="/closing/verify" '
+                         'style="text-decoration:none;display:inline-block;">마감 이후 검증 (수정 엑셀 업로드)</a></div>')
 
         if not dates:
             parts.append('<div class="card">수신된 결제내역이 없습니다.</div>')
@@ -18841,7 +18846,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
         if log_row:
             when = _closing_fmt_ts(log_row["run_at"] or "")
             lab = CLOSING_SLOT_LABELS.get(log_row["slot"], log_row["slot"])
-            src = "수동" if log_row["source"] == "manual" else "자동"
+            src = {"manual": "수동", "upload": "수정본 업로드"}.get(log_row["source"], "자동")
             if log_row["status"] != "success":
                 parts.append(_closing_box(["❌ 수신 실패 · " + when + " · " + lab + " · " + src,
                                            (log_row["error"] or "")[:200]], "bad"))
@@ -19727,6 +19732,456 @@ async def closing_payments_page(session_token: str = Cookie(default=None), branc
         h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td colspan="4">합계(취소 상계)</td><td style="text-align:right;">'
                  + f"{net_amt:,}" + '</td><td colspan="2">' + f"{net_cnt:,}" + '건</td></tr></tbody></table></div></div>')
     return HTMLResponse(content=render_page("".join(h), user, "closing"))
+
+
+# =====================================================================
+# 마감 이후 검증: 유비플러스 "수정된 결제내역" 엑셀 업로드 -> 일자별 'M' 슬롯 반영
+# - 미리보기는 DB에 아무것도 쓰지 않는다. 반영 시 (pay_date, snapshot_slot='M')만 교체한다.
+# - 'M'은 MAX(snapshot_slot) 정렬에서 '21'/'22'/'24'보다 최신이 되는 수동 수정 슬롯.
+# - 개인정보 6컬럼(연락처·거래내역·예금주·반려동물명·할인사유·상호명)은 읽지도 저장하지도 않는다.
+# =====================================================================
+CLOSING_VERIFY_MAX_BYTES = 4 * 1024 * 1024
+CLOSING_VERIFY_COLS = ("결제일시", "고객명", "결제구분", "승인금액", "카드사", "승인번호",
+                       "카드번호", "결제상태", "영수증번호", "지점")
+CLOSING_VERIFY_LOG_LIMIT = 10
+
+
+def _closing_verify_kst_today() -> str:
+    """한국시간(KST) 기준 오늘 날짜 'YYYY-MM-DD'"""
+    return _kst_now().strftime("%Y-%m-%d")
+
+
+def _closing_verify_is_master(user) -> bool:
+    """마스터 본인 + 매출 마감 메뉴 권한이 모두 있어야 한다."""
+    if not user or user.get("role") != "master":
+        return False
+    return has_menu_permission(user.get("login_id") or "", "closing")
+
+
+def _closing_verify_cell(v) -> str:
+    """엑셀 셀 값을 CSV 문자열로. 결제일시가 datetime이면 'YYYY-MM-DD HH:MM'으로 맞춘다."""
+    if v is None:
+        return ""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d %H:%M")
+    return str(v).strip()
+
+
+def _closing_verify_xlsx_to_csv(raw: bytes):
+    """수정 결제내역 xlsx -> (csv_bytes, 실제_머리글_목록, 오류메시지)
+    머리글 행은 앞 10줄 안에서 '결제일시'를 찾아 동적으로 찾고, 필요한 10개 컬럼만 CSV로 만든다."""
+    import csv
+    import io
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as e:
+        return None, [], "엑셀 파일을 열 수 없습니다: " + str(e)[:120]
+    ws = wb.active
+    if ws is None:
+        return None, [], "시트를 찾을 수 없습니다."
+    header = None
+    col_map = {}
+    out = io.StringIO()
+    writer = None
+    scanned = 0
+    for row in ws.iter_rows(values_only=True):
+        scanned += 1
+        if header is None:
+            if scanned > 10:
+                wb.close()
+                return None, [], "머리글 행(결제일시)을 앞 10줄 안에서 찾지 못했습니다."
+            vals = [("" if v is None else str(v).strip()) for v in row]
+            if "결제일시" in vals:
+                header = vals
+                idx = {name: i for i, name in enumerate(vals)}
+                missing = [c for c in CLOSING_VERIFY_COLS if c not in idx]
+                if missing:
+                    wb.close()
+                    return None, header, "없는 컬럼: " + ", ".join(missing)
+                col_map = {c: idx[c] for c in CLOSING_VERIFY_COLS}
+                writer = csv.writer(out)
+                writer.writerow(list(CLOSING_VERIFY_COLS))
+            continue
+
+        def cell(col):
+            i = col_map[col]
+            return row[i] if i < len(row) else None
+
+        dt = _closing_verify_cell(cell("결제일시"))
+        if not dt:
+            continue
+        writer.writerow([dt] + [_closing_verify_cell(cell(c)) for c in CLOSING_VERIFY_COLS[1:]])
+    wb.close()
+    if header is None:
+        return None, [], "머리글 행(결제일시)을 찾지 못했습니다."
+    return out.getvalue().encode("utf-8-sig"), header, ""
+
+
+def _closing_verify_load_rows(csv_bytes: bytes):
+    """10개 컬럼 CSV bytes -> ({pay_date: [행 튜플]}, 전체 일자 목록)
+    _parse_payment_csv 규칙을 일자별로 그대로 재사용한다."""
+    import csv
+    import io
+    import re as _re
+    try:
+        text = csv_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = csv_bytes.decode("cp949", errors="replace")
+    dates = set()
+    for r in csv.DictReader(io.StringIO(text)):
+        m = _re.match(r"^(\d{4}-\d{2}-\d{2})", (r.get("결제일시") or "").strip())
+        if m:
+            dates.add(m.group(1))
+    by_date = {}
+    for d in sorted(dates):
+        rows, _skipped, _unk = _parse_payment_csv(csv_bytes, d)
+        by_date[d] = rows
+    return by_date, sorted(dates)
+
+
+def _closing_verify_current(conn, pay_date: str):
+    """해당 일자 최신 슬롯(MAX(snapshot_slot))의 결제내역을 _parse_payment_csv와 같은 튜플 형태로 읽고,
+    마감 저장된 지점 수(closing_saves)도 함께 돌려준다. 반환: (slot, rows, saved_branch_cnt)"""
+    meta = conn.execute(
+        "SELECT MAX(snapshot_slot) AS slot FROM payment_records WHERE pay_date=?", (pay_date,)
+    ).fetchone()
+    slot = (meta["slot"] if meta else None) or ""
+    rows = []
+    if slot:
+        db_rows = conn.execute(
+            "SELECT pay_datetime, branch_name, customer_name, pay_type, approve_amount, "
+            "card_company_raw, card_company, approval_no, card_no_masked, pay_status, receipt_no "
+            "FROM payment_records WHERE pay_date=? AND snapshot_slot=?",
+            (pay_date, slot)
+        ).fetchall()
+        for r in db_rows:
+            rows.append((
+                pay_date, r["pay_datetime"], r["branch_name"], r["customer_name"], r["pay_type"],
+                int(r["approve_amount"] or 0), r["card_company_raw"], r["card_company"],
+                r["approval_no"], r["card_no_masked"], r["pay_status"], r["receipt_no"],
+            ))
+    saved = conn.execute(
+        "SELECT COUNT(DISTINCT branch_key) AS c FROM closing_saves WHERE pay_date=?", (pay_date,)
+    ).fetchone()
+    return slot, rows, int((saved["c"] if saved else 0) or 0)
+
+
+def _closing_verify_row_key(r):
+    """추가/삭제 판정용 행 키: 시각·지점(공백제거)·보호자·금액·상태·승인번호·영수증번호"""
+    return (r[1], _closing_norm(r[2]), (r[3] or "").strip(), int(r[5] or 0), r[10], r[8], r[11])
+
+
+def _closing_verify_day_diff(cur_rows, new_rows):
+    """현재 슬롯 행 vs 수정본 행 비교(순수 함수 — DB 무관).
+    반환: {"cur_count","new_count","added","removed","added_ex","removed_ex","branches"}
+    branches: 지점별 {"key","name","dc","da","cur_cnt","cur_amt","new_cnt","new_amt"} (dc/da=수정본-현재, 취소는 음수 상계)."""
+    from collections import Counter
+    ck = Counter(_closing_verify_row_key(r) for r in cur_rows)
+    nk = Counter(_closing_verify_row_key(r) for r in new_rows)
+    added_keys = nk - ck
+    removed_keys = ck - nk
+
+    def repmap(rows):
+        m = {}
+        for r in rows:
+            m.setdefault(_closing_verify_row_key(r), r)
+        return m
+
+    def examples(key_counter, rep):
+        out = [rep[k] for k in key_counter]
+        out.sort(key=lambda r: (r[1] or "", _closing_norm(r[2])))
+        return out[:10]
+
+    cur_rep = repmap(cur_rows)
+    new_rep = repmap(new_rows)
+
+    agg = {}
+    for tag, rows in (("cur", cur_rows), ("new", new_rows)):
+        for r in rows:
+            key = _closing_norm(r[2])
+            b = agg.setdefault(key, {"name": r[2], "cur": [0, 0], "new": [0, 0]})
+            amt = int(r[5] or 0)
+            if r[10] == "취소":
+                b[tag][0] -= 1
+                b[tag][1] -= amt
+            else:
+                b[tag][0] += 1
+                b[tag][1] += amt
+    branches = []
+    for key, b in agg.items():
+        dc = b["new"][0] - b["cur"][0]
+        da = b["new"][1] - b["cur"][1]
+        branches.append({"key": key, "name": b["name"], "dc": dc, "da": da,
+                         "cur_cnt": b["cur"][0], "cur_amt": b["cur"][1],
+                         "new_cnt": b["new"][0], "new_amt": b["new"][1]})
+    branches.sort(key=lambda d: (-abs(d["da"]), d["name"]))
+
+    return {
+        "cur_count": len(cur_rows), "new_count": len(new_rows),
+        "added": sum(added_keys.values()), "removed": sum(removed_keys.values()),
+        "added_ex": examples(added_keys, new_rep), "removed_ex": examples(removed_keys, cur_rep),
+        "branches": branches,
+    }
+
+
+def _closing_verify_example_html(rows) -> str:
+    """추가/삭제 예시 최대 10건: 시각·지점·보호자·금액·상태"""
+    from html import escape as _esc
+    if not rows:
+        return "-"
+    items = []
+    for r in rows:
+        amt = int(r[5] or 0)
+        cancel = r[10] == "취소"
+        items.append(
+            _esc((r[1] or "")[11:16] or (r[1] or "")) + " " + _esc(r[2] or "") + " "
+            + _esc((r[3] or "").strip()) + " " + (("-" if cancel else "") + f"{amt:,}")
+            + " " + _esc(r[10] or "")
+        )
+    return "<br>".join(items)
+
+
+def _closing_verify_master_redirect(user):
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/closing/verify", response_class=HTMLResponse)
+async def closing_verify_page(session_token: str = Cookie(default=None), applied: int = 0):
+    """수정 결제내역 엑셀 업로드 화면(마스터 전용). 최근 반영 기록을 보여 준다."""
+    from html import escape as _esc
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if not _closing_verify_is_master(user):
+        return _closing_verify_master_redirect(user)
+
+    conn = get_conn()
+    try:
+        logs = conn.execute(
+            "SELECT run_at, target_date, slot, rows_inserted, note FROM payment_sync_log "
+            "WHERE source='upload' ORDER BY id DESC LIMIT ?", (CLOSING_VERIFY_LOG_LIMIT,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    h = ['<h2 style="margin-bottom:8px;">🧾 마감 이후 검증 — 수정 결제내역 업로드</h2>']
+    if applied:
+        h.append('<div class="card" style="border-left:4px solid #10B981;">✅ '
+                 + str(int(applied)) + '개 일자를 수정본(슬롯 M)으로 반영했습니다. '
+                 + '반영된 일자는 매출 마감 화면에서 수정본 기준으로 표시됩니다.</div>')
+    h.append(
+        '<div class="card">'
+        '<div style="font-size:13px;color:#555;margin-bottom:10px;">'
+        '유비플러스에서 받은 <b>수정된 결제내역 엑셀(.xlsx, 4MB 이하)</b>을 올리면 일자별로 현재 수신본과 비교합니다. '
+        '미리보기에서는 아무것도 저장되지 않으며, 선택한 일자만 슬롯 M(수동 수정본)으로 반영됩니다. '
+        '오늘(KST) 이후 일자와 차이가 없는 일자는 반영할 수 없습니다.</div>'
+        '<form method="post" action="/closing/verify/preview" enctype="multipart/form-data" '
+        'style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">'
+        '<div><div style="font-size:12px;color:#666;">수정 결제내역 엑셀</div>'
+        '<input type="file" name="file" accept=".xlsx" required style="width:auto;"></div>'
+        '<button class="btn" type="submit">미리보기</button>'
+        '<a class="btn" href="/closing" style="text-decoration:none;background:#6B7280;">← 마감 화면</a></form>'
+        '</div>'
+    )
+    h.append('<div class="card"><div style="font-weight:bold;margin-bottom:8px;">최근 반영 기록</div>'
+             '<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:520px;"><thead><tr>'
+             '<th>반영 시각</th><th>일자</th><th>슬롯</th><th style="text-align:right;">행 수</th><th>메모</th>'
+             '</tr></thead><tbody>')
+    if not logs:
+        h.append('<tr><td colspan="5" style="text-align:center;color:#888;">반영 기록이 없습니다.</td></tr>')
+    for lg in logs:
+        h.append('<tr><td>' + _esc(_closing_fmt_ts(lg["run_at"] or "")) + '</td><td>' + _esc(lg["target_date"] or "")
+                 + '</td><td>' + _esc(CLOSING_SLOT_LABELS.get(lg["slot"], lg["slot"] or "")) + '</td><td style="text-align:right;">'
+                 + f"{int(lg['rows_inserted'] or 0):,}" + '</td><td>' + _esc(lg["note"] or "") + '</td></tr>')
+    h.append('</tbody></table></div></div>')
+    return HTMLResponse(content=render_page("".join(h), user, "closing"))
+
+
+@app.post("/closing/verify/preview", response_class=HTMLResponse)
+async def closing_verify_preview(request: Request, session_token: str = Cookie(default=None)):
+    """엑셀 업로드 -> 일자별 현재 수신본과 비교 미리보기. DB에는 아무것도 쓰지 않는다."""
+    import base64
+    import gzip
+    import re as _re
+    from html import escape as _esc
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if not _closing_verify_is_master(user):
+        return _closing_verify_master_redirect(user)
+
+    form = await request.form()
+    f = form.get("file")
+    error = ""
+    payload_b64 = ""
+    days = []
+    card_totals = {}
+    card_raw_flags = {}
+    total_rows = 0
+
+    fname = getattr(f, "filename", "") or ""
+    if not f or not fname:
+        error = "파일이 없습니다."
+    elif not fname.lower().endswith(".xlsx"):
+        error = "확장자가 .xlsx가 아닙니다."
+    else:
+        raw = await f.read()
+        if len(raw) > CLOSING_VERIFY_MAX_BYTES:
+            error = "파일 크기가 4MB를 초과합니다."
+        else:
+            csv_bytes, headers, xerr = _closing_verify_xlsx_to_csv(raw)
+            if xerr:
+                error = xerr
+                if headers:
+                    error += " (실제 머리글: " + ", ".join(headers) + ")"
+            else:
+                payload_b64 = base64.b64encode(gzip.compress(csv_bytes, 9)).decode("ascii")
+                by_date, all_dates = _closing_verify_load_rows(csv_bytes)
+                today = _closing_verify_kst_today()
+                conn = get_conn()
+                try:
+                    for d in all_dates:
+                        slot, cur_rows, saved_cnt = _closing_verify_current(conn, d)
+                        new_rows = by_date.get(d, [])
+                        total_rows += len(new_rows)
+                        for r in new_rows:
+                            card_totals[r[7] or "카드명 누락"] = card_totals.get(r[7] or "카드명 누락", 0) + 1
+                            if r[7] in ("기타(해외)카드", "카드명 누락"):
+                                rawv = (r[6] or "").strip() or "(빈 값)"
+                                card_raw_flags[rawv] = card_raw_flags.get(rawv, 0) + 1
+                        diff = _closing_verify_day_diff(cur_rows, new_rows)
+                        no_diff = diff["added"] == 0 and diff["removed"] == 0
+                        future = d >= today
+                        warn = (not no_diff) and diff["cur_count"] > 0 and diff["new_count"] < diff["cur_count"] * 0.9
+                        days.append({
+                            "date": d, "slot": slot, "cur_count": diff["cur_count"],
+                            "new_count": diff["new_count"], "added": diff["added"],
+                            "removed": diff["removed"], "branches": diff["branches"],
+                            "saved_cnt": saved_cnt, "no_diff": no_diff,
+                            "future": future, "warn": warn,
+                            "added_ex": diff["added_ex"], "removed_ex": diff["removed_ex"],
+                        })
+                finally:
+                    conn.close()
+
+    h = ['<h2 style="margin-bottom:8px;">🧾 마감 이후 검증 — 미리보기</h2>']
+    h.append('<a class="btn" href="/closing/verify" style="text-decoration:none;background:#6B7280;display:inline-block;margin-bottom:10px;">← 업로드 화면</a>')
+    if error:
+        h.append('<div class="card" style="border-left:4px solid #EF4444;">❌ ' + _esc(error) + '</div>')
+    elif not days:
+        h.append('<div class="card">유효한 결제 행이 없습니다.</div>')
+    else:
+        h.append('<div class="card" style="font-size:13px;color:#555;">'
+                 '수정본 총 <b>' + f"{total_rows:,}" + '</b>행 · 일자 <b>' + str(len(days)) + '</b>개. '
+                 '미리보기는 DB에 저장되지 않습니다. 반영할 일자를 선택한 뒤 [선택 일자 반영]을 누르세요.</div>')
+
+        # 카드사 분류 집계
+        h.append('<div class="card"><div style="font-weight:bold;margin-bottom:6px;">카드사 분류 (수정본 전체)</div>'
+                 '<div style="font-size:12px;color:#555;">'
+                 + " · ".join(_esc(k) + " " + f"{v:,}" for k, v in sorted(card_totals.items(), key=lambda x: -x[1]))
+                 + '</div>')
+        if card_raw_flags:
+            h.append('<div style="font-size:12px;color:#B45309;margin-top:6px;">'
+                     '기타(해외)카드/카드명 누락 원본 값: '
+                     + _esc(", ".join(f"{k}({v})" for k, v in sorted(card_raw_flags.items(), key=lambda x: -x[1])[:10]))
+                     + '</div>')
+        h.append('</div>')
+
+        h.append('<form method="post" action="/closing/verify/apply">')
+        h.append('<input type="hidden" name="payload" value="' + payload_b64 + '">')
+        h.append('<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:1080px;"><thead><tr>'
+                 '<th style="width:34px;">반영</th><th>일자</th><th>현재(슬롯)</th><th style="text-align:right;">현재 행수</th>'
+                 '<th style="text-align:right;">수정본 행수</th><th style="text-align:right;">추가</th><th style="text-align:right;">삭제</th>'
+                 '<th>지점별 순건수·순금액 변화</th><th style="text-align:right;">마감 저장 지점</th><th>추가 예시</th><th>삭제 예시</th>'
+                 '</tr></thead><tbody>')
+        for d in days:
+            disabled = d["no_diff"] or d["future"]
+            checked = (not disabled) and (not d["warn"])
+            brs = []
+            for b in d["branches"][:4]:
+                if b["dc"] == 0 and b["da"] == 0:
+                    continue
+                brs.append(_esc(b["name"]) + " " + _closing_sgn(b["dc"]) + "건/" + _closing_sgn(b["da"]) + "원")
+            if len(d["branches"]) > 4:
+                brs.append("외 " + str(len(d["branches"]) - 4) + "개 지점")
+            notes = []
+            if d["future"]:
+                notes.append("오늘(KST) 이후 일자")
+            if d["no_diff"]:
+                notes.append("차이 없음")
+            if d["warn"]:
+                notes.append("⚠️ 수정본 행수가 현재의 90% 미만")
+            cur_slot_lab = CLOSING_SLOT_LABELS.get(d["slot"], d["slot"] or "-")
+            h.append('<tr>'
+                     '<td style="text-align:center;"><input type="checkbox" name="dates" value="' + _esc(d["date"]) + '"'
+                     + (' checked' if checked else '') + (' disabled' if disabled else '') + '></td>'
+                     '<td>' + _esc(d["date"]) + '</td>'
+                     '<td>' + _esc(cur_slot_lab) + '</td>'
+                     '<td style="text-align:right;">' + f"{d['cur_count']:,}" + '</td>'
+                     '<td style="text-align:right;">' + f"{d['new_count']:,}" + '</td>'
+                     '<td style="text-align:right;color:#059669;">+' + str(d["added"]) + '</td>'
+                     '<td style="text-align:right;color:#DC2626;">-' + str(d["removed"]) + '</td>'
+                     '<td style="font-size:11px;">' + (_esc(" · ".join(brs)) if brs else "-") + '</td>'
+                     '<td style="text-align:right;">' + str(d["saved_cnt"]) + '</td>'
+                     '<td style="font-size:11px;">' + _closing_verify_example_html(d["added_ex"]) + '</td>'
+                     '<td style="font-size:11px;">' + _closing_verify_example_html(d["removed_ex"]) + '</td>'
+                     '</tr>'
+                     + ('<tr><td colspan="11" style="font-size:11px;color:#B45309;padding-top:0;">'
+                        + _esc(" · ".join(notes)) + '</td></tr>' if notes else ''))
+        h.append('</tbody></table></div></div>')
+        h.append('<div class="card" style="display:flex;gap:8px;flex-wrap:wrap;">'
+                 '<button class="btn" type="submit">선택 일자 반영 (슬롯 M)</button>'
+                 '<a class="btn" href="/closing/verify" style="text-decoration:none;background:#6B7280;">취소</a></div>')
+        h.append('</form>')
+    return HTMLResponse(content=render_page("".join(h), user, "closing"))
+
+
+@app.post("/closing/verify/apply")
+async def closing_verify_apply(request: Request, session_token: str = Cookie(default=None)):
+    """미리보기에서 넘어온 숨은 페이로드를 서버에서 다시 파싱·검증하고 선택 일자만 슬롯 M으로 반영한다."""
+    import base64
+    import gzip
+    import re as _re
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if not _closing_verify_is_master(user):
+        return _closing_verify_master_redirect(user)
+
+    form = await request.form()
+    payload = form.get("payload") or ""
+    selected = form.getlist("dates") if hasattr(form, "getlist") else []
+    try:
+        csv_bytes = gzip.decompress(base64.b64decode(payload))
+    except Exception:
+        return RedirectResponse(url="/closing/verify", status_code=303)
+
+    by_date, _all_dates = _closing_verify_load_rows(csv_bytes)
+    today = _closing_verify_kst_today()
+    kst_now = _kst_now()
+    applied = 0
+    for d in selected:
+        if not isinstance(d, str) or not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            continue
+        if d >= today:
+            continue
+        rows = by_date.get(d)
+        if rows is None:
+            continue
+        now_iso = kst_now.strftime("%Y-%m-%d %H:%M:%S")
+        _save_payment_rows(rows, d, "M", now_iso)
+        _payment_log_insert({
+            "run_at": now_iso, "slot": "M", "target_date": d, "source": "upload",
+            "status": "success", "rows": len(rows), "prev_rows": None,
+            "lm": "", "etag": "", "size": None, "max_pay": "",
+            "freshness": "", "note": "upload by " + str(user.get("login_id") or ""), "error": "",
+        })
+        applied += 1
+    return RedirectResponse(url="/closing/verify?applied=" + str(applied), status_code=303)
+
 
 
 
