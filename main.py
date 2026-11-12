@@ -4683,7 +4683,8 @@ def generate_qr_bytes(server_url, branch_code, item_code, scan_type, item_name="
     url = (f"{server_url}/scan"
            f"?branch_code={branch_code}"
            f"&item_code={item_code}"
-           f"&scan_type={scan_type}")
+           f"&scan_type={scan_type}"
+           f"&sv={SCAN_SERVICE_MARKER}")
     qr = qrcode.QRCode(version=1, box_size=8, border=4)
     qr.add_data(url)
     qr.make(fit=True)
@@ -5252,6 +5253,9 @@ def _scan_reject_page(title: str, message: str) -> HTMLResponse:
 
 
 SCAN_AUTOCLOSE_SECONDS = 5
+# 스캔 플로우 버전 마커: 새로 발급되는 QR URL과 완료 화면 URL에 sv=2를 붙여
+# scan_view_log.headers_json._raw_query에서 신/구 버전 트래픽을 구분한다.
+SCAN_SERVICE_MARKER = "2"
 
 
 @app.get("/scan", response_class=HTMLResponse)
@@ -5500,7 +5504,7 @@ def _do_scan_and_log(request: Request, branch_code: str, item_code: str, scan_ty
     conn.commit()
     conn.close()
 
-    return RedirectResponse(url=f"/scan/done?rid={request_id}", status_code=303)
+    return RedirectResponse(url=f"/scan/done?rid={request_id}&sv={SCAN_SERVICE_MARKER}", status_code=303)
 
 
 @app.get("/scan/done", response_class=HTMLResponse)
