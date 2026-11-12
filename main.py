@@ -2490,7 +2490,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
               if (e.button !== 0) return;
               e.preventDefault();
               e.stopPropagation();
-              if (!widths) freezeTable();
+              freezeTable();
               drag = {{ idx: idx, x0: e.clientX }};
               dirty = false;
               try {{ handle.setPointerCapture(e.pointerId); }} catch (err) {{}}
@@ -18632,9 +18632,74 @@ def _closing_collect_memos(form) -> dict:
     return out
 
 
-def _closing_compare_table_html(rows: list, has_receipt: bool, memo_mode=None, memos=None) -> str:
+def _closing_save_receipt_groups(conn, branch_key: str, branch_name: str, pay_date: str,
+                                 login_id: str, form) -> int:
+    """마감 화면 비교표의 '단말기 영수증 입력 값' 칸(rgl_/rgc_/rga_)을 receipt_entry_lines에 반영한다.
+    입력 단위는 비교 구분(그룹)이며, 카드사 구분은 저장 시 카드 행으로 환산한다.
+    - 일반 카드 구분: 해당 card_company 행을 교체
+    - 현금성(계좌·현금·소득공제): 소비자소득공제·사업자지출증빙 행을 지우고 묶음 행 1개로 저장
+    - 카드명 누락: '카드명 누락' 행으로 저장
+    반환: 값이 입력된 구분 수"""
+    now_iso = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
+    groups = {}
+    for i in range(60):
+        lb = str(form.get("rgl_" + str(i)) or "").strip()
+        if not lb or len(lb) > 60 or lb not in CLOSING_COMPARE_ROWS:
+            continue
+        try:
+            cnt = _closing_int(str(form.get("rgc_" + str(i)) or "").strip())
+            amt = _closing_int(str(form.get("rga_" + str(i)) or "").strip())
+        except ValueError:
+            continue
+        groups[lb] = (cnt, amt)
+    if not groups:
+        return 0
+
+    ent = conn.execute(
+        "SELECT id FROM receipt_entries WHERE branch_key=? AND pay_date=?", (branch_key, pay_date)
+    ).fetchone()
+    if ent:
+        entry_id = ent["id"]
+        conn.execute(
+            "UPDATE receipt_entries SET updated_by=?, updated_at=? WHERE id=?",
+            (login_id, now_iso, entry_id)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO receipt_entries (branch_key, branch_name, pay_date, entry_method, "
+            "entered_by, created_at, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (branch_key, branch_name, pay_date, "manual", login_id, now_iso, login_id, now_iso)
+        )
+        entry_id = conn.execute(
+            "SELECT id FROM receipt_entries WHERE branch_key=? AND pay_date=?", (branch_key, pay_date)
+        ).fetchone()["id"]
+
+    saved = 0
+    for lb, (cnt, amt) in groups.items():
+        dels = ["소비자소득공제", "사업자지출증빙", CLOSING_CASH_GROUP] if lb == CLOSING_CASH_GROUP else [lb]
+        for dc in dels:
+            conn.execute(
+                "DELETE FROM receipt_entry_lines WHERE entry_id=? AND card_company=?", (entry_id, dc)
+            )
+        if cnt == 0 and amt == 0:
+            continue
+        ac, cc = (cnt, 0) if cnt >= 0 else (0, -cnt)
+        aa, ca = (amt, 0) if amt >= 0 else (0, -amt)
+        conn.execute(
+            "INSERT INTO receipt_entry_lines (entry_id, card_company, approve_cnt, cancel_cnt, approve_amt, cancel_amt) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (entry_id, lb, ac, cc, aa, ca)
+        )
+        saved += 1
+    conn.commit()
+    return saved
+
+
+def _closing_compare_table_html(rows: list, has_receipt: bool, memo_mode=None, memos=None,
+                                receipt_edit: bool = False) -> str:
     """구분별 표: 결제내역(건수/금액) | 영수증 입력 값(건수/금액) | 차이(결제내역−영수증) | (메모)
     memo_mode: None(메모 칸 없음) / "edit"(불일치 행에 입력 칸) / "view"(저장된 메모 표시)
+    receipt_edit: True이면 영수증 건수/금액 칸을 입력칸(rgc_/rga_)으로 표시한다.
     """
     from html import escape as _esc
     memos = memos or {}
@@ -18664,8 +18729,15 @@ def _closing_compare_table_html(rows: list, has_receipt: bool, memo_mode=None, m
         bad = has_receipt and (dc != 0 or da != 0)
         h.append('<tr' + (' style="background:#FEF2F2;"' if bad else '') + '><td>' + _esc(label) + '</td>'
                  '<td ' + num + '>' + f"{pc:,}" + '</td><td ' + num + '>' + f"{pa:,}" + '</td>')
-        if has_receipt:
-            h.append('<td ' + num + '>' + f"{rc:,}" + '</td><td ' + num + '>' + f"{ra:,}" + '</td>')
+        if has_receipt or receipt_edit:
+            if receipt_edit:
+                h.append('<td><input type="hidden" name="rgl_' + str(idx) + '" value="' + _esc(label) + '">'
+                         '<input type="number" min="0" step="1" inputmode="numeric" name="rgc_' + str(idx)
+                         + '" value="' + str(rc) + '" style="width:62px;text-align:right;"></td>'
+                         '<td><input type="number" min="0" step="1" inputmode="numeric" name="rga_' + str(idx)
+                         + '" value="' + str(ra) + '" style="width:78px;text-align:right;"></td>')
+            else:
+                h.append('<td ' + num + '>' + f"{rc:,}" + '</td><td ' + num + '>' + f"{ra:,}" + '</td>')
             h.append('<td ' + (bad_style if dc != 0 else num) + '>' + _closing_sgn(dc) + '</td>'
                      '<td ' + (bad_style if da != 0 else num) + '>' + _closing_sgn(da) + '</td>')
         else:
@@ -18683,7 +18755,7 @@ def _closing_compare_table_html(rows: list, has_receipt: bool, memo_mode=None, m
 
     h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>'
              '<td ' + num + '>' + f"{tpc:,}" + '</td><td ' + num + '>' + f"{tpa:,}" + '</td>')
-    if has_receipt:
+    if has_receipt or receipt_edit:
         dc, da = tpc - trc, tpa - tra
         h.append('<td ' + num + '>' + f"{trc:,}" + '</td><td ' + num + '>' + f"{tra:,}" + '</td>')
         h.append('<td ' + (bad_style if dc != 0 else num) + '>' + _closing_sgn(dc) + '</td>'
@@ -18691,6 +18763,97 @@ def _closing_compare_table_html(rows: list, has_receipt: bool, memo_mode=None, m
     else:
         h.append(dash * 4)
     h.append(('<td></td>' if memo_mode else '') + '</tr></tbody></table></div>')
+    return "".join(h)
+
+
+def _closing_mslot_groups(conn, pay_date: str, branch_keys=None) -> dict:
+    """슬롯 'M'(수동 수정본) 결제내역을 구분별 순건수/순금액으로 묶는다(취소는 음수 상계).
+    branch_keys를 주면 해당 지점(공백 제거 기준)만 집계한다."""
+    ex_sql, ex_params = _closing_excluded_sql()
+    sql = ("SELECT card_company, "
+           "SUM(CASE WHEN pay_status='취소' THEN -1 ELSE 1 END) AS net_cnt, "
+           "SUM(CASE WHEN pay_status='취소' THEN -approve_amount ELSE approve_amount END) AS net_amt "
+           "FROM payment_records WHERE pay_date=? AND snapshot_slot='M' AND " + ex_sql)
+    params = [pay_date] + ex_params
+    if branch_keys:
+        ph = ",".join(["?"] * len(branch_keys))
+        sql += " AND REPLACE(branch_name, ' ', '') IN (" + ph + ")"
+        params += list(branch_keys)
+    rows = conn.execute(sql + " GROUP BY card_company", tuple(params)).fetchall()
+    groups = {}
+    for r in rows:
+        g = _closing_group(r["card_company"])
+        c0, a0 = groups.get(g, (0, 0))
+        groups[g] = (c0 + int(r["net_cnt"] or 0), a0 + int(r["net_amt"] or 0))
+    return groups
+
+
+def _closing_verify_compare_html(pay_groups: dict, rc_groups: dict, has_receipt: bool,
+                                 m_groups: dict) -> str:
+    """전지점 수정 데이터 비교 표: 구분 | 결제내역 | 단말기 영수증 입력 값 | 차이(결제−영수증)
+    | 수정 데이터(슬롯 M) | 차이(수정−결제). m_groups가 없으면 수정 열은 '-'로 표시."""
+    from html import escape as _esc
+    num = 'style="text-align:right;"'
+    bad_style = 'style="text-align:right;color:#DC2626;font-weight:bold;"'
+    good_style = 'style="text-align:right;color:#065F46;"'
+    dash = '<td style="text-align:right;color:#bbb;">-</td>'
+
+    labels = list(CLOSING_COMPARE_ROWS) + sorted(
+        (set(pay_groups) | set(rc_groups) | set(m_groups)) - set(CLOSING_COMPARE_ROWS))
+    h = ['<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:980px;">']
+    h.append(
+        '<thead><tr><th rowspan="2" style="min-width:130px;">구분</th>'
+        '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
+        '<th colspan="2" style="text-align:center;">단말기 영수증 입력 값</th>'
+        '<th colspan="2" style="text-align:center;">차이(결제−영수증)</th>'
+        '<th colspan="2" style="text-align:center;background:#7C3AED;color:#fff;">수정 데이터(슬롯 M)</th>'
+        '<th colspan="2" style="text-align:center;">차이(수정−결제)</th></tr><tr>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th>'
+        '<th style="text-align:right;">건수</th><th style="text-align:right;">금액</th></tr></thead><tbody>'
+    )
+    t = [0, 0, 0, 0, 0, 0]
+    for lb in labels:
+        pc, pa = pay_groups.get(lb, (0, 0))
+        rc, ra = rc_groups.get(lb, (0, 0))
+        mc, ma = m_groups.get(lb, (0, 0))
+        dc1, da1 = pc - rc, pa - ra
+        dc2, da2 = mc - pc, ma - pa
+        has_m = bool(m_groups)
+        changed = has_m and (dc2 != 0 or da2 != 0)
+        h.append('<tr' + (' style="background:#F5F3FF;"' if changed else '') + '><td>' + _esc(lb) + '</td>'
+                 '<td ' + num + '>' + f"{pc:,}" + '</td><td ' + num + '>' + f"{pa:,}" + '</td>')
+        if has_receipt:
+            h.append('<td ' + num + '>' + f"{rc:,}" + '</td><td ' + num + '>' + f"{ra:,}" + '</td>'
+                     '<td ' + (bad_style if dc1 != 0 else num) + '>' + _closing_sgn(dc1) + '</td>'
+                     '<td ' + (bad_style if da1 != 0 else num) + '>' + _closing_sgn(da1) + '</td>')
+        else:
+            h.append(dash * 4)
+        if has_m:
+            h.append('<td ' + num + '>' + f"{mc:,}" + '</td><td ' + num + '>' + f"{ma:,}" + '</td>'
+                     '<td ' + (good_style if dc2 > 0 else (bad_style if dc2 < 0 else num)) + '>' + _closing_sgn(dc2) + '</td>'
+                     '<td ' + (good_style if da2 > 0 else (bad_style if da2 < 0 else num)) + '>' + _closing_sgn(da2) + '</td>')
+        else:
+            h.append(dash * 4)
+        h.append('</tr>')
+        t[0] += pc; t[1] += pa; t[2] += rc; t[3] += ra; t[4] += mc; t[5] += ma
+    h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td>합계</td>'
+             '<td ' + num + '>' + f"{t[0]:,}" + '</td><td ' + num + '>' + f"{t[1]:,}" + '</td>')
+    if has_receipt:
+        h.append('<td ' + num + '>' + f"{t[2]:,}" + '</td><td ' + num + '>' + f"{t[3]:,}" + '</td>'
+                 '<td ' + (bad_style if t[0]-t[2] != 0 else num) + '>' + _closing_sgn(t[0]-t[2]) + '</td>'
+                 '<td ' + (bad_style if t[1]-t[3] != 0 else num) + '>' + _closing_sgn(t[1]-t[3]) + '</td>')
+    else:
+        h.append(dash * 4)
+    if m_groups:
+        h.append('<td ' + num + '>' + f"{t[4]:,}" + '</td><td ' + num + '>' + f"{t[5]:,}" + '</td>'
+                 '<td ' + num + '>' + _closing_sgn(t[4]-t[0]) + '</td>'
+                 '<td ' + num + '>' + _closing_sgn(t[5]-t[1]) + '</td>')
+    else:
+        h.append(dash * 4)
+    h.append('</tr></tbody></table></div>')
     return "".join(h)
 
 
@@ -18914,6 +19077,15 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             parts.append('<div class="card">' + _closing_compare_table_html(_closing_compare(sum_pay, sum_rc), entered > 0) + '</div>')
             parts.append('<h3 style="margin:16px 0 8px;">지점별 합계</h3>')
             parts.append('<div class="card">' + _closing_branch_compare_html(rows_b, date) + '</div>')
+            # 슬롯 M(수동 수정본) 데이터가 있으면 같은 양식으로 수정 데이터 비교를 추가한다
+            if entered > 0:
+                receipt_keys = {k for k in keys if data["receipts"].get(k) is not None}
+                m_groups = _closing_mslot_groups(conn, date, receipt_keys or None)
+                if m_groups:
+                    parts.append('<h3 style="margin:16px 0 8px;">수정 데이터 (슬롯 M · 영수증 입력 지점 기준)</h3>')
+                    parts.append('<div class="card">'
+                                 + _closing_verify_compare_html(sum_pay, sum_rc, True, m_groups)
+                                 + '</div>')
         else:
             # ---------- 지점 1곳(지점 계정 또는 마스터가 지점 선택) ----------
             pay = data["pay"].get(view_key)
@@ -18992,7 +19164,13 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                 if not pay and rc is None:
                     parts.append('<div class="card">해당 일자의 결제내역이 없습니다.</div>')
                 elif rc is None:
-                    parts.append('<div class="card">' + _closing_compare_table_html(_closing_compare(pg, rg), False) + '</div>')
+                    parts.append(
+                        '<form method="post" action="/closing/receipt-groups">'
+                        '<input type="hidden" name="date" value="' + _esc(date) + '">'
+                        '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
+                        '<div class="card">' + _closing_compare_table_html(_closing_compare(pg, rg), False, None, None, True)
+                        + '<div style="margin-top:12px;"><button class="btn" type="submit">영수증 저장</button></div></div></form>'
+                    )
                 else:
                     cmp_rows = _closing_compare(pg, rg)
                     memos = _closing_get_memos(conn, view_key, date)
@@ -19010,9 +19188,10 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                         '<form method="post" action="/closing/save">'
                         '<input type="hidden" name="date" value="' + _esc(date) + '">'
                         '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
-                        '<div class="card">' + _closing_compare_table_html(cmp_rows, True, "edit", memos)
+                        '<div class="card">' + _closing_compare_table_html(cmp_rows, True, "edit", memos, True)
                         + '<div id="closing-actions" style="margin-top:12px;">' + bottom_box
                         + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+                        '<button class="btn" type="submit" formaction="/closing/receipt-groups" style="background:#6B7280;">영수증 저장</button>'
                         '<button class="btn" type="submit" formaction="/closing/memo" style="background:#6B7280;">메모 저장</button>'
                         '<button class="btn" type="submit" formaction="/closing/save" onclick="' + confirm_js + '">마감 저장하기</button>'
                         '</div></div></div></form>'
@@ -19049,7 +19228,8 @@ def _closing_receipt_form_html(branch_name: str, branch_param: str, pay_date: st
     h.append('<input type="hidden" name="branch" value="' + _esc(branch_param) + '">')
     h.append('<div class="card"><div style="font-size:13px;color:#666;margin-bottom:10px;">'
              '단말기 영수증(일일마감집계)에 찍힌 값을 그대로 입력하세요. 영수증에 없는 카드사는 비워 두면 0으로 저장됩니다. '
-             '지점·일자당 1건이며, 마감 저장 전에는 다시 저장해서 수정할 수 있습니다.</div>')
+             '지점·일자당 1건이며, 마감 저장 전에는 다시 저장해서 수정할 수 있습니다. '
+             '※ "현금성"·"카드명 누락" 묶음은 마감 화면 비교표의 영수증 입력 값 칸에서 직접 입력합니다.</div>')
     h.append('<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:640px;"><thead><tr>'
              '<th style="min-width:110px;">카드사</th><th>승인건수</th><th>취소건수</th><th>승인금액</th><th>취소금액</th>'
              '<th style="text-align:right;">순건수</th><th style="text-align:right;">순금액</th></tr></thead><tbody>')
@@ -19177,7 +19357,12 @@ async def closing_receipt_save(request: Request, session_token: str = Cookie(def
                 "UPDATE receipt_entries SET updated_by=?, updated_at=? WHERE id=?",
                 (user["login_id"], now_iso, entry_id)
             )
-            conn.execute("DELETE FROM receipt_entry_lines WHERE entry_id=?", (entry_id,))
+            # 카드사 행만 다시 쓴다. 마감 화면에서 입력하는 묶음 행(현금성·카드명 누락)은 보존한다.
+            ph = ",".join(["?"] * len(CLOSING_RECEIPT_ROWS))
+            conn.execute(
+                "DELETE FROM receipt_entry_lines WHERE entry_id=? AND card_company IN (" + ph + ")",
+                tuple([entry_id] + list(CLOSING_RECEIPT_ROWS))
+            )
         else:
             conn.execute(
                 "INSERT INTO receipt_entries (branch_key, branch_name, pay_date, entry_method, "
@@ -19193,6 +19378,12 @@ async def closing_receipt_save(request: Request, session_token: str = Cookie(def
                 "INSERT INTO receipt_entry_lines (entry_id, card_company, approve_cnt, cancel_cnt, approve_amt, cancel_amt) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (entry_id, card, ac, cc, aa, ca)
+            )
+        # 카드사 화면에서 소득공제 계열을 입력하면 마감 화면의 '현금성' 묶음 행과 중복 계산되므로 묶음 행을 제거한다
+        if any(l[0] in ("소비자소득공제", "사업자지출증빙") and any(l[1:]) for l in lines):
+            conn.execute(
+                "DELETE FROM receipt_entry_lines WHERE entry_id=? AND card_company=?",
+                (entry_id, CLOSING_CASH_GROUP)
             )
         conn.commit()
     finally:
@@ -19229,10 +19420,45 @@ async def closing_memo_save(request: Request, session_token: str = Cookie(defaul
         if _closing_get_save(conn, key, pay_date):
             msg = "locked"
         else:
+            _closing_save_receipt_groups(conn, key, name, pay_date, user["login_id"], form)
             now_iso = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
             for lb, memo in _closing_collect_memos(form).items():
                 _closing_save_memo(conn, key, name, pay_date, lb, memo, user["login_id"], now_iso)
             conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(url=_closing_back_url(pay_date, branch_param, msg), status_code=303)
+
+
+@app.post("/closing/receipt-groups")
+async def closing_receipt_groups_save(request: Request, session_token: str = Cookie(default=None)):
+    """마감 화면 비교표의 '단말기 영수증 입력 값' 칸만 저장한다(영수증 입력 화면과 같은 데이터를 구분 단위로 갱신)."""
+    import re
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_all and not has_menu_permission(user["login_id"], "closing"):
+        return RedirectResponse(url="/", status_code=303)
+
+    form = await request.form()
+    pay_date = str(form.get("date") or "").strip()
+    branch_param = str(form.get("branch") or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", pay_date):
+        return RedirectResponse(url="/closing", status_code=303)
+
+    msg = "saved"
+    conn = get_conn()
+    try:
+        resolved = _closing_resolve_branch(conn, user, is_all, branch_param)
+        if not resolved:
+            return RedirectResponse(url="/closing", status_code=303)
+        key, name = resolved
+        if _closing_get_save(conn, key, pay_date):
+            msg = "locked"
+        else:
+            _closing_save_receipt_groups(conn, key, name, pay_date, user["login_id"], form)
     finally:
         conn.close()
     return RedirectResponse(url=_closing_back_url(pay_date, branch_param, msg), status_code=303)
@@ -19266,6 +19492,9 @@ async def closing_save(request: Request, session_token: str = Cookie(default=Non
 
         if _closing_get_save(conn, key, pay_date):
             return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "already"), status_code=303)
+
+        # 비교표에서 직접 입력한 영수증 값을 먼저 반영한 뒤 최신 영수증 기준으로 검증한다
+        _closing_save_receipt_groups(conn, key, name, pay_date, user["login_id"], form)
 
         data = _closing_load_all(conn, pay_date)
         rc = data["receipts"].get(key)
@@ -19660,24 +19889,42 @@ async def closing_payments_page(session_token: str = Cookie(default=None), branc
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         return RedirectResponse(url="/closing", status_code=303)
     branch_param = branch if is_all else ""
+    all_branches = is_all and not (branch_param or "").strip()
 
     conn = get_conn()
     try:
-        resolved = _closing_resolve_branch(conn, user, is_all, branch)
-        if not resolved:
-            return RedirectResponse(url="/closing", status_code=303)
-        key, name = resolved
-        meta = conn.execute(
-            "SELECT MAX(snapshot_slot) AS slot FROM payment_records WHERE pay_date=?", (date,)
-        ).fetchone()
-        slot = (meta["slot"] if meta else None) or ""
-        rows = []
-        if slot:
-            rows = conn.execute(
-                "SELECT pay_datetime, customer_name, pay_type, card_company, approve_amount, pay_status "
-                "FROM payment_records WHERE pay_date=? AND snapshot_slot=? AND REPLACE(branch_name, ' ', '')=? "
-                "ORDER BY pay_datetime, id", (date, slot, key)
-            ).fetchall()
+        if all_branches:
+            # 마스터/본사: 지점 미선택 시 전 지점 결제내역
+            key, name = "", "전 지점"
+            meta = conn.execute(
+                "SELECT MAX(snapshot_slot) AS slot FROM payment_records WHERE pay_date=?", (date,)
+            ).fetchone()
+            slot = (meta["slot"] if meta else None) or ""
+            rows = []
+            if slot:
+                ex_sql, ex_params = _closing_excluded_sql()
+                rows = conn.execute(
+                    "SELECT pay_datetime, branch_name, customer_name, pay_type, card_company, approve_amount, pay_status "
+                    "FROM payment_records WHERE pay_date=? AND snapshot_slot=? AND " + ex_sql +
+                    " ORDER BY branch_name, pay_datetime, id",
+                    tuple([date, slot] + ex_params)
+                ).fetchall()
+        else:
+            resolved = _closing_resolve_branch(conn, user, is_all, branch)
+            if not resolved:
+                return RedirectResponse(url="/closing", status_code=303)
+            key, name = resolved
+            meta = conn.execute(
+                "SELECT MAX(snapshot_slot) AS slot FROM payment_records WHERE pay_date=?", (date,)
+            ).fetchone()
+            slot = (meta["slot"] if meta else None) or ""
+            rows = []
+            if slot:
+                rows = conn.execute(
+                    "SELECT pay_datetime, customer_name, pay_type, card_company, approve_amount, pay_status "
+                    "FROM payment_records WHERE pay_date=? AND snapshot_slot=? AND REPLACE(branch_name, ' ', '')=? "
+                    "ORDER BY pay_datetime, id", (date, slot, key)
+                ).fetchall()
     finally:
         conn.close()
 
@@ -19712,8 +19959,10 @@ async def closing_payments_page(session_token: str = Cookie(default=None), branc
     else:
         net_cnt = 0
         net_amt = 0
-        h.append('<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:640px;"><thead><tr>'
-                 '<th>시각</th><th>보호자</th><th>결제구분</th><th>구분</th><th style="text-align:right;">금액</th><th>상태</th><th>비고</th>'
+        h.append('<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:'
+                 + ('760' if all_branches else '640') + 'px;"><thead><tr>'
+                 + ('<th>지점</th>' if all_branches else '')
+                 + '<th>시각</th><th>보호자</th><th>결제구분</th><th>구분</th><th style="text-align:right;">금액</th><th>상태</th><th>비고</th>'
                  '</tr></thead><tbody>')
         for r, g in items:
             cancel = r["pay_status"] == "취소"
@@ -19725,11 +19974,13 @@ async def closing_payments_page(session_token: str = Cookie(default=None), branc
             if not cancel and dup.get((cust, amt, g), 0) >= 2:
                 note = "동일 보호자·동일 금액 " + str(dup[(cust, amt, g)]) + "회"
             color = ' style="color:#DC2626;"' if cancel else ''
-            h.append('<tr' + color + '><td>' + _esc((r["pay_datetime"] or "")[-5:]) + '</td><td>' + _esc(cust) + '</td><td>'
+            h.append('<tr' + color + '>' + ('<td>' + _esc(r["branch_name"] or "") + '</td>' if all_branches else '')
+                     + '<td>' + _esc((r["pay_datetime"] or "")[-5:]) + '</td><td>' + _esc(cust) + '</td><td>'
                      + _esc(r["pay_type"] or "") + '</td><td>' + _esc(g) + '</td><td style="text-align:right;">'
                      + (("-" if cancel else "") + f"{amt:,}") + '</td><td>' + _esc(r["pay_status"] or "") + '</td><td style="color:#B45309;">'
                      + _esc(note) + '</td></tr>')
-        h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td colspan="4">합계(취소 상계)</td><td style="text-align:right;">'
+        h.append('<tr style="background:#EEF2FF;font-weight:bold;"><td colspan="' + ('5' if all_branches else '4')
+                 + '">합계(취소 상계)</td><td style="text-align:right;">'
                  + f"{net_amt:,}" + '</td><td colspan="2">' + f"{net_cnt:,}" + '건</td></tr></tbody></table></div></div>')
     return HTMLResponse(content=render_page("".join(h), user, "closing"))
 
@@ -19981,6 +20232,8 @@ async def closing_verify_page(session_token: str = Cookie(default=None), applied
         '<div><div style="font-size:12px;color:#666;">수정 결제내역 엑셀</div>'
         '<input type="file" name="file" accept=".xlsx" required style="width:auto;"></div>'
         '<button class="btn" type="submit">미리보기</button>'
+        '<button class="btn" type="submit" name="direct" value="1" style="background:#B45309;" '
+        'onclick="return confirm(\'미리보기 없이 차이가 있는 모든 과거 일자를 수정본(슬롯 M)으로 반영합니다.\\n90% 미만 경고·차이 없음·오늘 이후 일자는 제외됩니다.\\n계속할까요?\')">미리보기 없이 전체 반영</button>'
         '<a class="btn" href="/closing" style="text-decoration:none;background:#6B7280;">← 마감 화면</a></form>'
         '</div>'
     )
@@ -20065,6 +20318,12 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
                         })
                 finally:
                     conn.close()
+                if str(form.get("direct") or "") == "1":
+                    # 미리보기 없이 바로 반영: 차이 있는 과거 일자 중 90% 미만 경고 일자는 제외
+                    eligible = [d["date"] for d in days
+                                if not d["future"] and not d["no_diff"] and not d["warn"]]
+                    applied = _closing_verify_apply_dates(by_date, eligible, user.get("login_id"))
+                    return RedirectResponse(url="/closing/verify?applied=" + str(applied), status_code=303)
 
     h = ['<h2 style="margin-bottom:8px;">🧾 마감 이후 검증 — 미리보기</h2>']
     h.append('<a class="btn" href="/closing/verify" style="text-decoration:none;background:#6B7280;display:inline-block;margin-bottom:10px;">← 업로드 화면</a>')
@@ -20138,12 +20397,37 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
     return HTMLResponse(content=render_page("".join(h), user, "closing"))
 
 
+def _closing_verify_apply_dates(by_date: dict, dates: list, login_id: str) -> int:
+    """선택된 일자만 슬롯 'M'으로 반영한다. 오늘(KST) 이후·파일에 없는 날짜는 건너뛴다.
+    반환: 실제 반영된 일자 수"""
+    import re as _re
+    today = _closing_verify_kst_today()
+    now_iso = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
+    applied = 0
+    for d in dates:
+        if not isinstance(d, str) or not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            continue
+        if d >= today:
+            continue
+        rows = by_date.get(d)
+        if rows is None:
+            continue
+        _save_payment_rows(rows, d, "M", now_iso)
+        _payment_log_insert({
+            "run_at": now_iso, "slot": "M", "target_date": d, "source": "upload",
+            "status": "success", "rows": len(rows), "prev_rows": None,
+            "lm": "", "etag": "", "size": None, "max_pay": "",
+            "freshness": "", "note": "upload by " + str(login_id or ""), "error": "",
+        })
+        applied += 1
+    return applied
+
+
 @app.post("/closing/verify/apply")
 async def closing_verify_apply(request: Request, session_token: str = Cookie(default=None)):
     """미리보기에서 넘어온 숨은 페이로드를 서버에서 다시 파싱·검증하고 선택 일자만 슬롯 M으로 반영한다."""
     import base64
     import gzip
-    import re as _re
 
     user = get_session(session_token)
     if not user:
@@ -20160,26 +20444,7 @@ async def closing_verify_apply(request: Request, session_token: str = Cookie(def
         return RedirectResponse(url="/closing/verify", status_code=303)
 
     by_date, _all_dates = _closing_verify_load_rows(csv_bytes)
-    today = _closing_verify_kst_today()
-    kst_now = _kst_now()
-    applied = 0
-    for d in selected:
-        if not isinstance(d, str) or not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
-            continue
-        if d >= today:
-            continue
-        rows = by_date.get(d)
-        if rows is None:
-            continue
-        now_iso = kst_now.strftime("%Y-%m-%d %H:%M:%S")
-        _save_payment_rows(rows, d, "M", now_iso)
-        _payment_log_insert({
-            "run_at": now_iso, "slot": "M", "target_date": d, "source": "upload",
-            "status": "success", "rows": len(rows), "prev_rows": None,
-            "lm": "", "etag": "", "size": None, "max_pay": "",
-            "freshness": "", "note": "upload by " + str(user.get("login_id") or ""), "error": "",
-        })
-        applied += 1
+    applied = _closing_verify_apply_dates(by_date, selected, user.get("login_id"))
     return RedirectResponse(url="/closing/verify?applied=" + str(applied), status_code=303)
 
 
