@@ -20993,13 +20993,34 @@ def _cl_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
         else:
             result["branch_failed"].append(str(item["name"]) + "(" + str(detail)[:60] + ")")
 
-    if branch_on:
-        if miss_on:
-            for m in targets["missing"]:
-                _send_one(m, "미제출")
-        if mis_on:
-            for m in targets["mismatch"]:
-                _send_one(m, "불일치 " + str(m["count"]) + "건")
+    # 미제출만 지점별 채널로 발송한다. 불일치는 지점 채널로 보내지 않고
+    # 테스트 채널+테스트 메일로만 발송한다(아래 별도 블록).
+    if branch_on and miss_on:
+        for m in targets["missing"]:
+            _send_one(m, "미제출")
+
+    if mode == "auto" and mis_on and targets["mismatch"]:
+        mlines = [date_str + " 매출 마감 불일치 알림", "",
+                  "불일치가 있는 지점 " + str(len(targets["mismatch"])) + "곳:"]
+        for m in targets["mismatch"]:
+            mlines.append("- " + str(m["name"]) + " (불일치 " + str(m["count"]) + "건)")
+        mlines += ["", "매출 마감: " + link]
+        mbody = "\n".join(mlines)
+        ok, detail = send_teams_notification(
+            CL_NOTIFY_TEST_BRANCH_CODE, "🧾 매출 마감 불일치 알림",
+            mbody, link, "매출 마감 열기", sent_by)
+        result["mismatch_sent"] = bool(ok)
+        if not ok:
+            result["mismatch_detail"] = str(detail)[:80]
+        try:
+            res = send_email(CL_NOTIFY_MAIL_TO, "매출 마감 불일치 (" + date_str + ")", mbody)
+            mail_ok = res[0] if isinstance(res, tuple) else bool(res)
+            mail_detail = res[1] if (isinstance(res, tuple) and len(res) > 1) else ""
+        except Exception as e:
+            mail_ok, mail_detail = False, str(e)
+        result["mismatch_mail_sent"] = bool(mail_ok)
+        if not mail_ok:
+            result["mismatch_mail_detail"] = str(mail_detail)[:80]
 
     has_any = bool(targets["missing"] or targets["mismatch"])
     if test_on and has_any:
@@ -21008,7 +21029,8 @@ def _cl_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
         if miss_on or mode == "test":
             lines.append("■ 미제출 " + str(len(targets["missing"])) + "곳: "
                          + (", ".join(m["name"] for m in targets["missing"]) or "없음"))
-        if mis_on or mode == "test":
+        # 불일치는 auto 모드에서 전용 알림으로 이미 발송됐으므로 요약에서는 test 모드만 표시한다
+        if mode == "test":
             lines.append("■ 불일치 " + str(len(targets["mismatch"])) + "곳: "
                          + (", ".join(m["name"] + "(" + str(m["count"]) + "건)" for m in targets["mismatch"]) or "없음"))
         lines += ["", "매출 마감: " + link]
@@ -21077,8 +21099,8 @@ def _cl_notify_panel(date_str: str) -> str:
         '<div style="display:grid;grid-template-columns:minmax(400px,1fr) 2fr;gap:14px;align-items:start;">'
         '<div>'
         + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
-        + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점", _cl_setting_on("closing_notify_mismatch"))
-        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 실제 발송", _cl_setting_on("closing_notify_branch"))
+        + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점 — 테스트 채널·메일로 발송", _cl_setting_on("closing_notify_mismatch"))
+        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 미제출 알림 발송", _cl_setting_on("closing_notify_branch"))
         + _row("test", "테스트 발송", f"켜면 테스트 채널({CL_NOTIFY_TEST_BRANCH_CODE})·테스트 메일로 발송", _cl_setting_on("closing_notify_test"))
         + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
         'onclick="clReminderTest(this)" data-date="' + date_str + '">🧪 자동 알림 테스트 (테스트 채널·테스트 메일로만)</button>'
