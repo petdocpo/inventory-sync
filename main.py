@@ -16676,8 +16676,7 @@ async def _select_stocktake_items(year_month: str = None):
 
     try:
         if year_month is None:
-            today = date.today()
-            year_month = f"{today.year}-{today.month:02d}"
+            year_month = _kst_year_month()
 
         conn = get_conn()
 
@@ -16804,9 +16803,7 @@ async def master_stocktake_page(session_token: str = Cookie(default=None), team:
     if not has_menu_permission(user["login_id"], "stocktake"):
         return RedirectResponse(url="/master", status_code=303)
 
-    from datetime import date
-    today = date.today()
-    year_month = f"{today.year}-{today.month:02d}"
+    year_month = _kst_year_month()
 
     conn = get_conn()
     my_account = conn.execute("SELECT team FROM accounts WHERE login_id=?", (user["login_id"],)).fetchone()
@@ -16878,7 +16875,28 @@ async def master_stocktake_page(session_token: str = Cookie(default=None), team:
       <select id="teamSelect" onchange="location.href='/master/stocktake?team=' + this.value" {'disabled' if is_team_locked else ''}>
         {team_options_html}
       </select>
+      <button type="button" class="btn" style="margin-top:8px;font-size:12px;padding:6px 12px;background:#64748B;" onclick="stReselect()">이번 달 품목 재선정</button>
+      <span id="stReselectMsg" style="font-size:12px;color:#555;margin-left:8px;"></span>
     </div>
+    <script>
+    async function stReselect() {{
+      var ym = '{year_month}';
+      if (!confirm(ym + ' 실사 품목을 다시 선정할까요?\\n(이미 선정된 품목이 있으면 건너뜁니다)')) return;
+      var msg = document.getElementById('stReselectMsg');
+      msg.textContent = '선정 중...';
+      try {{
+        var res = await fetch('/master/stocktake/admin-reselect', {{
+          method: 'POST', headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{year_month: ym}})
+        }});
+        var data = await res.json();
+        msg.textContent = data.status === 'ok'
+          ? '완료: ' + Object.keys(data.selected_by_branch || {{}}).length + '개 지점 선정'
+          : (data.reason || data.error || '처리 실패');
+        if (data.status === 'ok') setTimeout(function(){{ location.reload(); }}, 800);
+      }} catch (e) {{ msg.textContent = '오류: ' + e.message; }}
+    }}
+    </script>
     <div style="display:flex;flex-direction:column;gap:8px;margin-top:12px;">
       {branch_cards_html}
     </div>
@@ -16894,9 +16912,7 @@ async def master_stocktake_detail_page(branch_code: str, session_token: str = Co
     if not has_menu_permission(user["login_id"], "stocktake"):
         return RedirectResponse(url="/master", status_code=303)
 
-    from datetime import date
-    today = date.today()
-    year_month = f"{today.year}-{today.month:02d}"
+    year_month = _kst_year_month()
 
     conn = get_conn()
     branch = conn.execute("SELECT branch_name FROM accounts WHERE branch_code=? AND role='branch'", (branch_code,)).fetchone()
@@ -17110,9 +17126,7 @@ async def master_stocktake_save(branch_code: str, request: Request, session_toke
     if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
         return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
 
-    from datetime import date
-    today = date.today()
-    year_month = f"{today.year}-{today.month:02d}"
+    year_month = _kst_year_month()
 
     data = await request.json()
     items = data.get("items", [])
@@ -17162,9 +17176,7 @@ async def master_stocktake_result_page(session_token: str = Cookie(default=None)
     if not has_menu_permission(user["login_id"], "stocktake-result"):
         return RedirectResponse(url="/master", status_code=303)
 
-    from datetime import date
-    today = date.today()
-    default_ym = f"{today.year}-{today.month:02d}"
+    default_ym = _kst_year_month()
     selected_ym = year_month or default_ym
 
     conn = get_conn()
@@ -17407,9 +17419,7 @@ async def master_stocktake_result_export(session_token: str = Cookie(default=Non
         return RedirectResponse(url="/master", status_code=303)
 
     if not year_month:
-        from datetime import date
-        today = date.today()
-        year_month = f"{today.year}-{today.month:02d}"
+        year_month = _kst_year_month()
 
     conn = get_conn()
     records = conn.execute(
@@ -19126,8 +19136,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             parts.append('<h3 style="margin:12px 0 8px;">구분별 (영수증 입력 지점 기준)</h3>')
             parts.append('<div class="card">' + _closing_compare_table_html(_closing_compare(sum_pay, sum_rc), entered > 0) + '</div>')
             parts.append('<h3 style="margin:16px 0 8px;">지점별 합계</h3>')
-            parts.append('<div class="card">' + _closing_branch_compare_html(
-                rows_b, date, notify=(user.get("role") == "master")) + '</div>')
+            parts.append('<div class="card">' + _closing_branch_compare_html(rows_b, date) + '</div>')
             # 슬롯 M(수동 수정본) 데이터가 있으면 같은 양식으로 수정 데이터 비교를 추가한다
             if entered > 0:
                 receipt_keys = {k for k in keys if data["receipts"].get(k) is not None}
@@ -20583,9 +20592,10 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
                 finally:
                     conn.close()
                 if str(form.get("direct") or "") == "1":
-                    # 미리보기 없이 바로 반영: 차이 있는 과거 일자 중 90% 미만 경고 일자는 제외
+                    # 미리보기 없이 바로 반영: 차이 있는 과거 일자 전부(차이 없음도 덮어씀).
+                    # 오늘(KST) 이후와 90% 미만 경고 일자만 제외한다.
                     eligible = [d["date"] for d in days
-                                if not d["future"] and not d["no_diff"] and not d["warn"]]
+                                if not d["future"] and not d["warn"]]
                     applied = _closing_verify_apply_dates(by_date, eligible, user.get("login_id"))
                     # 결과를 일자별로 보여 준다(무엇이 반영/제외됐는지 확인 가능하게)
                     elig_set = set(eligible)
@@ -20649,8 +20659,8 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
                  '<th>지점별 순건수·순금액 변화</th><th style="text-align:right;">마감 저장 지점</th><th>추가 예시</th><th>삭제 예시</th>'
                  '</tr></thead><tbody>')
         for d in days:
-            disabled = d["no_diff"] or d["future"]
-            checked = (not disabled) and (not d["warn"])
+            disabled = d["future"]
+            checked = (not disabled) and (not d["warn"]) and (not d["no_diff"])
             brs = []
             for b in d["branches"][:4]:
                 if b["dc"] == 0 and b["da"] == 0:
@@ -20950,6 +20960,8 @@ def _cl_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
 
 
 def _cl_notify_panel(date_str: str) -> str:
+    from html import escape as _esc
+
     def _row(key, label, desc, on):
         checked = " checked" if on else ""
         return (
@@ -20957,6 +20969,32 @@ def _cl_notify_panel(date_str: str) -> str:
             f'<input type="checkbox" style="width:auto;margin:0;" data-key="{key}" onchange="clToggle(this)"{checked}>'
             f'<span><b>{label}</b> <span style="color:#888;font-size:12px;">{desc}</span></span></label>'
         )
+
+    # 해당 일자 결제내역이 있는 지점들의 알림 토글(오른쪽 열)
+    conn = get_conn()
+    try:
+        ex_sql, ex_params = _closing_excluded_sql()
+        brows = conn.execute(
+            "SELECT DISTINCT branch_name FROM payment_records WHERE pay_date=? AND " + ex_sql
+            + " ORDER BY branch_name", tuple([date_str] + ex_params)
+        ).fetchall()
+    finally:
+        conn.close()
+    branch_html = []
+    for r in brows:
+        bname = r["branch_name"] or ""
+        bkey = _closing_norm(bname)
+        if not bkey:
+            continue
+        on = " checked" if _cl_branch_on(bkey) else ""
+        branch_html.append(
+            '<label style="display:flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap;">'
+            '<input type="checkbox" style="width:auto;margin:0;" data-bkey="' + _esc(bkey) + '"'
+            ' onchange="clBranchToggle(this)"' + on + '>' + _esc(bname) + '</label>'
+        )
+    if not branch_html:
+        branch_html.append('<span style="font-size:12px;color:#999;">해당 일자 결제내역이 있는 지점이 없습니다.</span>')
+
     return (
         '<div class="card" style="margin-bottom:12px;">'
         '<div style="font-size:13px;font-weight:bold;margin-bottom:4px;">📨 마감 알림 설정 (기본 꺼짐)</div>'
@@ -20964,6 +21002,8 @@ def _cl_notify_panel(date_str: str) -> str:
         '지점 채널 발송은 "지점 발송" 스위치와 해당 지점 "알림" 체크가 모두 켜져 있을 때만 나갑니다. '
         '"테스트 발송" 스위치가 켜져 있으면 테스트 채널·테스트 메일 사본도 함께 발송됩니다. '
         '"자동 알림 테스트" 버튼은 스위치와 무관하게 테스트 채널·테스트 메일로만 발송됩니다.</div>'
+        '<div style="display:grid;grid-template-columns:minmax(230px,1fr) 2fr;gap:14px;align-items:start;">'
+        '<div>'
         + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
         + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점", _cl_setting_on("closing_notify_mismatch"))
         + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 실제 발송", _cl_setting_on("closing_notify_branch"))
@@ -20973,7 +21013,13 @@ def _cl_notify_panel(date_str: str) -> str:
         + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;margin-top:6px;" onclick="clBranchAll(true)">지점 알림 전체 켜기</button>'
         + ' <button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" onclick="clBranchAll(false)">지점 알림 전체 끄기</button>'
         + '<div id="clNotifyResult" style="font-size:12px;color:#475569;margin-top:6px;"></div>'
-        '</div>' + _CL_NOTIFY_JS
+        + '</div>'
+        '<div><div style="font-size:12px;font-weight:bold;margin-bottom:4px;">지점별 알림</div>'
+        '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:3px 10px;">'
+        + "".join(branch_html)
+        + '</div></div>'
+        '</div>'
+        + _CL_NOTIFY_JS
     )
 
 
@@ -22386,6 +22432,11 @@ def _kst_now():
     """서버(UTC) 시간대와 무관하게 한국 시간 기준 현재 시각"""
     from datetime import timezone, timedelta
     return datetime.now(timezone(timedelta(hours=9)))
+
+
+def _kst_year_month() -> str:
+    """KST 기준 현재 연월(YYYY-MM). 서버가 UTC여도 월 경계에서 어긋나지 않게 한다."""
+    return _kst_now().strftime("%Y-%m")
 
 
 def _po_load_product_info() -> dict:
