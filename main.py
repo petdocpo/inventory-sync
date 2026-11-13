@@ -21096,13 +21096,11 @@ def _cl_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
     if test_on and has_any:
         prefix = "[테스트] " if mode == "test" else "[테스트 채널] "
         lines = [date_str + " 매출 마감 알림 대상", ""]
-        if miss_on or mode == "test":
-            lines.append("■ 미제출 " + str(len(targets["missing"])) + "곳: "
-                         + (", ".join(m["name"] for m in targets["missing"]) or "없음"))
-        # 불일치는 auto 모드에서 전용 알림으로 이미 발송됐으므로 요약에서는 test 모드만 표시한다
-        if mode == "test":
-            lines.append("■ 불일치 " + str(len(targets["mismatch"])) + "곳: "
-                         + (", ".join(m["name"] + "(" + str(m["count"]) + "건)" for m in targets["mismatch"]) or "없음"))
+        # 테스트 채널 요약은 스위치와 무관하게 항상 양쪽 현황을 보여준다(없으면 '없음')
+        lines.append("■ 미제출 " + str(len(targets["missing"])) + "곳: "
+                     + (", ".join(m["name"] for m in targets["missing"]) or "없음"))
+        lines.append("■ 불일치 " + str(len(targets["mismatch"])) + "곳: "
+                     + (", ".join(m["name"] + "(" + str(m["count"]) + "건)" for m in targets["mismatch"]) or "없음"))
         lines += ["", "매출 마감: " + link]
         body = "\n".join(lines)
         ok, detail = send_teams_notification(
