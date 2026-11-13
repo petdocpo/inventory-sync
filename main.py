@@ -3597,6 +3597,7 @@ def _sc_request_button(code, name, status) -> str:
 def _sc_notify_panel(sel_date_str: str) -> str:
     branch_on = _sc_setting_on("stock_closing_notify_branch")
     test_on = _sc_setting_on("stock_closing_notify_test")
+    mis_on = _sc_setting_on("stock_closing_notify_mismatch")
 
     def _row(key, label, desc, on):
         checked = " checked" if on else ""
@@ -3613,7 +3614,8 @@ def _sc_notify_panel(sel_date_str: str) -> str:
         "지점 채널 발송은 '지점 발송' 스위치와 해당 지점 '알림' 체크가 모두 켜져 있을 때만 나갑니다(자동·수동 '제출 요청' 공통). "
         "'테스트 발송' 스위치가 켜져 있으면 테스트 채널 사본도 함께 발송됩니다. "
         "'테스트'·'자동 알림 테스트' 버튼은 스위치와 무관하게 테스트 채널로만 발송됩니다(자동 알림 테스트는 테스트 메일도 발송).</div>"
-        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 실제 발송", branch_on)
+        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 미제출 알림 발송", branch_on)
+        + _row("mismatch", "불일치 발송", "오차 건수가 있는 지점 — 테스트 채널·테스트 메일로 발송", mis_on)
         + _row("test", "테스트 발송", f"켜면 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로 발송 · 자동 알림은 테스트 메일도 수신", test_on)
         + f'<div id="scMeta" data-date="{sel_date_str}" style="display:none;"></div>'
         + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
@@ -3646,7 +3648,8 @@ async def stock_closing_notify_toggle(request: Request, session_token: str = Coo
         raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
     key = str(body.get("key", "")).strip()
     enabled = bool(body.get("enabled"))
-    setting_key = {"branch": "stock_closing_notify_branch", "test": "stock_closing_notify_test"}.get(key)
+    setting_key = {"branch": "stock_closing_notify_branch", "test": "stock_closing_notify_test",
+                   "mismatch": "stock_closing_notify_mismatch"}.get(key)
     if not setting_key:
         raise HTTPException(status_code=400, detail="설정 키가 올바르지 않습니다.")
     value = "on" if enabled else "off"
@@ -3660,7 +3663,7 @@ async def stock_closing_notify_toggle(request: Request, session_token: str = Coo
         conn.commit()
     finally:
         conn.close()
-    label = "지점 발송" if key == "branch" else "테스트 발송"
+    label = {"branch": "지점 발송", "test": "테스트 발송", "mismatch": "불일치 발송"}.get(key, key)
     return JSONResponse({"ok": True, "message": label + (" 켜짐" if enabled else " 꺼짐")})
 
 @app.post("/stock-closing/notify-toggle-branch")
@@ -3857,22 +3860,78 @@ def _sc_missing_branches(date_str: str) -> list:
 STOCK_CLOSING_MAIL_TO = "hs.yu@petdoc.co.kr"
 
 
+def _sc_mismatch_branches(date_str: str) -> list:
+    """해당 날짜 마감 저장 건 중 오차(mismatch_count)가 있는 지점 목록."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT branch_code, mismatch_count FROM stock_closing_saves "
+        "WHERE close_date=? AND COALESCE(mismatch_count,0)>0", (date_str,)
+    ).fetchall()
+    conn.close()
+    name_of = {b["branch_code"]: b["branch_name"] for b in get_branches()}
+    out = []
+    for r in rows:
+        cnt = int(r["mismatch_count"] or 0)
+        if cnt <= 0:
+            continue
+        out.append({"code": r["branch_code"],
+                    "name": name_of.get(r["branch_code"], r["branch_code"]),
+                    "count": cnt})
+    return out
+
+
 def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> dict:
-    """미제출 지점 알림. mode='auto'는 자동 발송 스위치(지점/테스트) 설정을 따르고,
-    mode='test'는 스위치와 무관하게 테스트 채널(+테스트 메일)로만 보낸다."""
+    """미제출 지점 알림 + 오차(불일치) 지점 알림. mode='auto'는 자동 발송 스위치 설정을 따르고,
+    mode='test'는 스위치와 무관하게 테스트 채널(+테스트 메일)로만 보낸다.
+    오차 알림은 지점 채널이 아니라 테스트 채널+테스트 메일로만 발송한다."""
     missing = _sc_missing_branches(date_str)
+    mismatch = _sc_mismatch_branches(date_str)
     if mode == "test":
         branch_on, test_on = False, True
+        mis_on = True
     else:
         branch_on = _sc_setting_on("stock_closing_notify_branch")
         test_on = _sc_setting_on("stock_closing_notify_test")
+        mis_on = _sc_setting_on("stock_closing_notify_mismatch")
     result = {
         "date": date_str, "mode": mode, "missing": [m["name"] for m in missing],
+        "mismatch": [m["name"] for m in mismatch],
         "branch_sent": 0, "branch_failed": [], "test_sent": None, "mail_sent": None,
+        "mismatch_sent": None, "mismatch_mail_sent": None,
     }
-    if not missing:
+    if not missing and not mismatch:
         return result
+    status_link = base_url + "/stock-closing/status?date=" + date_str
     title = "📦 재고 마감 제출 요청"
+
+    # 오차(불일치) 알림 — auto 모드에서 '불일치 발송' 스위치가 켜져 있으면 테스트 채널+테스트 메일로만
+    if mode == "auto" and mis_on and mismatch:
+        mlines = [date_str + " 재고 마감 오차(불일치) 알림", "",
+                  "오차 건수가 있는 지점 " + str(len(mismatch)) + "곳:"]
+        for m in mismatch:
+            mlines.append("- " + str(m["name"]) + " (오차 " + str(m["count"]) + "건)")
+        mlines += ["", "재고 마감 현황: " + status_link]
+        mbody = "\n".join(mlines)
+        ok, detail = send_teams_notification(
+            STOCK_CLOSING_TEST_BRANCH_CODE, "📦 재고 마감 오차 알림",
+            mbody, status_link, "재고 마감 현황 열기", sent_by
+        )
+        result["mismatch_sent"] = bool(ok)
+        if not ok:
+            result["mismatch_detail"] = str(detail)[:80]
+        try:
+            res = send_email(
+                STOCK_CLOSING_MAIL_TO,
+                "재고 마감 오차 (" + date_str + ")",
+                mbody
+            )
+            mail_ok = res[0] if isinstance(res, tuple) else bool(res)
+            mail_detail = res[1] if (isinstance(res, tuple) and len(res) > 1) else ""
+        except Exception as e:
+            mail_ok, mail_detail = False, str(e)
+        result["mismatch_mail_sent"] = bool(mail_ok)
+        if not mail_ok:
+            result["mismatch_mail_detail"] = str(mail_detail)[:80]
     if branch_on:
         link = base_url + "/stock-closing?date=" + date_str
         enabled_branches = _sc_branch_on_set()
@@ -3887,9 +3946,12 @@ def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
                 result["branch_failed"].append(str(m["name"]) + "(" + str(detail)[:60] + ")")
     if test_on:
         prefix = "[테스트] " if mode == "test" else "[테스트 채널] "
-        status_link = base_url + "/stock-closing/status?date=" + date_str
         names = ", ".join(str(m["name"]) for m in missing)
         msg = date_str + " 재고 마감 미제출 지점 " + str(len(missing)) + "곳: " + names
+        # test 모드(버튼 테스트)에서는 오차 현황도 함께 보여준다. auto 모드의 오차는 위 전용 알림이 담당한다.
+        if mode == "test" and mismatch:
+            mnames = ", ".join(str(m["name"]) + "(" + str(m["count"]) + "건)" for m in mismatch)
+            msg += "\n오차 건수 있는 지점 " + str(len(mismatch)) + "곳: " + mnames
         ok, detail = send_teams_notification(
             STOCK_CLOSING_TEST_BRANCH_CODE, prefix + title, msg, status_link, "재고 마감 현황 열기", sent_by
         )
@@ -3901,6 +3963,10 @@ def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
         lines = [date_str + " 재고 마감 미제출 지점 " + str(len(missing)) + "곳", ""]
         for m in missing:
             lines.append("- " + str(m["name"]) + " (" + ("임시저장" if m["status"] == "draft" else "미제출") + ")")
+        if mode == "test" and mismatch:
+            lines += ["", "오차 건수 있는 지점 " + str(len(mismatch)) + "곳"]
+            for m in mismatch:
+                lines.append("- " + str(m["name"]) + " (오차 " + str(m["count"]) + "건)")
         lines += ["", "재고 마감 현황: " + status_link]
         try:
             res = send_email(
@@ -3982,14 +4048,15 @@ async def stock_closing_reminder_test(request: Request, session_token: str = Coo
         date_str, _sc_base_url(request), "test",
         "stock_closing_reminder_test_by_" + str(user.get("login_id") or "")
     )
-    if not result["missing"]:
-        text = date_str + " 미제출 지점이 없어 발송하지 않았습니다."
+    if not result["missing"] and not result.get("mismatch"):
+        text = date_str + " 미제출·오차 지점이 없어 발송하지 않았습니다."
     else:
         mail_txt = "성공" if result.get("mail_sent") else "실패(" + str(result.get("mail_detail", ""))[:60] + ")"
         text = ("테스트 발송 " + ("성공" if result["test_sent"] else "실패")
                 + " / 메일 " + mail_txt
-                + ": 미제출 " + str(len(result["missing"])) + "곳 (" + ", ".join(result["missing"])
-                + ") — 테스트 채널·테스트 메일로만 발송됨")
+                + ": 미제출 " + str(len(result["missing"])) + "곳"
+                + (", 오차 " + str(len(result["mismatch"])) + "곳" if result.get("mismatch") else "")
+                + " — 테스트 채널·테스트 메일로만 발송됨")
     return JSONResponse({"ok": True, "message": text})
 
 
@@ -4004,7 +4071,8 @@ async def cron_stock_closing_reminder(request: Request):
 
     target = (_dt.now(_tz(_td(hours=9))).date() - _td(days=1)).strftime("%Y-%m-%d")
     try:
-        if not _sc_setting_on("stock_closing_notify_branch") and not _sc_setting_on("stock_closing_notify_test"):
+        if not (_sc_setting_on("stock_closing_notify_branch") or _sc_setting_on("stock_closing_notify_test")
+                or _sc_setting_on("stock_closing_notify_mismatch")):
             return JSONResponse({"ok": True, "skipped": "자동 발송 스위치가 모두 꺼져 있습니다.", "date": target})
 
         conn = get_conn()
@@ -4035,7 +4103,9 @@ async def cron_stock_closing_reminder(request: Request):
         finally:
             conn.close()
 
-        failed = bool(result["branch_failed"]) or (result["test_sent"] is False) or (result.get("mail_sent") is False)
+        failed = (bool(result["branch_failed"]) or (result["test_sent"] is False)
+                  or (result.get("mail_sent") is False) or (result.get("mismatch_sent") is False)
+                  or (result.get("mismatch_mail_sent") is False))
         if failed:
             try:
                 report_cron_failure("stock-closing-reminder", "재고 마감 자동 알림 일부 실패: " + str(result)[:300])
