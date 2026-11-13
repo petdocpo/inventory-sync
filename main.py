@@ -2683,18 +2683,20 @@ async def auto_login(token: str):
     resp.set_cookie(key="session_token", value=session_token, max_age=7 * 24 * 3600, httponly=True)
     return resp
 
-def send_teams_notification_to_url(webhook_url: str, title: str, message: str, link_url: str = "", link_text: str = "", sent_by: str = "", device_info: str = "", target_label: str = "custom"):
+def send_teams_notification_to_url(webhook_url: str, title: str, message: str, link_url: str = "", link_text: str = "", sent_by: str = "", device_info: str = "", target_label: str = "custom", file_url: str = "", file_name: str = ""):
     """webhook_url을 직접 지정해서 발송 (자유 채널용). teams_send_log에도 기록."""
     import httpx
     body_blocks = [
         {"type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": True},
         {"type": "TextBlock", "text": message, "wrap": True}
     ]
+    actions = []
     if link_url:
-        body_blocks.append({
-            "type": "ActionSet",
-            "actions": [{"type": "Action.OpenUrl", "title": link_text or "바로가기", "url": link_url}]
-        })
+        actions.append({"type": "Action.OpenUrl", "title": link_text or "바로가기", "url": link_url})
+    if file_url:
+        actions.append({"type": "Action.OpenUrl", "title": "📎 " + (file_name or "파일 다운로드"), "url": file_url})
+    if actions:
+        body_blocks.append({"type": "ActionSet", "actions": actions})
     payload = {
         "type": "message",
         "attachments": [{
@@ -2726,7 +2728,7 @@ def send_teams_notification_to_url(webhook_url: str, title: str, message: str, l
     conn.close()
     return success, detail
 
-def send_teams_notification(branch_code: str, title: str, message: str, link_url: str = "", link_text: str = "", sent_by: str = "", device_info: str = ""):
+def send_teams_notification(branch_code: str, title: str, message: str, link_url: str = "", link_text: str = "", sent_by: str = "", device_info: str = "", file_url: str = "", file_name: str = ""):
     """지정된 branch_code(또는 'master')의 Teams 웹훅으로 알림 발송 (Adaptive Card 형식, 링크 지원).
     웹훅 미등록 시 조용히 무시. 모든 시도를 teams_send_log에 기록.
     반환값: (성공여부: bool, 상세정보: str)"""
@@ -2749,13 +2751,13 @@ def send_teams_notification(branch_code: str, title: str, message: str, link_url
         {"type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": True},
         {"type": "TextBlock", "text": message, "wrap": True}
     ]
+    actions = []
     if link_url:
-        body_blocks.append({
-            "type": "ActionSet",
-            "actions": [
-                {"type": "Action.OpenUrl", "title": link_text or "바로가기", "url": link_url}
-            ]
-        })
+        actions.append({"type": "Action.OpenUrl", "title": link_text or "바로가기", "url": link_url})
+    if file_url:
+        actions.append({"type": "Action.OpenUrl", "title": "📎 " + (file_name or "파일 다운로드"), "url": file_url})
+    if actions:
+        body_blocks.append({"type": "ActionSet", "actions": actions})
 
     payload = {
         "type": "message",
@@ -12428,6 +12430,11 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         <textarea id="twMsgBody" placeholder="메시지 내용을 입력하세요" style="width:100%;min-height:100px;padding:10px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box;font-size:14px;"></textarea>
         <input type="text" id="twMsgLinkUrl" placeholder="링크 URL (선택)" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;box-sizing:border-box;">
         <input type="text" id="twMsgLinkText" placeholder="링크 버튼 텍스트 (선택)" style="width:100%;padding:10px;border:1px solid #ccc;border-radius:6px;margin-top:8px;box-sizing:border-box;">
+        <div style="margin-top:8px;">
+          <input type="file" id="twMsgFile" style="font-size:12px;" onchange="twFilePicked(this)">
+          <div id="twMsgFileName" style="display:none;font-size:12px;color:#2563eb;margin-top:4px;"></div>
+          <div style="font-size:11px;color:#999;margin-top:2px;">첨부 파일은 다운로드 링크로 발송됩니다 (4MB 이하, jpg/png/pdf/xlsx/hwp/zip 등)</div>
+        </div>
         <div style="display:flex;gap:8px;margin-top:16px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeMessageModal()">취소</button>
           <button class="btn" style="flex:1;" onclick="sendMessage()">보내기</button>
@@ -12510,12 +12517,26 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         row.style.display = (row.style.display === 'none') ? 'table-row' : 'none';
       }}
 
+      function twFilePicked(input) {{
+        var label = document.getElementById('twMsgFileName');
+        if (input.files.length > 0) {{
+          label.innerText = '📎 ' + input.files[0].name;
+          label.style.display = 'block';
+        }} else {{
+          label.style.display = 'none';
+          label.innerText = '';
+        }}
+      }}
+
       function closeMessageModal() {{
         document.getElementById('twMessageModal').style.display = 'none';
         document.getElementById('twMsgTitle').value = '';
         document.getElementById('twMsgBody').value = '';
         document.getElementById('twMsgLinkUrl').value = '';
         document.getElementById('twMsgLinkText').value = '';
+        document.getElementById('twMsgFile').value = '';
+        document.getElementById('twMsgFileName').style.display = 'none';
+        document.getElementById('twMsgFileName').innerText = '';
       }}
 
       async function sendMessage() {{
@@ -12525,9 +12546,20 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         const linkUrl = document.getElementById('twMsgLinkUrl').value.trim();
         const linkText = document.getElementById('twMsgLinkText').value.trim();
         if (!body) {{ alert('메시지 내용을 입력하세요.'); return; }}
+        let fileUrl = '', fileName = '';
+        const fileInput = document.getElementById('twMsgFile');
+        if (fileInput.files.length > 0) {{
+          const fd = new FormData();
+          fd.append('file', fileInput.files[0]);
+          const upRes = await fetch('/master/teams-webhook/upload-file', {{ method: 'POST', body: fd }});
+          const up = await upRes.json();
+          if (!upRes.ok) {{ alert('파일 업로드 실패: ' + (up.detail || '알 수 없는 오류')); return; }}
+          fileUrl = up.url;
+          fileName = up.name;
+        }}
         const res = await fetch('/master/teams-webhook/broadcast', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ branch_codes: targets, title: title, message: body, link_url: linkUrl, link_text: linkText }})
+          body: JSON.stringify({{ branch_codes: targets, title: title, message: body, link_url: linkUrl, link_text: linkText, file_url: fileUrl, file_name: fileName }})
         }});
         const result = await res.json();
         if (res.ok) {{
@@ -12836,6 +12868,107 @@ async def master_teams_webhook_save(request: Request, session_token: str = Cooki
     return JSONResponse(content={"status": "ok"})
 
 
+def _compress_image_for_teams_upload(raw: bytes, ext: str, filename: str):
+    """전송용 이미지 자동 압축. (bytes, ext, compressed 여부) 반환.
+    이미지가 아니거나 압축 효과가 없으면 원본을 그대로 반환한다."""
+    if ext not in ("jpg", "jpeg", "png", "webp"):
+        return raw, ext, False
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        had_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+        # 긴 변 2000px 초과 시 축소
+        w, h = img.size
+        if max(w, h) > 2000:
+            scale = 2000 / max(w, h)
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+        # 후보 포맷: jpg→JPEG, png(알파없음)→JPEG, png(알파)→PNG, webp→WebP
+        if ext in ("jpg", "jpeg") or (ext == "png" and not had_alpha):
+            candidates = [("JPEG", img.convert("RGB"), "jpg")]
+        elif ext == "png":
+            candidates = [("PNG", img, "png")]
+        else:
+            candidates = [("WEBP", img, "webp")]
+
+        for fmt, im, new_ext in candidates:
+            buf = io.BytesIO()
+            if fmt == "JPEG":
+                im.save(buf, format="JPEG", quality=80, optimize=True)
+            elif fmt == "WEBP":
+                im.save(buf, format="WEBP", quality=80)
+            else:
+                im.save(buf, format="PNG", optimize=True)
+            cand = buf.getvalue()
+            if len(cand) < len(raw):
+                return cand, new_ext, True
+        return raw, ext, False
+    except Exception:
+        return raw, ext, False
+
+
+@app.post("/master/teams-webhook/upload-file")
+async def master_teams_webhook_upload_file(request: Request, session_token: str = Cookie(default=None)):
+    """메시지 첨부용 파일을 Supabase Storage 공개 버킷에 업로드하고 공개 URL 반환.
+    Teams 웹훅은 실제 파일 첨부를 지원하지 않아 다운로드 링크 방식으로 제공한다."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    form = await request.form()
+    file = form.get("file")
+    if not file:
+        return JSONResponse(status_code=400, content={"detail": "파일이 없습니다."})
+
+    filename = getattr(file, "filename", "") or "file"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    allowed_ext = {"jpg", "jpeg", "png", "gif", "webp", "xlsx", "xls", "csv", "pdf",
+                   "hwp", "hwpx", "doc", "docx", "ppt", "pptx", "txt", "zip"}
+    if ext not in allowed_ext:
+        return JSONResponse(status_code=400, content={"detail": "지원하지 않는 파일 형식입니다. (" + ", ".join(sorted(allowed_ext)) + ")"})
+
+    raw = await file.read()
+    max_size = 4 * 1024 * 1024  # Vercel 요청 본문 제한(~4.5MB) 고려해 4MB
+    if len(raw) > max_size:
+        return JSONResponse(status_code=400, content={"detail": "파일 크기는 4MB 이하만 가능합니다."})
+
+    # 이미지 파일은 자동 압축 (jpg 재인코딩, png→jpg 변환 등)
+    raw, ext, compressed = _compress_image_for_teams_upload(raw, ext, filename)
+
+    import mimetypes
+    import uuid
+    content_type = mimetypes.guess_type("file." + ext)[0] or "application/octet-stream"
+    obj_name = f"teams-files/{uuid.uuid4().hex}.{ext}"
+
+    supabase_url = "https://fjznuesrbrwcqbdghegn.supabase.co"
+    service_role_key = os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", "")
+    if not service_role_key:
+        return JSONResponse(status_code=500, content={"detail": "서버 설정 오류: service_role 키가 없습니다."})
+
+    upload_url = f"{supabase_url}/storage/v1/object/survey-images/{obj_name}"
+    async with httpx.AsyncClient() as client:
+        resp = await client.put(
+            upload_url,
+            content=raw,
+            headers={
+                "Authorization": f"Bearer {service_role_key}",
+                "apikey": service_role_key,
+                "Content-Type": content_type,
+                "x-upsert": "true"
+            },
+            timeout=60.0
+        )
+    if resp.status_code not in (200, 201):
+        return JSONResponse(status_code=500, content={
+            "detail": f"파일 업로드 실패 (Supabase 응답 {resp.status_code}): {resp.text[:200]}"
+        })
+
+    public_url = f"{supabase_url}/storage/v1/object/public/survey-images/{obj_name}"
+    return JSONResponse(content={"status": "ok", "url": public_url, "name": filename, "compressed": compressed})
+
+
 @app.post("/master/teams-webhook/broadcast")
 async def master_teams_webhook_broadcast(request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -12848,6 +12981,11 @@ async def master_teams_webhook_broadcast(request: Request, session_token: str = 
     message = data.get("message", "").strip()
     link_url = data.get("link_url", "").strip()
     link_text = data.get("link_text", "").strip()
+    file_url = data.get("file_url", "").strip()
+    file_name = data.get("file_name", "").strip()
+
+    if file_url and not file_url.startswith("https://"):
+        return JSONResponse(status_code=400, content={"detail": "파일 URL 형식이 올바르지 않습니다."})
 
     if not branch_codes or not message:
         return JSONResponse(status_code=400, content={"detail": "대상 또는 메시지가 비어있습니다."})
@@ -12858,7 +12996,8 @@ async def master_teams_webhook_broadcast(request: Request, session_token: str = 
     fail_count = 0
     fail_details = []
     for bc in branch_codes:
-        ok, detail = send_teams_notification(bc, title, message, link_url, link_text, user["branch_code"], device_info)
+        ok, detail = send_teams_notification(bc, title, message, link_url, link_text, user["branch_code"], device_info,
+                                             file_url=file_url, file_name=file_name)
         if ok:
             success_count += 1
         else:
