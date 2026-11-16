@@ -2694,6 +2694,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("stock-group", None, "📦", "재고&발주", [
             ("재고현황", "/inventory"),
             ("발주내역", "/purchase-history"),
+            ("유비플러스 재고", raw_menu_href),
         ]),
         ("qr", "/qr", "📷", "QR생성", None),
         ("adjust", "/adjust", "✏️", "수기조정", None),
@@ -3970,8 +3971,8 @@ async def stock_closing_page(
                     f"<td>{_html.escape(str(d['item_name']))}</td>"
                     f"<td>{_fmt_num(d['ups_qty'])}</td>"
                     f"<td>{_fmt_num(d['counted_qty'])}</td>"
-                    f"<td style='font-weight:bold;color:{dcolor};'>{dsign}{d['diff_qty']}</td>"
-                    f"<td style='font-size:12px;'>{_html.escape(str(d['estimate']))}</td>"
+                    f"<td style='font-weight:bold;color:{dcolor};white-space:nowrap;'>{dsign}{d['diff_qty']}</td>"
+                    f"<td style='font-size:12px;white-space:normal!important;word-break:break-word;'>{_html.escape(str(d['estimate']))}</td>"
                     "</tr>"
                 )
             disc_html = (
@@ -3980,10 +3981,10 @@ async def stock_closing_page(
                 '<p style="font-size:11px;color:#888;margin:0 0 8px 0;">'
                 '당일 유비플러스 출고와 QR 출고 스캔을 시간순으로 비교한 추정입니다. '
                 '실제 원인과 다를 수 있습니다.</p>'
-                '<div class="table-scroll-wrap"><table data-colver="2026-11"><thead><tr>'
-                '<th style="width:10%">지점</th><th style="width:30%">상품명</th>'
-                '<th style="width:14%">유비플러스 재고수량</th><th style="width:10%">실사수량</th>'
-                '<th style="width:8%">오차</th><th style="width:28%">추정값</th>'
+                '<div class="table-scroll-wrap"><table data-colver="2026-11" style="table-layout:auto;min-width:0;"><thead><tr>'
+                '<th style="width:10%">지점</th><th style="width:26%">상품명</th>'
+                '<th style="width:13%">유비플러스 재고수량</th><th style="width:9%">실사수량</th>'
+                '<th style="width:8%">오차</th><th style="width:34%">추정값</th>'
                 '</tr></thead><tbody>' + disc_rows + '</tbody></table></div></div>'
             )
 
@@ -17005,6 +17006,8 @@ async def raw_upload_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
+    if user["role"] != "master":
+        return RedirectResponse(url="/raw-branch", status_code=303)
 
     conn = get_conn()
     raws = conn.execute(
@@ -17379,8 +17382,8 @@ async def purchase_order_product_settings_page(
       }}
 
       let currentExcItemName = '';
-      let currentMonthlyItems = [];   // [{name}] — 1개 또는 일괄
-      let currentEodItems = [];       // [{code,name}] — 1개 또는 일괄
+      let currentMonthlyItems = [];   // name 목록 — 1개 또는 일괄
+      let currentEodItems = [];       // code+name 목록 — 1개 또는 일괄
 
       function toggleExcAll(el, cls) {{
         document.querySelectorAll('.' + cls).forEach(cb => cb.checked = el.checked);
@@ -19179,8 +19182,8 @@ async def raw_upload_ajax(
     file: UploadFile = File(...)
 ):
     user = get_session(session_token)
-    if not user:
-        return {"success": 0, "skipped": 0, "errors": ["로그인이 필요합니다"]}
+    if not user or user["role"] != "master":
+        return {"success": 0, "skipped": 0, "errors": ["마스터 계정만 업로드할 수 있습니다"]}
     upload_result = await _process_raw_upload_master(file)
     _sync_item_names_by_code()
     return upload_result
@@ -24959,6 +24962,8 @@ async def raw_upload_clear(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
+    if user["role"] != "master":
+        return RedirectResponse(url="/raw-branch", status_code=303)
     conn = get_conn()
     conn.execute("DELETE FROM raw_inventory")
     conn.commit()
