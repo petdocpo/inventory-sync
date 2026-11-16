@@ -3719,13 +3719,22 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
 
 # ── 지점 재고 실사 (daily stocktake — 소모품 제외 전 품목, 거래처/품류 필터) ──
 
+# 거래처명 정규화 매핑 — 비어 있으면 원본 그대로 사용. "펫네스트"/"펫네스트(디자인주권)" 합치기 여부는
+# 운영 데이터 확인 후 여기 한 곳만 수정하면 된다 (기본: 합치지 않음).
+_DST_VENDOR_NAME_MAP = {}
+
+# 상품 DB상 "구매처 없음"을 의미하는 플레이스홀더 — 거래처 필터에서는 (미등록)으로 취급
+_DST_SUPPLIER_BLANK_VALUES = {"[삭제된구매처]"}
+
+
 def _daily_stocktake_pm_map() -> dict:
-    """item_code -> {supplier, category, consumable}. product_master는 지점별 중복 행이 있어 품번별로 집계."""
+    """item_code -> {supplier, category, consumable}. product_master는 지점별 중복 행이 있어 품번별로 집계.
+    is_consumable은 PostgreSQL(boolean)/SQLite(int) 공통으로 CASE 집계 (COALESCE(x,0)은 PG에서 타입 오류)."""
     conn = get_conn()
     try:
         rows = conn.execute(
             "SELECT item_code, "
-            "MAX(COALESCE(is_consumable, 0)) AS is_consumable, "
+            "MAX(CASE WHEN is_consumable THEN 1 ELSE 0 END) AS is_consumable, "
             "min(NULLIF(trim(COALESCE(supplier, '')), '')) AS supplier, "
             "min(NULLIF(trim(COALESCE(category, '')), '')) AS category "
             "FROM product_master "
@@ -3739,47 +3748,23 @@ def _daily_stocktake_pm_map() -> dict:
         conn.close()
     pm = {}
     for r in rows:
+        supplier = (r["supplier"] or "").strip()
+        if supplier in _DST_SUPPLIER_BLANK_VALUES:
+            supplier = ""
+        supplier = _DST_VENDOR_NAME_MAP.get(supplier, supplier)
         pm[str(r["item_code"])] = {
-            "supplier": r["supplier"] or "",
+            "supplier": supplier,
             "category": r["category"] or "",
             "consumable": bool(r["is_consumable"]),
         }
     return pm
 
 
-def _dst_vendor_fallback_map() -> dict:
-    """item_code -> 최근 발주 거래처 (product_master.supplier가 비었을 때의 2순위 출처)."""
-    conn = get_conn()
-    try:
-        rows = conn.execute(
-            "SELECT item_code, vendor FROM purchase_records "
-            "WHERE item_code IS NOT NULL AND item_code <> '' "
-            "AND vendor IS NOT NULL AND trim(vendor) <> '' "
-            "ORDER BY purchase_datetime DESC"
-        ).fetchall()
-    except Exception:
-        rows = []
-    finally:
-        conn.close()
-    m = {}
-    for r in rows:
-        code = str(r["item_code"])
-        if code not in m:
-            m[code] = str(r["vendor"]).strip()
-    return m
-
-
-def _dst_name_prefix_vendor(item_name) -> str:
-    """상품명 '[거래처] 상품명' 형식의 앞쪽 대괄호 값을 거래처로 사용 (3순위 출처)."""
-    import re as _re
-    m = _re.match(r"^\s*\[([^\]]+)\]", str(item_name or ""))
-    return m.group(1).strip() if m else ""
-
-
 def _daily_stocktake_items(branch_code: str):
     """지점의 소모품 제외 품목 + QR재고 + 유비플러스 재고 + 거래처/품류 (inventory 보유 품목만).
-    거래처 우선순위: product_master.supplier → purchase_records 최근 vendor → 상품명 [거래처] 접두사.
-    품류(category)는 product_master.category가 유일한 출처 (미입력 시 (미등록)).
+    거래처·품류·소모품은 상품 DB(product_master)만 사용 — purchase_records/상품명 접두사 대체 조회 없음.
+    소모품 판정: product_master.is_consumable (NULL→소모품 아님) + 품번 미등록 해시 코드('미지정_')는 소모품 간주.
+    품번에 pm 행이 없으면 소모품 아님으로 간주(단 '미지정_' 제외).
     반환: (items, excluded_count) — 제외 규칙: 빈 품번, 지점 목록에 없는 branch_code,
     UPS(raw)에 없고 qr_qty=0인 행, 소모품."""
     conn = get_conn()
@@ -3791,7 +3776,6 @@ def _daily_stocktake_items(branch_code: str):
     finally:
         conn.close()
     pm = _daily_stocktake_pm_map()
-    vendor_fb = _dst_vendor_fallback_map()
     raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in fetch_raw_inventory()}
     valid_codes = {str(b["branch_code"]) for b in get_branches(branch_type=None)}
     branch_valid = str(branch_code) in valid_codes
@@ -3800,6 +3784,10 @@ def _daily_stocktake_items(branch_code: str):
     for r in inv_rows:
         code = str(r["item_code"] or "").strip()
         if not code or not branch_valid:
+            excluded += 1
+            continue
+        if code.startswith("미지정_"):
+            # 유비플러스 원본에 품번이 없어 업로드 시 생성된 해시 코드 — 상품 DB에 없는 품목이라 소모품으로 간주해 제외
             excluded += 1
             continue
         info = pm.get(code) or {}
@@ -3812,11 +3800,10 @@ def _daily_stocktake_items(branch_code: str):
         if ups is None and qr_qty == 0:
             excluded += 1
             continue
-        supplier = info.get("supplier") or vendor_fb.get(code) or _dst_name_prefix_vendor(r["item_name"])
         items.append({
             "item_code": code,
             "item_name": r["item_name"],
-            "supplier": supplier,
+            "supplier": info.get("supplier", ""),
             "category": info.get("category", ""),
             "qr_qty": qr_qty,
             "ups": ups,
