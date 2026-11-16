@@ -13590,10 +13590,17 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
         exc_rows = conn.execute(
             "SELECT branch_code, item_code FROM eod_alert_exclusion"
         ).fetchall()
+        ss_rows = conn.execute(
+            "SELECT branch_name, item_name, qty, safety_qty FROM safety_stock"
+        ).fetchall()
     finally:
         conn.close()
 
     raw_map = {(r["branch_code"], r["item_code"]): (r["quantity"] or 0) for r in raw_rows}
+    ss_map = {}
+    for r in ss_rows:
+        v = r["qty"] or r["safety_qty"] or 0
+        ss_map[(r["branch_name"], r["item_name"])] = v
     pm_map = {r["item_code"]: r for r in pm_rows}
     exc_set = {(r["branch_code"], r["item_code"]) for r in exc_rows}
     b2c = {b["branch_name"]: b["branch_code"] for b in get_branches(branch_type='branch')}
@@ -13625,6 +13632,7 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
             "item_name": r["item_name"] or ic,
             "daily": round(daily, 2), "stock": stock,
             "need": round(need, 1), "shortage": round(shortage, 1),
+            "safety": ss_map.get((bn, r["item_name"]), 0),
             "depletion": depletion.isoformat(), "arrival": thu.isoformat(),
             "moq": moq, "suggest_qty": suggest,
         })
@@ -13657,7 +13665,7 @@ async def master_test_eod_alert(request: Request, session_token: str = Cookie(de
     sent_count = 0
     for bn, its in by_branch.items():
         preview = "\n".join(
-            f"- {it['item_name']} ({it['item_code']}): 현재 {it['stock']} / 필요 {it['need']} / 부족 {it['shortage']} → 권장 {it['suggest_qty']}"
+            f"- {it['item_name']} ({it['item_code']}): 현재 재고 {it['stock']}개 / 예상 소진량 {it['need']}개 / 안전재고 {it['safety']}개 → 권장 {it['suggest_qty']}"
             for it in its[:8]
         )
         more = f"\n...외 {len(its) - 8}건" if len(its) > 8 else ""
@@ -13762,7 +13770,7 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
 
         def _eod_body(bn_label, its, prefix=""):
             preview = "\n".join(
-                f"- {it['item_name']} ({it['item_code']}): 현재 {it['stock']} / 필요 {it['need']} / 부족 {it['shortage']} → 권장 {it['suggest_qty']}"
+                f"- {it['item_name']} ({it['item_code']}): 현재 재고 {it['stock']}개 / 예상 소진량 {it['need']}개 / 안전재고 {it['safety']}개 → 권장 {it['suggest_qty']}"
                 for it in its[:15]
             )
             more = f"\n...외 {len(its) - 15}건" if len(its) > 15 else ""
@@ -13782,7 +13790,7 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
                 lines.append(f"[{bn}] {len(its)}건")
                 for it in its[:10]:
                     lines.append(
-                        f"  - {it['item_name']} ({it['item_code']}): 현재 {it['stock']} / 필요 {it['need']} / 부족 {it['shortage']} → 권장 {it['suggest_qty']}"
+                        f"  - {it['item_name']} ({it['item_code']}): 현재 {it['stock']}개 / 예상 소진 {it['need']}개 / 안전재고 {it['safety']}개 → 권장 {it['suggest_qty']}"
                     )
             body = (
                 "[테스트 모드] 실제 지점 채널에는 발송되지 않습니다.\n"
