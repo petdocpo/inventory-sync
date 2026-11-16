@@ -3954,10 +3954,8 @@ async def daily_stocktake_page(
         return f'<td class="dst-diff" style="font-weight:bold;color:{color};">{txt}</td>'
 
     rows_html = ""
-    shown_codes = set()
     for it in filtered_items:
         code = it["item_code"]
-        shown_codes.add(code)
         line = line_map.get(code)
         if line is not None:
             # 저장된 라인: 스냅샷 값 + 저장된 실사 수량
@@ -3996,8 +3994,10 @@ async def daily_stocktake_page(
         )
 
     # 저장됐지만 현재 inventory에 없는 품목 (삭제/미등록) — 읽기 전용으로 표시
+    # 필터로 숨겨진 품목까지 '삭제된 품목'으로 붙지 않도록 필터 적용 전 전체 대상(items) 기준으로 판정
+    eligible_codes = {it["item_code"] for it in items}
     for code, line in line_map.items():
-        if code in shown_codes:
+        if code in eligible_codes:
             continue
         rows_html += (
             "<tr style=\"background:#F9FAFB;color:#888;\">"

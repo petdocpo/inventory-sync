@@ -4,8 +4,6 @@
 -- 매핑: 장례용품 CSAS01-000155,156→유골함 / CSST01-000047→스톤함 / 스톤제작→스톤함 / 요람장→요람
 --       기억머문담(광주)→기억머문담 / 그 외(소모품·비품·서비스류 등)→기타
 -- 주의: 실행 전 product_master_backup 생성 권장. 품번에 여러 행(지점별)이 있어도 같은 값으로 갱신됨.
-BEGIN;
-
 UPDATE product_master pm
 SET category = v.cat
 FROM (VALUES
@@ -197,5 +195,3 @@ FROM (VALUES
 ) AS v(code, cat)
 WHERE pm.item_code = v.code;
 
--- 결과 확인 후 이상 없으면 COMMIT, 이상하면 ROLLBACK
-COMMIT;
