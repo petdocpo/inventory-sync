@@ -3120,6 +3120,12 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
               dirty = false;
               try {{ handle.setPointerCapture(e.pointerId); }} catch (err) {{}}
             }});
+            // 정렬 가능한 헤더(th onclick)와 충돌 방지: 핸들 클릭/드래그 후 발생하는
+            // click 이벤트가 th로 버블링되어 정렬(페이지 리로드)을 일으키지 않도록 차단
+            handle.addEventListener('click', function(e) {{
+              e.preventDefault();
+              e.stopPropagation();
+            }});
             handle.addEventListener('pointermove', function(e) {{
               if (!drag || drag.idx !== idx || !widths) return;
               var next = colDragWidths(widths, idx, e.clientX - drag.x0, mins);
@@ -3670,6 +3676,7 @@ def _sc_discrepancy_analysis(branch_code: str, sel_date, lines: list) -> list:
 
         out.append({
             "branch_code": l["branch_code"],
+            "item_code": code,
             "item_name": l["item_name"] or "",
             "ups_qty": l["ups_qty"],
             "counted_qty": l["counted_qty"],
@@ -3770,17 +3777,6 @@ async def stock_closing_page(
                 "SELECT * FROM stock_closing_lines WHERE save_id=? ORDER BY item_code",
                 (save["id"],)
             ).fetchall()
-        scan_last = conn.execute(
-            "SELECT MAX(scanned_at) as t FROM scan_log WHERE branch_code=?",
-            (target_branch,)
-        ).fetchone()
-        raw_last = conn.execute(
-            "SELECT MAX(uploaded_at) as t FROM raw_inventory WHERE branch_code=?",
-            (target_branch,)
-        ).fetchone()
-    else:
-        scan_last = conn.execute("SELECT MAX(scanned_at) as t FROM scan_log").fetchone()
-        raw_last = conn.execute("SELECT MAX(uploaded_at) as t FROM raw_inventory").fetchone()
     conn.close()
 
     save_status = ((save["status"] or "draft") if save else "")
@@ -3802,17 +3798,6 @@ async def stock_closing_page(
             draft_reasons = {l["item_code"]: (l["reason"] or "") for l in snap_lines}
         except Exception:
             draft_reasons = {}
-
-    def _fmt_kst(v):
-        if not v:
-            return "기록 없음"
-        try:
-            d = _dt.fromisoformat(str(v).replace("Z", "+00:00"))
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=_tz.utc)
-            return d.astimezone(kst).strftime("%m/%d %H:%M")
-        except Exception:
-            return str(v)[:16]
 
     def _fmt_num(v):
         return "-" if v is None else str(v)
@@ -3917,26 +3902,28 @@ async def stock_closing_page(
         "</div></form>"
     )
 
+    # 상단 메타 정보 — 필터 아래, 테이블 위에 표시 (기존 QR/RW 마지막 스캔 카드 대체)
+    meta_lines = [
+        f"{sel_date_str} (00시~24시) QR 스캔 기준",
+        "금일 출고 수량 = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − 유비플러스 재고",
+    ]
+    if view_mode in ("live", "past_live") and items:
+        basis_text = ", ".join(sorted({it["basis_label"] for it in items}))
+        meta_lines.append("QR 재고·유비플러스 재고 기준: " + basis_text)
+    if view_mode == "live":
+        meta_lines.append(f"마감 가능 기간: {sel_date_str} ~ {window_end_str}")
     cards_html = (
-        '<div style="display:flex;gap:8px;margin-bottom:16px;">'
-        '<div class="card" style="flex:1;text-align:center;margin-bottom:0;">'
-        '<div style="font-size:11px;color:#888;">QR 마지막 스캔</div>'
-        f'<div style="font-size:13px;font-weight:bold;">{_fmt_kst(scan_last["t"] if scan_last else None)}</div></div>'
-        '<div class="card" style="flex:1;text-align:center;margin-bottom:0;">'
-        '<div style="font-size:11px;color:#888;">RAW 마지막 확인</div>'
-        f'<div style="font-size:13px;font-weight:bold;">{_fmt_kst(raw_last["t"] if raw_last else None)}</div></div>'
-        "</div>"
+        '<div class="card" style="margin-bottom:16px;padding:10px 14px;">'
+        + "".join(
+            f'<div style="font-size:12px;color:#475569;line-height:1.7;">{_html.escape(ln)}</div>'
+            for ln in meta_lines
+        )
+        + "</div>"
     )
 
     # 상태 안내 문구
     notice_style = 'class="card" style="font-size:12px;margin-bottom:12px;'
     notices_html = ""
-    if view_mode in ("live", "past_live") and items:
-        basis_text = ", ".join(sorted({it["basis_label"] for it in items}))
-        notices_html += (
-            f'<div {notice_style}color:#475569;background:#F8FAFC;">'
-            "QR 재고·유비플러스 재고 기준: " + basis_text + "</div>"
-        )
     if view_mode == "closed":
         _sc_reason = ""
         try:
@@ -3953,10 +3940,6 @@ async def stock_closing_page(
             + _sc_reason_html + "</div>"
         )
     elif view_mode == "live":
-        notices_html += (
-            f'<div {notice_style}color:#475569;background:#F8FAFC;">'
-            f'마감 가능 기간: {sel_date_str} ~ {window_end_str}</div>'
-        )
         if save:
             _sc_draft_reason = ""
             try:
@@ -4106,7 +4089,7 @@ async def stock_closing_page(
             return;
           }
           if (noReason > 0) {
-            alert('오차가 있는 품목 ' + noReason + '개의 사유가 입력되지 않았습니다.\\n표의 \'사유\' 칸에 입력한 뒤 마감해주세요.');
+            alert("오차가 있는 품목 " + noReason + "개의 사유가 입력되지 않았습니다.\\n표의 '사유' 칸에 입력한 뒤 마감해주세요.");
             return;
           }
           if (!confirm('마감 후에는 수정할 수 없습니다.\\n입력한 내용을 확인했다면 [확인]을 눌러 마감해주세요.')) {
@@ -4143,9 +4126,6 @@ async def stock_closing_page(
     content = (
         '<h2 style="margin:0 0 8px 0;">📦 재고 마감</h2>'
         + _sc_closer_box(view_mode, save, can_write)
-        + f'<p style="color:#888;font-size:13px;margin-bottom:4px;">{sel_date_str} (00시~24시) QR 스캔 기준</p>'
-        '<p style="color:#888;font-size:12px;margin-bottom:16px;">'
-        "금일 출고 수량 = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − 유비플러스 재고</p>"
         + filter_html
         + cards_html
         + notices_html
@@ -26421,7 +26401,7 @@ SAFETY_COMPARE_CSS = """
 .sc-wrap { overflow-x: auto; }
 .sc-table { border-collapse: collapse !important; width: 100%; table-layout: auto !important; font-size: 13px; color: #1F2937 !important; background: #FFFFFF !important; }
 .sc-table th, .sc-table td { border: 1px solid #CBD5E1 !important; padding: 6px 10px !important; text-align: left; white-space: nowrap !important; width: auto !important; min-width: 0 !important; max-width: none !important; overflow: visible !important; text-overflow: clip !important; }
-.sc-table th { background: #1E2761 !important; color: #FFFFFF !important; font-weight: bold; resize: none !important; position: static !important; }
+.sc-table th { background: #1E2761 !important; color: #FFFFFF !important; font-weight: bold; resize: none !important; position: relative !important; }
 .sc-table td { background: #FFFFFF !important; color: #1F2937 !important; }
 .sc-table tbody tr:nth-child(even) td { background: #F8FAFC !important; }
 .sc-num { text-align: right !important; }
