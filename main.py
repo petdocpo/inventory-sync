@@ -44,6 +44,7 @@ NOTIFICATION_TYPES = {
     "purchase_new":        {"label": "발주내역 알림",         "desc": "새 발주 등록 시"},
     "restock_missing":     {"label": "미입고 알림",           "desc": "(준비 중)"},
     "safety_stock_change": {"label": "안전재고 변경 알림",     "desc": "(준비 중)"},
+    "eod_alert":           {"label": "긴급발주 알림",         "desc": "목요일 도착 전 수요일 소진 예상 시"},
 }
 
 TEAMS_ALERT_TYPES = {
@@ -75,6 +76,16 @@ TEAMS_ALERT_TYPES = {
         "test_js_func": "testPurchaseNew",
         "on_desc": "10분마다 신규 발주 검사 후 Teams 발송",
         "off_desc": "Teams 발송 안 함 (웹푸시는 별개로 계속 동작)",
+        "default_enabled": False,
+    },
+    "eod_alert": {
+        "label": "긴급발주 알림",
+        "toggle_key": "eod_alert_enabled",
+        "toggle_route": "/master/toggle-eod-alert",
+        "test_route": "/master/teams-webhook/test-eod-alert",
+        "test_js_func": "testEodAlert",
+        "on_desc": "매일 계산 후 수요일 전 소진 예상 지점에 Teams 발송",
+        "off_desc": "발송 안 함",
         "default_enabled": False,
     },
 }
@@ -2123,6 +2134,18 @@ def init_db():
             last_updated TEXT,
             action TEXT,
             detail TEXT
+        )
+    """)
+
+    # 긴급발주 알럿 지점×품번 제외 목록 (상품설정 '긴급발주 제외'에서 관리)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS eod_alert_exclusion (
+            {pk},
+            branch_code TEXT NOT NULL,
+            item_code TEXT NOT NULL,
+            item_name TEXT,
+            created_at TEXT,
+            UNIQUE(branch_code, item_code)
         )
     """)
 
@@ -13532,6 +13555,273 @@ async def cron_check_new_purchase(authorization: str = Header(default="")):
         report_cron_failure("check-new-purchase", err_msg)
         return JSONResponse(status_code=500, content={"detail": err_msg})
 
+def _eod_alert_candidates(lookback_days: int = 56) -> dict:
+    """긴급발주 알럿 대상 계산 — 화요일 발주→목요일 도착 주기 기준, 수요일 전 소진 예상 지점×품번.
+    안전재고 무관: 현재고(raw_inventory) < 일평균판매×도착까지일수 이면 대상.
+    제외: product_master 미등록/소모품/전체미발주, 판매 0, eod_alert_exclusion 등록 건.
+    반환: {"today","arrival","days_left","items":[{branch_name,branch_code,item_code,item_name,daily,stock,need,shortage,depletion,suggest_qty,moq}]}
+    """
+    import math
+    from datetime import date, timedelta
+
+    today = date.today()
+    thu = today + timedelta(days=(3 - today.weekday()) % 7)  # 이번주 목요일
+    if thu <= today:
+        thu += timedelta(days=7)  # 이미 지났으면 다음주 목요일
+    days_left = (thu - today).days
+    start = today - timedelta(days=lookback_days)
+
+    conn = get_conn()
+    try:
+        sales_rows = conn.execute("""
+            SELECT branch_name, item_code, MAX(item_name) AS item_name, SUM(quantity) AS qty
+            FROM sales_records
+            WHERE sale_date >= ? AND sale_date < ? AND item_code IS NOT NULL AND item_code <> ''
+            GROUP BY branch_name, item_code
+        """, (start.isoformat(), today.isoformat())).fetchall()
+        raw_rows = conn.execute(
+            "SELECT branch_code, item_code, quantity FROM raw_inventory"
+        ).fetchall()
+        pm_rows = conn.execute("""
+            SELECT DISTINCT ON (item_code) item_code, moq, is_consumable, order_excluded
+            FROM product_master WHERE item_code IS NOT NULL AND item_code <> ''
+            ORDER BY item_code, id
+        """).fetchall()
+        exc_rows = conn.execute(
+            "SELECT branch_code, item_code FROM eod_alert_exclusion"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    raw_map = {(r["branch_code"], r["item_code"]): (r["quantity"] or 0) for r in raw_rows}
+    pm_map = {r["item_code"]: r for r in pm_rows}
+    exc_set = {(r["branch_code"], r["item_code"]) for r in exc_rows}
+    b2c = {b["branch_name"]: b["branch_code"] for b in get_branches(branch_type='branch')}
+
+    items = []
+    for r in sales_rows:
+        bn, ic = r["branch_name"], r["item_code"]
+        bc = b2c.get(bn)
+        if not bc:
+            continue
+        pm = pm_map.get(ic)
+        if not pm or pm["is_consumable"] or pm["order_excluded"]:
+            continue
+        daily = (r["qty"] or 0) / float(lookback_days)
+        if daily <= 0:
+            continue
+        stock = raw_map.get((bc, ic), 0) or 0
+        need = daily * days_left
+        if stock >= need:
+            continue
+        if (bc, ic) in exc_set:
+            continue
+        shortage = need - stock
+        moq = pm["moq"] or 1
+        suggest = math.ceil(shortage / moq) * moq if shortage > 0 else 0
+        depletion = today if stock <= 0 else today + timedelta(days=math.ceil(stock / daily))
+        items.append({
+            "branch_name": bn, "branch_code": bc, "item_code": ic,
+            "item_name": r["item_name"] or ic,
+            "daily": round(daily, 2), "stock": stock,
+            "need": round(need, 1), "shortage": round(shortage, 1),
+            "depletion": depletion.isoformat(), "arrival": thu.isoformat(),
+            "moq": moq, "suggest_qty": suggest,
+        })
+
+    items.sort(key=lambda x: (x["branch_name"], -x["daily"]))
+    return {
+        "today": today.isoformat(), "arrival": thu.isoformat(),
+        "days_left": days_left, "lookback_days": lookback_days,
+        "items": items,
+    }
+
+
+@app.post("/master/teams-webhook/test-eod-alert")
+async def master_test_eod_alert(request: Request, session_token: str = Cookie(default=None)):
+    """긴급발주 알럿 테스트 발송 — 실제 계산 결과를 선택 채널로만 전송."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    data = await request.json()
+    target_branch_code = data.get("branch_code", "").strip()
+    if not target_branch_code:
+        return JSONResponse(status_code=400, content={"detail": "테스트 대상 채널 코드가 필요합니다."})
+
+    result = _eod_alert_candidates()
+    by_branch: Dict[str, list] = {}
+    for it in result["items"]:
+        by_branch.setdefault(it["branch_name"], []).append(it)
+
+    sent_count = 0
+    for bn, its in by_branch.items():
+        preview = "\n".join(
+            f"- {it['item_name']} ({it['item_code']}): 현재 {it['stock']} / 필요 {it['need']} / 부족 {it['shortage']} → 권장 {it['suggest_qty']}"
+            for it in its[:8]
+        )
+        more = f"\n...외 {len(its) - 8}건" if len(its) > 8 else ""
+        title = f"🧪[테스트] 긴급발주 알림 ({bn})"
+        body = (
+            f"[테스트] 실제 대상 지점: {bn}\n"
+            f"기준일 {result['today']} / 도착 예정 {result['arrival']} (D-{result['days_left']}일)\n"
+            f"수요일 전 소진 예상 {len(its)}건\n{preview}{more}"
+        )
+        send_teams_notification(target_branch_code, title, body, sent_by=f"test_by_{user['login_id']}")
+        sent_count += 1
+
+    return JSONResponse(content={
+        "success": True,
+        "item_count": len(result["items"]),
+        "branch_count": sent_count,
+        "arrival": result["arrival"],
+    })
+
+
+@app.post("/master/toggle-eod-alert")
+async def master_toggle_eod_alert(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='eod_alert_enabled'"
+    ).fetchone()
+    current = (row["value"] == "true") if row else False
+    new_value = "false" if current else "true"
+
+    if row:
+        conn.execute(
+            "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='eod_alert_enabled'",
+            (new_value,)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO system_settings (key, value) VALUES ('eod_alert_enabled', ?)",
+            (new_value,)
+        )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/master/notification-settings", status_code=303)
+
+
+@app.post("/master/toggle-eod-alert-test")
+async def master_toggle_eod_alert_test(session_token: str = Cookie(default=None)):
+    """긴급발주 알림 테스트 모드 — ON이면 크론 발송이 지점 채널 대신 테스트 채널로 감."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='eod_alert_test_enabled'"
+    ).fetchone()
+    current = (row["value"] == "true") if row else False
+    new_value = "false" if current else "true"
+
+    if row:
+        conn.execute(
+            "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='eod_alert_test_enabled'",
+            (new_value,)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO system_settings (key, value) VALUES ('eod_alert_test_enabled', ?)",
+            (new_value,)
+        )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/master/notification-settings", status_code=303)
+
+
+@app.get("/api/cron/send-eod-alert")
+async def cron_send_eod_alert(authorization: str = Header(default="")):
+    """긴급발주 알럿 일일 발송 (cron-job.org 매일 10:00 호출).
+    eod_alert_enabled='true' 일 때만 동작. 지점별 Teams 채널로 지점×품번 목록 발송."""
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    if authorization != expected:
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    try:
+        conn = get_conn()
+        enabled_row = conn.execute(
+            "SELECT value FROM system_settings WHERE key='eod_alert_enabled'"
+        ).fetchone()
+        test_row = conn.execute(
+            "SELECT value FROM system_settings WHERE key='eod_alert_test_enabled'"
+        ).fetchone()
+        conn.close()
+        if not enabled_row or enabled_row["value"] != "true":
+            return JSONResponse(content={"skipped": True, "reason": "eod_alert_enabled off"})
+        test_mode = bool(test_row and test_row["value"] == "true")
+
+        result = _eod_alert_candidates()
+        if not result["items"]:
+            return JSONResponse(content={"item_count": 0, "sent_count": 0})
+
+        def _eod_body(bn_label, its, prefix=""):
+            preview = "\n".join(
+                f"- {it['item_name']} ({it['item_code']}): 현재 {it['stock']} / 필요 {it['need']} / 부족 {it['shortage']} → 권장 {it['suggest_qty']}"
+                for it in its[:15]
+            )
+            more = f"\n...외 {len(its) - 15}건" if len(its) > 15 else ""
+            return (
+                f"{prefix}{bn_label} — 목요일 도착 전 소진 예상 {len(its)}건\n"
+                f"기준일 {result['today']} / 도착 예정 {result['arrival']} (D-{result['days_left']}일)\n"
+                f"{preview}{more}\n\n※ 정기 발주 마감 전 확인 부탁드립니다."
+            )
+
+        # 테스트 모드: 전체 대상을 테스트 채널 1곳으로만 발송
+        if test_mode:
+            by_branch_all: Dict[str, list] = {}
+            for it in result["items"]:
+                by_branch_all.setdefault(it["branch_name"], []).append(it)
+            lines = []
+            for bn, its in by_branch_all.items():
+                lines.append(f"[{bn}] {len(its)}건")
+                for it in its[:10]:
+                    lines.append(
+                        f"  - {it['item_name']} ({it['item_code']}): 현재 {it['stock']} / 필요 {it['need']} / 부족 {it['shortage']} → 권장 {it['suggest_qty']}"
+                    )
+            body = (
+                "[테스트 모드] 실제 지점 채널에는 발송되지 않습니다.\n"
+                f"전체 {len(result['items'])}건 / {len(by_branch_all)}개 지점\n"
+                f"기준일 {result['today']} / 도착 예정 {result['arrival']} (D-{result['days_left']}일)\n\n"
+                + "\n".join(lines[:200])
+            )
+            send_teams_notification(
+                STOCK_CLOSING_TEST_BRANCH_CODE, "🧪[테스트] 🚨 긴급발주 알림", body,
+                sent_by="system_cron_eod_alert_test"
+            )
+            return JSONResponse(content={
+                "item_count": len(result["items"]), "sent_count": 1, "test_mode": True,
+            })
+
+        by_branch: Dict[str, list] = {}
+        for it in result["items"]:
+            by_branch.setdefault(it["branch_code"], []).append(it)
+
+        sent_count = 0
+        for bc, its in by_branch.items():
+            bn = its[0]["branch_name"]
+            send_teams_notification(
+                bc, "🚨 긴급발주 알림", _eod_body(bn, its),
+                sent_by="system_cron_eod_alert"
+            )
+            sent_count += 1
+
+        return JSONResponse(content={
+            "item_count": len(result["items"]),
+            "sent_count": sent_count,
+            "arrival": result["arrival"],
+        })
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure("send-eod-alert", err_msg)
+        return JSONResponse(status_code=500, content={"detail": err_msg})
+
+
 @app.post("/master/teams-webhook/test-unsubmitted-reminder")
 async def master_test_unsubmitted_reminder(request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -13782,34 +14072,176 @@ async def master_notification_settings_page(session_token: str = Cookie(default=
     if not has_menu_permission(user["login_id"], "notification-settings"):
         return RedirectResponse(url="/master", status_code=303)
 
-    toggle_cards_html = ""
-    for alert_key, alert_info in TEAMS_ALERT_TYPES.items():
+    # ── 알림 설정 아코디언: 그룹별 온오프 토글 ──
+    def _ns_json_row(label, desc, enabled, url, key):
+        return f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #f0f0f0;gap:8px;">
+          <div style="min-width:0;">
+            <div style="font-size:13px;font-weight:600;">{label}</div>
+            <div style="font-size:11px;color:#888;">{desc}</div>
+          </div>
+          <label class="ns-toggle" data-url="{url}" data-key="{key}" data-enabled="{'1' if enabled else '0'}"
+                 style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0;cursor:pointer;">
+            <input type="checkbox" class="ns-toggle-input" {'checked' if enabled else ''}
+                   style="opacity:0;width:0;height:0;position:absolute;">
+            <span class="ns-toggle-track" style="position:absolute;pointer-events:none;top:0;left:0;right:0;bottom:0;background:{'#1E2761' if enabled else '#ccc'};border-radius:24px;transition:0.2s;">
+              <span class="ns-toggle-knob" style="position:absolute;height:18px;width:18px;left:{'23px' if enabled else '3px'};top:3px;background:white;border-radius:50%;transition:0.2s;"></span>
+            </span>
+          </label>
+        </div>"""
+
+    def _ns_form_row(label, desc, enabled, route):
+        btn = "끄기" if enabled else "켜기"
+        return f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid #f0f0f0;gap:8px;">
+          <div style="min-width:0;">
+            <div style="font-size:13px;font-weight:600;">{label}</div>
+            <div style="font-size:11px;color:#888;">{desc}</div>
+          </div>
+          <form method="post" action="{route}" style="margin:0;flex-shrink:0;">
+            <button type="submit" class="btn" style="font-size:12px;padding:6px 14px;">{btn}</button>
+          </form>
+        </div>"""
+
+    def _ns_section(title, icon, rows_html, default_open=False):
+        on_cnt = rows_html.count("checked") if default_open else 0
+        return f"""
+        <div class="card" style="padding:0;overflow:hidden;margin-bottom:12px;">
+          <div class="ns-acc-head" style="display:flex;justify-content:space-between;align-items:center;padding:14px 16px;cursor:pointer;user-select:none;">
+            <div style="font-weight:bold;font-size:14px;">{icon} {title}</div>
+            <span class="ns-acc-arrow" style="color:#888;transition:transform .2s;">{'▼' if default_open else '▶'}</span>
+          </div>
+          <div class="ns-acc-body" style="display:{'block' if default_open else 'none'};padding:0 16px 8px 16px;">
+            {rows_html}
+          </div>
+        </div>"""
+
+    # 그룹1: 매출 마감 (JSON 토글)
+    sales_rows = ""
+    for key, label, desc in [
+        ("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점"),
+        ("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치 — 테스트 채널·메일 + 지점 채널"),
+        ("branch", "지점 발송", "'알림' 체크가 켜진 지점의 팀즈 채널로 발송"),
+        ("test", "테스트 발송", "테스트 채널·테스트 메일로 발송"),
+    ]:
+        sales_rows += _ns_json_row(label, desc, _cl_setting_on("closing_notify_" + key), "/closing/notify-toggle", key)
+
+    # 그룹2: 재고 마감 (JSON 토글)
+    stockclose_rows = ""
+    for key, label, desc in [
+        ("branch", "지점 발송", "'알림' 체크가 켜진 지점의 팀즈 채널로 발송"),
+        ("test", "테스트 발송", "테스트 채널로 발송"),
+        ("mismatch", "불일치 발송", "마감 불일치 지점 + 테스트 채널·메일"),
+    ]:
+        stockclose_rows += _ns_json_row("[재고] " + label, desc, _sc_setting_on("stock_closing_notify_" + key), "/stock-closing/notify-toggle", key)
+
+    # 그룹3: 긴급발주 알림 (TEAMS 폼 토글, 단독 섹션)
+    def _ns_teams_enabled(alert_key):
+        info = TEAMS_ALERT_TYPES[alert_key]
         conn = get_conn()
         row = conn.execute(
-            "SELECT value FROM system_settings WHERE key=?", (alert_info["toggle_key"],)
+            "SELECT value FROM system_settings WHERE key=?", (info["toggle_key"],)
         ).fetchone()
         conn.close()
-        is_enabled = (row["value"] == "true") if row else alert_info["default_enabled"]
-        status_text = f"🟢 켜짐 ({alert_info['on_desc']})" if is_enabled else f"🔴 꺼짐 ({alert_info['off_desc']})"
-        btn_label = "끄기" if is_enabled else "켜기"
-        toggle_cards_html += f"""
-        <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
-          <div>
-            <div style="font-weight:bold;margin-bottom:4px;">{alert_info['label']}</div>
-            <div style="font-size:13px;color:#888;">{status_text}</div>
-          </div>
-          <form method="post" action="{alert_info['toggle_route']}" style="margin:0;">
-            <button type="submit" class="btn" style="font-size:13px;padding:8px 16px;">{btn_label}</button>
-          </form>
-        </div>
-        """
+        return info, (row["value"] == "true") if row else info["default_enabled"]
+
+    eod_info, eod_on = _ns_teams_enabled("eod_alert")
+    eod_rows = _ns_form_row(eod_info["label"], eod_info["on_desc"] if eod_on else eod_info["off_desc"], eod_on, eod_info["toggle_route"])
+
+    conn = get_conn()
+    eod_test_row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='eod_alert_test_enabled'"
+    ).fetchone()
+    conn.close()
+    eod_test_on = (eod_test_row["value"] == "true") if eod_test_row else False
+    eod_rows += _ns_form_row(
+        "테스트 모드", f"켜면 매일 발송이 지점 채널 대신 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로 갑니다",
+        eod_test_on, "/master/toggle-eod-alert-test"
+    )
+    eod_rows += f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;gap:8px;">
+      <div style="min-width:0;">
+        <div style="font-size:13px;font-weight:600;">지금 테스트 발송</div>
+        <div style="font-size:11px;color:#888;">현재 계산 결과를 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로 즉시 발송 (지점 채널 무관)</div>
+      </div>
+      <button type="button" class="btn" id="nsEodTestBtn" style="font-size:12px;padding:6px 14px;background:#F97316;flex-shrink:0;" onclick="nsTestEodAlert(this)">발송</button>
+    </div>"""
+
+    # 그룹4: 발주·재고 알림 (TEAMS 폼 토글)
+    stock_rows = ""
+    for alert_key in ("purchase_new_teams", "qr_raw_mismatch_teams"):
+        info, is_enabled = _ns_teams_enabled(alert_key)
+        stock_rows += _ns_form_row(info["label"], info["on_desc"] if is_enabled else info["off_desc"], is_enabled, info["toggle_route"])
+
+    # 그룹5: 기타
+    info, is_enabled = _ns_teams_enabled("unsubmitted_reminder")
+    misc_rows = _ns_form_row(info["label"], info["on_desc"] if is_enabled else info["off_desc"], is_enabled, info["toggle_route"])
 
     content = f"""
     <h2 style="margin-bottom:16px;">⏰ 알림 설정</h2>
-    {toggle_cards_html}
+    {_ns_section("매출 마감 알림", "🧾", sales_rows)}
+    {_ns_section("재고 마감 알림", "📊", stockclose_rows)}
+    {_ns_section("긴급발주 알림", "🚨", eod_rows)}
+    {_ns_section("발주·재고 알림", "📦", stock_rows)}
+    {_ns_section("기타 알림", "🔔", misc_rows)}
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <p style="font-size:13px;color:#1E40AF;">이 설정은 <a href="/master/teams-webhook">팀즈웹훅 관리</a> 페이지의 토글과 동일하게 연동됩니다.</p>
+      <p style="font-size:13px;color:#1E40AF;margin:0;">이 설정은 <a href="/master/teams-webhook">팀즈웹훅 관리</a> 페이지의 토글과 동일하게 연동됩니다. 긴급발주 알림 테스트는 팀즈웹훅 관리의 '알림 테스트 발송'에서 가능합니다.</p>
     </div>
+    <script>
+      document.querySelectorAll('.ns-acc-head').forEach(function(h) {{
+        h.addEventListener('click', function() {{
+          var body = h.nextElementSibling;
+          var arrow = h.querySelector('.ns-acc-arrow');
+          var open = body.style.display !== 'none';
+          body.style.display = open ? 'none' : 'block';
+          arrow.textContent = open ? '▶' : '▼';
+        }});
+      }});
+      document.querySelectorAll('.ns-toggle').forEach(function(lbl) {{
+        lbl.addEventListener('click', async function() {{
+          var input = lbl.querySelector('.ns-toggle-input');
+          var track = lbl.querySelector('.ns-toggle-track');
+          var knob = lbl.querySelector('.ns-toggle-knob');
+          var next = !input.checked;
+          input.checked = next;
+          track.style.background = next ? '#1E2761' : '#ccc';
+          knob.style.left = next ? '23px' : '3px';
+          var res = await fetch(lbl.dataset.url, {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ key: lbl.dataset.key, enabled: next }})
+          }});
+          if (res.ok) {{ location.reload(); }} else {{
+            input.checked = !next;
+            track.style.background = next ? '#ccc' : '#1E2761';
+            knob.style.left = next ? '3px' : '23px';
+            var d = await res.json().catch(function() {{ return {{}}; }});
+            alert(d.detail || '저장 실패');
+          }}
+        }});
+      }});
+      window.nsTestEodAlert = async function(btn) {{
+        btn.disabled = true;
+        var orig = btn.innerText;
+        btn.innerText = '발송 중...';
+        try {{
+          var res = await fetch('/master/teams-webhook/test-eod-alert', {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ branch_code: '{STOCK_CLOSING_TEST_BRANCH_CODE}' }})
+          }});
+          var result = await res.json();
+          if (res.ok) {{
+            alert('테스트 발송 완료! 대상 ' + result.item_count + '건(' + result.branch_count + '개 지점) 미리보기 발송\\n도착 예정 ' + result.arrival);
+          }} else {{
+            alert('오류: ' + (result.detail || '발송 실패'));
+          }}
+        }} catch (e) {{
+          alert('오류: ' + e.message);
+        }} finally {{
+          btn.disabled = false;
+          btn.innerText = orig;
+        }}
+      }};
+    </script>
     """
     return HTMLResponse(content=render_page(content, user, "notif-settings"))
 
@@ -14223,6 +14655,21 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         const result = await res.json();
         if (res.ok) {{
           alert('테스트 발송 완료! 최근 발주 ' + result.purchase_count + '건 미리보기 발송\\nTeams 채널을 확인하세요.');
+        }} else {{
+          alert('오류: ' + (result.detail || '발송 실패'));
+        }}
+      }}
+
+      async function testEodAlert(alertKey) {{
+        const target = document.getElementById('testTarget_' + alertKey).value;
+        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/test-eod-alert', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: target }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('테스트 발송 완료! 대상 ' + result.item_count + '건(' + result.branch_count + '개 지점) 미리보기 발송\\n도착 예정 ' + result.arrival);
         }} else {{
           alert('오류: ' + (result.detail || '발송 실패'));
         }}
@@ -16483,11 +16930,17 @@ async def purchase_order_product_settings_page(
     monthly_exc_rows = conn.execute(
         "SELECT item_code, item_name, branch_code FROM purchase_order_monthly_exception"
     ).fetchall()
+    eod_exc_rows = conn.execute(
+        "SELECT item_code, branch_code FROM eod_alert_exclusion"
+    ).fetchall()
     conn.close()
 
     monthly_exc_map: Dict[str, list] = {}
     for r in monthly_exc_rows:
         monthly_exc_map.setdefault(r["item_code"] or r["item_name"], []).append(r["branch_code"])
+    eod_exc_map: Dict[str, list] = {}
+    for r in eod_exc_rows:
+        eod_exc_map.setdefault(r["item_code"], []).append(r["branch_code"])
         
     branches = get_branches(branch_type='branch')
     branch_options_json = json.dumps(
@@ -16498,9 +16951,10 @@ async def purchase_order_product_settings_page(
         sel = "selected" if filter_branch == b["branch_name"] else ""
         branch_filter_options += f'<option value="{b["branch_name"]}" {sel}>{b["branch_name"]}</option>'
 
+    import html as _h
     rows_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="13" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="17" style="text-align:center;padding:20px;color:#888;">등록된 상품이 없습니다.</td></tr>'
     else:
         for r in rows:
             consumable_checked = "checked" if r["is_consumable"] else ""
@@ -16509,10 +16963,18 @@ async def purchase_order_product_settings_page(
                 f'<span class="badge-green">{len(exc_branches)}개 지점</span>'
                 if exc_branches else '<span style="color:#888;font-size:11px;">없음</span>'
             )
+            eod_branches = eod_exc_map.get(r["item_code"] or "", [])
+            eod_badge = (
+                f'<span class="badge-green">{len(eod_branches)}개 지점</span>'
+                if eod_branches else '<span style="color:#888;font-size:11px;">없음</span>'
+            )
             safe_item_name = (r["item_name"] or "").replace("'", "")
+            safe_item_code = (r["item_code"] or "").replace("'", "")
+            item_code_attr = _h.escape(str(r["item_code"] or ""), quote=True)
+            item_name_attr = _h.escape(str(r["item_name"] or ""), quote=True)
             rows_html += f"""
             <tr>
-              <td style="text-align:center;"><input type="checkbox" class="pm-row-check" data-id="{r['id']}" style="width:18px;height:18px;"></td>
+              <td style="text-align:center;"><input type="checkbox" class="pm-row-check" data-id="{r['id']}" data-itemcode="{item_code_attr}" data-itemname="{item_name_attr}" style="width:18px;height:18px;"></td>
               <td class="pm-col-branch">{r['branch_name'] or ''}</td>
               <td class="pm-col-item">{r['item_name'] or ''}</td>
               <td class="pm-col-code">{r['item_code'] or ''}</td>
@@ -16529,6 +16991,10 @@ async def purchase_order_product_settings_page(
               <td class="pm-col-exc">
                 {exc_badge}
                 <button class="btn" style="font-size:11px;padding:4px 8px;background:#8B5CF6;" onclick="openMonthlyExc('{safe_item_name}')">설정</button>
+              </td>
+              <td class="pm-col-eodexc">
+                {eod_badge}
+                <button class="btn" style="font-size:11px;padding:4px 8px;background:#F97316;" onclick="openEodExc('{safe_item_code}', '{safe_item_name}')">설정</button>
               </td>
               <td style="display:flex;gap:4px;">
                 <button class="btn" style="font-size:12px;padding:6px 12px;" onclick="savePmRow({r['id']})">저장</button>
@@ -16591,7 +17057,7 @@ async def purchase_order_product_settings_page(
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap;"><input type="checkbox" name="show_hidden" value="1" {'checked' if show_hidden else ''} onchange="this.form.submit()"> 숨김 상품도 보기</label>
         <button class="btn" type="submit">검색</button>
         <a href="/master/purchase-order/product-settings" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
-        <button type="button" class="btn" style="background:#64748B;" onclick="openPmColSettings()">⚙️ 컬럼 설정</button>
+        <a href="/master/purchase-order/settings-guide" style="padding:10px 14px;background:#EFF6FF;border:1px solid #93C5FD;border-radius:8px;font-size:13px;text-decoration:none;color:#1E40AF;">📖 설정 설명</a>
       </form>
       <p style="font-size:13px;color:#888;margin-bottom:12px;">{len(rows)}건 (최대 300건까지 표시)</p>
       <div class="card" style="background:#F0FDF4;border:1px solid #86EFAC;margin-bottom:12px;">
@@ -16603,7 +17069,11 @@ async def purchase_order_product_settings_page(
           <input type="number" id="pmBulkMoq" placeholder="MOQ 일괄값" style="width:110px;">
           <input type="number" id="pmBulkMin" placeholder="최소 안전재고 일괄값" min="0" style="width:150px;">
           <button class="btn" type="button" onclick="applyBulkToChecked()" style="background:#8B5CF6;">✓ 체크 항목에 적용</button>
+          <span style="color:#ccc;">|</span>
+          <button class="btn" type="button" onclick="openBulkMonthlyExc()" style="background:#8B5CF6;">📦 선택 품목 월예외 설정</button>
+          <button class="btn" type="button" onclick="openBulkEodExc()" style="background:#F97316;">🚨 선택 품목 긴급발주 제외</button>
         </div>
+        <p style="font-size:11px;color:#888;margin:6px 0 0 0;">체크한 행들을 품번 기준으로 묶어 같은 지점 설정을 한 번에 저장합니다. 월예외는 품명 기준으로 묶입니다.</p>
       </div>
 
       <table class="pm-table">
@@ -16622,7 +17092,8 @@ async def purchase_order_product_settings_page(
           <th class="pm-col-category">품류</th>
           <th class="pm-col-ptype">종류</th>
           <th class="pm-col-ctype">소모품종류</th>
-          <th class="pm-col-exc">지방점 주발주 제외</th><th></th>
+          <th class="pm-col-exc">지방점 주발주 제외</th>
+          <th class="pm-col-eodexc" title="긴급발주 알럿에서 제외할 지점. 체크된 지점은 소진 예상이 떠도 알럿이 나가지 않습니다.">긴급발주 제외</th><th></th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
@@ -16630,7 +17101,11 @@ async def purchase_order_product_settings_page(
 
     <div id="monthlyExcModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
       <div style="background:#fff;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:80vh;overflow-y:auto;">
-        <h3 id="monthlyExcTitle" style="margin-bottom:12px;">지방점 주발주 제외</h3>
+        <h3 id="monthlyExcTitle" style="margin-bottom:4px;">지방점 주발주 제외</h3>
+        <p id="monthlyExcSub" style="font-size:12px;color:#888;margin:0 0 8px 0;">체크된 지점은 이 상품을 월 1회 발주로 분류합니다.</p>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;margin-bottom:6px;">
+          <input type="checkbox" id="mexcSelectAll" onchange="toggleExcAll(this, 'mexc-branch')"> 전체 선택/해제
+        </label>
         <div id="monthlyExcBranchList" style="margin-bottom:16px;"></div>
         <div style="display:flex;gap:8px;">
           <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeMonthlyExc()">닫기</button>
@@ -16639,84 +17114,23 @@ async def purchase_order_product_settings_page(
       </div>
     </div>
 
-    <div id="pmColSettingsModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
-      <div style="background:#fff;border-radius:12px;padding:24px;max-width:360px;width:90%;">
-        <h3 style="margin-bottom:12px;">⚙️ 표시할 컬럼 선택</h3>
-        <div id="pmColCheckboxList" style="display:flex;flex-direction:column;gap:8px;font-size:14px;"></div>
-        <style>#pmColCheckboxList input[type="checkbox"] {{ width: auto !important; }}</style>
-        <div style="display:flex;gap:8px;margin-top:16px;">
-          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closePmColSettings()">닫기</button>
-          <button class="btn" style="flex:1;" onclick="applyPmColSettings()">적용</button>
+    <div id="eodExcModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center;">
+      <div style="background:#fff;border-radius:12px;padding:24px;max-width:420px;width:90%;max-height:80vh;overflow-y:auto;">
+        <h3 id="eodExcTitle" style="margin-bottom:4px;">긴급발주 제외</h3>
+        <p id="eodExcSub" style="font-size:12px;color:#888;margin:0 0 8px 0;">체크된 지점은 이 상품의 소진 예상이 떠도 긴급발주 알럿이 발송되지 않습니다.</p>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;margin-bottom:6px;">
+          <input type="checkbox" id="eodexcSelectAll" onchange="toggleExcAll(this, 'eodexc-branch')"> 전체 선택/해제
+        </label>
+        <div id="eodExcBranchList" style="margin-bottom:16px;"></div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn" style="flex:1;background:#eee;color:#333;" onclick="closeEodExc()">닫기</button>
+          <button class="btn" style="flex:1;background:#F97316;" onclick="saveEodExc()">저장</button>
         </div>
       </div>
     </div>
 
     <script>
       const allBranches = {branch_options_json};
-
-      const PM_COLUMNS = [
-        {{ key: 'branch', label: '지점', locked: false }},
-        {{ key: 'item', label: '상품명', locked: true }},
-        {{ key: 'code', label: '품번', locked: false }},
-        {{ key: 'price', label: '구매금액', locked: false }},
-        {{ key: 'supplier', label: '거래처', locked: false }},
-        {{ key: 'tax', label: '과세설정', locked: false }},
-        {{ key: 'leadtime', label: '리드타임(일)', locked: false }},
-        {{ key: 'moq', label: 'MOQ', locked: false }},
-        {{ key: 'minsafe', label: '최소 안전재고', locked: false }},
-        {{ key: 'consumable', label: '소모품', locked: false }},
-        {{ key: 'category', label: '품류', locked: false }},
-        {{ key: 'ptype', label: '종류', locked: false }},
-        {{ key: 'ctype', label: '소모품종류', locked: false }},
-        {{ key: 'exc', label: '지방점 주발주 제외', locked: false }},
-      ];
-      const PM_STORAGE_KEY = 'pm_product_settings_col_settings';
-
-      function getPmColSettings() {{
-        try {{
-          const saved = localStorage.getItem(PM_STORAGE_KEY);
-          if (saved) return JSON.parse(saved);
-        }} catch(e) {{}}
-        const defaults = {{}};
-        PM_COLUMNS.forEach(c => defaults[c.key] = true);
-        return defaults;
-      }}
-
-      function applyPmColVisibility() {{
-        const settings = getPmColSettings();
-        PM_COLUMNS.forEach(c => {{
-          const visible = settings[c.key] !== false;
-          document.querySelectorAll('.pm-col-' + c.key).forEach(el => {{
-            el.style.display = visible ? '' : 'none';
-          }});
-        }});
-      }}
-
-      function openPmColSettings() {{
-        const settings = getPmColSettings();
-        const container = document.getElementById('pmColCheckboxList');
-        container.innerHTML = PM_COLUMNS.map(c =>
-          '<label style="display:flex;align-items:center;gap:8px;' + (c.locked ? 'opacity:0.5;' : '') + '">' +
-          '<input type="checkbox" class="pm-col-setting-check" data-key="' + c.key + '" style="width:18px;height:18px;flex-shrink:0;" ' +
-          (settings[c.key] !== false ? 'checked' : '') + (c.locked ? ' disabled' : '') + '>' +
-          '<span>' + c.label + (c.locked ? ' (필수)' : '') + '</span></label>'
-        ).join('');
-        document.getElementById('pmColSettingsModal').style.display = 'flex';
-      }}
-
-      function closePmColSettings() {{
-        document.getElementById('pmColSettingsModal').style.display = 'none';
-      }}
-
-      function applyPmColSettings() {{
-        const settings = {{}};
-        document.querySelectorAll('.pm-col-setting-check').forEach(cb => {{
-          settings[cb.dataset.key] = cb.checked;
-        }});
-        localStorage.setItem(PM_STORAGE_KEY, JSON.stringify(settings));
-        applyPmColVisibility();
-        closePmColSettings();
-      }}
 
       function sortPm(col) {{
         const params = new URLSearchParams(window.location.search);
@@ -16729,18 +17143,58 @@ async def purchase_order_product_settings_page(
       }}
 
       let currentExcItemName = '';
+      let currentMonthlyItems = [];   // [{name}] — 1개 또는 일괄
+      let currentEodItems = [];       // [{code,name}] — 1개 또는 일괄
+
+      function toggleExcAll(el, cls) {{
+        document.querySelectorAll('.' + cls).forEach(cb => cb.checked = el.checked);
+      }}
+
+      function renderExcBranches(containerId, checkedSet, cls) {{
+        const container = document.getElementById(containerId);
+        container.innerHTML = allBranches.map(b =>
+          '<label style="display:block;font-size:13px;margin-bottom:6px;"><input type="checkbox" class="' + cls + '" value="' + b.code + '" ' +
+          (checkedSet.has(b.code) ? 'checked' : '') + ' style="margin-right:6px;">' + b.name + '</label>'
+        ).join('');
+      }}
+
+      function checkedExcBranches(cls) {{
+        return Array.from(document.querySelectorAll('.' + cls + ':checked')).map(c => c.value);
+      }}
+
+      function collectCheckedPmItems() {{
+        const seenCode = new Set(), seenName = new Set();
+        const codes = [], names = [];
+        document.querySelectorAll('.pm-row-check:checked').forEach(cb => {{
+          const code = cb.dataset.itemcode || '';
+          const name = cb.dataset.itemname || '';
+          if (code && !seenCode.has(code)) {{ seenCode.add(code); codes.push({{ code: code, name: name }}); }}
+          if (name && !seenName.has(name)) {{ seenName.add(name); names.push(name); }}
+        }});
+        return {{ codes: codes, names: names }};
+      }}
 
       async function openMonthlyExc(itemName) {{
         currentExcItemName = itemName;
+        currentMonthlyItems = [{{ name: itemName }}];
         document.getElementById('monthlyExcTitle').innerText = itemName + ' — 월1회 예외 지점';
+        document.getElementById('monthlyExcSub').innerText = '체크된 지점은 이 상품을 월 1회 발주로 분류합니다.';
+        document.getElementById('mexcSelectAll').checked = false;
         const res = await fetch('/master/purchase-order/monthly-exception/list?item_name=' + encodeURIComponent(itemName));
         const data = await res.json();
-        const checkedSet = new Set(data.branches || []);
-        const container = document.getElementById('monthlyExcBranchList');
-        container.innerHTML = allBranches.map(b =>
-          '<label style="display:block;font-size:13px;margin-bottom:6px;"><input type="checkbox" class="mexc-branch" value="' + b.code + '" ' +
-          (checkedSet.has(b.code) ? 'checked' : '') + ' style="margin-right:6px;">' + b.name + '</label>'
-        ).join('');
+        renderExcBranches('monthlyExcBranchList', new Set(data.branches || []), 'mexc-branch');
+        document.getElementById('monthlyExcModal').style.display = 'flex';
+      }}
+
+      function openBulkMonthlyExc() {{
+        const items = collectCheckedPmItems();
+        if (!items.names.length) {{ alert('체크된 품목이 없습니다. 표의 체크박스로 품목을 선택하세요.'); return; }}
+        currentMonthlyItems = items.names.map(n => ({{ name: n }}));
+        document.getElementById('monthlyExcTitle').innerText = items.names.length + '개 품목 — 월1회 예외 지점';
+        document.getElementById('monthlyExcSub') && (document.getElementById('monthlyExcSub').innerText =
+          '선택한 ' + items.names.length + '개 품목의 월예외 지점이 체크한 내용으로 모두 동일하게 저장됩니다.');
+        document.getElementById('mexcSelectAll').checked = false;
+        renderExcBranches('monthlyExcBranchList', new Set(), 'mexc-branch');
         document.getElementById('monthlyExcModal').style.display = 'flex';
       }}
 
@@ -16749,12 +17203,57 @@ async def purchase_order_product_settings_page(
       }}
 
       async function saveMonthlyExc() {{
-        const checked = Array.from(document.querySelectorAll('.mexc-branch:checked')).map(c => c.value);
-        const res = await fetch('/master/purchase-order/monthly-exception/save', {{
-          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ item_name: currentExcItemName, branch_codes: checked }})
-        }});
-        if (res.ok) {{ location.reload(); }} else {{ alert('저장 실패'); }}
+        const checked = checkedExcBranches('mexc-branch');
+        for (const it of currentMonthlyItems) {{
+          const res = await fetch('/master/purchase-order/monthly-exception/save', {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ item_name: it.name, branch_codes: checked }})
+          }});
+          if (!res.ok) {{ alert('저장 실패: ' + it.name); return; }}
+        }}
+        location.reload();
+      }}
+
+      async function openEodExc(itemCode, itemName) {{
+        currentEodItems = [{{ code: itemCode, name: itemName }}];
+        document.getElementById('eodExcTitle').innerText = itemName + ' — 긴급발주 제외 지점';
+        document.getElementById('eodExcSub').innerText = '체크된 지점은 이 상품의 소진 예상이 떠도 긴급발주 알럿이 발송되지 않습니다.';
+        document.getElementById('eodexcSelectAll').checked = false;
+        const res = await fetch('/master/purchase-order/eod-exception/list?item_code=' + encodeURIComponent(itemCode));
+        const data = await res.json();
+        renderExcBranches('eodExcBranchList', new Set(data.branches || []), 'eodexc-branch');
+        document.getElementById('eodExcModal').style.display = 'flex';
+      }}
+
+      function openBulkEodExc() {{
+        const items = collectCheckedPmItems();
+        const uniq = [];
+        const seen = new Set();
+        items.codes.forEach(c => {{ if (c.code && !seen.has(c.code)) {{ seen.add(c.code); uniq.push(c); }} }});
+        if (!uniq.length) {{ alert('체크된 품목이 없습니다. 표의 체크박스로 품목을 선택하세요.'); return; }}
+        currentEodItems = uniq;
+        document.getElementById('eodExcTitle').innerText = uniq.length + '개 품목 — 긴급발주 제외 지점';
+        document.getElementById('eodExcSub').innerText =
+          '선택한 ' + uniq.length + '개 품목의 제외 지점이 체크한 내용으로 모두 동일하게 저장됩니다.';
+        document.getElementById('eodexcSelectAll').checked = false;
+        renderExcBranches('eodExcBranchList', new Set(), 'eodexc-branch');
+        document.getElementById('eodExcModal').style.display = 'flex';
+      }}
+
+      function closeEodExc() {{
+        document.getElementById('eodExcModal').style.display = 'none';
+      }}
+
+      async function saveEodExc() {{
+        const checked = checkedExcBranches('eodexc-branch');
+        for (const it of currentEodItems) {{
+          const res = await fetch('/master/purchase-order/eod-exception/save', {{
+            method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{ item_code: it.code, item_name: it.name, branch_codes: checked }})
+          }});
+          if (!res.ok) {{ alert('저장 실패: ' + (it.name || it.code)); return; }}
+        }}
+        location.reload();
       }}
 
       async function addPmItem() {{
@@ -16912,11 +17411,159 @@ async def purchase_order_product_settings_page(
           alert('적용 실패: ' + (data.detail || '오류'));
         }}
       }}
-
-      applyPmColVisibility();
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.get("/master/purchase-order/settings-guide", response_class=HTMLResponse)
+async def purchase_order_settings_guide(
+    session_token: str = Cookie(default=None),
+    q: str = "",
+):
+    """발주 규칙 설명 페이지 — 품번별로 실제 적용되는 예외 변수(소모품/미발주/리드타임/MOQ/월예외 등)를 시각화."""
+    from html import escape as _esc
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "product-settings"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    conn = get_conn()
+    try:
+        pm_rows = conn.execute("""
+            SELECT item_code,
+                   MAX(item_name) AS item_name,
+                   MAX(CASE WHEN is_consumable THEN 1 ELSE 0 END) AS is_consumable,
+                   MAX(CASE WHEN order_excluded THEN 1 ELSE 0 END) AS order_excluded,
+                   MIN(NULLIF(lead_time_days, 0)) AS lead_time_days,
+                   MAX(COALESCE(NULLIF(moq, 0), 1)) AS moq,
+                   MAX(min_safety_qty) AS min_safety_qty,
+                   COUNT(*) AS branch_rows
+            FROM product_master
+            WHERE item_code IS NOT NULL AND item_code <> ''
+            GROUP BY item_code
+            ORDER BY item_code
+        """).fetchall()
+        monthly_exc_rows = conn.execute(
+            "SELECT item_code, item_name, branch_code FROM purchase_order_monthly_exception"
+        ).fetchall()
+        consumable_exc_rows = conn.execute(
+            "SELECT item_code, branch_code FROM product_branch_order_exclusion"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    code_to_name = {b["branch_code"]: b["branch_name"] for b in get_branches(branch_type=None)}
+    monthly_map: Dict[str, set] = {}
+    monthly_name_map: Dict[str, set] = {}
+    for r in monthly_exc_rows:
+        nm = code_to_name.get(r["branch_code"], r["branch_code"] or "?")
+        if r["item_code"]:
+            monthly_map.setdefault(r["item_code"], set()).add(nm)
+        elif r["item_name"]:
+            monthly_name_map.setdefault(r["item_name"], set()).add(nm)
+    consumable_map: Dict[str, set] = {}
+    for r in consumable_exc_rows:
+        if r["item_code"]:
+            consumable_map.setdefault(r["item_code"], set()).add(
+                code_to_name.get(r["branch_code"], r["branch_code"] or "?"))
+
+    q = (q or "").strip()
+    trs = []
+    for r in pm_rows:
+        code = r["item_code"] or ""
+        name = r["item_name"] or ""
+        if q and q not in code and q not in name:
+            continue
+        lt = r["lead_time_days"]
+        lt_val = int(lt) if lt is not None else 0
+        mo = monthly_map.get(code, set()) | monthly_name_map.get(name, set())
+        ci = consumable_map.get(code, set())
+
+        if r["order_excluded"]:
+            klass = ("전체 미발주", "#DC2626")
+        elif r["is_consumable"]:
+            klass = ("소모품 — 발주 제외" + ("(일부 지점 포함)" if ci else ""), "#D97706")
+        elif lt_val >= 35:
+            klass = ("월발주 (리드타임 35일↑)", "#7C3AED")
+        elif lt_val <= 0:
+            klass = ("리드타임 없음 — 계산 제외", "#64748B")
+        else:
+            klass = ("주발주", "#065F46")
+        if mo:
+            klass = (klass[0] + " + 월예외", klass[1])
+
+        def _exc_cells(branches_set):
+            if not branches_set:
+                return '<span style="color:#999;">-</span>'
+            return _esc(", ".join(sorted(branches_set)))
+
+        trs.append(
+            "<tr>"
+            f"<td style='font-family:monospace;'>{_esc(code)}</td>"
+            f"<td>{_esc(name)}</td>"
+            f"<td style='text-align:center;'>{r['branch_rows']}</td>"
+            f"<td><span style='background:{klass[1]};color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;white-space:nowrap;'>{_esc(klass[0])}</span></td>"
+            f"<td style='text-align:center;'>{'예' if r['is_consumable'] else '-'}</td>"
+            f"<td style='text-align:center;'>{'예' if r['order_excluded'] else '-'}</td>"
+            f"<td style='text-align:center;'>{lt_val if lt_val else '-'}</td>"
+            f"<td style='text-align:center;'>{int(r['moq'] or 1)}</td>"
+            f"<td style='text-align:center;'>{r['min_safety_qty'] if r['min_safety_qty'] is not None else '<span style=\'color:#999;\'>공통</span>'}</td>"
+            f"<td style='font-size:12px;'>{_exc_cells(mo)}</td>"
+            f"<td style='font-size:12px;'>{_exc_cells(ci)}</td>"
+            "</tr>"
+        )
+
+    rows_html = "".join(trs) if trs else (
+        "<tr><td colspan='11' style='text-align:center;padding:24px;color:#888;'>"
+        "등록된 품번이 없습니다.</td></tr>")
+
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
+      <a href="/master/purchase-order/product-settings" style="color:#1E2761;">← 상품 설정</a>
+      <h2>📖 발주 설정 설명</h2>
+      <span style="font-size:12px;color:#888;">품번 {len(pm_rows)}개 기준 (지점 행 {sum(int(r['branch_rows']) for r in pm_rows)}개 집계)</span>
+    </div>
+
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;margin:0 0 8px 0;"><b>발주 판정 순서</b> (발주 미리보기/검수 공통)</p>
+      <ol style="font-size:13px;color:#1E3A8A;margin:0;padding-left:20px;line-height:1.8;">
+        <li><b>전체 미발주</b>(order_excluded=예) → 항상 제외</li>
+        <li><b>현재고 ≥ 안전재고</b> → 제외 (재고 충분)</li>
+        <li><b>소모품</b> → 제외. 단 <b>product_branch_order_exclusion</b>에 지점×품번 등록 시 그 지점만 포함</li>
+        <li><b>미입고 발주(접수/승인)</b> 존재 → 제외 + 별도 보고</li>
+        <li>통과 시 <b>주/월 분류</b>: 리드타임 ≥35일 또는 월예외 등록 → 월발주, 나머지 주발주</li>
+        <li>최종수량 = 안전재고를 <b>MOQ 배수</b>로 올림</li>
+      </ol>
+    </div>
+
+    <div class="card" style="background:#FFFBEB;border:1px solid #FCD34D;">
+      <p style="font-size:13px;color:#92400E;margin:0;"><b>예외 변수 컨트롤 위치</b><br>
+      · 소모품 / 리드타임 / MOQ / 최소 안전재고 / 전체 미발주(숨기기) →
+        <a href="/master/purchase-order/product-settings" style="color:#1E40AF;">상품 설정</a> 페이지 (품번 단위 일괄 적용 권장)<br>
+      · 월 1회 예외(지점×상품) → 상품 설정 표의 '지방점 주발주 제외' 열 '설정' 버튼<br>
+      · 소모품 지점별 포함 예외 → product_branch_order_exclusion 테이블 (별도 관리 화면 없음)</p>
+    </div>
+
+    <div class="card">
+      <form method="get" action="/master/purchase-order/settings-guide" style="display:flex;gap:8px;margin-bottom:12px;">
+        <input name="q" value="{_esc(q)}" placeholder="품번/상품명 검색" style="flex:1;min-width:200px;">
+        <button class="btn" type="submit">검색</button>
+        <a href="/master/purchase-order/settings-guide" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
+      </form>
+      <table>
+        <thead><tr>
+          <th>품번</th><th>상품명</th><th>지점행</th><th>적용 분류</th>
+          <th>소모품</th><th>전체미발주</th><th>리드타임</th><th>MOQ</th><th>최소안전재고</th>
+          <th>월예외 지점</th><th>소모품 포함 지점</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
 
 # ============================================================
 # 미등록 상품 감지 / 등록 (상품 설정 페이지)
@@ -17597,6 +18244,46 @@ async def purchase_order_monthly_exception_save(request: Request, session_token:
         conn.execute(
             "INSERT INTO purchase_order_monthly_exception (item_name, item_code, branch_code) VALUES (?, ?, ?)",
             (item_name, item_code, bc)
+        )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.get("/master/purchase-order/eod-exception/list")
+async def purchase_order_eod_exception_list(item_code: str, session_token: str = Cookie(default=None)):
+    """긴급발주 제외 지점 목록 — 마스터 전용"""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT branch_code FROM eod_alert_exclusion WHERE item_code=?", (item_code,)
+    ).fetchall()
+    conn.close()
+    return JSONResponse(content={"branches": [r["branch_code"] for r in rows]})
+
+
+@app.post("/master/purchase-order/eod-exception/save")
+async def purchase_order_eod_exception_save(request: Request, session_token: str = Cookie(default=None)):
+    """긴급발주 제외 지점 저장 — 마스터 전용. item_code 기준 전체 교체."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    item_code = (data.get("item_code") or "").strip()
+    item_name = (data.get("item_name") or "").strip()
+    branch_codes = data.get("branch_codes", [])
+    if not item_code:
+        return JSONResponse(status_code=400, content={"detail": "품번이 없습니다."})
+
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    conn.execute("DELETE FROM eod_alert_exclusion WHERE item_code=?", (item_code,))
+    for bc in branch_codes:
+        conn.execute(
+            "INSERT INTO eod_alert_exclusion (branch_code, item_code, item_name, created_at) VALUES (?, ?, ?, ?)",
+            (bc, item_code, item_name, now)
         )
     conn.commit()
     conn.close()
