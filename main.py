@@ -2397,11 +2397,11 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("closing-group", None, "🧾", "마감", [
             ("재고 마감", "/stock-closing/status" if is_master else "/stock-closing"),
             ("매출 마감", "/closing"),
+            ("재고 실사", daily_stocktake_href),
         ]),
         ("stock-group", None, "📦", "재고&발주", [
             ("재고현황", "/inventory"),
             ("발주내역", "/purchase-history"),
-            ("재고 실사", daily_stocktake_href),
         ]),
         ("qr", "/qr", "📷", "QR생성", None),
         ("adjust", "/adjust", "✏️", "수기조정", None),
@@ -2419,8 +2419,8 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
 
     # 합쳐진 메뉴는 기존 각 페이지가 넘기는 active 값으로도 강조되도록 묶어 둔다
     menu_active_keys = {
-        "closing-group": ("closing-group", "closing", "stock-closing"),
-        "stock-group": ("stock-group", "inventory", "purchase-history", "daily-stocktake"),
+        "closing-group": ("closing-group", "closing", "stock-closing", "daily-stocktake"),
+        "stock-group": ("stock-group", "inventory", "purchase-history"),
         "notice-group": ("notice-group", "survey-group", "notice", "qna", "survey", "vendor-eval"),
     }
 
@@ -4871,8 +4871,8 @@ def _sc_notify_panel(sel_date_str: str) -> str:
         "지점 채널 발송은 '지점 발송' 스위치와 해당 지점 '알림' 체크가 모두 켜져 있을 때만 나갑니다(자동·수동 '제출 요청' 공통). "
         "'테스트 발송' 스위치가 켜져 있으면 테스트 채널 사본도 함께 발송됩니다. "
         "'테스트'·'자동 알림 테스트' 버튼은 스위치와 무관하게 테스트 채널로만 발송됩니다(자동 알림 테스트는 테스트 메일도 발송).</div>"
-        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 미제출 알림 발송", branch_on)
-        + _row("mismatch", "불일치 발송", "오차 건수가 있는 지점 — 테스트 채널·테스트 메일로 발송", mis_on)
+        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 미제출·불일치 알림 발송", branch_on)
+        + _row("mismatch", "불일치 발송", "오차 건수가 있는 지점 — 테스트 채널·테스트 메일 + 지점별 알림 체크된 지점 팀즈 채널로 발송", mis_on)
         + _row("test", "테스트 발송", f"켜면 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로 발송 · 자동 알림은 테스트 메일도 수신", test_on)
         + f'<div id="scMeta" data-date="{sel_date_str}" style="display:none;"></div>'
         + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
@@ -5140,7 +5140,7 @@ def _sc_mismatch_branches(date_str: str) -> list:
 def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> dict:
     """미제출 지점 알림 + 오차(불일치) 지점 알림. mode='auto'는 자동 발송 스위치 설정을 따르고,
     mode='test'는 스위치와 무관하게 테스트 채널(+테스트 메일)로만 보낸다.
-    오차 알림은 지점 채널이 아니라 테스트 채널+테스트 메일로만 발송한다."""
+    오차 알림은 테스트 채널+테스트 메일 요약 + 지점 발송/불일치 발송/지점별 알림이 모두 켜진 지점 채널로도 발송."""
     missing = _sc_missing_branches(date_str)
     mismatch = _sc_mismatch_branches(date_str)
     if mode == "test":
@@ -5155,6 +5155,7 @@ def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
         "mismatch": [m["name"] for m in mismatch],
         "branch_sent": 0, "branch_failed": [], "test_sent": None, "mail_sent": None,
         "mismatch_sent": None, "mismatch_mail_sent": None,
+        "mismatch_branch_sent": 0, "mismatch_branch_failed": [],
     }
     if not missing and not mismatch:
         return result
@@ -5189,6 +5190,23 @@ def _sc_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
         result["mismatch_mail_sent"] = bool(mail_ok)
         if not mail_ok:
             result["mismatch_mail_detail"] = str(mail_detail)[:80]
+
+    # 불일치 지점 채널 발송 — 지점 발송+불일치 발송 스위치와 지점별 알림이 모두 켜진 경우만 (auto 모드)
+    if mode == "auto" and branch_on and mis_on and mismatch:
+        sc_enabled = _sc_branch_on_set()
+        for m in mismatch:
+            if str(m["code"]) not in sc_enabled:
+                continue
+            mmsg = (str(m["name"]) + " " + date_str + " 재고 마감 오차(불일치) "
+                    + str(m["count"]) + "건이 있습니다. 재고 마감 화면에서 확인해주세요.")
+            ok2, detail2 = send_teams_notification(
+                m["code"], "📦 재고 마감 오차 알림", mmsg,
+                base_url + "/stock-closing?date=" + date_str, "재고 마감 열기", sent_by
+            )
+            if ok2:
+                result["mismatch_branch_sent"] += 1
+            else:
+                result["mismatch_branch_failed"].append(str(m["name"]) + "(" + str(detail2)[:60] + ")")
     if branch_on:
         link = base_url + "/stock-closing?date=" + date_str
         enabled_branches = _sc_branch_on_set()
@@ -22576,11 +22594,12 @@ def _cl_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
     result = {"date": date_str, "mode": mode,
               "missing": [m["name"] for m in targets["missing"]],
               "mismatch": [m["name"] for m in targets["mismatch"]],
-              "branch_sent": 0, "branch_failed": [], "test_sent": None, "mail_sent": None}
+              "branch_sent": 0, "branch_failed": [], "test_sent": None, "mail_sent": None,
+              "mismatch_branch_sent": 0, "mismatch_branch_failed": []}
     enabled_branches = _cl_branch_on_set() if branch_on else set()
     link = base_url + "/closing?date=" + date_str
 
-    def _send_one(item, kind_label):
+    def _send_one(item, kind_label, count=None):
         code = item.get("code") or ""
         if not code:
             result["branch_failed"].append(str(item["name"]) + "(지점코드 없음)")
@@ -22588,18 +22607,25 @@ def _cl_run_reminder(date_str: str, base_url: str, mode: str, sent_by: str) -> d
         if str(item["key"]) not in enabled_branches:
             return
         title = "🧾 매출 마감 " + kind_label
-        msg = (str(item["name"]) + " " + date_str + " 매출 마감 " + kind_label + " 건이 있습니다. 마감 화면에서 확인해주세요.")
+        cnt_txt = (" " + str(count) + "건") if count else " 건"
+        msg = (str(item["name"]) + " " + date_str + " 매출 마감 " + kind_label + cnt_txt
+               + "이 있습니다. 마감 화면에서 확인해주세요.")
         ok, detail = send_teams_notification(code, title, msg, link, "매출 마감 열기", sent_by)
         if ok:
             result["branch_sent"] += 1
+            if kind_label == "불일치":
+                result["mismatch_branch_sent"] += 1
         else:
             result["branch_failed"].append(str(item["name"]) + "(" + str(detail)[:60] + ")")
 
-    # 미제출만 지점별 채널로 발송한다. 불일치는 지점 채널로 보내지 않고
-    # 테스트 채널+테스트 메일로만 발송한다(아래 별도 블록).
+    # 미제출·불일치 모두 지점 채널로 발송한다(지점 발송+해당 종류 스위치+지점별 알림 체크가 모두 필요).
+    # 불일치는 테스트 채널+테스트 메일 요약도 함께 발송한다(아래 별도 블록).
     if branch_on and miss_on:
         for m in targets["missing"]:
             _send_one(m, "미제출")
+    if branch_on and mis_on:
+        for m in targets["mismatch"]:
+            _send_one(m, "불일치", m.get("count"))
 
     if mode == "auto" and mis_on and targets["mismatch"]:
         mlines = [date_str + " 매출 마감 불일치 알림", "",
@@ -22699,8 +22725,8 @@ def _cl_notify_panel(date_str: str) -> str:
         '<div style="display:grid;grid-template-columns:minmax(400px,1fr) 2fr;gap:14px;align-items:start;">'
         '<div>'
         + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
-        + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점 — 테스트 채널·메일로 발송", _cl_setting_on("closing_notify_mismatch"))
-        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 미제출 알림 발송", _cl_setting_on("closing_notify_branch"))
+        + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점 — 테스트 채널·메일 + 지점별 알림 체크된 지점 팀즈 채널로 발송", _cl_setting_on("closing_notify_mismatch"))
+        + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 미제출·불일치 알림 발송", _cl_setting_on("closing_notify_branch"))
         + _row("test", "테스트 발송", f"켜면 테스트 채널({CL_NOTIFY_TEST_BRANCH_CODE})·테스트 메일로 발송", _cl_setting_on("closing_notify_test"))
         + '<button class="btn" type="button" style="font-size:12px;padding:6px 12px;background:#64748B;margin-top:6px;" '
         'onclick="clReminderTest(this)" data-date="' + date_str + '">🧪 자동 알림 테스트 (테스트 채널·테스트 메일로만)</button>'
