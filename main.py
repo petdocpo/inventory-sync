@@ -2212,32 +2212,66 @@ _COLUMN_SETTINGS_HTML = """
           for (var i = 0; i < all.length; i++) { if (all[i] === table) return i; }
           return -1;
         }
-        function cvKey(table) {
+        function cvBaseKey(table) {
           var i = cvIndex(table);
           var v = table.getAttribute('data-colver') || '';
-          return PREFIX + window.location.pathname + '_' + i + (v ? '_' + v : '');
+          return window.location.pathname + '_' + i + (v ? '_' + v : '');
         }
+        function cvKey(table) {
+          return PREFIX + cvBaseKey(table);
+        }
+        window.__COL_DEFAULTS__ = COL_DEFAULTS;
         function cvEligible(table) {
           if (!table.tHead || !table.tHead.rows.length) return false;
           // closest()는 자기 자신도 매칭하므로 부모부터 검사해야 중첩 테이블만 걸러진다
           if (table.parentElement && table.parentElement.closest('table')) return false;
           var ths = table.tHead.getElementsByTagName('th');
           if (ths.length < 2) return false;
-          for (var i = 0; i < ths.length; i++) { if (ths[i].rowSpan > 1) return false; }
           return true;
+        }
+        // 헤더 점유 그리드: rowspan/colspan을 모두 펼쳐 마지막 행의 컬럼별 셀을 구한다
+        function cvHeadGrid(table) {
+          var hrows = table.tHead.rows;
+          var grid = [];
+          for (var r = 0; r < hrows.length; r++) {
+            var cells = hrows[r].cells, col = 0;
+            grid[r] = grid[r] || [];
+            for (var c = 0; c < cells.length; c++) {
+              var cell = cells[c];
+              while (grid[r][col]) col++;
+              var rs = cell.rowSpan || 1, cs = cell.colSpan || 1;
+              for (var dr = 0; dr < rs; dr++) {
+                for (var dc = 0; dc < cs; dc++) {
+                  grid[r + dr] = grid[r + dr] || [];
+                  grid[r + dr][col + dc] = cell;
+                }
+              }
+              col += cs;
+            }
+          }
+          return grid;
         }
         function cvUnits(table) {
           var hrows = table.tHead.rows;
-          var row = hrows[hrows.length - 1];
-          var units = [], col = 0;
-          for (var c = 0; c < row.cells.length; c++) {
-            var cell = row.cells[c];
+          var grid = cvHeadGrid(table);
+          var last = grid[hrows.length - 1] || [];
+          var top = grid[0] || [];
+          var units = [];
+          for (var i = 0; i < last.length; i++) {
+            var cell = last[i];
+            if (!cell) continue;
+            if (i > 0 && last[i - 1] === cell) continue;  // colspan 이어지는 컬럼은 같은 항목
             var cs = cell.colSpan || 1;
-            var label = (cell.textContent || '').replace(/\\s+/g, ' ').trim();
-            var u = { label: label || ('항목 ' + (units.length + 1)), cols: [] };
-            for (var k = 0; k < cs; k++) { u.cols.push(col + k); }
+            var own = (cell.textContent || '').replace(/\\s+/g, ' ').trim();
+            // 상위 그룹 헤더(결제내역 등)와 하위 헤더(건수/금액)를 합쳐 라벨 생성
+            var grpCell = top[i];
+            var grp = grpCell && grpCell !== cell
+              ? (grpCell.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+            var label = (grp ? grp + ' ' : '') + (own || ('항목 ' + (units.length + 1)));
+            var u = { label: label, cols: [] };
+            for (var k = 0; k < cs && i + k < last.length; k++) { u.cols.push(i + k); }
             units.push(u);
-            col += cs;
+            i += cs - 1;
           }
           return units;
         }
@@ -2245,11 +2279,34 @@ _COLUMN_SETTINGS_HTML = """
         function cvDefaultHidden(table) {
           try {
             var d = COL_DEFAULTS || {};
-            var i = cvIndex(table);
-            var v = table.getAttribute('data-colver') || '';
-            var a = d[window.location.pathname + '_' + i + (v ? '_' + v : '')];
+            var a = d[cvBaseKey(table)];
             return Array.isArray(a) ? a : [];
           } catch (e) { return []; }
+        }
+        // 폰트 크기 — localStorage 개인 설정 우선, 없으면 서버 기본값, 둘 다 없으면 미적용
+        var FONT_MIN = 8, FONT_MAX = 24;
+        function cvFontStoreKey(table) { return 'colFont_' + cvBaseKey(table); }
+        function cvFontDefault(table) {
+          try {
+            var a = (COL_DEFAULTS || {})[cvBaseKey(table) + '_f'];
+            if (Array.isArray(a) && a.length && typeof a[0] === 'number' && a[0] >= FONT_MIN && a[0] <= FONT_MAX) return a[0];
+          } catch (e) {}
+          return 0;
+        }
+        function cvFontSize(table) {
+          try {
+            var s = localStorage.getItem(cvFontStoreKey(table));
+            if (s) { var n = parseInt(s, 10); if (n >= FONT_MIN && n <= FONT_MAX) return n; }
+          } catch (e) {}
+          return cvFontDefault(table) || 9;  // 전역 기본 9px
+        }
+        function cvApplyFont(table) {
+          var px = cvFontSize(table);
+          if (!px) return;
+          var ths = table.tHead ? table.tHead.getElementsByTagName('th') : [];
+          var tds = table.getElementsByTagName('td');
+          for (var i = 0; i < ths.length; i++) { ths[i].style.fontSize = px + 'px'; }
+          for (var j = 0; j < tds.length; j++) { tds[j].style.fontSize = px + 'px'; }
         }
         function cvHidden(table) {
           try {
@@ -2315,7 +2372,7 @@ _COLUMN_SETTINGS_HTML = """
           }
         }
         function cvApplyAll() {
-          document.querySelectorAll('table').forEach(cvApply);
+          document.querySelectorAll('table').forEach(function(t) { cvApply(t); cvApplyFont(t); });
         }
         // 각 표 우측 위에 ⚙️ 칼럼 버튼을 주입 — 클릭 시 해당 표만 설정 모달로 연다
         function cvInjectButtons() {
@@ -2328,14 +2385,32 @@ _COLUMN_SETTINGS_HTML = """
             if (prev && prev.classList && prev.classList.contains('cv-col-bar')) return;
             var bar = document.createElement('div');
             bar.className = 'cv-col-bar';
-            bar.style.cssText = 'display:flex;justify-content:flex-end;margin:0 0 4px 0;';
-            var btn = document.createElement('button');
-            btn.type = 'button';
-            btn.textContent = '⚙️ 칼럼';
-            btn.title = '이 표의 칼럼 표시 설정';
-            btn.style.cssText = 'background:#fff;border:1px solid #ccc;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;color:#555;box-shadow:0 1px 3px rgba(0,0,0,.12);';
-            btn.addEventListener('click', function() { window.openColSettings(table); });
-            bar.appendChild(btn);
+            bar.style.cssText = 'display:flex;justify-content:flex-end;align-items:center;gap:4px;margin:0 0 4px 0;';
+            function mkBtn(txt, title, fn) {
+              var b = document.createElement('button');
+              b.type = 'button'; b.textContent = txt; b.title = title;
+              b.style.cssText = 'background:#fff;border:1px solid #ccc;border-radius:6px;padding:3px 8px;font-size:12px;cursor:pointer;color:#555;';
+              b.addEventListener('click', fn);
+              return b;
+            }
+            var fontLbl = document.createElement('span');
+            fontLbl.className = 'cv-font-lbl';
+            fontLbl.style.cssText = 'font-size:11px;color:#666;min-width:26px;text-align:center;';
+            function refreshFontLbl() {
+              fontLbl.textContent = cvFontSize(table) ? cvFontSize(table) + 'px' : '기본';
+            }
+            function bumpFont(delta) {
+              var cur = cvFontSize(table) || 11;
+              var next = Math.min(FONT_MAX, Math.max(FONT_MIN, cur + delta));
+              try { localStorage.setItem(cvFontStoreKey(table), String(next)); } catch (e) {}
+              cvApplyFont(table);
+              refreshFontLbl();
+            }
+            bar.appendChild(mkBtn('A−', '글자 작게', function() { bumpFont(-1); }));
+            bar.appendChild(fontLbl);
+            bar.appendChild(mkBtn('A+', '글자 크게', function() { bumpFont(1); }));
+            refreshFontLbl();
+            bar.appendChild(mkBtn('⚙️ 칼럼', '이 표의 칼럼 표시 설정', function() { window.openColSettings(table); }));
             host.insertBefore(bar, anchor);
           });
         }
@@ -2400,15 +2475,43 @@ _COLUMN_SETTINGS_HTML = """
           document.getElementById('colSetOverlay').style.display = 'none';
           document.getElementById('colSetModal').style.display = 'none';
         };
+        // 마스터 전용: 현재 페이지 모든 표의 폰트 크기를 전체 계정 기본값으로 저장
+        window.saveColFonts = function(btn) {
+          var tables = {};
+          document.querySelectorAll('table').forEach(function(table) {
+            if (!cvEligible(table)) return;
+            var suffix = String(cvIndex(table)) + ((table.getAttribute('data-colver') || '') ? '_' + table.getAttribute('data-colver') : '');
+            tables[suffix + '_f'] = [cvFontSize(table)];
+          });
+          var orig = btn ? btn.textContent : '';
+          if (btn) btn.textContent = '…';
+          fetch('/api/column-defaults', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ page: window.location.pathname, tables: tables })
+          }).then(function(r) { return r.json(); }).then(function(d) {
+            if (btn) { btn.textContent = (d && d.ok) ? '✓' : '!'; setTimeout(function() { btn.textContent = orig; }, 1500); }
+          }).catch(function() { if (btn) btn.textContent = orig; });
+        };
         // 마스터만: 현재 페이지의 실효 숨김 설정(localStorage+기본값 반영)을 전체 계정 기본값으로 저장
         window.saveColDefaults = function() {
           var msg = document.getElementById('colSetDefaultMsg');
           var tables = {};
           document.querySelectorAll('table').forEach(function(table) {
             if (!cvEligible(table)) return;
-            var i = cvIndex(table);
-            var v = table.getAttribute('data-colver') || '';
-            tables[String(i) + (v ? '_' + v : '')] = cvHidden(table);
+            var suffix = String(cvIndex(table)) + ((table.getAttribute('data-colver') || '') ? '_' + table.getAttribute('data-colver') : '');
+            tables[suffix] = cvHidden(table);
+            // 컬럼 너비 기본값 — 현재 렌더링된 헤더 셀 너비
+            try {
+              var cells = window.__cvColHeaderCells ? window.__cvColHeaderCells(table) : null;
+              if (cells && cells.length) {
+                var ws = [];
+                for (var i = 0; i < cells.length; i++) { ws.push(Math.round(cells[i].offsetWidth)); }
+                tables[suffix + '_w'] = ws;
+              }
+            } catch (e) {}
+            // 폰트 크기 기본값
+            var fs = cvFontSize(table);
+            if (fs) { tables[suffix + '_f'] = [fs]; }
           });
           fetch('/api/column-defaults', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -2478,9 +2581,7 @@ async def column_defaults_save(request: Request, session_token: str = Cookie(def
             data = {}
         if not isinstance(data, dict):
             data = {}
-        prefix = page + "_"
-        for k in [k for k in data if str(k).startswith(prefix)]:
-            data.pop(k)
+        # 키 단위 병합 — 페이지의 다른 테이블/너비/폰트 기본값은 유지된다
         data.update(clean)
         value = json.dumps(data, ensure_ascii=False)
         exist = conn.execute("SELECT value FROM system_settings WHERE key='column_defaults'").fetchone()
@@ -2509,7 +2610,14 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
 
     is_master = user and (user.get("role") == "master" or user.get("branch_type") == "hq")
     col_settings_enabled = os.getenv("COL_SETTINGS_ENABLED", "on").strip().lower() not in ("off", "0", "false", "no")
+    col_font_btn = (
+        '<button type="button" onclick="saveColFonts(this)" '
+        'style="background:rgba(255,255,255,.15);color:white;border:none;'
+        'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">font</button>'
+        if (col_settings_enabled and is_master) else ""
+    )
     col_settings_btn = (
+        col_font_btn +
         '<button type="button" onclick="openColSettings()" '
         'style="background:rgba(255,255,255,.15);color:white;border:none;'
         'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">🧩 칼럼</button>'
@@ -2881,6 +2989,14 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             if (!isResizableTable(table)) return;
             var saved = null;
             try {{ saved = localStorage.getItem(storageKey(table)); }} catch (e) {{}}
+            if (!saved) {{
+              // 개인 설정이 없으면 마스터가 저장한 전체 계정 기본 너비 적용
+              try {{
+                var dk = storageKey(table).slice(STORAGE_PREFIX.length) + '_w';
+                var wd = (window.__COL_DEFAULTS__ || {{}})[dk];
+                if (Array.isArray(wd)) saved = JSON.stringify(wd);
+              }} catch (e) {{}}
+            }}
             if (!saved) return;
             try {{
               var widths = JSON.parse(saved);
@@ -2898,7 +3014,15 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             }} catch (e) {{}}
           }});
         }}
-        restoreWidths();
+        // 칼럼 설정 스크립트에서 너비 기본값 저장 시 참조
+        window.__cvColHeaderCells = colHeaderCells;
+        // __COL_DEFAULTS__는 페이지 하단 칼럼 설정 스크립트에서 설정되므로
+        // 너비 복원은 DOM 로드 완료 후 실행해야 서버 기본값 fallback이 적용된다
+        if (document.readyState === 'loading') {{
+          document.addEventListener('DOMContentLoaded', restoreWidths);
+        }} else {{
+          restoreWidths();
+        }}
         if (!document.getElementById('colWHandleStyle')) {{
           var st = document.createElement('style');
           st.id = 'colWHandleStyle';
