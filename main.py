@@ -21,7 +21,7 @@ load_dotenv(".env")
 
 app = FastAPI()
 
-from db import get_conn, pk_column, upsert_suffix  # noqa: E402
+from db import get_conn, pk_column, upsert_suffix, USE_POSTGRES  # noqa: E402
 
 def is_item_consumable(conn, branch_code: str, item_code: str) -> bool:
     """items 테이블 기준 소모품 여부 확인 (RAW 자동반영 대상 판별용)"""
@@ -99,6 +99,7 @@ MENU_DEFINITIONS = {
     "cron-failure-log": "크론 실패 이력",
     "stocktake": "지점 월 재고실사(운영팀장)",
     "stocktake-result": "재고실사(결과)",
+    "daily-stocktake": "지점 재고 실사 결과",
     "notice-manage": "공지사항 관리",
     "qna-manage": "Q&A 게시판 관리",
     "closing": "매출 마감",
@@ -2073,6 +2074,77 @@ def init_db():
         )
     """)
 
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS daily_stocktake_saves (
+            {pk},
+            branch_code TEXT NOT NULL,
+            count_date TEXT NOT NULL,
+            closer_name TEXT,
+            saved_by TEXT,
+            saved_at TEXT,
+            item_count INTEGER DEFAULT 0,
+            mismatch_count INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'open',
+            closed_at TEXT,
+            closed_by TEXT,
+            reopened_at TEXT,
+            reopened_by TEXT,
+            UNIQUE(branch_code, count_date)
+        )
+    """)
+
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS daily_stocktake_lines (
+            {pk},
+            save_id INTEGER NOT NULL,
+            branch_code TEXT,
+            count_date TEXT,
+            item_code TEXT,
+            item_name TEXT,
+            supplier TEXT,
+            category TEXT,
+            qr_qty INTEGER,
+            ups_qty INTEGER,
+            counted_qty INTEGER,
+            diff_qty INTEGER,
+            UNIQUE(save_id, item_code)
+        )
+    """)
+
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS inventory_orphan_cleanup_log (
+            {pk},
+            run_at TEXT,
+            source TEXT,
+            branch_code TEXT,
+            item_code TEXT,
+            item_name TEXT,
+            quantity INTEGER,
+            last_updated TEXT,
+            action TEXT,
+            detail TEXT
+        )
+    """)
+
+    # daily_stocktake_saves 마감 기능 컬럼 보강 (additive — 기존 행/제약 변경 없음)
+    _dst_save_new_cols = {
+        "status": "TEXT DEFAULT 'open'",
+        "closed_at": "TEXT",
+        "closed_by": "TEXT",
+        "reopened_at": "TEXT",
+        "reopened_by": "TEXT",
+    }
+    if USE_POSTGRES:
+        for _c, _ddl in _dst_save_new_cols.items():
+            conn.execute(
+                f"ALTER TABLE daily_stocktake_saves ADD COLUMN IF NOT EXISTS {_c} {_ddl}"
+            )
+    else:
+        _existing = {r[1] for r in conn.execute("PRAGMA table_info(daily_stocktake_saves)").fetchall()}
+        for _c, _ddl in _dst_save_new_cols.items():
+            if _c not in _existing:
+                conn.execute(f"ALTER TABLE daily_stocktake_saves ADD COLUMN {_c} {_ddl}")
+
     conn.commit()
     conn.close()
 
@@ -2104,6 +2176,191 @@ def render_notice_content(raw_content: str) -> str:
     return escaped.replace("\n", "<br>")
  
  
+_COLUMN_SETTINGS_HTML = """
+      <div id="colSetOverlay" onclick="if(event.target===this)closeColSettings()"
+           style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:400;"></div>
+      <div id="colSetModal" style="display:none;position:fixed;top:50%;left:50%;
+           transform:translate(-50%,-50%);background:white;border-radius:12px;
+           max-width:480px;width:92%;max-height:75vh;overflow-y:auto;z-index:401;
+           box-shadow:0 8px 30px rgba(0,0,0,.3);padding:18px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <b style="font-size:15px;">칼럼 표시 설정</b>
+          <button onclick="closeColSettings()" style="border:none;background:#eee;border-radius:8px;
+                  padding:4px 12px;font-size:12px;cursor:pointer;">닫기</button>
+        </div>
+        <div id="colSetBody"></div>
+      </div>
+      <script>
+      (function() {
+        var PREFIX = 'colVis_';
+        function cvIndex(table) {
+          var all = document.querySelectorAll('table');
+          for (var i = 0; i < all.length; i++) { if (all[i] === table) return i; }
+          return -1;
+        }
+        function cvKey(table) {
+          var i = cvIndex(table);
+          var v = table.getAttribute('data-colver') || '';
+          return PREFIX + window.location.pathname + '_' + i + (v ? '_' + v : '');
+        }
+        function cvEligible(table) {
+          if (!table.tHead || !table.tHead.rows.length) return false;
+          if (table.closest('table')) return false;
+          var ths = table.tHead.getElementsByTagName('th');
+          if (ths.length < 2) return false;
+          for (var i = 0; i < ths.length; i++) { if (ths[i].rowSpan > 1) return false; }
+          return true;
+        }
+        function cvUnits(table) {
+          var hrows = table.tHead.rows;
+          var row = hrows[hrows.length - 1];
+          var units = [], col = 0;
+          for (var c = 0; c < row.cells.length; c++) {
+            var cell = row.cells[c];
+            var cs = cell.colSpan || 1;
+            var label = (cell.textContent || '').replace(/\\s+/g, ' ').trim();
+            var u = { label: label || ('항목 ' + (units.length + 1)), cols: [] };
+            for (var k = 0; k < cs; k++) { u.cols.push(col + k); }
+            units.push(u);
+            col += cs;
+          }
+          return units;
+        }
+        function cvHidden(table) {
+          try {
+            var s = localStorage.getItem(cvKey(table));
+            if (!s) return [];
+            var a = JSON.parse(s);
+            return Array.isArray(a) ? a : [];
+          } catch (e) { return []; }
+        }
+        function cvSaveHidden(table, arr) {
+          try { localStorage.setItem(cvKey(table), JSON.stringify(arr)); } catch (e) {}
+        }
+        function cvSetCell(cell, hide) {
+          var fields = cell.querySelectorAll('input,select,textarea');
+          if (hide) {
+            for (var i = 0; i < fields.length; i++) {
+              var f = fields[i];
+              if (f.hasAttribute('required')) {
+                f.setAttribute('data-cv-req', '1');
+                f.removeAttribute('required');
+              }
+            }
+            cell.setAttribute('data-cv-hidden', '1');
+            cell.style.display = 'none';
+          } else if (cell.getAttribute('data-cv-hidden') === '1') {
+            for (var j = 0; j < fields.length; j++) {
+              var g = fields[j];
+              if (g.getAttribute('data-cv-req') === '1') {
+                g.setAttribute('required', '');
+                g.removeAttribute('data-cv-req');
+              }
+            }
+            cell.removeAttribute('data-cv-hidden');
+            cell.style.display = '';
+          }
+        }
+        function cvApply(table) {
+          if (!cvEligible(table)) return;
+          var units = cvUnits(table);
+          if (!units.length) return;
+          var hidden = cvHidden(table).filter(function(i) { return i >= 0 && i < units.length; });
+          var visibleCount = units.length - hidden.length;
+          if (visibleCount === 0) { hidden = []; cvSaveHidden(table, []); }
+          var hiddenCols = {};
+          hidden.forEach(function(i) {
+            units[i].cols.forEach(function(c) { hiddenCols[c] = true; });
+          });
+          var rows = table.rows;
+          for (var r = 0; r < rows.length; r++) {
+            var row = rows[r], col = 0;
+            for (var c = 0; c < row.cells.length; c++) {
+              var cell = row.cells[c];
+              var cs = cell.colSpan || 1;
+              var allHidden = true;
+              for (var k = 0; k < cs; k++) {
+                if (!hiddenCols[col + k]) { allHidden = false; break; }
+              }
+              cvSetCell(cell, allHidden);
+              col += cs;
+            }
+          }
+        }
+        function cvApplyAll() {
+          document.querySelectorAll('table').forEach(cvApply);
+        }
+        window.openColSettings = function() {
+          var body = document.getElementById('colSetBody');
+          body.innerHTML = '';
+          var any = false;
+          document.querySelectorAll('table').forEach(function(table) {
+            if (!cvEligible(table)) return;
+            any = true;
+            var units = cvUnits(table);
+            var hidden = cvHidden(table);
+            var box = document.createElement('div');
+            box.style.cssText = 'margin-bottom:16px;';
+            var head = document.createElement('div');
+            head.style.cssText = 'font-weight:bold;font-size:13px;margin-bottom:6px;';
+            head.textContent = '테이블 ' + (cvIndex(table) + 1) + ' (' + units.length + '개 항목)';
+            box.appendChild(head);
+            units.forEach(function(u, ui) {
+              var lab = document.createElement('label');
+              lab.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;padding:2px 0;';
+              var cb = document.createElement('input');
+              cb.type = 'checkbox';
+              cb.checked = hidden.indexOf(ui) < 0;
+              cb.addEventListener('change', function() {
+                var h = cvHidden(table).filter(function(i) { return i >= 0 && i < units.length; });
+                var pos = h.indexOf(ui);
+                if (cb.checked && pos >= 0) { h.splice(pos, 1); }
+                if (!cb.checked && pos < 0) { h.push(ui); }
+                if (units.length - h.length === 0) {
+                  alert('항목을 모두 숨길 수는 없습니다. 최소 1개는 표시해야 합니다.');
+                  cb.checked = true;
+                  return;
+                }
+                cvSaveHidden(table, h);
+                cvApply(table);
+                window.openColSettings();
+              });
+              lab.appendChild(cb);
+              lab.appendChild(document.createTextNode(u.label));
+              box.appendChild(lab);
+            });
+            var reset = document.createElement('button');
+            reset.textContent = '이 테이블 초기화';
+            reset.style.cssText = 'margin-top:6px;font-size:12px;padding:4px 10px;border:1px solid #ccc;background:#f5f5f5;border-radius:6px;cursor:pointer;';
+            reset.addEventListener('click', function() {
+              cvSaveHidden(table, []);
+              cvApply(table);
+              window.openColSettings();
+            });
+            box.appendChild(reset);
+            body.appendChild(box);
+          });
+          if (!any) {
+            body.innerHTML = '<div style="color:#888;font-size:13px;">설정할 수 있는 테이블이 없습니다.</div>';
+          }
+          document.getElementById('colSetOverlay').style.display = 'block';
+          document.getElementById('colSetModal').style.display = 'block';
+        };
+        window.closeColSettings = function() {
+          document.getElementById('colSetOverlay').style.display = 'none';
+          document.getElementById('colSetModal').style.display = 'none';
+        };
+        cvApplyAll();
+        var __cvTimer = null;
+        new MutationObserver(function() {
+          clearTimeout(__cvTimer);
+          __cvTimer = setTimeout(cvApplyAll, 300);
+        }).observe(document.body, { childList: true, subtree: true });
+      })();
+      </script>
+"""
+
+
 def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> str:
     """공통 레이아웃 — 상단 타이틀 + 하단 메뉴 포함"""
     # ⚠️ 모바일 전용 테이블 글씨 축소 — f-string 중괄호 충돌 방지를 위해 별도 문자열로 조립
@@ -2118,11 +2375,20 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     role_badge = f'<span style="background:#4FC3F7;color:white;padding:2px 10px;border-radius:12px;font-size:12px;margin-left:8px;">{branch_name}</span>' if user else ""
 
     is_master = user and (user.get("role") == "master" or user.get("branch_type") == "hq")
+    col_settings_enabled = os.getenv("COL_SETTINGS_ENABLED", "on").strip().lower() not in ("off", "0", "false", "no")
+    col_settings_btn = (
+        '<button type="button" onclick="openColSettings()" '
+        'style="background:rgba(255,255,255,.15);color:white;border:none;'
+        'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">🧩 칼럼</button>'
+        if col_settings_enabled else ""
+    )
+    col_settings_html = _COLUMN_SETTINGS_HTML if col_settings_enabled else ""
     raw_menu_href = "/master/raw-upload" if is_master else "/raw-branch"
     vendor_eval_href = "/master/vendor-eval" if is_master else "/vendor-eval"
     survey_menu_href = "/master/survey" if is_master else "/survey"
     notice_menu_href = "/master/notice" if is_master else "/notice"
     qna_menu_href = "/master/qna" if is_master else "/qna"
+    daily_stocktake_href = "/master/daily-stocktake" if is_master else "/daily-stocktake"
 
     # menus: (key, href|None, icon, label, submenu|None)
     # submenu가 있으면 href는 무시되고 클릭 시 소메뉴가 토글됩니다.
@@ -2135,6 +2401,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("stock-group", None, "📦", "재고&발주", [
             ("재고현황", "/inventory"),
             ("발주내역", "/purchase-history"),
+            ("재고 실사", daily_stocktake_href),
         ]),
         ("qr", "/qr", "📷", "QR생성", None),
         ("adjust", "/adjust", "✏️", "수기조정", None),
@@ -2153,7 +2420,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     # 합쳐진 메뉴는 기존 각 페이지가 넘기는 active 값으로도 강조되도록 묶어 둔다
     menu_active_keys = {
         "closing-group": ("closing-group", "closing", "stock-closing"),
-        "stock-group": ("stock-group", "inventory", "purchase-history"),
+        "stock-group": ("stock-group", "inventory", "purchase-history", "daily-stocktake"),
         "notice-group": ("notice-group", "survey-group", "notice", "qna", "survey", "vendor-eval"),
     }
 
@@ -2281,7 +2548,10 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     <body>
       <div class="topbar">
         <span style="font-weight:bold;">📦 재고 관리 시스템{role_badge}</span>
-        <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
+        <div style="display:flex;align-items:center;">
+          {col_settings_btn}
+          <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
+        </div>
       </div>
       <div class="content">{content}</div>
       <div id="noticePopupOverlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
@@ -2576,6 +2846,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         }}
       }})();
       </script>
+      {col_settings_html}
     </body></html>
     """
 
@@ -3444,6 +3715,1003 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
     else:
         msg = "저장되었습니다. (임시저장 — 마감 전까지 수정할 수 있습니다)"
     return JSONResponse({"ok": True, "mode": mode, "message": msg})
+
+
+# ── 지점 재고 실사 (daily stocktake — 소모품 제외 전 품목, 거래처/품류 필터) ──
+
+def _daily_stocktake_pm_map() -> dict:
+    """item_code -> {supplier, category, consumable}. product_master는 지점별 중복 행이 있어 품번별로 집계."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT item_code, "
+            "MAX(COALESCE(is_consumable, 0)) AS is_consumable, "
+            "min(NULLIF(trim(COALESCE(supplier, '')), '')) AS supplier, "
+            "min(NULLIF(trim(COALESCE(category, '')), '')) AS category "
+            "FROM product_master "
+            "WHERE item_code IS NOT NULL AND item_code <> '' "
+            "GROUP BY item_code"
+        ).fetchall()
+    except Exception:
+        # product_master 테이블이 없는 환경(SQLite 로컬 등)에서는 마스터 정보 없이 진행
+        rows = []
+    finally:
+        conn.close()
+    pm = {}
+    for r in rows:
+        pm[str(r["item_code"])] = {
+            "supplier": r["supplier"] or "",
+            "category": r["category"] or "",
+            "consumable": bool(r["is_consumable"]),
+        }
+    return pm
+
+
+def _dst_vendor_fallback_map() -> dict:
+    """item_code -> 최근 발주 거래처 (product_master.supplier가 비었을 때의 2순위 출처)."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT item_code, vendor FROM purchase_records "
+            "WHERE item_code IS NOT NULL AND item_code <> '' "
+            "AND vendor IS NOT NULL AND trim(vendor) <> '' "
+            "ORDER BY purchase_datetime DESC"
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    m = {}
+    for r in rows:
+        code = str(r["item_code"])
+        if code not in m:
+            m[code] = str(r["vendor"]).strip()
+    return m
+
+
+def _dst_name_prefix_vendor(item_name) -> str:
+    """상품명 '[거래처] 상품명' 형식의 앞쪽 대괄호 값을 거래처로 사용 (3순위 출처)."""
+    import re as _re
+    m = _re.match(r"^\s*\[([^\]]+)\]", str(item_name or ""))
+    return m.group(1).strip() if m else ""
+
+
+def _daily_stocktake_items(branch_code: str):
+    """지점의 소모품 제외 품목 + QR재고 + 유비플러스 재고 + 거래처/품류 (inventory 보유 품목만).
+    거래처 우선순위: product_master.supplier → purchase_records 최근 vendor → 상품명 [거래처] 접두사.
+    품류(category)는 product_master.category가 유일한 출처 (미입력 시 (미등록)).
+    반환: (items, excluded_count) — 제외 규칙: 빈 품번, 지점 목록에 없는 branch_code,
+    UPS(raw)에 없고 qr_qty=0인 행, 소모품."""
+    conn = get_conn()
+    try:
+        inv_rows = conn.execute(
+            "SELECT item_code, item_name, quantity FROM inventory WHERE branch_code=? ORDER BY item_code",
+            (branch_code,)
+        ).fetchall()
+    finally:
+        conn.close()
+    pm = _daily_stocktake_pm_map()
+    vendor_fb = _dst_vendor_fallback_map()
+    raw_map = {f"{r['branch_code']}|{r['item_code']}": r["quantity"] for r in fetch_raw_inventory()}
+    valid_codes = {str(b["branch_code"]) for b in get_branches(branch_type=None)}
+    branch_valid = str(branch_code) in valid_codes
+    items = []
+    excluded = 0
+    for r in inv_rows:
+        code = str(r["item_code"] or "").strip()
+        if not code or not branch_valid:
+            excluded += 1
+            continue
+        info = pm.get(code) or {}
+        if info.get("consumable"):
+            excluded += 1
+            continue
+        key = f"{branch_code}|{code}"
+        ups = raw_map.get(key)
+        qr_qty = r["quantity"] or 0
+        if ups is None and qr_qty == 0:
+            excluded += 1
+            continue
+        supplier = info.get("supplier") or vendor_fb.get(code) or _dst_name_prefix_vendor(r["item_name"])
+        items.append({
+            "item_code": code,
+            "item_name": r["item_name"],
+            "supplier": supplier,
+            "category": info.get("category", ""),
+            "qr_qty": qr_qty,
+            "ups": ups,
+        })
+    return items, excluded
+
+
+def _dst_closer_box(save, can_write: bool) -> str:
+    """재고 실사 화면 맨 위의 '실사 담당자' 입력칸"""
+    import html as _html
+    name = ""
+    if save:
+        try:
+            name = str(save["closer_name"] or "")
+        except Exception:
+            name = ""
+    esc = _html.escape(name)
+    if can_write:
+        return (
+            '<div class="card" style="margin-bottom:12px;">'
+            '<label style="font-size:13px;font-weight:bold;">실사 담당자 <span style="color:#DC2626;">*</span></label>'
+            f'<input type="text" id="dstCloser" maxlength="30" placeholder="실사 담당자 이름 (필수)" value="{esc}" style="margin-top:6px;max-width:260px;">'
+            '<div style="font-size:12px;color:#888;margin-top:4px;">실제 실사하는 사람의 이름을 입력해주세요. 저장할 때 필수입니다.</div>'
+            "</div>"
+        )
+    shown = esc if esc else "-"
+    return (
+        '<div class="card" style="margin-bottom:12px;font-size:13px;">'
+        f'<b>실사 담당자</b> {shown}</div>'
+    )
+
+
+@app.get("/daily-stocktake", response_class=HTMLResponse)
+async def daily_stocktake_page(
+    session_token: str = Cookie(default=None),
+    filter_branch: str = "",
+    date: str = "",
+    vendor: str = "",
+    category: str = "",
+):
+    """재고 실사 — 날짜/거래처/품류 선택 후 소모품 제외 품목 실사 수량 입력·저장. 마스터는 지점 선택 후 실사 가능."""
+    import html as _html
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    is_master_user = user["role"] == "master" or user.get("branch_type") == "hq"
+    kst = _tz(_td(hours=9))
+    today_kst = _dt.now(kst).date()
+
+    sel_date = today_kst
+    if date:
+        try:
+            sel_date = _dt.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            sel_date = today_kst
+    if sel_date > today_kst:
+        sel_date = today_kst
+    sel_date_str = sel_date.strftime("%Y-%m-%d")
+    today_str = today_kst.strftime("%Y-%m-%d")
+
+    target_branch = filter_branch if is_master_user else user["branch_code"]
+
+    # 마스터가 지점을 선택하지 않은 경우: 지점 선택 안내만 표시
+    if is_master_user and not target_branch:
+        branch_options = '<option value="">-- 지점을 선택하세요 --</option>'
+        for b in get_branches():
+            branch_options += (
+                f'<option value="{_html.escape(str(b["branch_code"]))}">'
+                f'{_html.escape(str(b["branch_name"]))}</option>'
+            )
+        picker = (
+            '<div class="card" style="max-width:420px;margin:40px auto;text-align:center;">'
+            '<h2 style="margin-bottom:12px;">🧮 재고 실사</h2>'
+            '<p style="color:#888;font-size:13px;margin-bottom:16px;">실사할 지점을 선택하세요.</p>'
+            '<form method="get" action="/daily-stocktake">'
+            f'<select name="filter_branch" style="margin-bottom:12px;">{branch_options}</select>'
+            '<br><button class="btn" type="submit">선택</button>'
+            '<a href="/master/daily-stocktake" style="display:inline-block;margin-left:8px;padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">결과 보기</a>'
+            "</form></div>"
+        )
+        return HTMLResponse(render_page(picker, user, "daily-stocktake"))
+
+    # 저장 내역 + 라인 조회
+    save = None
+    line_map = {}
+    conn = get_conn()
+    try:
+        save = conn.execute(
+            "SELECT * FROM daily_stocktake_saves WHERE branch_code=? AND count_date=?",
+            (target_branch, sel_date_str)
+        ).fetchone()
+        if save:
+            for l in conn.execute(
+                "SELECT * FROM daily_stocktake_lines WHERE save_id=?",
+                (save["id"],)
+            ).fetchall():
+                line_map[str(l["item_code"])] = l
+    finally:
+        conn.close()
+
+    items, excluded_count = _daily_stocktake_items(target_branch)
+
+    # 마감 상태 — 마감된 실사는 입력·저장·마감 모두 불가 (서버에서도 강제)
+    is_closed = bool(save and (save["status"] or "open") == "closed")
+    page_can_write = not is_closed
+
+    # 거래처/품류 필터 옵션 (필터 전 전체 품목 기준)
+    def _opts(values, current, none_label):
+        vals = sorted({v for v in values if v})
+        has_none = any(not v for v in values)
+        out = f'<option value="">전체</option>'
+        if has_none:
+            sel = "selected" if current == "__none__" else ""
+            out += f'<option value="__none__" {sel}>{none_label}</option>'
+        for v in vals:
+            sel = "selected" if current == v else ""
+            out += f'<option value="{_html.escape(v)}" {sel}>{_html.escape(v)}</option>'
+        return out
+
+    all_suppliers = [it["supplier"] for it in items]
+    all_categories = [it["category"] for it in items]
+    vendor_options = _opts(all_suppliers, vendor, "(미등록)")
+    category_options = _opts(all_categories, category, "(미등록)")
+
+    def _match(val, flt):
+        if not flt:
+            return True
+        if flt == "__none__":
+            return not val
+        return val == flt
+
+    filtered_items = [
+        it for it in items
+        if _match(it["supplier"], vendor) and _match(it["category"], category)
+    ]
+
+    def _fmt_num(v):
+        return "-" if v is None else str(v)
+
+    def _diff_html(d):
+        if d is None:
+            return '<td class="dst-diff" style="font-weight:bold;color:#888;">-</td>'
+        color = "#22C55E" if d == 0 else ("#EF4444" if d < 0 else "#F59E0B")
+        txt = ("+" if d > 0 else "") + str(d)
+        return f'<td class="dst-diff" style="font-weight:bold;color:{color};">{txt}</td>'
+
+    rows_html = ""
+    shown_codes = set()
+    for it in filtered_items:
+        code = it["item_code"]
+        shown_codes.add(code)
+        line = line_map.get(code)
+        if line is not None:
+            # 저장된 라인: 스냅샷 값 + 저장된 실사 수량
+            qr_disp = _fmt_num(line["qr_qty"])
+            ups_val = line["ups_qty"]
+            ups_disp = _fmt_num(ups_val)
+            ups_attr = "" if ups_val is None else str(ups_val)
+            cv = line["counted_qty"]
+            badge = ' <span style="font-size:10px;color:#1E40AF;background:#EFF6FF;padding:1px 5px;border-radius:8px;">스냅샷</span>'
+        else:
+            qr_disp = _fmt_num(it["qr_qty"])
+            ups_val = it["ups"]
+            ups_disp = _fmt_num(ups_val)
+            ups_attr = "" if ups_val is None else str(ups_val)
+            cv = None
+            badge = (' <span style="font-size:10px;color:#166534;background:#F0FDF4;padding:1px 5px;border-radius:8px;">현재값</span>'
+                     if save else "")
+        if ups_val is None:
+            badge += ' <span style="font-size:10px;color:#92400E;background:#FFFBEB;padding:1px 5px;border-radius:8px;">UPS 없음</span>'
+        val_attr = "" if cv is None else f' value="{cv}"'
+        dis_attr = "" if page_can_write else " disabled"
+        rows_html += (
+            "<tr>"
+            f"<td>{_html.escape(str(target_branch))}</td>"
+            f"<td>{_html.escape(str(it['item_name'] or ''))}</td>"
+            f"<td>{_html.escape(code)}</td>"
+            f"<td>{qr_disp}</td>"
+            f"<td>{ups_disp}{badge}</td>"
+            f'<td><input type="number" min="0" class="dst-input" '
+            f'data-code="{_html.escape(code)}" data-ups="{ups_attr}"{val_attr}{dis_attr} '
+            'placeholder="실사" oninput="dstUpdateDiff(this)" '
+            'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
+            '<td class="dst-diff" style="font-weight:bold;color:#888;">-</td>'
+            + _sc_adjust_cell(target_branch, code, page_can_write)
+            + "</tr>"
+        )
+
+    # 저장됐지만 현재 inventory에 없는 품목 (삭제/미등록) — 읽기 전용으로 표시
+    for code, line in line_map.items():
+        if code in shown_codes:
+            continue
+        rows_html += (
+            "<tr style=\"background:#F9FAFB;color:#888;\">"
+            f"<td>{_html.escape(str(target_branch))}</td>"
+            f"<td>{_html.escape(str(line['item_name'] or ''))} <span style=\"font-size:10px;\">(삭제된 품목)</span></td>"
+            f"<td>{_html.escape(code)}</td>"
+            f"<td>{_fmt_num(line['qr_qty'])}</td>"
+            f"<td>{_fmt_num(line['ups_qty'])}</td>"
+            f"<td>{_fmt_num(line['counted_qty'])}</td>"
+            + _diff_html(line["diff_qty"])
+            + "<td>-</td>"
+            + "</tr>"
+        )
+
+    if not rows_html:
+        rows_html = (
+            '<tr><td colspan="8" style="text-align:center;padding:24px;color:#888;">'
+            "표시할 품목이 없습니다 (소모품 제외 inventory 등록 품목 기준)</td></tr>"
+        )
+
+    # 필터 폼
+    branch_select_html = ""
+    if is_master_user:
+        branch_options = '<option value="">-- 지점 선택 --</option>'
+        for b in get_branches():
+            sel = "selected" if target_branch == b["branch_code"] else ""
+            branch_options += (
+                f'<option value="{_html.escape(str(b["branch_code"]))}" {sel}>'
+                f'{_html.escape(str(b["branch_name"]))}</option>'
+            )
+        branch_select_html = (
+            '<div style="flex:1;min-width:140px;max-width:220px;">'
+            '<label style="font-size:12px;color:#888;">지점</label>'
+            f'<select name="filter_branch" style="margin-top:4px;">{branch_options}</select>'
+            "</div>"
+        )
+    filter_html = (
+        '<form method="get" action="/daily-stocktake" style="margin-bottom:16px;">'
+        '<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
+        + branch_select_html
+        + '<div style="flex:1;min-width:130px;max-width:170px;">'
+        '<label style="font-size:12px;color:#888;">날짜</label>'
+        f'<input type="date" name="date" value="{sel_date_str}" max="{today_str}" style="margin-top:4px;">'
+        "</div>"
+        '<div style="flex:1;min-width:120px;max-width:180px;">'
+        '<label style="font-size:12px;color:#888;">거래처</label>'
+        f'<select name="vendor" style="margin-top:4px;">{vendor_options}</select>'
+        "</div>"
+        '<div style="flex:1;min-width:110px;max-width:160px;">'
+        '<label style="font-size:12px;color:#888;">품류</label>'
+        f'<select name="category" style="margin-top:4px;">{category_options}</select>'
+        "</div>"
+        '<button class="btn" type="submit">조회</button>'
+        '<a href="/daily-stocktake" style="padding:10px 14px;background:#eee;'
+        'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>'
+        "</div></form>"
+    )
+
+    notices_html = ""
+    notice_style = 'class="card" style="font-size:12px;margin-bottom:12px;'
+    if is_closed:
+        closed_at_txt = _html.escape(str(save["closed_at"] or "-"))
+        closed_by_txt = _html.escape(str(save["closed_by"] or "-"))
+        reopen_btn = ""
+        if is_master_user:
+            reopen_btn = (
+                '<button class="btn" type="button" style="margin-left:8px;background:#B45309;" '
+                f'onclick="dstReopen(\'{_html.escape(str(target_branch))}\', \'{sel_date_str}\')">마감 해제</button>'
+            )
+        notices_html += (
+            f'<div {notice_style}color:#7F1D1D;background:#FEF2F2;font-weight:bold;">'
+            f'🔒 마감됨 — 담당자 {_html.escape(str(save["closer_name"] or "-"))} · '
+            f'마감자 {closed_by_txt} · 마감시각 {closed_at_txt}. 마감 후에는 수정할 수 없습니다.'
+            + reopen_btn + "</div>"
+        )
+    elif save:
+        notices_html += (
+            f'<div {notice_style}color:#1E40AF;background:#EFF6FF;">'
+            f'💾 저장된 실사 기록 있음 — 담당자 {_html.escape(str(save["closer_name"] or "-"))} · '
+            f'저장자 {_html.escape(str(save["saved_by"] or "-"))} · '
+            f'{_html.escape(str(save["saved_at"] or "-"))}. '
+            '빈 칸으로 저장하면 기존 값이 유지됩니다.</div>'
+        )
+    if is_master_user:
+        notices_html += (
+            f'<div {notice_style}color:#475569;background:#F8FAFC;">'
+            "마스터 계정으로 실사할 지점을 선택한 뒤 입력·저장할 수 있습니다. "
+            '<a href="/master/daily-stocktake" style="color:#1E2761;font-weight:bold;">→ 지점별 실사 결과 보기</a></div>'
+        )
+
+    script = """
+    <script>
+      function dstUpdateDiff(inp) {
+        var tr = inp.closest('tr');
+        var cell = tr.querySelector('.dst-diff');
+        var ups = inp.getAttribute('data-ups');
+        if (inp.value === '' || ups === '') {
+          cell.textContent = '-';
+          cell.style.color = '#888';
+          return;
+        }
+        var diff = parseInt(inp.value, 10) - parseInt(ups, 10);
+        if (isNaN(diff)) {
+          cell.textContent = '-';
+          cell.style.color = '#888';
+          return;
+        }
+        cell.textContent = (diff > 0 ? '+' : '') + diff;
+        cell.style.color = diff === 0 ? '#22C55E' : (diff < 0 ? '#EF4444' : '#F59E0B');
+      }
+
+      function dstCollect() {
+        var closerEl = document.getElementById('dstCloser');
+        var closer = closerEl ? closerEl.value.trim() : '';
+        if (closer === '') {
+          alert('실사 담당자 이름을 입력해주세요. (필수)');
+          if (closerEl) closerEl.focus();
+          return null;
+        }
+        var counts = {};
+        document.querySelectorAll('.dst-input').forEach(function(inp) {
+          if (inp.value !== '') { counts[inp.getAttribute('data-code')] = inp.value; }
+        });
+        var branchEl = document.querySelector('select[name="filter_branch"]');
+        var payload = {
+          date: '__DST_DATE__',
+          closer_name: closer,
+          counts: counts
+        };
+        if (branchEl && branchEl.value) payload.branch_code = branchEl.value;
+        return payload;
+      }
+
+      async function dstSubmit() {
+        var payload = dstCollect();
+        if (!payload) return;
+        var filled = Object.keys(payload.counts).length;
+        if (filled === 0) {
+          alert('실사 수량이 입력된 상품이 없습니다.');
+          return;
+        }
+        try {
+          var res = await fetch('/daily-stocktake/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+          });
+          var data = await res.json();
+          if (!res.ok) {
+            alert(data.detail || '저장에 실패했습니다.');
+            return;
+          }
+          alert(data.message || '저장되었습니다.');
+          location.reload();
+        } catch (e) {
+          alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+        }
+      }
+
+      function dstEsc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+          return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+        });
+      }
+
+      function dstShowMissingConfirm(missing) {
+        var body = document.getElementById('dstMissingBody');
+        var msg = document.getElementById('dstMissingMsg');
+        if (!body || !msg) return;
+        msg.textContent = '입력하지 않은 ' + missing.length + '개 품목을 0으로 입력하고 마감하시겠습니까?';
+        var html = '';
+        missing.forEach(function(m) {
+          var zd = (m.zero_diff === null || m.zero_diff === undefined) ? '오차 없음' : String(m.zero_diff);
+          html += '<tr>'
+            + '<td>' + dstEsc(m.item_name) + '</td>'
+            + '<td>' + dstEsc(m.item_code) + '</td>'
+            + '<td style="text-align:right;">' + (m.ups_qty === null || m.ups_qty === undefined ? '-' : dstEsc(m.ups_qty)) + '</td>'
+            + '<td style="text-align:right;">' + dstEsc(zd) + '</td>'
+            + '</tr>';
+        });
+        body.innerHTML = html;
+        document.getElementById('dstMissingOverlay').style.display = 'flex';
+      }
+
+      function dstHideMissingConfirm() {
+        var ov = document.getElementById('dstMissingOverlay');
+        if (ov) ov.style.display = 'none';
+      }
+
+      async function dstClose(confirmZero) {
+        var payload = dstCollect();
+        if (!payload) return;
+        payload.confirm_zero = !!confirmZero;
+        try {
+          var res = await fetch('/daily-stocktake/close', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(payload)
+          });
+          var data = await res.json();
+          if (!res.ok) {
+            alert(data.detail || '마감에 실패했습니다.');
+            return;
+          }
+          if (data.needs_confirm) {
+            dstShowMissingConfirm(data.missing || []);
+            return;
+          }
+          dstHideMissingConfirm();
+          alert(data.message || '마감되었습니다.');
+          location.reload();
+        } catch (e) {
+          alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+        }
+      }
+
+      async function dstReopen(branch, dateStr) {
+        if (!confirm('마감을 해제하면 다시 수정할 수 있습니다. 해제하시겠습니까?')) return;
+        try {
+          var res = await fetch('/daily-stocktake/reopen', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({branch_code: branch, date: dateStr})
+          });
+          var data = await res.json();
+          if (!res.ok) {
+            alert(data.detail || '마감 해제에 실패했습니다.');
+            return;
+          }
+          alert(data.message || '마감이 해제되었습니다.');
+          location.reload();
+        } catch (e) {
+          alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+        }
+      }
+
+      window.addEventListener('load', function() {
+        document.querySelectorAll('.dst-input').forEach(function(inp) {
+          if (inp.value !== '') dstUpdateDiff(inp);
+        });
+      });
+    </script>
+    """.replace("__DST_DATE__", sel_date_str)
+
+    content = (
+        '<h2 style="margin:0 0 8px 0;">🧮 재고 실사</h2>'
+        + _dst_closer_box(save, page_can_write)
+        + f'<p style="color:#888;font-size:13px;margin-bottom:4px;">{sel_date_str} 기준 · 소모품 제외 품목'
+        + (f' · 제외된 품목 {excluded_count}건' if excluded_count else '')
+        + '</p>'
+        '<p style="color:#888;font-size:12px;margin-bottom:16px;">'
+        "오차 = 실사 수량 − 유비플러스 재고 · 빈 칸은 저장 시 기존 값 유지 · "
+        "inventory 미등록 품목은 실사 대상이 아닙니다</p>"
+        + filter_html
+        + notices_html
+        + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-16">'
+        "<thead><tr>"
+        '<th style="width:8%">지점</th><th style="width:24%">상품명</th>'
+        '<th style="width:10%">상품코드</th><th style="width:9%">QR 재고 수량</th>'
+        '<th style="width:11%">유비플러스 재고 수량</th>'
+        '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:10%">QR 수정</th>'
+        "</tr></thead><tbody>"
+        + rows_html
+        + "</tbody></table></div>"
+        + ('<div style="margin-top:12px;"><span style="font-size:12px;color:#888;">'
+           "마감된 실사입니다. 수정하려면 마스터가 마감 해제 후 진행해주세요.</span></div>"
+           if is_closed else
+           '<div style="display:flex;gap:8px;margin-top:12px;">'
+           + '<button class="btn" type="button" style="flex:1;" onclick="dstSubmit()">💾 저장</button>'
+           + '<button class="btn" type="button" style="flex:1;background:#B45309;" onclick="dstClose(false)">🔒 마감</button>'
+           + "</div>")
+        + '<p style="font-size:12px;color:#888;margin-top:8px;">'
+        "필터로 일부 품목만 보이는 상태에서 저장해도 나머지 품목의 기존 실사값은 유지됩니다. "
+        "저장하지 않은 입력은 사라지므로 먼저 저장해주세요. 마감 시 입력하지 않은 품목은 0으로 처리할지 확인합니다.</p>"
+        + "</div>"
+        # 미입력 품목 0 입력 확인 모달
+        + '<div id="dstMissingOverlay" style="display:none;position:fixed;inset:0;'
+        'background:rgba(0,0,0,0.45);z-index:1000;align-items:center;justify-content:center;">'
+        '<div style="background:#fff;border-radius:12px;max-width:640px;width:92%;max-height:80vh;'
+        'display:flex;flex-direction:column;overflow:hidden;">'
+        '<div style="padding:16px 16px 8px;font-weight:bold;font-size:15px;" id="dstMissingMsg"></div>'
+        '<div style="overflow-y:auto;padding:0 16px;"><table style="width:100%;border-collapse:collapse;font-size:13px;">'
+        '<thead><tr style="background:#F3F4F6;"><th style="text-align:left;padding:6px;">상품명</th>'
+        '<th style="text-align:left;padding:6px;">상품코드</th>'
+        '<th style="text-align:right;padding:6px;">유비플러스 재고</th>'
+        '<th style="text-align:right;padding:6px;">0 입력 시 오차</th></tr></thead>'
+        '<tbody id="dstMissingBody"></tbody></table></div>'
+        '<div style="display:flex;gap:8px;padding:14px 16px;justify-content:flex-end;">'
+        '<button class="btn" type="button" style="background:#6B7280;" onclick="dstHideMissingConfirm()">돌아가기</button>'
+        '<button class="btn" type="button" style="background:#B45309;" onclick="dstClose(true)">0으로 입력하고 마감</button>'
+        "</div></div></div>"
+        + script
+    )
+    return HTMLResponse(render_page(content, user, active="daily-stocktake"))
+
+
+def _dst_parse_counts(counts, item_map: dict) -> dict:
+    """실사 수량 입력 파싱 — 빈 칸=변경 없음, 숫자/범위 검증. 반환 {item_code: counted}."""
+    from fastapi import HTTPException
+    parsed = {}
+    for code, raw_val in (counts or {}).items():
+        code = str(code)
+        if code not in item_map:
+            continue  # 현재 실사 대상이 아닌 품번은 무시
+        if raw_val is None or str(raw_val).strip() == "":
+            continue  # 빈 칸 = 변경 없음
+        try:
+            counted = int(str(raw_val).strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="실사 수량이 숫자가 아닙니다: " + code)
+        if counted < 0 or counted > 1000000:
+            raise HTTPException(status_code=400, detail="실사 수량은 0~1000000 사이여야 합니다: " + code)
+        parsed[code] = counted
+    return parsed
+
+
+def _dst_get_or_create_save(conn, branch_code: str, date_str: str, closer_name: str, login: str, now_str: str):
+    """(branch_code, count_date) save 행을 찾아 id 반환. 없으면 생성. 마감 여부는 호출부에서 검사."""
+    existing = conn.execute(
+        "SELECT id, status FROM daily_stocktake_saves WHERE branch_code=? AND count_date=?",
+        (branch_code, date_str)
+    ).fetchone()
+    if existing:
+        save_id = existing["id"]
+        conn.execute(
+            "UPDATE daily_stocktake_saves SET closer_name=?, saved_by=?, saved_at=? WHERE id=?",
+            (closer_name, login, now_str, save_id)
+        )
+        return save_id, existing
+    conn.execute(
+        "INSERT INTO daily_stocktake_saves (branch_code, count_date, closer_name, saved_by, saved_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (branch_code, date_str, closer_name, login, now_str)
+    )
+    row = conn.execute(
+        "SELECT id FROM daily_stocktake_saves WHERE branch_code=? AND count_date=?",
+        (branch_code, date_str)
+    ).fetchone()
+    return row["id"], None
+
+
+def _dst_write_counts(conn, save_id, branch_code: str, date_str: str, parsed: dict, item_map: dict):
+    """제출된 실사 수량을 품목별 upsert (qr/ups 스냅샷 갱신) + item/mismatch 재계산."""
+    for code, counted in parsed.items():
+        it = item_map[code]
+        ups = it["ups"]
+        diff = (counted - ups) if ups is not None else None
+        conn.execute(
+            "INSERT INTO daily_stocktake_lines "
+            "(save_id, branch_code, count_date, item_code, item_name, supplier, category, "
+            " qr_qty, ups_qty, counted_qty, diff_qty) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(save_id, item_code) DO UPDATE SET "
+            "item_name=excluded.item_name, supplier=excluded.supplier, category=excluded.category, "
+            "qr_qty=excluded.qr_qty, ups_qty=excluded.ups_qty, "
+            "counted_qty=excluded.counted_qty, diff_qty=excluded.diff_qty",
+            (save_id, branch_code, date_str, code, it["item_name"], it["supplier"], it["category"],
+             it["qr_qty"], ups, counted, diff)
+        )
+    # item_count/mismatch_count는 DB의 해당 save 전체 라인 기준으로 재계산
+    cnt_row = conn.execute(
+        "SELECT COUNT(*) AS c, "
+        "SUM(CASE WHEN diff_qty IS NOT NULL AND diff_qty <> 0 THEN 1 ELSE 0 END) AS m "
+        "FROM daily_stocktake_lines WHERE save_id=?",
+        (save_id,)
+    ).fetchone()
+    conn.execute(
+        "UPDATE daily_stocktake_saves SET item_count=?, mismatch_count=? WHERE id=?",
+        (int(cnt_row["c"] or 0), int(cnt_row["m"] or 0), save_id)
+    )
+
+
+def _dst_missing_items(conn, save_id, items: list) -> list:
+    """전체 대상 품목(_daily_stocktake_items 기준) 중 counted_qty가 NULL인 품목 목록."""
+    rows = conn.execute(
+        "SELECT item_code, counted_qty FROM daily_stocktake_lines WHERE save_id=?",
+        (save_id,)
+    ).fetchall()
+    counted_map = {str(r["item_code"]): r["counted_qty"] for r in rows}
+    missing = []
+    for it in items:
+        cv = counted_map.get(it["item_code"])
+        if cv is None:
+            ups = it["ups"]
+            missing.append({
+                "item_code": it["item_code"],
+                "item_name": it["item_name"],
+                "ups_qty": ups,
+                "zero_diff": (-ups) if ups is not None else None,
+            })
+    return missing
+
+
+def _dst_validate_common(request_body: dict, user: dict):
+    """save/close 공통 검증 — 지점 결정, 날짜, 담당자. 반환 (branch_code, date_str, closer_name)."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fastapi import HTTPException
+
+    is_master = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_master:
+        branch_code = str(request_body.get("branch_code", "")).strip()
+        valid_codes = {b["branch_code"] for b in get_branches()}
+        if not branch_code or branch_code not in valid_codes:
+            raise HTTPException(status_code=400, detail="실사할 지점을 선택해주세요.")
+    else:
+        # 지점 계정은 body의 branch_code를 무시하고 세션 지점으로 강제
+        branch_code = user["branch_code"]
+
+    date_str = str(request_body.get("date", "")).strip()
+    closer_name = str(request_body.get("closer_name", "")).strip()[:30]
+    if not closer_name:
+        raise HTTPException(status_code=400, detail="실사 담당자 이름을 입력해주세요. (필수)")
+    try:
+        sel_date = _dt.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+    today_kst = _dt.now(_tz(_td(hours=9))).date()
+    if sel_date > today_kst:
+        raise HTTPException(status_code=400, detail="미래 날짜는 실사할 수 없습니다.")
+    return branch_code, date_str, closer_name
+
+
+@app.post("/daily-stocktake/save")
+async def daily_stocktake_save(request: Request, session_token: str = Cookie(default=None)):
+    """재고 실사 저장 — 서버에서 품목·재고값 재계산, 실사 수량만 받음. 품목별 upsert라 필터 상태 저장도 안전. 마감된 실사는 거부."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+
+    branch_code, date_str, closer_name = _dst_validate_common(body, user)
+    counts = body.get("counts") or {}
+    if not isinstance(counts, dict):
+        raise HTTPException(status_code=400, detail="실사 수량 형식이 올바르지 않습니다.")
+
+    # 서버에서 현재 품목·재고값 재계산 (필터 무관 전체 소모품 제외 품목)
+    items, _excluded = _daily_stocktake_items(branch_code)
+    item_map = {it["item_code"]: it for it in items}
+    parsed = _dst_parse_counts(counts, item_map)
+
+    kst = _tz(_td(hours=9))
+    now_str = _dt.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+    login = user.get("login_id") or branch_code
+
+    conn = get_conn()
+    try:
+        save_id, existing = _dst_get_or_create_save(conn, branch_code, date_str, closer_name, login, now_str)
+        if existing and (existing["status"] or "open") == "closed":
+            raise HTTPException(status_code=409, detail="이미 마감된 실사입니다. 마감 후에는 수정할 수 없습니다.")
+        _dst_write_counts(conn, save_id, branch_code, date_str, parsed, item_map)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return JSONResponse({"ok": True, "message": "저장되었습니다. (" + str(len(parsed)) + "개 품목 반영)"})
+
+
+@app.post("/daily-stocktake/close")
+async def daily_stocktake_close(request: Request, session_token: str = Cookie(default=None)):
+    """재고 실사 마감 — 제출값 저장 후 미입력 품목이 있으면 확인 요청, confirm_zero 시 0 입력 후 마감.
+    전체 대상 품목(_daily_stocktake_items) 기준, 단일 트랜잭션."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+
+    branch_code, date_str, closer_name = _dst_validate_common(body, user)
+    counts = body.get("counts") or {}
+    if not isinstance(counts, dict):
+        raise HTTPException(status_code=400, detail="실사 수량 형식이 올바르지 않습니다.")
+    confirm_zero = bool(body.get("confirm_zero"))
+
+    items, _excluded = _daily_stocktake_items(branch_code)
+    item_map = {it["item_code"]: it for it in items}
+    parsed = _dst_parse_counts(counts, item_map)
+
+    kst = _tz(_td(hours=9))
+    now_str = _dt.now(kst).strftime("%Y-%m-%d %H:%M:%S")
+    login = user.get("login_id") or branch_code
+
+    conn = get_conn()
+    try:
+        save_id, existing = _dst_get_or_create_save(conn, branch_code, date_str, closer_name, login, now_str)
+        if existing and (existing["status"] or "open") == "closed":
+            raise HTTPException(status_code=409, detail="이미 마감된 실사입니다.")
+
+        # 제출된 입력값 먼저 저장
+        _dst_write_counts(conn, save_id, branch_code, date_str, parsed, item_map)
+
+        # 전체 대상 품목 기준 미입력 확인 (필터 무관)
+        missing = _dst_missing_items(conn, save_id, items)
+        if missing and not confirm_zero:
+            conn.commit()  # 제출 입력값은 저장, 마감은 보류
+            return JSONResponse({
+                "ok": True,
+                "needs_confirm": True,
+                "missing_count": len(missing),
+                "missing": missing[:200],
+                "message": "입력하지 않은 " + str(len(missing)) + "개 품목이 있습니다.",
+            })
+
+        if missing:
+            # 미입력 품목을 0으로 입력 (스냅샷 갱신, diff = 0 - ups)
+            zero_parsed = {m["item_code"]: 0 for m in missing}
+            _dst_write_counts(conn, save_id, branch_code, date_str, zero_parsed, item_map)
+
+        conn.execute(
+            "UPDATE daily_stocktake_saves SET status='closed', closed_at=?, closed_by=?, "
+            "saved_by=?, saved_at=? WHERE id=?",
+            (now_str, login, login, now_str, save_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return JSONResponse({"ok": True, "message": "마감되었습니다. 마감 후에는 수정할 수 없습니다."})
+
+
+@app.post("/daily-stocktake/reopen")
+async def daily_stocktake_reopen(request: Request, session_token: str = Cookie(default=None)):
+    """마감 해제 — 마스터 전용. 해제자/시각 기록."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    is_master = user["role"] == "master" or user.get("branch_type") == "hq"
+    if not is_master:
+        raise HTTPException(status_code=403, detail="마감 해제는 마스터만 가능합니다.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+
+    branch_code = str(body.get("branch_code", "")).strip()
+    valid_codes = {b["branch_code"] for b in get_branches()}
+    if not branch_code or branch_code not in valid_codes:
+        raise HTTPException(status_code=400, detail="지점을 선택해주세요.")
+    date_str = str(body.get("date", "")).strip()
+    try:
+        _dt.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+
+    now_str = _dt.now(_tz(_td(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
+    login = user.get("login_id") or branch_code
+
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "UPDATE daily_stocktake_saves SET status='open', reopened_at=?, reopened_by=? "
+            "WHERE branch_code=? AND count_date=? RETURNING id",
+            (now_str, login, branch_code, date_str)
+        ).fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="해당 날짜의 실사 기록이 없습니다.")
+    return JSONResponse({"ok": True, "message": "마감이 해제되었습니다."})
+
+
+@app.get("/master/daily-stocktake", response_class=HTMLResponse)
+async def master_daily_stocktake_page(
+    session_token: str = Cookie(default=None),
+    filter_branch: str = "",
+    date: str = "",
+):
+    """마스터 > 지점 재고 실사 결과 목록"""
+    import html as _html
+    from datetime import datetime as _dt
+
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "daily-stocktake"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    # 지점명 매핑
+    branch_name_map = {}
+    for b in get_branches(branch_type=None):
+        branch_name_map[b["branch_code"]] = b["branch_name"]
+
+    conn = get_conn()
+    try:
+        query = "SELECT * FROM daily_stocktake_saves WHERE 1=1"
+        params = []
+        if filter_branch:
+            query += " AND branch_code=?"
+            params.append(filter_branch)
+        if date:
+            query += " AND count_date=?"
+            params.append(date)
+        query += " ORDER BY count_date DESC, branch_code LIMIT 500"
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    branch_options = '<option value="">전체 지점</option>'
+    for b in get_branches():
+        sel = "selected" if filter_branch == b["branch_code"] else ""
+        branch_options += (
+            f'<option value="{_html.escape(str(b["branch_code"]))}" {sel}>'
+            f'{_html.escape(str(b["branch_name"]))}</option>'
+        )
+
+    filter_html = (
+        '<form method="get" action="/master/daily-stocktake" style="margin-bottom:16px;">'
+        '<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
+        '<div style="flex:1;min-width:140px;max-width:220px;">'
+        '<label style="font-size:12px;color:#888;">지점</label>'
+        f'<select name="filter_branch" style="margin-top:4px;">{branch_options}</select>'
+        "</div>"
+        '<div style="flex:1;min-width:130px;max-width:170px;">'
+        '<label style="font-size:12px;color:#888;">실사일</label>'
+        f'<input type="date" name="date" value="{_html.escape(date)}" style="margin-top:4px;">'
+        "</div>"
+        '<button class="btn" type="submit">조회</button>'
+        '<a href="/master/daily-stocktake" style="padding:10px 14px;background:#eee;'
+        'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>'
+        '<a href="/daily-stocktake" style="padding:10px 14px;background:#1E2761;color:white;'
+        'border-radius:8px;font-size:13px;text-decoration:none;">🧮 실사하기</a>'
+        "</div></form>"
+    )
+
+    rows_html = ""
+    if not rows:
+        rows_html = '<tr><td colspan="9" style="text-align:center;padding:24px;color:#888;">실사 기록이 없습니다.</td></tr>'
+    else:
+        for s in rows:
+            bc = str(s["branch_code"])
+            bname = branch_name_map.get(bc, bc)
+            mism = s["mismatch_count"] or 0
+            mism_badge = (
+                f'<span class="badge-red">{mism}건</span>' if mism else '<span class="badge-green">0건</span>'
+            )
+            is_closed = (s["status"] or "open") == "closed"
+            status_badge = (
+                '<span class="badge-red" style="background:#FEF2F2;color:#7F1D1D;">마감</span>'
+                if is_closed else
+                '<span class="badge-green">진행중</span>'
+            )
+            detail_url = (
+                "/daily-stocktake?filter_branch=" + _html.escape(bc)
+                + "&date=" + _html.escape(str(s["count_date"]))
+            )
+            rows_html += (
+                "<tr>"
+                f"<td>{_html.escape(bname)}</td>"
+                f"<td>{_html.escape(str(s['count_date']))}</td>"
+                f"<td>{_html.escape(str(s['closer_name'] or '-'))}</td>"
+                f"<td>{_html.escape(str(s['saved_by'] or '-'))}</td>"
+                f"<td>{_html.escape(str(s['saved_at'] or '-'))}</td>"
+                f"<td style='text-align:center;'>{s['item_count'] or 0}</td>"
+                f"<td style='text-align:center;'>{mism_badge}</td>"
+                f"<td style='text-align:center;'>{status_badge}</td>"
+                f'<td><a href="{detail_url}" style="background:#1E2761;color:white;padding:4px 10px;'
+                'border-radius:6px;font-size:12px;text-decoration:none;">상세</a></td>'
+                "</tr>"
+            )
+
+    content = (
+        '<h2 style="margin:0 0 8px 0;">🧮 재고 실사 결과</h2>'
+        '<p style="color:#888;font-size:13px;margin-bottom:16px;">지점별 일일 재고 실사 기록 (소모품 제외)</p>'
+        + filter_html
+        + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-17">'
+        "<thead><tr>"
+        '<th style="width:16%">지점</th><th style="width:11%">실사일</th>'
+        '<th style="width:11%">담당자</th><th style="width:12%">저장자</th>'
+        '<th style="width:14%">저장일시</th><th style="width:7%">품목수</th>'
+        '<th style="width:9%">오차 품목수</th><th style="width:8%">상태</th><th style="width:11%">상세</th>'
+        "</tr></thead><tbody>"
+        + rows_html
+        + "</tbody></table></div></div>"
+    )
+    return HTMLResponse(render_page(content, user, active="master"))
 
 # 재고 마감 "제출 요청" 테스트 수신 채널(teams_webhook의 branch_code). 목록에 '테스트용지점' 행이 없어서 우선 유한서 채널로 지정 — 바꾸려면 이 한 줄만 수정
 STOCK_CLOSING_TEST_BRANCH_CODE = "admin_hs"
@@ -13821,6 +15089,16 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
+    if menu_allowed("daily-stocktake"):
+        stocktake_cards.append("""
+      <a href="/master/daily-stocktake" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🧮</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">재고 실사(지점)</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">지점별 일일 실사 결과/입력</div>
+        </div>
+      </a>
+        """)
 
     # ---- 그룹 3: 거래처관리 ----
     vendor_cards = []
@@ -16690,6 +17968,127 @@ def _sync_item_names_by_code() -> dict:
         conn.close()
     return result
 
+# ── 고아 재고 자동 정리 (raw_inventory에 없는 inventory 행) ──
+# 모드: INVENTORY_ORPHAN_MODE = dry(기본, 기록만) | live(실삭제) | off
+# 유예: INVENTORY_ORPHAN_GRACE_DAYS일 이내 갱신된 행은 보호 (QR 선등록 → 유비 후등록 플로우)
+# 안전: 후보가 대상 지점 전체 재고의 INVENTORY_ORPHAN_MAX_RATIO 초과 시 삭제 중단 + 알림
+INVENTORY_ORPHAN_MODE = os.getenv("INVENTORY_ORPHAN_MODE", "dry")
+INVENTORY_ORPHAN_GRACE_DAYS = int(os.getenv("INVENTORY_ORPHAN_GRACE_DAYS", "7"))
+INVENTORY_ORPHAN_MAX_RATIO = float(os.getenv("INVENTORY_ORPHAN_MAX_RATIO", "0.2"))
+INVENTORY_ORPHAN_LOG_LIMIT = 5000
+
+
+def _cleanup_orphan_inventory(branch_codes, source_label: str) -> dict:
+    """이번에 raw_inventory가 갱신된 지점들에 한해, raw에 없는 inventory 행을 정리.
+    반환 dict는 호출부 결과에 병합용."""
+    from datetime import timedelta as _td
+    mode = (os.getenv("INVENTORY_ORPHAN_MODE", INVENTORY_ORPHAN_MODE) or "dry").strip().lower()
+    if mode in ("off", "disabled", "false", "0"):
+        return {"mode": mode, "skipped": "disabled"}
+    branches = [str(b) for b in (branch_codes or []) if b]
+    if not branches:
+        return {"mode": mode, "skipped": "no_branches"}
+
+    conn = get_conn()
+    try:
+        ph = ",".join("?" for _ in branches)
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM inventory WHERE branch_code IN ({ph})", branches
+        ).fetchone()
+        total = int(total_row["c"] or 0)
+        inv_rows = conn.execute(
+            f"SELECT id, branch_code, item_code, item_name, quantity, last_updated "
+            f"FROM inventory WHERE branch_code IN ({ph})", branches
+        ).fetchall()
+        raw_keys = set()
+        for r in conn.execute("SELECT branch_code, item_code FROM raw_inventory").fetchall():
+            raw_keys.add((str(r["branch_code"]), str(r["item_code"])))
+
+        cutoff = datetime.now() - _td(days=INVENTORY_ORPHAN_GRACE_DAYS)
+        now_iso = datetime.now().isoformat()
+        candidates = []
+        for r in inv_rows:
+            if (str(r["branch_code"]), str(r["item_code"])) in raw_keys:
+                continue
+            lu = r["last_updated"]
+            if lu:
+                try:
+                    lu_dt = datetime.fromisoformat(str(lu).replace("Z", "+00:00"))
+                    if lu_dt.tzinfo is not None:
+                        lu_dt = lu_dt.astimezone().replace(tzinfo=None)
+                    if lu_dt > cutoff:
+                        continue  # 유예 기간 내 갱신 → 보호
+                except Exception:
+                    continue  # 파싱 불가 → 보호 (삭제하지 않음)
+            candidates.append(r)
+
+        result = {"mode": mode, "total": total, "candidates": len(candidates),
+                  "deleted": 0, "logged": 0}
+        if not candidates:
+            return result
+
+        ratio = len(candidates) / total if total else 1.0
+        exceed = total > 0 and ratio > INVENTORY_ORPHAN_MAX_RATIO
+
+        def _log_row(r, action, detail):
+            conn.execute(
+                "INSERT INTO inventory_orphan_cleanup_log "
+                "(run_at, source, branch_code, item_code, item_name, quantity, last_updated, action, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (now_iso, source_label, str(r["branch_code"]), str(r["item_code"]),
+                 str(r["item_name"] or ""), r["quantity"], str(r["last_updated"] or ""),
+                 action, detail)
+            )
+
+        if mode == "live" and exceed:
+            detail = (f"삭제 중단: 후보 {len(candidates)}건이 대상 지점 재고 {total}건의 "
+                      f"{ratio:.0%}로 한도 {INVENTORY_ORPHAN_MAX_RATIO:.0%} 초과")
+            for r in candidates[:INVENTORY_ORPHAN_LOG_LIMIT]:
+                _log_row(r, "skipped_ratio", detail)
+            conn.commit()
+            try:
+                report_cron_failure("inventory-orphan-cleanup", detail)
+            except Exception:
+                pass
+            result["skipped"] = "ratio_guard"
+            result["logged"] = min(len(candidates), INVENTORY_ORPHAN_LOG_LIMIT)
+            return result
+
+        action = "deleted" if mode == "live" else "dry_run"
+        detail = ("유비플러스(raw_inventory) 미등록 품목" if mode == "live"
+                  else "dry-run: 삭제 예정 대상 (실삭제하려면 INVENTORY_ORPHAN_MODE=live)")
+        for r in candidates[:INVENTORY_ORPHAN_LOG_LIMIT]:
+            _log_row(r, action, detail)
+        result["logged"] = min(len(candidates), INVENTORY_ORPHAN_LOG_LIMIT)
+
+        if mode == "live":
+            ids = [int(r["id"]) for r in candidates]
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                conn.execute(
+                    f"DELETE FROM inventory WHERE id IN ({','.join('?' for _ in chunk)})", chunk
+                )
+            result["deleted"] = len(ids)
+
+        conn.commit()
+        if mode == "live" and len(candidates) > INVENTORY_ORPHAN_LOG_LIMIT:
+            result["log_truncated"] = True
+        return result
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        err = "고아 재고 정리 실패: " + str(e)[:300]
+        try:
+            report_cron_failure("inventory-orphan-cleanup", err)
+        except Exception:
+            pass
+        return {"mode": mode, "error": err}
+    finally:
+        conn.close()
+
+
 async def _fetch_and_process_s3_csv():
     """S3의 유비플러스 재고현황 CSV를 다운로드하여 재고수불부 형식과 동일하게 파싱/반영"""
     import httpx
@@ -16867,10 +18266,17 @@ async def _fetch_and_process_s3_csv():
             conn2.close()
 
         name_sync = _sync_item_names_by_code()
+        orphan_cleanup = None
+        if success > 0:
+            try:
+                orphan_cleanup = _cleanup_orphan_inventory(branches_in_file, "s3_csv")
+            except Exception as e:
+                orphan_cleanup = {"error": str(e)[:300]}
         return {"success": success, "skipped": skipped, "errors": errors[:10],
                 "header_row_used": header_row_idx,
                 "hq_debug": debug_hq_log[:20],
                 "name_sync": name_sync,
+                "orphan_cleanup": orphan_cleanup,
                 "synced_at": now}
     except Exception as e:
         err_msg = str(e)[:500]
@@ -22074,9 +23480,17 @@ async def _process_raw_upload_master(file: UploadFile):
         conn2.commit()
         conn2.close()
 
+    orphan_cleanup = None
+    if success > 0:
+        try:
+            orphan_cleanup = _cleanup_orphan_inventory(branches_in_file, "raw_upload_master")
+        except Exception as e:
+            orphan_cleanup = {"error": str(e)[:300]}
+
     return {"success": success, "skipped": skipped, "errors": errors[:10],
             "header_row_used": header_row_idx,
             "hq_debug": debug_hq_log[:20],
+            "orphan_cleanup": orphan_cleanup,
             "col_map_debug": {k: v for k, v in col_map.items()}}
 
 
@@ -22137,6 +23551,7 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
     success, skipped, errors = 0, 0, []
     hq_adjustments = []
     debug_hq_log = []
+    seen_branches = set()
 
 
     conn = get_conn()
@@ -22184,6 +23599,7 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
             if restrict_branch and branch_code != restrict_branch:
                 skipped += 1
                 continue
+            seen_branches.add(branch_code)
 
             conn.execute("""
                 INSERT INTO raw_inventory
@@ -22259,9 +23675,17 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
         conn2.commit()
         conn2.close()
 
+    orphan_cleanup = None
+    if success > 0 and seen_branches:
+        try:
+            orphan_cleanup = _cleanup_orphan_inventory(list(seen_branches), "raw_upload_branch")
+        except Exception as e:
+            orphan_cleanup = {"error": str(e)[:300]}
+
     return {"success": success, "skipped": skipped, "errors": errors[:10],
             "header_row_used": header_row_idx,
             "hq_debug": debug_hq_log[:20],
+            "orphan_cleanup": orphan_cleanup,
             "col_map_debug": {k: v for k, v in col_map.items()}}
 
 @app.post("/master/raw-upload/clear")
