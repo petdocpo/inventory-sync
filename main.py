@@ -2182,6 +2182,20 @@ def init_db():
             if "reason" not in _sc_existing:
                 conn.execute("ALTER TABLE stock_closing_saves ADD COLUMN reason TEXT")
 
+    # stock_closing_lines 행별 사유 컬럼 보강 (additive)
+    if USE_POSTGRES:
+        conn.execute(
+            "ALTER TABLE IF EXISTS stock_closing_lines ADD COLUMN IF NOT EXISTS reason TEXT"
+        )
+    else:
+        _scl_tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='stock_closing_lines'"
+        ).fetchone()
+        if _scl_tbl:
+            _scl_existing = {r[1] for r in conn.execute("PRAGMA table_info(stock_closing_lines)").fetchall()}
+            if "reason" not in _scl_existing:
+                conn.execute("ALTER TABLE stock_closing_lines ADD COLUMN reason TEXT")
+
     conn.commit()
     conn.close()
 
@@ -3513,24 +3527,22 @@ def _stock_closing_live_items(target_branch: str, sel_date) -> list:
     items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
     return items
 
-def _sc_discrepancy_analysis(branch_code: str, sel_date, lines: list) -> list:
-    """오차(diff_qty != 0)가 있는 품목별로 당일 유비플러스 출고(sales_records)와
-    QR 출고 스캔(scan_log OUT)을 시간순으로 매칭해 누락/오등록 추정 문자열을 만든다.
-    반환: [{branch_code,item_name,ups_qty,counted_qty,diff_qty,estimate}]"""
+def _sc_day_flows(branch_code: str, sel_date, codes: list):
+    """지점×날짜×품번목록의 당일 출고 흐름을 시간순 이벤트로 반환.
+    반환: (ups_by_code, qr_by_code) — 각 값은 [{"t": naive KST datetime, "code","customer"?}...]"""
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     kst = _tz(_td(hours=9))
     utc = _tz.utc
     date_str = sel_date.strftime("%Y-%m-%d")
-    diff_lines = [l for l in lines if (l["diff_qty"] or 0) != 0]
-    if not diff_lines or not branch_code:
-        return []
+    codes = [str(c) for c in codes]
+    if not codes or not branch_code:
+        return {}, {}
 
     branches = get_branches(branch_type='branch')
     code_to_name = {b["branch_code"]: b["branch_name"] for b in branches}
     branch_name = code_to_name.get(branch_code, "")
-    codes = [str(l["item_code"]) for l in diff_lines]
-    if not codes or not branch_name:
-        return []
+    if not branch_name:
+        return {}, {}
 
     start_kst = _dt(sel_date.year, sel_date.month, sel_date.day, tzinfo=kst)
     end_kst = start_kst + _td(days=1)
@@ -3554,82 +3566,99 @@ def _sc_discrepancy_analysis(branch_code: str, sel_date, lines: list) -> list:
     finally:
         conn.close()
 
-    WINDOW_MIN = 30  # 시간 매칭 허용 오차(분)
-
-    def _ups_events():
-        ev = []
-        for r in ups_rows:
-            try:
-                t = _dt.strptime(str(r["sale_datetime"]), "%Y-%m-%d %H:%M")
-            except Exception:
-                continue
-            qty = max(1, int(r["quantity"] or 1))
-            for _ in range(min(qty, 50)):
-                ev.append({"t": t, "code": r["item_code"],
-                           "customer": (r["customer_name"] or "").strip() or "고객"})
-        return ev
-
-    def _qr_events():
-        ev = []
-        for r in qr_rows:
-            try:
-                t = _dt.fromisoformat(str(r["scanned_at"]).replace("Z", "+00:00"))
-                if t.tzinfo is None:
-                    t = t.replace(tzinfo=utc)
-                t = t.astimezone(kst).replace(tzinfo=None)
-            except Exception:
-                continue
-            ev.append({"t": t, "code": r["item_code"]})
-        return ev
-
-    ups_ev = _ups_events()
-    qr_ev = _qr_events()
-    ups_by_code = {}
-    qr_by_code = {}
-    for e in ups_ev:
-        ups_by_code.setdefault(e["code"], []).append(e)
-    for e in qr_ev:
-        qr_by_code.setdefault(e["code"], []).append(e)
+    ups_by_code, qr_by_code = {}, {}
+    for r in ups_rows:
+        try:
+            t = _dt.strptime(str(r["sale_datetime"]), "%Y-%m-%d %H:%M")
+        except Exception:
+            continue
+        qty = max(1, int(r["quantity"] or 1))
+        for _ in range(min(qty, 50)):
+            ups_by_code.setdefault(r["item_code"], []).append({
+                "t": t, "code": r["item_code"],
+                "customer": (r["customer_name"] or "").strip() or "고객",
+            })
+    for r in qr_rows:
+        try:
+            t = _dt.fromisoformat(str(r["scanned_at"]).replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=utc)
+            t = t.astimezone(kst).replace(tzinfo=None)
+        except Exception:
+            continue
+        qr_by_code.setdefault(r["item_code"], []).append({"t": t, "code": r["item_code"]})
     for v in ups_by_code.values():
         v.sort(key=lambda x: x["t"])
     for v in qr_by_code.values():
         v.sort(key=lambda x: x["t"])
+    return ups_by_code, qr_by_code
 
+
+def _sc_match_flows(u_list: list, q_list: list, window_min: int = 30):
+    """유비플러스 이벤트(u_list)와 QR 이벤트(q_list)를 시간순 매칭.
+    반환: (missed_ups, extra_qr) — 매칭 안 된 이벤트들."""
     import bisect
+    from datetime import timedelta as _td
+    q_times = [q["t"] for q in q_list]
+    used_q = [False] * len(q_list)
+    missed_ups = []
+    for u in u_list:
+        lo = bisect.bisect_left(q_times, u["t"] - _td(minutes=window_min))
+        hi = bisect.bisect_right(q_times, u["t"] + _td(minutes=window_min))
+        best_i, best_d = -1, None
+        for i in range(lo, hi):
+            if used_q[i]:
+                continue
+            d = abs((u["t"] - q_times[i]).total_seconds()) / 60.0
+            if best_d is None or d < best_d:
+                best_i, best_d = i, d
+        if best_i >= 0:
+            used_q[best_i] = True
+        else:
+            missed_ups.append(u)
+    extra_qr = [q for i, q in enumerate(q_list) if not used_q[i]]
+    return missed_ups, extra_qr
+
+
+def _sc_discrepancy_analysis(branch_code: str, sel_date, lines: list) -> list:
+    """오차(diff_qty != 0)가 있는 품목별로 당일 유비플러스 출고(sales_records)와
+    QR 출고 스캔(scan_log OUT)을 시간순으로 매칭해 누락/오등록 추정 문자열을 만든다.
+    건수 차이(net)가 큰 쪽만 보고하고, 양쪽에 남은 건(교차)은 건수 차이가 없을 때만 표시.
+    반환: [{branch_code,item_name,ups_qty,counted_qty,diff_qty,estimate}]"""
+    date_str = sel_date.strftime("%Y-%m-%d")
+    diff_lines = [l for l in lines if (l["diff_qty"] or 0) != 0]
+    if not diff_lines or not branch_code:
+        return []
+
+    codes = [str(l["item_code"]) for l in diff_lines]
+    ups_by_code, qr_by_code = _sc_day_flows(branch_code, sel_date, codes)
+
     out = []
     for l in diff_lines:
         code = str(l["item_code"])
         u_list = ups_by_code.get(code, [])
         q_list = qr_by_code.get(code, [])
-        q_times = [q["t"] for q in q_list]
-        used_q = [False] * len(q_list)
-        missed_ups = []   # 유비플러스에는 있는데 QR 스캔이 없는 건 → QR 누락 추정
-        for u in u_list:
-            # 시간순 정렬된 q_list에서 윈도우 내 미사용 후보만 검사
-            lo = bisect.bisect_left(q_times, u["t"] - _td(minutes=WINDOW_MIN))
-            hi = bisect.bisect_right(q_times, u["t"] + _td(minutes=WINDOW_MIN))
-            best_i, best_d = -1, None
-            for i in range(lo, hi):
-                if used_q[i]:
-                    continue
-                d = abs((u["t"] - q_times[i]).total_seconds()) / 60.0
-                if best_d is None or d < best_d:
-                    best_i, best_d = i, d
-            if best_i >= 0:
-                used_q[best_i] = True
-            else:
-                missed_ups.append(u)
-        extra_qr = [q for i, q in enumerate(q_list) if not used_q[i]]  # QR만 있는 건 → 유비플러스 오등록 추정
+        missed_ups, extra_qr = _sc_match_flows(u_list, q_list)
 
+        net = len(u_list) - len(q_list)  # >0 이면 유비플러스가 더 많음 → QR 누락 방향
         parts = []
-        for u in missed_ups[:3]:
-            parts.append(f"{u['t'].strftime('%H:%M')} {u['customer']} QR 누락 추정")
-        if len(missed_ups) > 3:
-            parts.append(f"QR 누락 외 {len(missed_ups) - 3}건")
-        for q in extra_qr[:3]:
-            parts.append(f"{q['t'].strftime('%H:%M')} 유비플러스 오등록 추정")
-        if len(extra_qr) > 3:
-            parts.append(f"오등록 외 {len(extra_qr) - 3}건")
+        # 건수 차이가 있으면 차이가 큰 쪽의 미매칭 건만 보고 (반대쪽은 타이밍 노이즈)
+        if net > 0 and missed_ups:
+            for u in missed_ups[:3]:
+                parts.append(f"{u['t'].strftime('%H:%M')} {u['customer']} QR 누락 추정")
+            if len(missed_ups) > 3:
+                parts.append(f"QR 누락 외 {len(missed_ups) - 3}건")
+        elif net < 0 and extra_qr:
+            for q in extra_qr[:3]:
+                parts.append(f"{q['t'].strftime('%H:%M')} 유비플러스 오등록 추정")
+            if len(extra_qr) > 3:
+                parts.append(f"오등록 외 {len(extra_qr) - 3}건")
+        else:
+            # 건수는 같은데 시간대가 어긋난 교차 케이스 — 양쪽 미매칭을 함께 표시
+            for u in missed_ups[:2]:
+                parts.append(f"{u['t'].strftime('%H:%M')} {u['customer']} QR 누락 추정")
+            for q in extra_qr[:2]:
+                parts.append(f"{q['t'].strftime('%H:%M')} 유비플러스 오등록 추정")
         if not parts:
             if u_list or q_list:
                 parts.append(
@@ -3681,9 +3710,9 @@ def _sc_closer_box(view_mode: str, save, can_write: bool) -> str:
             '<label style="font-size:13px;font-weight:bold;">마감 담당자 <span style="color:#DC2626;">*</span></label>'
             f'<input type="text" id="scCloser" maxlength="30" placeholder="마감 담당자 이름 (필수)" value="{esc}" style="margin-top:6px;max-width:260px;">'
             '<div style="font-size:12px;color:#888;margin-top:4px;">지점 계정과 무관하게 실제 마감하는 사람의 이름을 입력해주세요. 마감할 때 필수입니다.</div>'
-            '<label style="font-size:13px;font-weight:bold;display:block;margin-top:12px;">오차 사유</label>'
-            f'<input type="text" id="scReason" maxlength="200" placeholder="오차 사유 (오차가 있으면 마감 시 필수)" value="{resc}" style="margin-top:6px;max-width:100%;">'
-            '<div style="font-size:12px;color:#888;margin-top:4px;">실사 수량과 유비플러스 재고에 오차가 있는 품목이 있으면 마감할 때 사유 입력이 필수입니다.</div>'
+            '<label style="font-size:13px;font-weight:bold;display:block;margin-top:12px;">전체 오차 사유 <span style="color:#888;font-weight:normal;">(선택)</span></label>'
+            f'<input type="text" id="scReason" maxlength="200" placeholder="전체 사유 — 품목별 사유는 표의 \'사유\' 칸에 입력" value="{resc}" style="margin-top:6px;max-width:100%;">'
+            '<div style="font-size:12px;color:#888;margin-top:4px;">오차가 있는 품목은 표의 \'사유\' 칸 입력이 마감 시 필수입니다. 여기는 전체를 덮는 메모입니다.</div>'
             "</div>"
         )
     shown = esc if esc else "-"
@@ -3766,8 +3795,13 @@ async def stock_closing_page(
     can_write = (view_mode == "live") and (not is_master_user)
 
     draft_counts = {}
+    draft_reasons = {}
     if save and view_mode == "live":
         draft_counts = {l["item_code"]: l["counted_qty"] for l in snap_lines}
+        try:
+            draft_reasons = {l["item_code"]: (l["reason"] or "") for l in snap_lines}
+        except Exception:
+            draft_reasons = {}
 
     def _fmt_kst(v):
         if not v:
@@ -3804,6 +3838,7 @@ async def stock_closing_page(
                 f"<td>{_fmt_num(l['ups_qty'])}</td>"
                 f"<td>{_fmt_num(l['counted_qty'])}</td>"
                 + _diff_html(l["diff_qty"])
+                + "<td>" + (_html.escape(str(l["reason"])) if "reason" in l.keys() and l["reason"] else "-") + "</td>"
                 + "<td>-</td>"
                 + "</tr>"
             )
@@ -3823,6 +3858,8 @@ async def stock_closing_page(
                 ups_attr = ""
             cv = draft_counts.get(it["item_code"])
             val_attr = "" if cv is None else f' value="{cv}"'
+            rv = draft_reasons.get(it["item_code"], "")
+            r_attr = _html.escape(str(rv))
             dis = "" if can_write else " disabled"
             rows_html += (
                 "<tr>"
@@ -3837,14 +3874,16 @@ async def stock_closing_page(
                 f'placeholder="실사" oninput="scUpdateDiff(this)"{dis} '
                 'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
                 '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
+                f'<td><input type="text" class="sc-reason" data-code="{_html.escape(str(it["item_code"]))}" '
+                f'value="{r_attr}" placeholder="오차 시 필수" maxlength="200"{dis} '
+                'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;font-size:12px;"></td>'
                 + _sc_adjust_cell(it["branch_code"], it["item_code"], can_edit_date)
                 + "</tr>"
-                "</tr>"
             )
         empty_msg = "해당 날짜에 스캔된 QR 등록 상품이 없습니다"
     if not rows_html:
         rows_html = (
-            '<tr><td colspan="9" style="text-align:center;padding:24px;color:#888;">'
+            '<tr><td colspan="10" style="text-align:center;padding:24px;color:#888;">'
             + empty_msg + "</td></tr>"
         )
 
@@ -4023,10 +4062,14 @@ async def stock_closing_page(
 
       function scCollect() {
         var counts = {};
+        var reasons = {};
         document.querySelectorAll('.sc-input').forEach(function(inp) {
           counts[inp.getAttribute('data-code')] = inp.value;
         });
-        return counts;
+        document.querySelectorAll('.sc-reason').forEach(function(inp) {
+          reasons[inp.getAttribute('data-code')] = inp.value;
+        });
+        return {counts: counts, reasons: reasons};
       }
 
       async function scSubmit(mode) {
@@ -4044,21 +4087,26 @@ async def stock_closing_page(
         }
         if (mode === 'close') {
           var empty = 0;
-          var hasDiff = false;
+          var noReason = 0;
           document.querySelectorAll('.sc-input').forEach(function(inp) {
             if (inp.value === '') empty++;
           });
-          document.querySelectorAll('.sc-diff').forEach(function(c) {
-            var t = c.textContent.trim();
-            if (t !== '' && t !== '-' && t !== '0') hasDiff = true;
+          document.querySelectorAll('.sc-input').forEach(function(inp) {
+            var tr = inp.closest('tr');
+            var diffCell = tr ? tr.querySelector('.sc-diff') : null;
+            var t = diffCell ? diffCell.textContent.trim() : '';
+            if (t !== '' && t !== '-' && t !== '0') {
+              var code = inp.getAttribute('data-code');
+              var rInp = tr.querySelector('.sc-reason[data-code="' + code + '"]');
+              if (!rInp || rInp.value.trim() === '') noReason++;
+            }
           });
           if (empty > 0) {
             alert('실사 수량이 입력되지 않은 상품이 ' + empty + '개 있습니다.\\n모든 상품에 입력한 뒤 마감해주세요.');
             return;
           }
-          if (hasDiff && reason === '') {
-            alert('오차가 있는 품목이 있습니다.\\n오차 사유를 입력한 뒤 마감해주세요.');
-            if (reasonEl) reasonEl.focus();
+          if (noReason > 0) {
+            alert('오차가 있는 품목 ' + noReason + '개의 사유가 입력되지 않았습니다.\\n표의 \'사유\' 칸에 입력한 뒤 마감해주세요.');
             return;
           }
           if (!confirm('마감 후에는 수정할 수 없습니다.\\n입력한 내용을 확인했다면 [확인]을 눌러 마감해주세요.')) {
@@ -4066,10 +4114,11 @@ async def stock_closing_page(
           }
         }
         try {
+          var collected = scCollect();
           var res = await fetch('/stock-closing/save', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({date: date, mode: mode, counts: scCollect(), closer_name: closer, reason: reason})
+            body: JSON.stringify({date: date, mode: mode, counts: collected.counts, reasons: collected.reasons, closer_name: closer, reason: reason})
           });
           var data = await res.json();
           if (!res.ok) {
@@ -4106,7 +4155,7 @@ async def stock_closing_page(
         '<th style="width:8%">지점</th><th style="width:25%">상품명</th>'
         '<th style="width:10%">상품코드</th><th style="width:9%">금일 출고 수량</th>'
         '<th style="width:9%">QR 재고 수량</th><th style="width:11%">유비플러스 재고 수량</th>'
-        '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:10%">QR 수정</th>'
+        '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:12%">사유</th><th style="width:10%">QR 수정</th>'
         "</tr></thead><tbody>"
         + rows_html
         + "</tbody></table></div>"
@@ -4115,6 +4164,170 @@ async def stock_closing_page(
         + script
     )
     return HTMLResponse(render_page(content, user, active="stock-closing"))
+
+
+@app.get("/master/sc-estimate-test", response_class=HTMLResponse)
+async def master_sc_estimate_test(
+    session_token: str = Cookie(default=None),
+    branch_code: str = "",
+    date: str = "",
+):
+    """오차 추정 미리보기 — 텍스트 추정 vs 타임라인 2행 표시 비교용 테스트 페이지 (마스터 전용)"""
+    import html as _html
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    kst = _tz(_td(hours=9))
+    today_kst = _dt.now(kst).date()
+    sel_date = today_kst
+    if date:
+        try:
+            sel_date = _dt.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    if sel_date > today_kst:
+        sel_date = today_kst
+    sel_date_str = sel_date.strftime("%Y-%m-%d")
+
+    branches = get_branches(branch_type='branch')
+    if not branch_code and branches:
+        branch_code = branches[0]["branch_code"]
+    bname_map = {b["branch_code"]: b["branch_name"] for b in branches}
+
+    # 저장 내역이 있으면 그 품목 기준, 없으면 당일 출고가 있는 품목 전체(최대 60)
+    conn = get_conn()
+    save = conn.execute(
+        "SELECT * FROM stock_closing_saves WHERE branch_code=? AND close_date=? ORDER BY id DESC LIMIT 1",
+        (branch_code, sel_date_str)
+    ).fetchone() if branch_code else None
+    lines = []
+    if save:
+        lines = conn.execute(
+            "SELECT * FROM stock_closing_lines WHERE save_id=? ORDER BY item_code",
+            (save["id"],)
+        ).fetchall()
+    conn.close()
+
+    if lines:
+        codes = [str(l["item_code"]) for l in lines]
+        name_map = {str(l["item_code"]): (l["item_name"] or "") for l in lines}
+        diff_map = {str(l["item_code"]): (l["diff_qty"] or 0) for l in lines}
+    else:
+        ups_tmp, qr_tmp = _sc_day_flows(branch_code, sel_date, [""])
+        # 빈 코드로는 못 가져오므로 scan/sales에서 코드 수집
+        conn = get_conn()
+        date_str = sel_date_str
+        bn = bname_map.get(branch_code, "")
+        rows = conn.execute(
+            "SELECT DISTINCT item_code FROM scan_log WHERE branch_code=? AND scan_type='OUT' "
+            "AND substr(scanned_at,1,10) IN (?, ?)",
+            (branch_code, sel_date_str, (sel_date - _td(days=1)).strftime("%Y-%m-%d"))
+        ).fetchall()
+        codes = [r["item_code"] for r in rows][:60]
+        conn.close()
+        name_map, diff_map = {}, {}
+
+    ups_by_code, qr_by_code = _sc_day_flows(branch_code, sel_date, codes) if codes else ({}, {})
+
+    # 텍스트 추정 (오차 있는 품목만)
+    pseudo_lines = [
+        {"branch_code": branch_code, "item_code": c, "item_name": name_map.get(c, c),
+         "ups_qty": None, "counted_qty": None, "diff_qty": diff_map.get(c, 1)}
+        for c in codes if diff_map.get(c, 0) != 0 or not lines
+    ]
+    estimates = {r["item_code"]: r["estimate"] for r in
+                 _sc_discrepancy_analysis(branch_code, sel_date, pseudo_lines)} if pseudo_lines else {}
+
+    items_html = ""
+    shown = 0
+    for c in codes:
+        u_list = ups_by_code.get(c, [])
+        q_list = qr_by_code.get(c, [])
+        if not u_list and not q_list:
+            continue
+        missed, extra = _sc_match_flows(u_list, q_list)
+        matched_u = [u for u in u_list if u not in missed]
+        matched_q = [q for q in q_list if q not in extra]
+        nm = _html.escape(str(name_map.get(c) or c))
+        diff_v = diff_map.get(c)
+        diff_badge = ""
+        if diff_v is not None and diff_v != 0:
+            diff_badge = f'<span style="color:#DC2626;font-weight:bold;">오차 {diff_v:+d}</span>'
+        est = _html.escape(str(estimates.get(c, "-")))
+        # 타임라인: 2행 — QR 스캔 / 유비플러스 판매
+        def _chips(evts, is_ups):
+            out = []
+            for e in evts:
+                t = e["t"].strftime("%H:%M")
+                if is_ups:
+                    label = f"{t} {e.get('customer','')}"
+                    cls = "background:#DCFCE7;"
+                else:
+                    label = t
+                    cls = "background:#DBEAFE;"
+                out.append(
+                    f'<span style="display:inline-block;margin:2px;padding:2px 6px;border-radius:4px;font-size:11px;{cls}">{_html.escape(label)}</span>'
+                )
+            return " ".join(out) if out else '<span style="color:#aaa;">없음</span>'
+        qr_chips = _chips(q_list, False)
+        ups_chips = _chips(u_list, True)
+        # 미매칭 하이라이트는 별도 행으로
+        miss_chips = " ".join(
+            f'<span style="display:inline-block;margin:2px;padding:2px 6px;border-radius:4px;font-size:11px;background:#FEE2E2;color:#991B1B;">{_html.escape(u["t"].strftime("%H:%M") + " " + u.get("customer",""))} QR누락?</span>'
+            for u in missed[:10]
+        )
+        ext_chips = " ".join(
+            f'<span style="display:inline-block;margin:2px;padding:2px 6px;border-radius:4px;font-size:11px;background:#FEE2E2;color:#991B1B;">{_html.escape(q["t"].strftime("%H:%M"))} 오등록?</span>'
+            for q in extra[:10]
+        )
+        items_html += f"""
+        <div class="card" style="padding:10px 14px;margin-bottom:8px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <div style="font-weight:bold;font-size:13px;">{nm} <span style="color:#888;font-weight:normal;">({c})</span> {diff_badge}</div>
+            <div style="font-size:11px;color:#888;">QR {len(q_list)}건 / 유비플러스 {len(u_list)}건</div>
+          </div>
+          <div style="font-size:12px;margin:6px 0;padding:6px;background:#FFF7ED;border-radius:6px;">
+            <b>텍스트 추정:</b> {est}
+          </div>
+          <details>
+            <summary style="font-size:12px;color:#1E2761;cursor:pointer;">타임라인 보기 (QR / 유비플러스 2행)</summary>
+            <div style="margin-top:6px;font-size:12px;">
+              <div style="margin-bottom:4px;"><b>QR 스캔:</b> {qr_chips}</div>
+              <div style="margin-bottom:4px;"><b>유비플러스:</b> {ups_chips}</div>
+              {(('<div style="margin-bottom:4px;"><b style="color:#DC2626;">미매칭 추정:</b> ' + miss_chips + ext_chips + '</div>') if (missed or extra) else '')}
+            </div>
+          </details>
+        </div>"""
+        shown += 1
+        if shown >= 60:
+            break
+
+    branch_options = "".join(
+        f'<option value="{b["branch_code"]}" {"selected" if b["branch_code"]==branch_code else ""}>{b["branch_name"]}</option>'
+        for b in branches
+    )
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>🧪 오차 추정 미리보기</h2>
+    </div>
+    <div class="card" style="margin-bottom:12px;">
+      <form method="get" action="/master/sc-estimate-test" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <select name="branch_code" style="padding:8px;">{branch_options}</select>
+        <input type="date" name="date" value="{sel_date_str}" max="{today_kst.strftime('%Y-%m-%d')}" style="padding:8px;">
+        <button class="btn" type="submit">조회</button>
+      </form>
+      <p style="font-size:12px;color:#888;margin:8px 0 0 0;">
+        {('저장 내역 ' + str(save['close_date']) + ' 기준 ' + str(len(lines)) + '개 품목') if lines else '저장 내역 없음 — 당일 출고 있는 품목 최대 60개 표시'}
+        · 매칭 허용 오차 ±30분
+      </p>
+    </div>
+    {items_html if items_html else '<div class="card" style="text-align:center;color:#888;padding:30px;">표시할 출고 내역이 없습니다.</div>'}
+    """
+    return HTMLResponse(render_page(content, user, "master"))
 
 
 @app.post("/stock-closing/save")
@@ -4140,6 +4353,9 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
     counts = body.get("counts") or {}
     closer_name = str(body.get("closer_name", "")).strip()[:30]
     reason = str(body.get("reason", "")).strip()[:200]
+    reasons = body.get("reasons") or {}
+    if not isinstance(reasons, dict):
+        reasons = {}
     if mode == "close" and not closer_name:
         raise HTTPException(status_code=400, detail="마감 담당자 이름을 입력해주세요. (마감 시 필수)")
     if mode not in ("draft", "close"):
@@ -4176,18 +4392,24 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
         diff = (counted - ups) if (counted is not None and ups is not None) else None
         if diff is not None and diff != 0:
             mismatch += 1
-        lines.append((it["item_code"], it["item_name"], it["cnt"], it["qr_qty"], ups, counted, diff))
+        line_reason = str(reasons.get(it["item_code"], "") or "").strip()[:200] or None
+        lines.append((it["item_code"], it["item_name"], it["cnt"], it["qr_qty"], ups, counted, diff, line_reason))
 
     if mode == "close" and missing > 0:
         raise HTTPException(
             status_code=400,
             detail="실사 수량이 입력되지 않은 상품이 " + str(missing) + "개 있습니다. 화면을 새로고침한 뒤 모두 입력하고 마감해주세요."
         )
-    if mode == "close" and mismatch > 0 and not reason:
-        raise HTTPException(
-            status_code=400,
-            detail="오차가 있는 품목이 " + str(mismatch) + "개 있습니다. 오차 사유를 입력한 뒤 마감해주세요."
+    if mode == "close":
+        no_reason = sum(
+            1 for ln in lines
+            if ln[6] is not None and ln[6] != 0 and not ln[7]
         )
+        if no_reason > 0:
+            raise HTTPException(
+                status_code=400,
+                detail="오차가 있는 품목 " + str(no_reason) + "개의 사유가 입력되지 않았습니다. 표의 '사유' 칸에 입력한 뒤 마감해주세요."
+            )
 
     now_str = _dt.now(_tz(_td(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
     login = user.get("login_id") or branch_code
@@ -4226,7 +4448,7 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
         for ln in lines:
             conn.execute(
                 "INSERT INTO stock_closing_lines (save_id, branch_code, close_date, item_code, item_name, "
-                "scan_qty, qr_qty, ups_qty, counted_qty, diff_qty) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "scan_qty, qr_qty, ups_qty, counted_qty, diff_qty, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (save_id, branch_code, date_str) + ln
             )
         conn.commit()
@@ -24847,7 +25069,6 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
             item_code = str(row[col_map["item_code"]]).strip() if row[col_map["item_code"]] else ""
 
             if not item_code:
-                import hashlib
                 import hashlib
                 name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
                 item_code = f"미지정_{name_hash}"

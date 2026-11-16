@@ -145,6 +145,7 @@ class FakeConn:
                 "save_id": p[0], "branch_code": p[1], "close_date": p[2],
                 "item_code": p[3], "item_name": p[4], "scan_qty": p[5],
                 "qr_qty": p[6], "ups_qty": p[7], "counted_qty": p[8], "diff_qty": p[9],
+                "reason": p[10] if len(p) > 10 else None,
             })
             self.rowcount = 1
             return []
@@ -376,13 +377,14 @@ class TestSave(StockClosingTestBase):
         self.expect_http(400, self.run_save,
                          {"date": dstr(TODAY), "mode": "close", "closer_name": "김마감",
                           "counts": {"I1": "1"}})
-        # 오차 있는데 사유 없음 -> 거부
+        # 오차 있는데 품목별 사유 없음 -> 거부
         self.expect_http(400, self.run_save,
                          {"date": dstr(TODAY), "mode": "close", "closer_name": "김마감",
                           "counts": {"I1": "1", "I2": "2"}})
-        # 사유 입력 -> 성공
+        # 품목별 사유 입력 -> 성공
         resp = self.run_save({"date": dstr(TODAY), "mode": "close", "closer_name": "김마감",
                               "reason": "파손 확인",
+                              "reasons": {"I1": "파손", "I2": "분실"},
                               "counts": {"I1": "1", "I2": "2"}})
         data = self.resp_json(resp)
         self.assertTrue(data["ok"])
@@ -392,6 +394,7 @@ class TestSave(StockClosingTestBase):
         self.assertIsNotNone(save["closed_at"])
         self.assertEqual(save["closer_name"], "김마감")
         self.assertEqual(save["reason"], "파손 확인")
+        self.assertEqual(self.conn.lines[0]["reason"], "파손")
 
     def test_a5_already_closed_rejected(self):
         self.seed_items()
@@ -428,7 +431,7 @@ class TestSave(StockClosingTestBase):
         self.seed_items(items=("I1",))
         long_name = "가" * 40
         resp = self.run_save({"date": dstr(TODAY), "mode": "close", "closer_name": "  " + long_name + "  ",
-                              "reason": "사유", "counts": {"I1": "1"}})
+                              "reason": "사유", "reasons": {"I1": "사유"}, "counts": {"I1": "1"}})
         self.assertTrue(self.resp_json(resp)["ok"])
         self.assertEqual(self.conn.saves[0]["closer_name"], "가" * 30)
 
@@ -1024,9 +1027,9 @@ class TestPages(StockClosingTestBase):
         self.session_user = dict(self.BRANCH_USER)
         resp = asyncio.run(main.stock_closing_page(session_token="x", filter_branch="", date=""))
         html = self._body(resp)
-        # 9칸 헤더 + 빈 목록 colspan=9 (아이템 없음 상태)
+        # 10칸 헤더 + 빈 목록 colspan=10 (아이템 없음 상태)
         self.assertIn("QR 수정", html)
-        self.assertIn('colspan="9"', html)
+        self.assertIn('colspan="10"', html)
         # 지점 계정 live 모드 -> 마감 담당자 입력칸 활성
         self.assertIn('id="scCloser"', html)
         # 실사 입력칸 width:100%
