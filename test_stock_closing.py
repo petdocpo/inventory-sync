@@ -164,22 +164,23 @@ class FakeConn:
             return []
         if "UPDATE stock_closing_saves SET status=?" in q:
             (status, saved_by, saved_at, closed_by, closed_at,
-             item_count, mismatch_count, sid) = p
+             item_count, mismatch_count, reason, sid) = p
             for s in self.saves:
                 if s["id"] == sid:
                     s.update({"status": status, "saved_by": saved_by, "saved_at": saved_at,
                               "closed_by": closed_by, "closed_at": closed_at,
-                              "item_count": item_count, "mismatch_count": mismatch_count})
+                              "item_count": item_count, "mismatch_count": mismatch_count,
+                              "reason": reason})
             self.rowcount = 1
             return []
         if "INSERT INTO stock_closing_saves" in q:
             (branch, cdate, status, saved_by, saved_at, closed_by, closed_at,
-             item_count, mismatch) = p
+             item_count, mismatch, reason) = p
             row = {"id": self._next_id, "branch_code": branch, "close_date": cdate,
                    "status": status, "saved_by": saved_by, "saved_at": saved_at,
                    "closed_by": closed_by, "closed_at": closed_at,
                    "item_count": item_count, "mismatch_count": mismatch,
-                   "closer_name": None}
+                   "closer_name": None, "reason": reason}
             self._next_id += 1
             self.saves.append(row)
             self.rowcount = 1
@@ -375,8 +376,13 @@ class TestSave(StockClosingTestBase):
         self.expect_http(400, self.run_save,
                          {"date": dstr(TODAY), "mode": "close", "closer_name": "김마감",
                           "counts": {"I1": "1"}})
-        # 모두 입력 -> 성공
+        # 오차 있는데 사유 없음 -> 거부
+        self.expect_http(400, self.run_save,
+                         {"date": dstr(TODAY), "mode": "close", "closer_name": "김마감",
+                          "counts": {"I1": "1", "I2": "2"}})
+        # 사유 입력 -> 성공
         resp = self.run_save({"date": dstr(TODAY), "mode": "close", "closer_name": "김마감",
+                              "reason": "파손 확인",
                               "counts": {"I1": "1", "I2": "2"}})
         data = self.resp_json(resp)
         self.assertTrue(data["ok"])
@@ -385,6 +391,7 @@ class TestSave(StockClosingTestBase):
         self.assertEqual(save["closed_by"], "a1")
         self.assertIsNotNone(save["closed_at"])
         self.assertEqual(save["closer_name"], "김마감")
+        self.assertEqual(save["reason"], "파손 확인")
 
     def test_a5_already_closed_rejected(self):
         self.seed_items()
@@ -421,7 +428,7 @@ class TestSave(StockClosingTestBase):
         self.seed_items(items=("I1",))
         long_name = "가" * 40
         resp = self.run_save({"date": dstr(TODAY), "mode": "close", "closer_name": "  " + long_name + "  ",
-                              "counts": {"I1": "1"}})
+                              "reason": "사유", "counts": {"I1": "1"}})
         self.assertTrue(self.resp_json(resp)["ok"])
         self.assertEqual(self.conn.saves[0]["closer_name"], "가" * 30)
 

@@ -2168,6 +2168,20 @@ def init_db():
             if _c not in _existing:
                 conn.execute(f"ALTER TABLE daily_stocktake_saves ADD COLUMN {_c} {_ddl}")
 
+    # stock_closing_saves 오차 사유 컬럼 보강 (additive)
+    if USE_POSTGRES:
+        conn.execute(
+            "ALTER TABLE IF EXISTS stock_closing_saves ADD COLUMN IF NOT EXISTS reason TEXT"
+        )
+    else:
+        _sc_tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='stock_closing_saves'"
+        ).fetchone()
+        if _sc_tbl:
+            _sc_existing = {r[1] for r in conn.execute("PRAGMA table_info(stock_closing_saves)").fetchall()}
+            if "reason" not in _sc_existing:
+                conn.execute("ALTER TABLE stock_closing_saves ADD COLUMN reason TEXT")
+
     conn.commit()
     conn.close()
 
@@ -3498,6 +3512,143 @@ def _stock_closing_live_items(target_branch: str, sel_date) -> list:
     items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
     return items
 
+def _sc_discrepancy_analysis(branch_code: str, sel_date, lines: list) -> list:
+    """오차(diff_qty != 0)가 있는 품목별로 당일 유비플러스 출고(sales_records)와
+    QR 출고 스캔(scan_log OUT)을 시간순으로 매칭해 누락/오등록 추정 문자열을 만든다.
+    반환: [{branch_code,item_name,ups_qty,counted_qty,diff_qty,estimate}]"""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    kst = _tz(_td(hours=9))
+    utc = _tz.utc
+    date_str = sel_date.strftime("%Y-%m-%d")
+    diff_lines = [l for l in lines if (l["diff_qty"] or 0) != 0]
+    if not diff_lines or not branch_code:
+        return []
+
+    branches = get_branches(branch_type='branch')
+    code_to_name = {b["branch_code"]: b["branch_name"] for b in branches}
+    branch_name = code_to_name.get(branch_code, "")
+    codes = [str(l["item_code"]) for l in diff_lines]
+    if not codes or not branch_name:
+        return []
+
+    start_kst = _dt(sel_date.year, sel_date.month, sel_date.day, tzinfo=kst)
+    end_kst = start_kst + _td(days=1)
+    start_utc = start_kst.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%S")
+    end_utc = end_kst.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    conn = get_conn()
+    try:
+        ph = ",".join("?" for _ in codes)
+        ups_rows = conn.execute(
+            "SELECT sale_datetime, customer_name, item_code, quantity FROM sales_records "
+            f"WHERE sale_date=? AND branch_name=? AND item_code IN ({ph})",
+            tuple([date_str, branch_name] + codes)
+        ).fetchall()
+        qr_rows = conn.execute(
+            "SELECT scanned_at, item_code FROM scan_log "
+            f"WHERE branch_code=? AND scan_type='OUT' AND scanned_at>=? AND scanned_at<? "
+            f"AND item_code IN ({ph})",
+            tuple([branch_code, start_utc, end_utc] + codes)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    WINDOW_MIN = 30  # 시간 매칭 허용 오차(분)
+
+    def _ups_events():
+        ev = []
+        for r in ups_rows:
+            try:
+                t = _dt.strptime(str(r["sale_datetime"]), "%Y-%m-%d %H:%M")
+            except Exception:
+                continue
+            qty = max(1, int(r["quantity"] or 1))
+            for _ in range(min(qty, 50)):
+                ev.append({"t": t, "code": r["item_code"],
+                           "customer": (r["customer_name"] or "").strip() or "고객"})
+        return ev
+
+    def _qr_events():
+        ev = []
+        for r in qr_rows:
+            try:
+                t = _dt.fromisoformat(str(r["scanned_at"]).replace("Z", "+00:00"))
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=utc)
+                t = t.astimezone(kst).replace(tzinfo=None)
+            except Exception:
+                continue
+            ev.append({"t": t, "code": r["item_code"]})
+        return ev
+
+    ups_ev = _ups_events()
+    qr_ev = _qr_events()
+    ups_by_code = {}
+    qr_by_code = {}
+    for e in ups_ev:
+        ups_by_code.setdefault(e["code"], []).append(e)
+    for e in qr_ev:
+        qr_by_code.setdefault(e["code"], []).append(e)
+    for v in ups_by_code.values():
+        v.sort(key=lambda x: x["t"])
+    for v in qr_by_code.values():
+        v.sort(key=lambda x: x["t"])
+
+    import bisect
+    out = []
+    for l in diff_lines:
+        code = str(l["item_code"])
+        u_list = ups_by_code.get(code, [])
+        q_list = qr_by_code.get(code, [])
+        q_times = [q["t"] for q in q_list]
+        used_q = [False] * len(q_list)
+        missed_ups = []   # 유비플러스에는 있는데 QR 스캔이 없는 건 → QR 누락 추정
+        for u in u_list:
+            # 시간순 정렬된 q_list에서 윈도우 내 미사용 후보만 검사
+            lo = bisect.bisect_left(q_times, u["t"] - _td(minutes=WINDOW_MIN))
+            hi = bisect.bisect_right(q_times, u["t"] + _td(minutes=WINDOW_MIN))
+            best_i, best_d = -1, None
+            for i in range(lo, hi):
+                if used_q[i]:
+                    continue
+                d = abs((u["t"] - q_times[i]).total_seconds()) / 60.0
+                if best_d is None or d < best_d:
+                    best_i, best_d = i, d
+            if best_i >= 0:
+                used_q[best_i] = True
+            else:
+                missed_ups.append(u)
+        extra_qr = [q for i, q in enumerate(q_list) if not used_q[i]]  # QR만 있는 건 → 유비플러스 오등록 추정
+
+        parts = []
+        for u in missed_ups[:3]:
+            parts.append(f"{u['t'].strftime('%H:%M')} {u['customer']} QR 누락 추정")
+        if len(missed_ups) > 3:
+            parts.append(f"QR 누락 외 {len(missed_ups) - 3}건")
+        for q in extra_qr[:3]:
+            parts.append(f"{q['t'].strftime('%H:%M')} 유비플러스 오등록 추정")
+        if len(extra_qr) > 3:
+            parts.append(f"오등록 외 {len(extra_qr) - 3}건")
+        if not parts:
+            if u_list or q_list:
+                parts.append(
+                    f"유비플러스 출고 {len(u_list)}건 / QR 출고 {len(q_list)}건 — 시간 매칭 실패"
+                )
+            else:
+                parts.append("당일 출고 내역 없음")
+        estimate = " / ".join(parts)
+
+        out.append({
+            "branch_code": l["branch_code"],
+            "item_name": l["item_name"] or "",
+            "ups_qty": l["ups_qty"],
+            "counted_qty": l["counted_qty"],
+            "diff_qty": l["diff_qty"],
+            "estimate": estimate,
+        })
+    return out
+
+
 def _sc_adjust_cell(branch_code, item_code, editable) -> str:
     """재고 마감 목록의 'QR 수정' 칸 — 수기조정(/adjust)으로 해당 지점·상품을 미리 선택해서 이동"""
     from urllib.parse import quote as _quote
@@ -3510,27 +3661,35 @@ def _sc_adjust_cell(branch_code, item_code, editable) -> str:
     )
 
 def _sc_closer_box(view_mode: str, save, can_write: bool) -> str:
-    """재고 마감 화면 맨 위의 '마감 담당자' 입력칸 (지점 계정과 무관한 사람 이름, 마감 시 필수)"""
+    """재고 마감 화면 맨 위의 '마감 담당자' + '오차 사유' 입력칸"""
     import html as _html
     name = ""
+    reason = ""
     if save:
         try:
             name = str(save["closer_name"] or "")
+            reason = str(save["reason"] or "")
         except Exception:
             name = ""
+            reason = ""
     esc = _html.escape(name)
+    resc = _html.escape(reason)
     if can_write:
         return (
             '<div class="card" style="margin-bottom:12px;">'
             '<label style="font-size:13px;font-weight:bold;">마감 담당자 <span style="color:#DC2626;">*</span></label>'
             f'<input type="text" id="scCloser" maxlength="30" placeholder="마감 담당자 이름 (필수)" value="{esc}" style="margin-top:6px;max-width:260px;">'
             '<div style="font-size:12px;color:#888;margin-top:4px;">지점 계정과 무관하게 실제 마감하는 사람의 이름을 입력해주세요. 마감할 때 필수입니다.</div>'
+            '<label style="font-size:13px;font-weight:bold;display:block;margin-top:12px;">오차 사유</label>'
+            f'<input type="text" id="scReason" maxlength="200" placeholder="오차 사유 (오차가 있으면 마감 시 필수)" value="{resc}" style="margin-top:6px;max-width:100%;">'
+            '<div style="font-size:12px;color:#888;margin-top:4px;">실사 수량과 유비플러스 재고에 오차가 있는 품목이 있으면 마감할 때 사유 입력이 필수입니다.</div>'
             "</div>"
         )
     shown = esc if esc else "-"
+    rshown = resc if resc else "-"
     return (
         '<div class="card" style="margin-bottom:12px;font-size:13px;">'
-        f'<b>마감 담당자</b> {shown}</div>'
+        f'<b>마감 담당자</b> {shown}<br><b>오차 사유</b> {rshown}</div>'
     )
 
 
@@ -3739,10 +3898,19 @@ async def stock_closing_page(
             "QR 재고·유비플러스 재고 기준: " + basis_text + "</div>"
         )
     if view_mode == "closed":
+        _sc_reason = ""
+        try:
+            _sc_reason = str(save["reason"] or "")
+        except Exception:
+            _sc_reason = ""
+        _sc_reason_html = (
+            f' · 사유: {_html.escape(_sc_reason)}' if _sc_reason else ""
+        )
         notices_html += (
             f'<div {notice_style}color:#166534;background:#F0FDF4;">'
             f'✅ 마감 완료 — {_html.escape(str(save["closed_by"] or "-"))} · '
-            f'{_html.escape(str(save["closed_at"] or "-"))} · 마감 후에는 수정할 수 없습니다.</div>'
+            f'{_html.escape(str(save["closed_at"] or "-"))} · 마감 후에는 수정할 수 없습니다.'
+            + _sc_reason_html + "</div>"
         )
     elif view_mode == "live":
         notices_html += (
@@ -3750,10 +3918,19 @@ async def stock_closing_page(
             f'마감 가능 기간: {sel_date_str} ~ {window_end_str}</div>'
         )
         if save:
+            _sc_draft_reason = ""
+            try:
+                _sc_draft_reason = str(save["reason"] or "")
+            except Exception:
+                _sc_draft_reason = ""
+            _sc_draft_reason_html = (
+                f' · 사유: {_html.escape(_sc_draft_reason)}' if _sc_draft_reason else ""
+            )
             notices_html += (
                 f'<div {notice_style}color:#1E40AF;background:#EFF6FF;">'
                 f'💾 임시저장됨 — {_html.escape(str(save["saved_by"] or "-"))} · '
-                f'{_html.escape(str(save["saved_at"] or "-"))} (마감 전까지 수정할 수 있습니다)</div>'
+                f'{_html.escape(str(save["saved_at"] or "-"))} (마감 전까지 수정할 수 있습니다)'
+                + _sc_draft_reason_html + "</div>"
             )
         if sel_date != today_kst:
             notices_html += (
@@ -3777,6 +3954,38 @@ async def stock_closing_page(
             f'<div {notice_style}color:#92400E;background:#FFFBEB;">'
             "전일 날짜 마감입니다. 재고 값은 위에 표시된 기준 시각을 따릅니다.</div>"
         )
+
+    # 저장된 내역 기준 오차 분석 — 유비플러스 출고 vs QR 출고 스캔 시간 매칭 추정
+    disc_html = ""
+    if save and target_branch:
+        disc_items = _sc_discrepancy_analysis(target_branch, sel_date, snap_lines)
+        if disc_items:
+            disc_rows = ""
+            for d in disc_items:
+                dcolor = "#EF4444" if (d["diff_qty"] or 0) < 0 else "#F59E0B"
+                dsign = "+" if (d["diff_qty"] or 0) > 0 else ""
+                disc_rows += (
+                    "<tr>"
+                    f"<td>{_html.escape(str(d['branch_code']))}</td>"
+                    f"<td>{_html.escape(str(d['item_name']))}</td>"
+                    f"<td>{_fmt_num(d['ups_qty'])}</td>"
+                    f"<td>{_fmt_num(d['counted_qty'])}</td>"
+                    f"<td style='font-weight:bold;color:{dcolor};'>{dsign}{d['diff_qty']}</td>"
+                    f"<td style='font-size:12px;'>{_html.escape(str(d['estimate']))}</td>"
+                    "</tr>"
+                )
+            disc_html = (
+                '<div class="card" style="border:1px solid #FCA5A5;background:#FFF7ED;margin-bottom:16px;">'
+                '<h3 style="margin:0 0 4px 0;font-size:14px;">⚠️ 오차 내역 — 추정 원인</h3>'
+                '<p style="font-size:11px;color:#888;margin:0 0 8px 0;">'
+                '당일 유비플러스 출고와 QR 출고 스캔을 시간순으로 비교한 추정입니다. '
+                '실제 원인과 다를 수 있습니다.</p>'
+                '<div class="table-scroll-wrap"><table data-colver="2026-11"><thead><tr>'
+                '<th style="width:10%">지점</th><th style="width:30%">상품명</th>'
+                '<th style="width:14%">유비플러스 재고수량</th><th style="width:10%">실사수량</th>'
+                '<th style="width:8%">오차</th><th style="width:28%">추정값</th>'
+                '</tr></thead><tbody>' + disc_rows + '</tbody></table></div></div>'
+            )
 
     buttons_html = ""
     if can_write:
@@ -3825,6 +4034,8 @@ async def stock_closing_page(
         var date = meta.getAttribute('data-date');
         var closerEl = document.getElementById('scCloser');
         var closer = closerEl ? closerEl.value.trim() : '';
+        var reasonEl = document.getElementById('scReason');
+        var reason = reasonEl ? reasonEl.value.trim() : '';
         if (mode === 'close' && closer === '') {
           alert('마감 담당자 이름을 입력해주세요. (마감 시 필수)');
           if (closerEl) closerEl.focus();
@@ -3832,11 +4043,21 @@ async def stock_closing_page(
         }
         if (mode === 'close') {
           var empty = 0;
+          var hasDiff = false;
           document.querySelectorAll('.sc-input').forEach(function(inp) {
             if (inp.value === '') empty++;
           });
+          document.querySelectorAll('.sc-diff').forEach(function(c) {
+            var t = c.textContent.trim();
+            if (t !== '' && t !== '-' && t !== '0') hasDiff = true;
+          });
           if (empty > 0) {
             alert('실사 수량이 입력되지 않은 상품이 ' + empty + '개 있습니다.\\n모든 상품에 입력한 뒤 마감해주세요.');
+            return;
+          }
+          if (hasDiff && reason === '') {
+            alert('오차가 있는 품목이 있습니다.\\n오차 사유를 입력한 뒤 마감해주세요.');
+            if (reasonEl) reasonEl.focus();
             return;
           }
           if (!confirm('마감 후에는 수정할 수 없습니다.\\n입력한 내용을 확인했다면 [확인]을 눌러 마감해주세요.')) {
@@ -3847,7 +4068,7 @@ async def stock_closing_page(
           var res = await fetch('/stock-closing/save', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({date: date, mode: mode, counts: scCollect(), closer_name: closer})
+            body: JSON.stringify({date: date, mode: mode, counts: scCollect(), closer_name: closer, reason: reason})
           });
           var data = await res.json();
           if (!res.ok) {
@@ -3878,6 +4099,7 @@ async def stock_closing_page(
         + filter_html
         + cards_html
         + notices_html
+        + disc_html
         + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11">'
         "<thead><tr>"
         '<th style="width:8%">지점</th><th style="width:25%">상품명</th>'
@@ -3916,6 +4138,7 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
     mode = str(body.get("mode", "")).strip()
     counts = body.get("counts") or {}
     closer_name = str(body.get("closer_name", "")).strip()[:30]
+    reason = str(body.get("reason", "")).strip()[:200]
     if mode == "close" and not closer_name:
         raise HTTPException(status_code=400, detail="마감 담당자 이름을 입력해주세요. (마감 시 필수)")
     if mode not in ("draft", "close"):
@@ -3959,6 +4182,11 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
             status_code=400,
             detail="실사 수량이 입력되지 않은 상품이 " + str(missing) + "개 있습니다. 화면을 새로고침한 뒤 모두 입력하고 마감해주세요."
         )
+    if mode == "close" and mismatch > 0 and not reason:
+        raise HTTPException(
+            status_code=400,
+            detail="오차가 있는 품목이 " + str(mismatch) + "개 있습니다. 오차 사유를 입력한 뒤 마감해주세요."
+        )
 
     now_str = _dt.now(_tz(_td(hours=9))).strftime("%Y-%m-%d %H:%M:%S")
     login = user.get("login_id") or branch_code
@@ -3978,15 +4206,15 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
             save_id = existing["id"]
             conn.execute(
                 "UPDATE stock_closing_saves SET status=?, saved_by=?, saved_at=?, closed_by=?, closed_at=?, "
-                "item_count=?, mismatch_count=? WHERE id=?",
-                (status, login, now_str, closed_by, closed_at, len(lines), mismatch, save_id)
+                "item_count=?, mismatch_count=?, reason=? WHERE id=?",
+                (status, login, now_str, closed_by, closed_at, len(lines), mismatch, reason or None, save_id)
             )
             conn.execute("DELETE FROM stock_closing_lines WHERE save_id=?", (save_id,))
         else:
             conn.execute(
                 "INSERT INTO stock_closing_saves (branch_code, close_date, status, saved_by, saved_at, "
-                "closed_by, closed_at, item_count, mismatch_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (branch_code, date_str, status, login, now_str, closed_by, closed_at, len(lines), mismatch)
+                "closed_by, closed_at, item_count, mismatch_count, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (branch_code, date_str, status, login, now_str, closed_by, closed_at, len(lines), mismatch, reason or None)
             )
             row = conn.execute(
                 "SELECT id FROM stock_closing_saves WHERE branch_code=? AND close_date=?",
