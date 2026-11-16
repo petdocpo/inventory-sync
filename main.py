@@ -13665,7 +13665,7 @@ async def master_test_eod_alert(request: Request, session_token: str = Cookie(de
     sent_count = 0
     for bn, its in by_branch.items():
         preview = "\n".join(
-            f"- {it['item_name']} ({it['item_code']}): 현재 재고 {it['stock']}개 / 예상 소진량 {it['need']}개 / 안전재고 {it['safety']}개 → 권장 {it['suggest_qty']}"
+            f"- {it['item_name']}: 현재 재고 {it['stock']}개 / 예상 소진량 {it['need']}개 / 안전재고 {it['safety']}개"
             for it in its[:8]
         )
         more = f"\n...외 {len(its) - 8}건" if len(its) > 8 else ""
@@ -13770,7 +13770,7 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
 
         def _eod_body(bn_label, its, prefix=""):
             preview = "\n".join(
-                f"- {it['item_name']} ({it['item_code']}): 현재 재고 {it['stock']}개 / 예상 소진량 {it['need']}개 / 안전재고 {it['safety']}개 → 권장 {it['suggest_qty']}"
+                f"- {it['item_name']}: 현재 재고 {it['stock']}개 / 예상 소진량 {it['need']}개 / 안전재고 {it['safety']}개"
                 for it in its[:15]
             )
             more = f"\n...외 {len(its) - 15}건" if len(its) > 15 else ""
@@ -13790,7 +13790,7 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
                 lines.append(f"[{bn}] {len(its)}건")
                 for it in its[:10]:
                     lines.append(
-                        f"  - {it['item_name']} ({it['item_code']}): 현재 {it['stock']}개 / 예상 소진 {it['need']}개 / 안전재고 {it['safety']}개 → 권장 {it['suggest_qty']}"
+                        f"  - {it['item_name']}: 현재 {it['stock']}개 / 예상 소진 {it['need']}개 / 안전재고 {it['safety']}개"
                     )
             body = (
                 "[테스트 모드] 실제 지점 채널에는 발송되지 않습니다.\n"
