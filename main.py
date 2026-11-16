@@ -2177,6 +2177,13 @@ def render_notice_content(raw_content: str) -> str:
  
  
 _COLUMN_SETTINGS_HTML = """
+      <style>
+        #colSetModal label { display:flex !important; align-items:center; gap:6px;
+          font-size:13px; padding:2px 0; cursor:pointer; }
+        #colSetModal input[type="checkbox"] { width:auto !important; padding:0 !important;
+          border:none !important; margin:0 !important; flex-shrink:0; }
+        #colSetModal button { font-family:inherit; }
+      </style>
       <div id="colSetOverlay" onclick="if(event.target===this)closeColSettings()"
            style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:400;"></div>
       <div id="colSetModal" style="display:none;position:fixed;top:50%;left:50%;
@@ -2189,10 +2196,17 @@ _COLUMN_SETTINGS_HTML = """
                   padding:4px 12px;font-size:12px;cursor:pointer;">닫기</button>
         </div>
         <div id="colSetBody"></div>
+        <div id="colSetDefaultBar" style="display:none;margin-top:14px;padding-top:10px;border-top:1px solid #eee;">
+          <button type="button" onclick="saveColDefaults()"
+            style="background:#1E2761;color:white;border:none;padding:7px 12px;border-radius:8px;font-size:12px;cursor:pointer;">⭐ 이 페이지 설정을 모든 계정 기본값으로</button>
+          <span id="colSetDefaultMsg" style="font-size:12px;color:#666;margin-left:8px;"></span>
+        </div>
       </div>
       <script>
       (function() {
         var PREFIX = 'colVis_';
+        var COL_DEFAULTS = __COL_DEFAULTS_JSON__;
+        var COL_DEFAULTS_MASTER = __COL_DEFAULTS_MASTER__;
         function cvIndex(table) {
           var all = document.querySelectorAll('table');
           for (var i = 0; i < all.length; i++) { if (all[i] === table) return i; }
@@ -2205,7 +2219,8 @@ _COLUMN_SETTINGS_HTML = """
         }
         function cvEligible(table) {
           if (!table.tHead || !table.tHead.rows.length) return false;
-          if (table.closest('table')) return false;
+          // closest()는 자기 자신도 매칭하므로 부모부터 검사해야 중첩 테이블만 걸러진다
+          if (table.parentElement && table.parentElement.closest('table')) return false;
           var ths = table.tHead.getElementsByTagName('th');
           if (ths.length < 2) return false;
           for (var i = 0; i < ths.length; i++) { if (ths[i].rowSpan > 1) return false; }
@@ -2226,13 +2241,25 @@ _COLUMN_SETTINGS_HTML = """
           }
           return units;
         }
+        // 서버에 저장된 전체 계정 기본값 (마스터가 저장, localStorage 미설정 시 fallback)
+        function cvDefaultHidden(table) {
+          try {
+            var d = COL_DEFAULTS || {};
+            var i = cvIndex(table);
+            var v = table.getAttribute('data-colver') || '';
+            var a = d[window.location.pathname + '_' + i + (v ? '_' + v : '')];
+            return Array.isArray(a) ? a : [];
+          } catch (e) { return []; }
+        }
         function cvHidden(table) {
           try {
             var s = localStorage.getItem(cvKey(table));
-            if (!s) return [];
-            var a = JSON.parse(s);
-            return Array.isArray(a) ? a : [];
-          } catch (e) { return []; }
+            if (s) {
+              var a = JSON.parse(s);
+              return Array.isArray(a) ? a : [];
+            }
+          } catch (e) {}
+          return cvDefaultHidden(table);
         }
         function cvSaveHidden(table, arr) {
           try { localStorage.setItem(cvKey(table), JSON.stringify(arr)); } catch (e) {}
@@ -2290,11 +2317,34 @@ _COLUMN_SETTINGS_HTML = """
         function cvApplyAll() {
           document.querySelectorAll('table').forEach(cvApply);
         }
-        window.openColSettings = function() {
+        // 각 표 우측 위에 ⚙️ 칼럼 버튼을 주입 — 클릭 시 해당 표만 설정 모달로 연다
+        function cvInjectButtons() {
+          document.querySelectorAll('table').forEach(function(table) {
+            if (!cvEligible(table)) return;
+            var anchor = table.closest('.table-scroll-wrap') || table;
+            var host = anchor.parentElement;
+            if (!host) return;
+            var prev = anchor.previousElementSibling;
+            if (prev && prev.classList && prev.classList.contains('cv-col-bar')) return;
+            var bar = document.createElement('div');
+            bar.className = 'cv-col-bar';
+            bar.style.cssText = 'display:flex;justify-content:flex-end;margin:0 0 4px 0;';
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = '⚙️ 칼럼';
+            btn.title = '이 표의 칼럼 표시 설정';
+            btn.style.cssText = 'background:#fff;border:1px solid #ccc;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;color:#555;box-shadow:0 1px 3px rgba(0,0,0,.12);';
+            btn.addEventListener('click', function() { window.openColSettings(table); });
+            bar.appendChild(btn);
+            host.insertBefore(bar, anchor);
+          });
+        }
+        window.openColSettings = function(onlyTable) {
           var body = document.getElementById('colSetBody');
           body.innerHTML = '';
           var any = false;
           document.querySelectorAll('table').forEach(function(table) {
+            if (onlyTable && table !== onlyTable) return;
             if (!cvEligible(table)) return;
             any = true;
             var units = cvUnits(table);
@@ -2323,7 +2373,7 @@ _COLUMN_SETTINGS_HTML = """
                 }
                 cvSaveHidden(table, h);
                 cvApply(table);
-                window.openColSettings();
+                window.openColSettings(onlyTable);
               });
               lab.appendChild(cb);
               lab.appendChild(document.createTextNode(u.label));
@@ -2335,7 +2385,7 @@ _COLUMN_SETTINGS_HTML = """
             reset.addEventListener('click', function() {
               cvSaveHidden(table, []);
               cvApply(table);
-              window.openColSettings();
+              window.openColSettings(onlyTable);
             });
             box.appendChild(reset);
             body.appendChild(box);
@@ -2350,15 +2400,98 @@ _COLUMN_SETTINGS_HTML = """
           document.getElementById('colSetOverlay').style.display = 'none';
           document.getElementById('colSetModal').style.display = 'none';
         };
+        // 마스터만: 현재 페이지의 실효 숨김 설정(localStorage+기본값 반영)을 전체 계정 기본값으로 저장
+        window.saveColDefaults = function() {
+          var msg = document.getElementById('colSetDefaultMsg');
+          var tables = {};
+          document.querySelectorAll('table').forEach(function(table) {
+            if (!cvEligible(table)) return;
+            var i = cvIndex(table);
+            var v = table.getAttribute('data-colver') || '';
+            tables[String(i) + (v ? '_' + v : '')] = cvHidden(table);
+          });
+          fetch('/api/column-defaults', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({page: window.location.pathname, tables: tables})
+          }).then(function(r) { return r.json(); }).then(function(d) {
+            msg.textContent = (d && d.ok) ? '저장되었습니다.' : ((d && d.detail) || '저장 실패');
+          }).catch(function() { msg.textContent = '저장 실패'; });
+        };
+        if (COL_DEFAULTS_MASTER) {
+          var bar = document.getElementById('colSetDefaultBar');
+          if (bar) bar.style.display = 'block';
+        }
         cvApplyAll();
+        cvInjectButtons();
         var __cvTimer = null;
         new MutationObserver(function() {
           clearTimeout(__cvTimer);
-          __cvTimer = setTimeout(cvApplyAll, 300);
+          __cvTimer = setTimeout(function() { cvApplyAll(); cvInjectButtons(); }, 300);
         }).observe(document.body, { childList: true, subtree: true });
       })();
       </script>
 """
+
+
+@app.post("/api/column-defaults")
+async def column_defaults_save(request: Request, session_token: str = Cookie(default=None)):
+    """칼럼 표시 기본값 저장 — 마스터 전용. system_settings 'column_defaults'에 페이지별 JSON 병합."""
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    is_master = user["role"] == "master" or user.get("branch_type") == "hq"
+    if not is_master:
+        raise HTTPException(status_code=403, detail="기본값 설정은 마스터만 가능합니다.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    page = str((body or {}).get("page") or "").strip()
+    tables = (body or {}).get("tables")
+    if not page.startswith("/") or not isinstance(tables, dict):
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+
+    clean = {}
+    for suffix, hidden in tables.items():
+        suffix = str(suffix)
+        if not suffix or len(suffix) > 60:
+            continue
+        if not isinstance(hidden, list):
+            continue
+        vals = []
+        for v in hidden[:100]:
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= iv <= 100:
+                vals.append(iv)
+        clean[page + "_" + suffix] = sorted(set(vals))
+
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM system_settings WHERE key='column_defaults'").fetchone()
+        try:
+            data = json.loads(row["value"]) if row and row["value"] else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        prefix = page + "_"
+        for k in [k for k in data if str(k).startswith(prefix)]:
+            data.pop(k)
+        data.update(clean)
+        value = json.dumps(data, ensure_ascii=False)
+        exist = conn.execute("SELECT value FROM system_settings WHERE key='column_defaults'").fetchone()
+        if exist:
+            conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='column_defaults'", (value,))
+        else:
+            conn.execute("INSERT INTO system_settings (key, value) VALUES ('column_defaults', ?)", (value,))
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True, "message": "기본값이 저장되었습니다."})
 
 
 def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> str:
@@ -2382,7 +2515,21 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">🧩 칼럼</button>'
         if col_settings_enabled else ""
     )
-    col_settings_html = _COLUMN_SETTINGS_HTML if col_settings_enabled else ""
+    col_settings_html = ""
+    if col_settings_enabled:
+        col_defaults_json = "{}"
+        try:
+            _c = get_conn()
+            _row = _c.execute("SELECT value FROM system_settings WHERE key='column_defaults'").fetchone()
+            _c.close()
+            if _row and _row["value"]:
+                json.loads(_row["value"])  # JSON 형식 검증
+                col_defaults_json = str(_row["value"]).replace("<", "\\u003c")
+        except Exception:
+            col_defaults_json = "{}"
+        col_settings_html = (_COLUMN_SETTINGS_HTML
+                             .replace("__COL_DEFAULTS_JSON__", col_defaults_json)
+                             .replace("__COL_DEFAULTS_MASTER__", "true" if is_master else "false"))
     raw_menu_href = "/master/raw-upload" if is_master else "/raw-branch"
     vendor_eval_href = "/master/vendor-eval" if is_master else "/vendor-eval"
     survey_menu_href = "/master/survey" if is_master else "/survey"
@@ -4585,6 +4732,46 @@ async def daily_stocktake_reopen(request: Request, session_token: str = Cookie(d
     return JSONResponse({"ok": True, "message": "마감이 해제되었습니다."})
 
 
+@app.post("/daily-stocktake/delete")
+async def daily_stocktake_delete(request: Request, session_token: str = Cookie(default=None)):
+    """실사 기록 삭제 — 마스터 전용. 저장 헤더와 라인을 함께 삭제 (되돌릴 수 없음)."""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    is_master = user["role"] == "master" or user.get("branch_type") == "hq"
+    if not is_master:
+        raise HTTPException(status_code=403, detail="실사 기록 삭제는 마스터만 가능합니다.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+
+    try:
+        save_id = int(body.get("save_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="삭제할 실사 기록을 찾을 수 없습니다.")
+
+    conn = get_conn()
+    try:
+        target = conn.execute(
+            "SELECT id, branch_code, count_date FROM daily_stocktake_saves WHERE id=?", (save_id,)
+        ).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="실사 기록이 없습니다.")
+        conn.execute("DELETE FROM daily_stocktake_lines WHERE save_id=?", (save_id,))
+        conn.execute("DELETE FROM daily_stocktake_saves WHERE id=?", (save_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True, "message": "실사 기록이 삭제되었습니다."})
+
+
 @app.get("/master/daily-stocktake", response_class=HTMLResponse)
 async def master_daily_stocktake_page(
     session_token: str = Cookie(default=None),
@@ -4680,7 +4867,11 @@ async def master_daily_stocktake_page(
                 f"<td style='text-align:center;'>{mism_badge}</td>"
                 f"<td style='text-align:center;'>{status_badge}</td>"
                 f'<td><a href="{detail_url}" style="background:#1E2761;color:white;padding:4px 10px;'
-                'border-radius:6px;font-size:12px;text-decoration:none;">상세</a></td>'
+                'border-radius:6px;font-size:12px;text-decoration:none;">상세</a> '
+                f'<button type="button" onclick="dstDeleteSave({int(s["id"])}, '
+                f'\'{_html.escape(bname)}\', \'{_html.escape(str(s["count_date"]))}\')" '
+                'style="background:#DC2626;color:white;border:none;padding:4px 10px;'
+                'border-radius:6px;font-size:12px;cursor:pointer;margin-left:4px;">삭제</button></td>'
                 "</tr>"
             )
 
@@ -4688,15 +4879,30 @@ async def master_daily_stocktake_page(
         '<h2 style="margin:0 0 8px 0;">🧮 재고 실사 결과</h2>'
         '<p style="color:#888;font-size:13px;margin-bottom:16px;">지점별 일일 재고 실사 기록 (소모품 제외)</p>'
         + filter_html
-        + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-17">'
+        + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-18">'
         "<thead><tr>"
         '<th style="width:16%">지점</th><th style="width:11%">실사일</th>'
         '<th style="width:11%">담당자</th><th style="width:12%">저장자</th>'
         '<th style="width:14%">저장일시</th><th style="width:7%">품목수</th>'
-        '<th style="width:9%">오차 품목수</th><th style="width:8%">상태</th><th style="width:11%">상세</th>'
+        '<th style="width:9%">오차 품목수</th><th style="width:8%">상태</th><th style="width:13%">상세/삭제</th>'
         "</tr></thead><tbody>"
         + rows_html
         + "</tbody></table></div></div>"
+        + """<script>
+        async function dstDeleteSave(saveId, bname, cdate) {
+          if (!confirm(bname + ' ' + cdate + ' 실사 기록을 삭제하시겠습니까?\\n저장된 실사 수량 전체가 삭제되며 되돌릴 수 없습니다.')) return;
+          try {
+            var res = await fetch('/daily-stocktake/delete', {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({save_id: saveId})
+            });
+            var data = await res.json();
+            if (!res.ok) { alert(data.detail || '삭제에 실패했습니다.'); return; }
+            alert(data.message || '삭제되었습니다.');
+            location.reload();
+          } catch (e) { alert('오류가 발생했습니다.'); }
+        }
+        </script>"""
     )
     return HTMLResponse(render_page(content, user, active="master"))
 
