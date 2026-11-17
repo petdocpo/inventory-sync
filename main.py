@@ -2391,7 +2391,7 @@ _COLUMN_SETTINGS_HTML = """
             var s = localStorage.getItem(cvFontStoreKey(table));
             if (s) { var n = parseInt(s, 10); if (n >= FONT_MIN && n <= FONT_MAX) return n; }
           } catch (e) {}
-          return cvFontDefault(table) || 9;  // 전역 기본 9px
+          return cvFontDefault(table) || 11;  // 전역 기본 11px
         }
         function cvApplyFont(table) {
           var px = cvFontSize(table);
@@ -2400,6 +2400,8 @@ _COLUMN_SETTINGS_HTML = """
           var tds = table.getElementsByTagName('td');
           for (var i = 0; i < ths.length; i++) { ths[i].style.fontSize = px + 'px'; }
           for (var j = 0; j < tds.length; j++) { tds[j].style.fontSize = px + 'px'; }
+          var fields = table.querySelectorAll('td input, td select, td textarea, th input, th select, th textarea');
+          for (var k = 0; k < fields.length; k++) { fields[k].style.fontSize = px + 'px'; }
         }
         function cvHidden(table) {
           try {
@@ -2864,7 +2866,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       <style>
                 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-               background: #f5f7fa; padding-bottom: 80px; font-size: 15px; }}
+               background: #f5f7fa; padding-bottom: 80px; font-size: 11px; }}
         .topbar {{ background: #1E2761; color: white; padding: 10px 14px;
                   display: flex; justify-content: space-between; align-items: center; }}
         .content {{ max-width: 960px; margin: 0 auto; padding: 10px 14px; }}
@@ -2875,7 +2877,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         .btn:hover {{ background: #2a3580; }}
         .btn-red {{ background: #EF4444; }}
         input, select {{ width: 100%; padding: 8px; border: 1px solid #ddd;
-                        border-radius: 8px; font-size: 13px; margin-top: 4px; }}
+                        border-radius: 8px; font-size: 11px; margin-top: 4px; }}
         table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
         .table-scroll-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
         th {{ background: #1E2761; color: white; padding: 8px 6px; text-align: left; font-size: 11px;
@@ -10297,8 +10299,8 @@ async def survey_write_page(survey_id: int, session_token: str = Cookie(default=
             body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f7fa; padding: 20px 14px; }}
             .card {{ background: white; border-radius: 12px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }}
             table {{ width: 100%; border-collapse: collapse; }}
-            th {{ background: #1E2761; color: white; padding: 8px 6px; text-align: left; font-size: 13px; }}
-            td {{ padding: 8px 6px; border-bottom: 1px solid #eee; font-size: 13px; }}
+            th {{ background: #1E2761; color: white; padding: 8px 6px; text-align: left; font-size: 11px; }}
+            td {{ padding: 8px 6px; border-bottom: 1px solid #eee; font-size: 11px; }}
           </style>
         </head>
         <body>{inner_content}</body></html>
@@ -17245,7 +17247,7 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
         body {{ font-family: -apple-system, sans-serif; background:#f5f6fa; padding:20px; }}
         h2 {{ color:#1E2761; }}
         table {{ width:100%; border-collapse:collapse; background:#fff; margin-bottom:32px; box-shadow:0 1px 3px rgba(0,0,0,0.1); }}
-        th, td {{ padding:10px 12px; border-bottom:1px solid #eee; font-size:13px; }}
+        th, td {{ padding:10px 12px; border-bottom:1px solid #eee; font-size:11px; }}
         th {{ background:#1E2761; color:#fff; text-align:left; }}
         .count-badge {{ display:inline-block; background:#1E2761; color:#fff; border-radius:12px; padding:2px 10px; font-size:12px; margin-left:8px; }}
         a.back-link {{ color:#1E2761; text-decoration:none; font-size:13px; }}
