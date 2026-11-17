@@ -4067,6 +4067,19 @@ async def stock_closing_page(
                     unmatch = ('<div style="margin-top:4px;"><b style="color:#DC2626;font-size:11px;">미매칭 추정:</b> '
                                + miss_chips + ext_chips + '</div>')
                 has_tl = bool(qr_ev or ups_ev)
+                # 1행: 요약 / 2행: 타임라인(항상 표시)
+                tl_row = ""
+                if has_tl:
+                    tl_row = (
+                        '<tr><td colspan="5" style="background:#F8FAFC;padding:8px 10px;">'
+                        '<div style="font-size:12px;">'
+                        '<div style="margin-bottom:4px;"><b>QR 스캔:</b> ' + qr_chips + '</div>'
+                        '<div style="margin-bottom:4px;"><b>유비플러스:</b> ' + ups_chips + '</div>'
+                        + unmatch + '</div></td></tr>'
+                    )
+                else:
+                    tl_row = ('<tr><td colspan="5" style="background:#F8FAFC;padding:6px 10px;'
+                              'color:#aaa;font-size:12px;">출고 내역 없음</td></tr>')
                 disc_rows += (
                     "<tr>"
                     f"<td>{_html.escape(str(d['branch_code']))}</td>"
@@ -4074,26 +4087,18 @@ async def stock_closing_page(
                     f"<td>{_fmt_num(d['ups_qty'])}</td>"
                     f"<td>{_fmt_num(d['counted_qty'])}</td>"
                     f"<td style='font-weight:bold;color:{dcolor};white-space:nowrap;'>{dsign}{d['diff_qty']}</td>"
-                    "<td>"
-                    + (('<details style="font-size:12px;"><summary style="cursor:pointer;color:#1E2761;">'
-                        '타임라인 보기</summary>'
-                        '<div style="margin-top:6px;">'
-                        '<div style="margin-bottom:4px;"><b>QR 스캔:</b> ' + qr_chips + '</div>'
-                        '<div style="margin-bottom:4px;"><b>유비플러스:</b> ' + ups_chips + '</div>'
-                        + unmatch + '</div></details>') if has_tl
-                       else '<span style="color:#aaa;font-size:12px;">출고 내역 없음</span>')
-                    + "</td></tr>"
+                    "</tr>" + tl_row
                 )
             disc_html = (
                 '<div class="card" style="border:1px solid #FCA5A5;background:#FFF7ED;margin-bottom:16px;">'
                 '<h3 style="margin:0 0 4px 0;font-size:14px;">⚠️ 오차 내역</h3>'
                 '<p style="font-size:11px;color:#888;margin:0 0 8px 0;">'
-                '각 항목의 "타임라인 보기"를 열면 당일 QR 출고 스캔과 유비플러스 출고를 시간순으로 비교할 수 있습니다. '
+                '각 항목 아래에 당일 QR 출고 스캔과 유비플러스 출고를 시간순으로 나열했습니다. '
                 '빨간색은 시간 매칭이 안 된 건으로, 실제 원인과 다를 수 있는 추정입니다.</p>'
                 '<div class="table-scroll-wrap"><table data-colver="2026-11" style="table-layout:auto;min-width:0;"><thead><tr>'
                 '<th style="width:10%">지점</th><th style="width:30%">상품명</th>'
-                '<th style="width:12%">유비플러스 재고수량</th><th style="width:9%">실사수량</th>'
-                '<th style="width:8%">오차</th><th style="width:31%">타임라인</th>'
+                '<th style="width:14%">유비플러스 재고수량</th><th style="width:10%">실사수량</th>'
+                '<th style="width:9%">오차</th>'
                 '</tr></thead><tbody>' + disc_rows + '</tbody></table></div></div>'
             )
 
@@ -21807,6 +21812,14 @@ def _closing_mismatch_lines(conn, pay_date: str, slot: str, branch_key: str,
         else:
             lines.append(short + " " + f"{-da:,}" + "원 불일치 — 영수증이 더 많음(" + cnt_txt
                          + "). 결제 누락 확인 필요")
+    # 현금시재 불일치 — 저장된 경우에만 추가
+    try:
+        crow = _closing_cash_compare_row(conn, pay_date, slot, branch_key)
+        if crow is not None and crow[2] != crow[4]:
+            lines.append("현금시재 " + f"{crow[2] - crow[4]:+,}" + "원 불일치 — 예상 "
+                         + f"{crow[2]:,}" + "원 / 실사 " + f"{crow[4]:,}" + "원. 확인 필요")
+    except Exception:
+        pass
     return lines
 
 
@@ -21889,6 +21902,22 @@ def _closing_cash_expected(cash_sale_amt: int, lines: list) -> int:
     return total
 
 
+CLOSING_CASH_ROW_LABEL = "현금시재(실사)"
+
+
+def _closing_cash_compare_row(conn, pay_date: str, slot: str, branch_key: str):
+    """현금시재가 저장돼 있으면 비교표용 가상 행 반환.
+    (라벨, 결제건수=0, 결제금액=예상현금, 영수증건수=0, 영수증금액=실제시재)
+    — 결제내역 칸에는 '예상 현금(정답)', 영수증 칸에는 '실사 시재'가 들어간다.
+    미저장 또는 실제 시재 미입력이면 None."""
+    cash = _closing_cash_load(conn, branch_key, pay_date)
+    if not cash["saved"] or cash["actual"] is None:
+        return None
+    _, cash_amt = _closing_cash_sale(conn, pay_date, slot, branch_key)
+    expected = _closing_cash_expected(cash_amt, cash["lines"])
+    return (CLOSING_CASH_ROW_LABEL, 0, expected, 0, int(cash["actual"]))
+
+
 def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str,
                        conn, user, branch_param: str) -> str:
     """현금시재 입력 카드 — 영수증 사진 올리기 아래에 표시.
@@ -21905,8 +21934,8 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
     # ── 표: 현금 매출 고정행 + 수기 행(기타 입금/시재 사용) ──
     rows_html = (
         '<tr style="background:#F0FDF4;font-weight:bold;">'
-        '<td>현금 매출 (유비플러스 현금 결제)</td>'
-        f'<td style="text-align:right;">{cash_cnt}건 / {_money(cash_amt)}원</td>'
+        '<td style="font-size:13px;">현금 매출 (유비플러스 현금 결제)</td>'
+        f'<td style="text-align:right;font-size:13px;">{cash_cnt}건 / {_money(cash_amt)}원</td>'
         '<td colspan="2" style="color:#888;font-size:12px;">자동 계산 — 수정 불가</td></tr>'
     )
     for l in lines:
@@ -21957,16 +21986,18 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
     return (
         '<div class="card" style="padding:12px 14px;margin-bottom:10px;">'
         '<div style="font-size:14px;font-weight:bold;margin-bottom:8px;">💵 현금시재</div>'
-        '<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:640px;"><thead><tr>'
+        '<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:640px;font-size:13px;"><thead><tr>'
         '<th style="width:22%">구분</th><th style="width:18%">금액(원)</th>'
         '<th style="width:22%">고객명</th><th style="width:28%">비고</th><th style="width:10%"></th>'
         '</tr></thead><tbody>' + rows_html + '</tbody></table></div>'
-        '<div style="margin-top:10px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
-        '<div><label style="font-size:12px;color:#666;">실제 현금시재(원)</label><br>'
-        f'<input type="number" min="0" step="1" inputmode="numeric" name="cash_actual" form="cash-form" '
-        f'value="{actual if actual is not None else ""}" style="width:160px;margin-top:4px;" placeholder="실사한 현금"></div>'
-        '<button type="submit" form="cash-form" class="btn">현금시재 확인</button>'
+        '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
         '<button type="button" class="btn" style="background:#64748B;" onclick="cashAddRow()">+ 행 추가</button>'
+        '<span style="font-size:12px;color:#888;">기타 입금/시재 사용 내역을 추가하세요 (선택)</span></div>'
+        '<div style="margin-top:10px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
+        '<div><label style="font-size:13px;color:#666;">실제 현금시재(원)</label><br>'
+        f'<input type="number" min="0" step="1" inputmode="numeric" name="cash_actual" form="cash-form" '
+        f'value="{actual if actual is not None else ""}" style="width:160px;margin-top:4px;font-size:14px;" placeholder="실사한 현금"></div>'
+        '<button type="submit" form="cash-form" class="btn">현금시재 확인</button>'
         '</div>'
         + result_html +
         '</div>'
@@ -22530,6 +22561,48 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                 parts.append('<div class="card">'
                              + _closing_verify_compare_html(sum_pay, sum_rc, entered > 0, m_groups)
                              + '</div>')
+
+            # 💵 현금시재 현황 — 지점별 예상/실제/오차 (마스터가 한눈에 보고 지점 뷰에서 수정)
+            try:
+                cash_rows = conn.execute(
+                    "SELECT branch_key, branch_name, actual_cash FROM closing_cash WHERE pay_date=?",
+                    (date,)
+                ).fetchall()
+                if cash_rows:
+                    ov_html = ['<h3 style="margin:16px 0 8px;">💵 현금시재 현황</h3>',
+                               '<div class="card"><div class="table-scroll-wrap"><table data-colw '
+                               'style="table-layout:auto;min-width:560px;"><thead><tr>'
+                               '<th>지점</th><th style="text-align:right;">예상 현금(정답)</th>'
+                               '<th style="text-align:right;">실제 시재</th>'
+                               '<th style="text-align:right;">오차</th><th></th>'
+                               '</tr></thead><tbody>']
+                    for cr in cash_rows:
+                        ck = cr["branch_key"]
+                        clines = conn.execute(
+                            "SELECT kind, amount FROM closing_cash_lines WHERE branch_key=? AND pay_date=?",
+                            (ck, date)
+                        ).fetchall()
+                        _, cs_amt = _closing_cash_sale(conn, date, slot, ck)
+                        exp = _closing_cash_expected(cs_amt, [dict(x) for x in clines])
+                        act = int(cr["actual_cash"] or 0)
+                        df = act - exp
+                        dstyle = 'color:#166534;' if df == 0 else 'color:#DC2626;font-weight:bold;'
+                        dtxt = "0" if df == 0 else f"{df:+,}"
+                        ov_html.append(
+                            f'<tr><td>{_esc(cr["branch_name"] or ck)}</td>'
+                            f'<td style="text-align:right;">{exp:,}원</td>'
+                            f'<td style="text-align:right;">{act:,}원</td>'
+                            f'<td style="text-align:right;{dstyle}">{dtxt}원</td>'
+                            f'<td><a href="/closing?date={_q(date)}&branch={_q(cr["branch_name"] or ck)}" '
+                            'style="font-size:12px;color:#1E2761;">수정 →</a></td></tr>'
+                        )
+                    ov_html.append('</tbody></table></div>'
+                                   '<p style="font-size:11px;color:#888;margin:8px 0 0 0;">'
+                                   '예상 현금 = 유비플러스 현금 결제 + 기타 입금 − 시재 사용. '
+                                   '수정은 해당 지점 뷰에서 가능합니다.</p></div>')
+                    parts.append("".join(ov_html))
+            except Exception:
+                pass
         else:
             # ---------- 지점 1곳(지점 계정 또는 마스터가 지점 선택) ----------
             pay = data["pay"].get(view_key)
@@ -22623,6 +22696,9 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                     )
                 else:
                     cmp_rows = _closing_compare(pg, rg)
+                    _crow = _closing_cash_compare_row(conn, date, slot, view_key)
+                    if _crow is not None:
+                        cmp_rows.append(_crow)
                     memos = _closing_get_memos(conn, view_key, date)
                     need_closer = user["role"] != "master"
                     closer_check_js = ("var _c=document.getElementById('closingCloser');"
@@ -23052,6 +23128,9 @@ async def closing_save(request: Request, session_token: str = Cookie(default=Non
         pay = data["pay"].get(key)
         pg = pay["groups"] if pay else {}
         rows = _closing_compare(pg, rc["groups"])
+        _crow = _closing_cash_compare_row(conn, pay_date, data["slot"], key)
+        if _crow is not None:
+            rows.append(_crow)
         mism = [r for r in rows if r[1] != r[3] or r[2] != r[4]]
         memos = _closing_get_memos(conn, key, pay_date)
         if any(not (memos.get(r[0], "").strip()) for r in mism):
