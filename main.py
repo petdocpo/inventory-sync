@@ -2149,6 +2149,48 @@ def init_db():
         )
     """)
 
+    # 매출 마감 현금시재 (지점×일자 1건 + 수기 행들)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS closing_cash (
+            {pk},
+            branch_key TEXT NOT NULL,
+            branch_name TEXT,
+            pay_date TEXT NOT NULL,
+            actual_cash INTEGER,
+            updated_by TEXT,
+            updated_at TEXT,
+            UNIQUE(branch_key, pay_date)
+        )
+    """)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS closing_cash_lines (
+            {pk},
+            branch_key TEXT NOT NULL,
+            pay_date TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            amount INTEGER NOT NULL DEFAULT 0,
+            customer TEXT,
+            note TEXT,
+            sort_order INTEGER DEFAULT 0,
+            updated_by TEXT,
+            updated_at TEXT
+        )
+    """)
+
+    # 마감 가이드 파일 (매출/재고 마감 페이지 상단에서 열람, 마스터만 업로드)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS closing_guide_files (
+            {pk},
+            page TEXT NOT NULL,
+            storage_path TEXT NOT NULL,
+            original_name TEXT,
+            content_type TEXT,
+            size_bytes INTEGER,
+            uploaded_by TEXT,
+            uploaded_at TEXT
+        )
+    """)
+
     # daily_stocktake_saves 마감 기능 컬럼 보강 (additive — 기존 행/제약 변경 없음)
     _dst_save_new_cols = {
         "status": "TEXT DEFAULT 'open'",
@@ -3682,6 +3724,13 @@ def _sc_discrepancy_analysis(branch_code: str, sel_date, lines: list) -> list:
             "counted_qty": l["counted_qty"],
             "diff_qty": l["diff_qty"],
             "estimate": estimate,
+            # 타임라인 표시용 원본 이벤트 (오차내역 하단 아코디언)
+            "qr_events": [q["t"].strftime("%H:%M") for q in q_list[:200]],
+            "ups_events": [{"t": u["t"].strftime("%H:%M"), "customer": u["customer"]}
+                           for u in u_list[:200]],
+            "missed": [{"t": u["t"].strftime("%H:%M"), "customer": u["customer"]}
+                       for u in missed_ups[:50]],
+            "extra": [q["t"].strftime("%H:%M") for q in extra_qr[:50]],
         })
     return out
 
@@ -3983,10 +4032,41 @@ async def stock_closing_page(
     if save and target_branch:
         disc_items = _sc_discrepancy_analysis(target_branch, sel_date, snap_lines)
         if disc_items:
+            def _chip(t, bg, fg="#1F2937", extra=""):
+                return ('<span style="display:inline-block;margin:2px;padding:2px 6px;border-radius:4px;'
+                        'font-size:11px;background:' + bg + ';color:' + fg + ';">'
+                        + _html.escape(str(t) + extra) + '</span>')
+
             disc_rows = ""
             for d in disc_items:
                 dcolor = "#EF4444" if (d["diff_qty"] or 0) < 0 else "#F59E0B"
                 dsign = "+" if (d["diff_qty"] or 0) > 0 else ""
+                qr_ev = d.get("qr_events") or []
+                ups_ev = d.get("ups_events") or []
+                missed = d.get("missed") or []
+                extra = d.get("extra") or []
+                # 타임라인 칩 (각 행 최대 60개 표시)
+                qr_chips = " ".join(_chip(t, "#DBEAFE") for t in qr_ev[:60])
+                if len(qr_ev) > 60:
+                    qr_chips += _chip("외 " + str(len(qr_ev) - 60) + "건", "#E2E8F0", "#64748B")
+                ups_chips = " ".join(_chip(e["t"] + " " + (e.get("customer") or ""), "#DCFCE7")
+                                    for e in ups_ev[:60])
+                if len(ups_ev) > 60:
+                    ups_chips += _chip("외 " + str(len(ups_ev) - 60) + "건", "#E2E8F0", "#64748B")
+                if not qr_chips:
+                    qr_chips = '<span style="color:#aaa;">없음</span>'
+                if not ups_chips:
+                    ups_chips = '<span style="color:#aaa;">없음</span>'
+                miss_chips = " ".join(
+                    _chip(m["t"] + " " + (m.get("customer") or "") + " QR누락?", "#FEE2E2", "#991B1B")
+                    for m in missed[:20])
+                ext_chips = " ".join(
+                    _chip(t + " 오등록?", "#FEE2E2", "#991B1B") for t in extra[:20])
+                unmatch = ""
+                if miss_chips or ext_chips:
+                    unmatch = ('<div style="margin-top:4px;"><b style="color:#DC2626;font-size:11px;">미매칭 추정:</b> '
+                               + miss_chips + ext_chips + '</div>')
+                has_tl = bool(qr_ev or ups_ev)
                 disc_rows += (
                     "<tr>"
                     f"<td>{_html.escape(str(d['branch_code']))}</td>"
@@ -3994,19 +4074,26 @@ async def stock_closing_page(
                     f"<td>{_fmt_num(d['ups_qty'])}</td>"
                     f"<td>{_fmt_num(d['counted_qty'])}</td>"
                     f"<td style='font-weight:bold;color:{dcolor};white-space:nowrap;'>{dsign}{d['diff_qty']}</td>"
-                    f"<td style='font-size:12px;white-space:normal!important;word-break:break-word;'>{_html.escape(str(d['estimate']))}</td>"
-                    "</tr>"
+                    "<td>"
+                    + (('<details style="font-size:12px;"><summary style="cursor:pointer;color:#1E2761;">'
+                        '타임라인 보기</summary>'
+                        '<div style="margin-top:6px;">'
+                        '<div style="margin-bottom:4px;"><b>QR 스캔:</b> ' + qr_chips + '</div>'
+                        '<div style="margin-bottom:4px;"><b>유비플러스:</b> ' + ups_chips + '</div>'
+                        + unmatch + '</div></details>') if has_tl
+                       else '<span style="color:#aaa;font-size:12px;">출고 내역 없음</span>')
+                    + "</td></tr>"
                 )
             disc_html = (
                 '<div class="card" style="border:1px solid #FCA5A5;background:#FFF7ED;margin-bottom:16px;">'
-                '<h3 style="margin:0 0 4px 0;font-size:14px;">⚠️ 오차 내역 — 추정 원인</h3>'
+                '<h3 style="margin:0 0 4px 0;font-size:14px;">⚠️ 오차 내역</h3>'
                 '<p style="font-size:11px;color:#888;margin:0 0 8px 0;">'
-                '당일 유비플러스 출고와 QR 출고 스캔을 시간순으로 비교한 추정입니다. '
-                '실제 원인과 다를 수 있습니다.</p>'
+                '각 항목의 "타임라인 보기"를 열면 당일 QR 출고 스캔과 유비플러스 출고를 시간순으로 비교할 수 있습니다. '
+                '빨간색은 시간 매칭이 안 된 건으로, 실제 원인과 다를 수 있는 추정입니다.</p>'
                 '<div class="table-scroll-wrap"><table data-colver="2026-11" style="table-layout:auto;min-width:0;"><thead><tr>'
-                '<th style="width:10%">지점</th><th style="width:26%">상품명</th>'
-                '<th style="width:13%">유비플러스 재고수량</th><th style="width:9%">실사수량</th>'
-                '<th style="width:8%">오차</th><th style="width:34%">추정값</th>'
+                '<th style="width:10%">지점</th><th style="width:30%">상품명</th>'
+                '<th style="width:12%">유비플러스 재고수량</th><th style="width:9%">실사수량</th>'
+                '<th style="width:8%">오차</th><th style="width:31%">타임라인</th>'
                 '</tr></thead><tbody>' + disc_rows + '</tbody></table></div></div>'
             )
 
@@ -4125,6 +4212,7 @@ async def stock_closing_page(
 
     content = (
         '<h2 style="margin:0 0 8px 0;">📦 재고 마감</h2>'
+        + _closing_guide_bar(user, "stock-closing")
         + _sc_closer_box(view_mode, save, can_write)
         + filter_html
         + cards_html
@@ -21758,6 +21846,205 @@ def _closing_save_memo(conn, branch_key: str, branch_name: str, pay_date: str, l
         )
 
 
+def _closing_cash_sale(conn, pay_date: str, slot: str, branch_key: str):
+    """해당 지점·일자·슬롯의 유비플러스 '현금' 결제 순건수/순금액 (취소는 음수 상계).
+    계좌·소득공제·지출증빙은 제외 — 현금시재와 맞춰야 하는 건 '현금'뿐이다."""
+    row = conn.execute(
+        "SELECT SUM(CASE WHEN pay_status='취소' THEN -1 ELSE 1 END) AS net_cnt, "
+        "SUM(CASE WHEN pay_status='취소' THEN -approve_amount ELSE approve_amount END) AS net_amt "
+        "FROM payment_records WHERE pay_date=? AND snapshot_slot=? "
+        "AND REPLACE(branch_name, ' ', '')=? AND card_company='현금'",
+        (pay_date, slot or "", branch_key)
+    ).fetchone()
+    return int(row["net_cnt"] or 0), int(row["net_amt"] or 0)
+
+
+def _closing_cash_load(conn, branch_key: str, pay_date: str) -> dict:
+    """현금시재 저장값 + 수기 행 로드. 반환: {"actual": int|None, "lines": [...] , "saved": bool}"""
+    head = conn.execute(
+        "SELECT actual_cash, updated_by, updated_at FROM closing_cash WHERE branch_key=? AND pay_date=?",
+        (branch_key, pay_date)
+    ).fetchone()
+    lines = conn.execute(
+        "SELECT kind, amount, customer, note FROM closing_cash_lines "
+        "WHERE branch_key=? AND pay_date=? ORDER BY sort_order, id",
+        (branch_key, pay_date)
+    ).fetchall()
+    return {
+        "actual": (head["actual_cash"] if head else None),
+        "updated_by": (head["updated_by"] if head else ""),
+        "updated_at": (head["updated_at"] if head else ""),
+        "lines": [{"kind": l["kind"], "amount": int(l["amount"] or 0),
+                   "customer": l["customer"] or "", "note": l["note"] or ""} for l in lines],
+        "saved": bool(head),
+    }
+
+
+def _closing_cash_expected(cash_sale_amt: int, lines: list) -> int:
+    """예상 현금 = 현금 매출 + 기타 입금 − 시재 사용"""
+    total = cash_sale_amt
+    for l in lines:
+        amt = int(l.get("amount") or 0)
+        total += amt if l.get("kind") == "deposit" else -amt
+    return total
+
+
+def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str,
+                       conn, user, branch_param: str) -> str:
+    """현금시재 입력 카드 — 영수증 사진 올리기 아래에 표시.
+    정답(예상 현금)과 오차는 [현금시재 확인] 저장 후에만 보여 준다."""
+    from html import escape as _esc
+
+    cash_cnt, cash_amt = _closing_cash_sale(conn, pay_date, slot, view_key)
+    cash = _closing_cash_load(conn, view_key, pay_date)
+    lines = cash["lines"]
+
+    def _money(n):
+        return f"{n:,}"
+
+    # ── 표: 현금 매출 고정행 + 수기 행(기타 입금/시재 사용) ──
+    rows_html = (
+        '<tr style="background:#F0FDF4;font-weight:bold;">'
+        '<td>현금 매출 (유비플러스 현금 결제)</td>'
+        f'<td style="text-align:right;">{cash_cnt}건 / {_money(cash_amt)}원</td>'
+        '<td colspan="2" style="color:#888;font-size:12px;">자동 계산 — 수정 불가</td></tr>'
+    )
+    for l in lines:
+        kind_label = "기타 입금" if l["kind"] == "deposit" else "시재 사용"
+        rows_html += (
+            '<tr class="cash-line">'
+            f'<td><select name="cl_kind" style="width:100%;">'
+            f'<option value="deposit"{" selected" if l["kind"] == "deposit" else ""}>기타 입금</option>'
+            f'<option value="use"{" selected" if l["kind"] == "use" else ""}>시재 사용</option></select></td>'
+            f'<td><input type="number" min="0" step="1" inputmode="numeric" name="cl_amt" value="{l["amount"] or ""}" style="width:110px;"></td>'
+            f'<td><input type="text" name="cl_cust" maxlength="50" value="{_esc(l["customer"])}" placeholder="고객명" style="width:100%;"></td>'
+            f'<td><input type="text" name="cl_note" maxlength="100" value="{_esc(l["note"])}" placeholder="비고" style="width:100%;"></td>'
+            '<td><button type="button" class="btn" style="background:#DC2626;padding:4px 8px;font-size:11px;" onclick="this.closest(\'tr\').remove()">삭제</button></td></tr>'
+        )
+    if not lines:
+        rows_html += (
+            '<tr class="cash-line">'
+            '<td><select name="cl_kind" style="width:100%;">'
+            '<option value="deposit">기타 입금</option><option value="use">시재 사용</option></select></td>'
+            '<td><input type="number" min="0" step="1" inputmode="numeric" name="cl_amt" style="width:110px;"></td>'
+            '<td><input type="text" name="cl_cust" maxlength="50" placeholder="고객명" style="width:100%;"></td>'
+            '<td><input type="text" name="cl_note" maxlength="100" placeholder="비고" style="width:100%;"></td>'
+            '<td><button type="button" class="btn" style="background:#DC2626;padding:4px 8px;font-size:11px;" onclick="this.closest(\'tr\').remove()">삭제</button></td></tr>'
+        )
+
+    # 예상 현금(정답) 계산 — 저장된 수기 행 기준
+    expected = _closing_cash_expected(cash_amt, lines)
+    actual = cash["actual"]
+
+    result_html = ""
+    if cash["saved"]:
+        diff = (actual or 0) - expected
+        if diff == 0:
+            result_html = ('<div style="margin-top:10px;padding:10px 12px;background:#F0FDF4;border:1px solid #BBF7D0;'
+                           'border-radius:8px;font-size:14px;"><b style="color:#166534;">✅ 일치</b> '
+                           f'— 예상 {_money(expected)}원 / 실제 {_money(actual or 0)}원 / 오차 0원</div>')
+        else:
+            result_html = ('<div style="margin-top:10px;padding:10px 12px;background:#FEF2F2;border:1px solid #FECACA;'
+                           'border-radius:8px;font-size:14px;"><b style="color:#991B1B;">⚠️ 오차 {diff:+,}원</b> '
+                           f'— 예상(정답) {_money(expected)}원 / 실제 시재 {_money(actual or 0)}원</div>')
+        result_html += (f'<div style="font-size:11px;color:#888;margin-top:4px;">'
+                        f'마지막 확인: {cash["updated_by"] or "-"} · {_esc(cash["updated_at"] or "")} · '
+                        '값을 수정한 뒤 다시 [현금시재 확인]을 누르면 갱신됩니다.</div>')
+    else:
+        result_html = ('<div style="margin-top:10px;font-size:12px;color:#888;">'
+                       '아래 [현금시재 확인]을 누르면 예상 현금(정답)과 오차가 표시됩니다.</div>')
+
+    return (
+        '<div class="card" style="padding:12px 14px;margin-bottom:10px;">'
+        '<div style="font-size:14px;font-weight:bold;margin-bottom:8px;">💵 현금시재</div>'
+        '<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:640px;"><thead><tr>'
+        '<th style="width:22%">구분</th><th style="width:18%">금액(원)</th>'
+        '<th style="width:22%">고객명</th><th style="width:28%">비고</th><th style="width:10%"></th>'
+        '</tr></thead><tbody>' + rows_html + '</tbody></table></div>'
+        '<div style="margin-top:10px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
+        '<div><label style="font-size:12px;color:#666;">실제 현금시재(원)</label><br>'
+        f'<input type="number" min="0" step="1" inputmode="numeric" name="cash_actual" form="cash-form" '
+        f'value="{actual if actual is not None else ""}" style="width:160px;margin-top:4px;" placeholder="실사한 현금"></div>'
+        '<button type="submit" form="cash-form" class="btn">현금시재 확인</button>'
+        '<button type="button" class="btn" style="background:#64748B;" onclick="cashAddRow()">+ 행 추가</button>'
+        '</div>'
+        + result_html +
+        '</div>'
+        '<form id="cash-form" method="post" action="/closing/cash-save">'
+        '<input type="hidden" name="date" value="' + _esc(pay_date) + '">'
+        '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
+        '<input type="hidden" name="cash_lines" id="cash-lines-json" value="">'
+        '</form>'
+        '<script>(function(){'
+        'function cashAddRow(){'
+        'var tb=document.querySelector("#cash-form")?null:null;'
+        'var tbl=document.querySelectorAll("table");'
+        'var t=null;for(var i=0;i<tbl.length;i++){if(tbl[i].querySelector("tr.cash-line")){t=tbl[i];break;}}'
+        'if(!t)return;'
+        'var tr=t.querySelector("tr.cash-line").cloneNode(true);'
+        'tr.querySelectorAll("input").forEach(function(i){i.value="";});'
+        't.querySelector("tbody").appendChild(tr);'
+        '}'
+        'window.cashAddRow=cashAddRow;'
+        'var f=document.getElementById("cash-form");'
+        'if(f){f.addEventListener("submit",function(){'
+        'var rows=document.querySelectorAll("tr.cash-line");var out=[];'
+        'rows.forEach(function(tr){'
+        'var kind=tr.querySelector("[name=cl_kind]").value;'
+        'var amt=parseInt((tr.querySelector("[name=cl_amt]").value||"0").replace(/,/g,""),10)||0;'
+        'var cust=(tr.querySelector("[name=cl_cust]").value||"").trim();'
+        'var note=(tr.querySelector("[name=cl_note]").value||"").trim();'
+        'if(amt>0||cust||note)out.push({kind:kind,amount:amt,customer:cust,note:note});'
+        '});'
+        'document.getElementById("cash-lines-json").value=JSON.stringify(out);'
+        '});}'
+        '})();</script>'
+    )
+
+
+CLOSING_GUIDE_PAGES = ("closing", "stock-closing")
+CLOSING_GUIDE_MAX_BYTES = 20 * 1024 * 1024
+CLOSING_GUIDE_TYPES = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "gif": "image/gif",
+    "hwp": "application/x-hwp",
+    "hwpx": "application/zip",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "txt": "text/plain",
+    "zip": "application/zip",
+}
+
+
+def _closing_guide_bar(user: dict, page: str) -> str:
+    """매출/재고 마감 페이지 최상단의 '마감 가이드' 바 — 보기 버튼 + (마스터만) 업로드 폼."""
+    from html import escape as _esc
+    h = (
+        '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">'
+        '<span style="font-size:13px;color:#555;">📄 마감 가이드</span>'
+        '<a class="btn" href="/closing-guide/view?page=' + _esc(page) + '" target="_blank" '
+        'style="text-decoration:none;display:inline-block;background:#1E2761;">가이드 보기</a>'
+    )
+    if user and user.get("role") == "master":
+        h += (
+            '<form method="post" action="/closing-guide/upload" enctype="multipart/form-data" '
+            'style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0;">'
+            '<input type="hidden" name="page" value="' + _esc(page) + '">'
+            '<input type="hidden" name="next" value="' + _esc(page) + '">'
+            '<input type="file" name="file" required style="width:auto;max-width:220px;font-size:12px;">'
+            '<button class="btn" type="submit" style="background:#059669;padding:8px 12px;font-size:12px;">업로드</button>'
+            '<span style="font-size:11px;color:#888;">pdf/hwp/office/이미지, 20MB 이하</span></form>'
+        )
+    h += '</div>'
+    return h
+
+
 def _closing_collect_memos(form) -> dict:
     """화면에서 보낸 메모 입력(lb_i = 구분, memo_i = 메모)을 {구분: 메모}로 모은다."""
     out = {}
@@ -22093,6 +22380,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
     banners = {
         "saved": ("ok", "✅ 영수증 값을 저장했습니다."),
         "memo_saved": ("ok", "✅ 메모를 저장했습니다."),
+        "cash_saved": ("ok", "✅ 현금시재를 저장했습니다."),
         "no_receipt": ("bad", "⚠️ 영수증 값을 먼저 입력해야 마감 저장할 수 있습니다."),
         "closer_required": ("warn", "⚠️ 마감 담당자 이름을 입력해야 마감 저장할 수 있습니다."),
         "already": ("warn", "이미 마감 저장된 일자입니다."),
@@ -22124,6 +22412,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
         parts = ['<h2 style="margin-bottom:8px;">🧾 매출 마감</h2>']
         if msg in banners:
             parts.append(_closing_box([banners[msg][1]], banners[msg][0]))
+        parts.append(_closing_guide_bar(user, "closing"))
 
         form = ['<form method="get" action="/closing" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px;">']
         if is_all:
@@ -22317,6 +22606,10 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                     + '<span id="closing-upload-status" style="font-size:12px;color:#555;"></span></div></div>'
                     + CLOSING_UPLOAD_JS
                 )
+
+                # 💵 현금시재 — 영수증 사진 올리기 아래
+                _cash_view_name = ((pay or {}).get("name") or (rc or {}).get("name") or "")
+                parts.append(_closing_cash_html(view_key, _cash_view_name, date, slot, conn, user, branch_param))
 
                 if not pay and rc is None:
                     parts.append('<div class="card">해당 일자의 결제내역이 없습니다.</div>')
@@ -22628,6 +22921,84 @@ async def closing_receipt_groups_save(request: Request, session_token: str = Coo
     finally:
         conn.close()
     return RedirectResponse(url=_closing_back_url(pay_date, branch_param, msg), status_code=303)
+
+
+@app.post("/closing/cash-save")
+async def closing_cash_save(request: Request, session_token: str = Cookie(default=None)):
+    """현금시재 저장: 실제 시재 + 수기 행(기타 입금/시재 사용)을 지점×일자 단위로 교체 저장.
+    마감 저장된 일자는 잠긴다(영수증 사진과 동일 규칙)."""
+    import json as _json
+    import re
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_all and not has_menu_permission(user["login_id"], "closing"):
+        return RedirectResponse(url="/", status_code=303)
+
+    form = await request.form()
+    pay_date = str(form.get("date") or "").strip()
+    branch_param = str(form.get("branch") or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", pay_date):
+        return RedirectResponse(url="/closing", status_code=303)
+
+    actual_raw = str(form.get("cash_actual") or "").replace(",", "").strip()
+    actual = None
+    if actual_raw:
+        try:
+            actual = max(0, int(float(actual_raw)))
+        except ValueError:
+            actual = None
+
+    lines = []
+    try:
+        raw_lines = _json.loads(str(form.get("cash_lines") or "[]"))
+        if isinstance(raw_lines, list):
+            for i, l in enumerate(raw_lines[:50]):
+                if not isinstance(l, dict):
+                    continue
+                kind = "deposit" if l.get("kind") == "deposit" else "use"
+                try:
+                    amt = max(0, int(float(str(l.get("amount") or 0))))
+                except (TypeError, ValueError):
+                    amt = 0
+                cust = str(l.get("customer") or "").strip()[:50]
+                note = str(l.get("note") or "").strip()[:100]
+                if amt > 0 or cust or note:
+                    lines.append((kind, amt, cust, note, i))
+    except Exception:
+        lines = []
+
+    now_iso = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_conn()
+    try:
+        resolved = _closing_resolve_branch(conn, user, is_all, branch_param)
+        if not resolved:
+            return RedirectResponse(url="/closing", status_code=303)
+        key, name = resolved
+        if _closing_get_save(conn, key, pay_date):
+            return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "locked"), status_code=303)
+
+        conn.execute(
+            "INSERT INTO closing_cash (branch_key, branch_name, pay_date, actual_cash, updated_by, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(branch_key, pay_date) DO UPDATE SET "
+            "actual_cash=excluded.actual_cash, branch_name=excluded.branch_name, "
+            "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+            (key, name, pay_date, actual, user["login_id"], now_iso)
+        )
+        conn.execute("DELETE FROM closing_cash_lines WHERE branch_key=? AND pay_date=?", (key, pay_date))
+        for kind, amt, cust, note, i in lines:
+            conn.execute(
+                "INSERT INTO closing_cash_lines (branch_key, pay_date, kind, amount, customer, note, "
+                "sort_order, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (key, pay_date, kind, amt, cust, note, i, user["login_id"], now_iso)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "cash_saved"), status_code=303)
 
 
 @app.post("/closing/save")
@@ -23152,6 +23523,149 @@ async def closing_image(id: int = 0, session_token: str = Cookie(default=None)):
         return Response(status_code=404)
     return Response(content=resp.content, media_type=row["content_type"] or "image/jpeg",
                     headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.post("/closing-guide/upload")
+async def closing_guide_upload(request: Request, session_token: str = Cookie(default=None)):
+    """마감 가이드 파일 업로드 — 마스터 전용. 매출/재고 마감 페이지별로 최신 파일 1개를 보여 준다."""
+    import uuid
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if user.get("role") != "master":
+        return RedirectResponse(url="/", status_code=303)
+    if not os.environ.get("PURCHASE_SUPABASE_SERVICE_ROLE_KEY", ""):
+        return HTMLResponse(content=render_page(
+            '<div class="card">서버 설정 오류: 저장소 키가 없습니다.</div>', user, ""), status_code=500)
+
+    form = await request.form()
+    page = str(form.get("page") or "").strip()
+    nxt = str(form.get("next") or "").strip()
+    file = form.get("file")
+    back = "/" + (nxt if nxt in CLOSING_GUIDE_PAGES else "closing")
+    if page not in CLOSING_GUIDE_PAGES or not file:
+        return RedirectResponse(url=back, status_code=303)
+
+    raw = await file.read()
+    if len(raw) > CLOSING_GUIDE_MAX_BYTES or len(raw) == 0:
+        return RedirectResponse(url=back, status_code=303)
+    fname = (getattr(file, "filename", "") or "")
+    ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+    ctype = CLOSING_GUIDE_TYPES.get(ext)
+    if not ctype:
+        return RedirectResponse(url=back, status_code=303)
+
+    path = "guides/" + page + "/" + uuid.uuid4().hex + "." + ext
+    upload_url = CLOSING_SUPABASE_URL + "/storage/v1/object/" + CLOSING_IMG_BUCKET + "/" + path
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.put(upload_url, content=raw, headers=_closing_storage_headers(ctype))
+    if resp.status_code >= 300:
+        return HTMLResponse(content=render_page(
+            '<div class="card">가이드 업로드에 실패했습니다(' + str(resp.status_code) + ").</div>",
+            user, ""), status_code=502)
+
+    now_iso = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO closing_guide_files (page, storage_path, original_name, content_type, "
+            "size_bytes, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (page, path, fname[:200], ctype, len(raw), user["login_id"], now_iso)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(url=back, status_code=303)
+
+
+@app.get("/closing-guide/view", response_class=HTMLResponse)
+async def closing_guide_view(page: str = "closing", session_token: str = Cookie(default=None)):
+    """마감 가이드 보기 — 로그인 사용자 누구나 열람 가능. 최신 업로드 파일을 보여 준다."""
+    from html import escape as _esc
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if page not in CLOSING_GUIDE_PAGES:
+        page = "closing"
+    page_label = "매출 마감" if page == "closing" else "재고 마감"
+
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, original_name, content_type, uploaded_by, uploaded_at "
+            "FROM closing_guide_files WHERE page=? ORDER BY id DESC LIMIT 1", (page,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    h = ['<h2 style="margin-bottom:8px;">📄 ' + _esc(page_label) + ' 가이드</h2>']
+    h.append('<div style="margin-bottom:12px;"><a href="/' + page + '" class="btn" '
+             'style="text-decoration:none;display:inline-block;background:#6B7280;">← ' + _esc(page_label) + '으로</a></div>')
+    if not row:
+        h.append('<div class="card">등록된 가이드가 없습니다.'
+                 + (' (마스터 계정에서 파일을 업로드할 수 있습니다)' if user.get("role") == "master" else "")
+                 + '</div>')
+        if user.get("role") == "master":
+            h.append(_closing_guide_bar(user, page))
+        return HTMLResponse(content=render_page("".join(h), user, ""))
+
+    fid = row["id"]
+    ctype = row["content_type"] or ""
+    is_pdf = ctype == "application/pdf"
+    is_img = ctype.startswith("image/")
+    meta = (_esc(row["original_name"] or "guide") + " · " + _esc(row["uploaded_by"] or "-")
+            + " · " + _esc((row["uploaded_at"] or "")[:16]))
+    h.append('<div class="card" style="padding:12px 14px;margin-bottom:10px;font-size:12px;color:#666;">' + meta + '</div>')
+    if is_pdf or is_img:
+        h.append('<div class="card" style="padding:0;overflow:hidden;">'
+                 '<iframe src="/closing-guide/file?id=' + str(fid) + '" '
+                 'style="width:100%;height:78vh;border:0;display:block;"></iframe></div>')
+    else:
+        h.append('<div class="card">'
+                 '<p>이 형식은 브라우저에서 바로 표시할 수 없습니다. 파일을 다운로드해서 확인해 주세요.</p>'
+                 '<a class="btn" href="/closing-guide/file?id=' + str(fid) + '">파일 다운로드</a></div>')
+    if user.get("role") == "master":
+        h.append(_closing_guide_bar(user, page))
+    return HTMLResponse(content=render_page("".join(h), user, ""))
+
+
+@app.get("/closing-guide/file")
+async def closing_guide_file(id: int = 0, session_token: str = Cookie(default=None)):
+    """가이드 파일을 로그인 확인 후 내려 준다(비공개 버킷 프록시)."""
+    from fastapi.responses import Response
+
+    user = get_session(session_token)
+    if not user:
+        return Response(status_code=401)
+
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT storage_path, content_type, original_name FROM closing_guide_files WHERE id=?", (id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return Response(status_code=404)
+
+    url = (CLOSING_SUPABASE_URL + "/storage/v1/object/authenticated/" + CLOSING_IMG_BUCKET
+           + "/" + row["storage_path"])
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url, headers=_closing_storage_headers())
+    if resp.status_code != 200:
+        return Response(status_code=404)
+    fname = row["original_name"] or "guide"
+    from urllib.parse import quote as _q
+    return Response(
+        content=resp.content,
+        media_type=row["content_type"] or "application/octet-stream",
+        headers={
+            "Cache-Control": "private, max-age=3600",
+            "Content-Disposition": "inline; filename*=UTF-8''" + _q(fname),
+        },
+    )
 
 
 @app.get("/closing/receipt-view", response_class=HTMLResponse)
