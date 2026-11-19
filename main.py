@@ -108,6 +108,7 @@ MENU_DEFINITIONS = {
     "branch-exceptions": "발주서 지점 예외",
     "safety-stock": "안전재고 관리",
     "cron-failure-log": "크론 실패 이력",
+    "cron-manage": "크론 관리",
     "stocktake": "지점 월 재고실사(운영팀장)",
     "stocktake-result": "재고실사(결과)",
     "daily-stocktake": "지점 재고 실사 결과",
@@ -16491,6 +16492,16 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
+    if menu_allowed("cron-manage"):
+        etc_cards.append("""
+      <a href="/master/cron-manage" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">⏱️</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">크론 관리</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">자동 작업 상태/수동 실행</div>
+        </div>
+      </a>
+        """)
 
     # ---- 아코디언 그룹 조립 (카드 0개인 그룹은 렌더링 생략) ----
     def render_group(group_id: str, title: str, cards: list) -> str:
@@ -22564,44 +22575,77 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                              + _closing_verify_compare_html(sum_pay, sum_rc, entered > 0, m_groups)
                              + '</div>')
 
-            # 💵 현금시재 현황 — 지점별 예상/실제/오차 (마스터가 한눈에 보고 지점 뷰에서 수정)
+            # 💵 현금시재 현황 — 해당 일자 결제내역이 있는 전 지점 + 시재 저장 지점 전체
+            # (미입력 지점도 예상 현금은 계산해서 보여주고, 실제 시재·오차는 '-'로 표시)
             try:
-                cash_rows = conn.execute(
+                cash_saved = {str(r["branch_key"]): r for r in conn.execute(
                     "SELECT branch_key, branch_name, actual_cash FROM closing_cash WHERE pay_date=?",
                     (date,)
-                ).fetchall()
-                if cash_rows:
+                ).fetchall()}
+                cash_lines_map = {}
+                for lr in conn.execute(
+                    "SELECT branch_key, kind, amount FROM closing_cash_lines WHERE pay_date=?",
+                    (date,)
+                ).fetchall():
+                    cash_lines_map.setdefault(str(lr["branch_key"]), []).append(dict(lr))
+                # 이름 해석용: 지점 마스터 목록의 공백제거 키 -> 지점명
+                name_of_key = {}
+                for b in get_branches():
+                    name_of_key[_closing_norm(b.get("branch_name") or "")] = b.get("branch_name") or ""
+                for k, v in data["pay"].items():
+                    name_of_key.setdefault(k, v.get("name") or k)
+                for k, v in data["receipts"].items():
+                    name_of_key.setdefault(k, v.get("name") or k)
+                for k, v in cash_saved.items():
+                    name_of_key.setdefault(k, v.get("branch_name") or k)
+
+                cash_keys = sorted(set(keys) | set(cash_saved.keys()),
+                                   key=lambda x: name_of_key.get(x, x))
+                if cash_keys:
                     ov_html = ['<h3 style="margin:16px 0 8px;">💵 현금시재 현황</h3>',
                                '<div class="card"><div class="table-scroll-wrap"><table data-colw '
-                               'style="table-layout:auto;min-width:560px;"><thead><tr>'
-                               '<th>지점</th><th style="text-align:right;">예상 현금(정답)</th>'
+                               'style="table-layout:auto;min-width:640px;"><thead><tr>'
+                               '<th>지점</th><th style="text-align:right;">현금 매출</th>'
+                               '<th style="text-align:right;">기타 입금/사용</th>'
+                               '<th style="text-align:right;">예상 현금(정답)</th>'
                                '<th style="text-align:right;">실제 시재</th>'
                                '<th style="text-align:right;">오차</th><th></th>'
                                '</tr></thead><tbody>']
-                    for cr in cash_rows:
-                        ck = cr["branch_key"]
-                        clines = conn.execute(
-                            "SELECT kind, amount FROM closing_cash_lines WHERE branch_key=? AND pay_date=?",
-                            (ck, date)
-                        ).fetchall()
-                        _, cs_amt = _closing_cash_sale(conn, date, slot, ck)
-                        exp = _closing_cash_expected(cs_amt, [dict(x) for x in clines])
-                        act = int(cr["actual_cash"] or 0)
-                        df = act - exp
-                        dstyle = 'color:#166534;' if df == 0 else 'color:#DC2626;font-weight:bold;'
-                        dtxt = "0" if df == 0 else f"{df:+,}"
+                    for ck in cash_keys:
+                        cname = name_of_key.get(ck, ck)
+                        cs_cnt, cs_amt = _closing_cash_sale(conn, date, slot, ck)
+                        clines = cash_lines_map.get(ck, [])
+                        dep = sum(int(l["amount"] or 0) for l in clines if l["kind"] == "deposit")
+                        use = sum(int(l["amount"] or 0) for l in clines if l["kind"] == "use")
+                        exp = _closing_cash_expected(cs_amt, clines)
+                        saved_row = cash_saved.get(ck)
+                        act = saved_row["actual_cash"] if saved_row else None
+                        if act is None:
+                            act_txt = '<span style="color:#bbb;">-</span>'
+                            diff_txt = '<span style="color:#bbb;">-</span>'
+                        else:
+                            act = int(act)
+                            df = act - exp
+                            act_txt = f"{act:,}원"
+                            if df == 0:
+                                diff_txt = '<span style="color:#166534;">0원</span>'
+                            else:
+                                diff_txt = f'<span style="color:#DC2626;font-weight:bold;">{df:+,}원</span>'
                         ov_html.append(
-                            f'<tr><td>{_esc(cr["branch_name"] or ck)}</td>'
+                            f'<tr><td>{_esc(cname)}</td>'
+                            f'<td style="text-align:right;">{cs_amt:,}원</td>'
+                            f'<td style="text-align:right;">{dep - use:+,}원</td>'
                             f'<td style="text-align:right;">{exp:,}원</td>'
-                            f'<td style="text-align:right;">{act:,}원</td>'
-                            f'<td style="text-align:right;{dstyle}">{dtxt}원</td>'
-                            f'<td><a href="/closing?date={_q(date)}&branch={_q(cr["branch_name"] or ck)}" '
-                            'style="font-size:12px;color:#1E2761;">수정 →</a></td></tr>'
+                            f'<td style="text-align:right;">{act_txt}</td>'
+                            f'<td style="text-align:right;">{diff_txt}</td>'
+                            f'<td><a href="/closing?date={_q(date)}&branch={_q(cname)}" '
+                            'style="font-size:12px;color:#1E2761;white-space:nowrap;">'
+                            + ('수정 →' if act is not None else '입력 →') + '</a></td></tr>'
                         )
                     ov_html.append('</tbody></table></div>'
                                    '<p style="font-size:11px;color:#888;margin:8px 0 0 0;">'
                                    '예상 현금 = 유비플러스 현금 결제 + 기타 입금 − 시재 사용. '
-                                   '수정은 해당 지점 뷰에서 가능합니다.</p></div>')
+                                   '실제 시재가 없는 지점은 "-"로 표시되며, 입력은 해당 지점 뷰에서 가능합니다.</p></div>')
                     parts.append("".join(ov_html))
             except Exception:
                 pass
@@ -24738,9 +24782,12 @@ def _cl_notify_panel(date_str: str) -> str:
     def _row(key, label, desc, on):
         checked = " checked" if on else ""
         return (
-            '<label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:13px;">'
-            f'<input type="checkbox" style="width:auto;margin:0;" data-key="{key}" onchange="clToggle(this)"{checked}>'
-            f'<span><b>{label}</b> <span style="color:#888;font-size:12px;">{desc}</span></span></label>'
+            '<label style="display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;font-size:13px;">'
+            f'<input type="checkbox" style="width:auto;margin:2px 0 0 0;" data-key="{key}" onchange="clToggle(this)"{checked}>'
+            '<span style="min-width:0;">'
+            f'<div style="font-weight:600;white-space:nowrap;">{label}</div>'
+            f'<div style="color:#888;font-size:11px;line-height:1.4;">{desc}</div>'
+            '</span></label>'
         )
 
     # 해당 일자 결제내역이 있는 지점들의 알림 토글(오른쪽 열)
@@ -24775,7 +24822,7 @@ def _cl_notify_panel(date_str: str) -> str:
         '지점 채널 발송은 "지점 발송" 스위치와 해당 지점 "알림" 체크가 모두 켜져 있을 때만 나갑니다. '
         '"테스트 발송" 스위치가 켜져 있으면 테스트 채널·테스트 메일 사본도 함께 발송됩니다. '
         '"자동 알림 테스트" 버튼은 스위치와 무관하게 테스트 채널·테스트 메일로만 발송됩니다.</div>'
-        '<div style="display:grid;grid-template-columns:minmax(400px,1fr) 2fr;gap:14px;align-items:start;">'
+        '<div style="display:grid;grid-template-columns:minmax(340px,1fr) 1.6fr;gap:14px;align-items:start;">'
         '<div>'
         + _row("missing", "미제출 발송", "결제내역은 있으나 마감 저장이 없는 지점", _cl_setting_on("closing_notify_missing"))
         + _row("mismatch", "불일치 발송", "마감 저장됐으나 영수증과 불일치가 있는 지점 — 테스트 채널·메일 + 지점별 알림 체크된 지점 팀즈 채널로 발송", _cl_setting_on("closing_notify_mismatch"))
@@ -28302,6 +28349,276 @@ async def cron_failure_log_page(
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
+
+
+
+# ══════════════════════════════════════════════════════════
+# 마스터 > 크론 관리 — 자동 작업 상태 확인 + 외부 데이터 수신 수동 실행
+# 스케줄 자체는 외부 스케줄러(cron-job.org 등)가 담당. 이 페이지는
+# "지금 데이터가 들어오고 있는가"를 보여주고 필요 시 즉시 재수신한다.
+# ══════════════════════════════════════════════════════════
+
+# 크론 작업 메타: (path, 이름, 설명, 스케줄, 그룹, 실패로그 prefix, 수동실행 가능)
+CRON_MANAGE_JOBS = [
+    # ── 외부 데이터 수신 ──
+    ("sync-payment-records", "결제내역 수신", "유비플러스 결제내역 CSV → payment_records (21/22/24시 슬롯)", "슬롯별 매일", "외부 데이터 수신", "sync-payment-records", True),
+    ("sync-sales-records", "판매내역 수신", "유비플러스 판매내역 CSV → sales_records (전날분)", "매일", "외부 데이터 수신", "sync-sales-records", True),
+    ("sync-raw-inventory", "재고현황 수신", "유비플러스 재고현황 CSV(S3) → raw_inventory", "주기적", "외부 데이터 수신", "sync-raw-inventory", True),
+    ("sync-purchase-records", "구매내역 수신", "구매내역 CSV → purchase_records", "주기적", "외부 데이터 수신", "sync-purchase-records", True),
+    # ── 알림/리마인더 ──
+    ("stock-closing-reminder", "재고 마감 리마인더", "전일 재고 마감 미제출 지점 자동 발송", "매일 10:00", "알림/리마인더", "stock-closing-reminder", False),
+    ("closing-reminder", "매출 마감 리마인더", "전일 매출 마감 미제출·불일치 지점 자동 발송", "매일 10:00", "알림/리마인더", "closing-reminder", False),
+    ("send-eod-alert", "긴급발주 알림", "수요일 도착 전 소진 예상 지점 Teams 발송", "매일", "알림/리마인더", "send-eod-alert", False),
+    ("send-scheduled-messages", "예약 메시지 발송", "예약된 메시지 자동 발송", "주기적", "알림/리마인더", "send-scheduled-messages", False),
+    ("send-unsubmitted-reminder", "거래처평가 미제출 알림", "미제출 지점 알림", "매월 5·10·15·20·25·30일", "알림/리마인더", "send-unsubmitted-reminder", False),
+    ("send-survey-unsubmitted-reminder", "설문 미제출 알림", "설문 미제출 지점 알림", "주기적", "알림/리마인더", "send-survey-unsubmitted-reminder", False),
+    ("check-qr-raw-mismatch", "QR-RAW 불일치 검사", "재고 불일치 감지 → 알림", "3시간마다", "알림/리마인더", "check-qr-raw-mismatch", False),
+    ("check-new-purchase", "신규 발주 검사", "새 발주내역 감지 → 알림", "10분마다", "알림/리마인더", "check-new-purchase", False),
+    # ── 집계/정리 ──
+    ("compute-purchase-tracking-snapshot", "발주 트래킹 스냅샷", "발주 주기 트래킹 집계", "주기적", "집계/정리", "compute-purchase-tracking-snapshot", False),
+    ("select-stocktake-items", "재고실사 품목 선정", "월 재고실사 대상 품목 선정", "월 1회", "집계/정리", "select-stocktake-items", False),
+    ("cleanup-old-data", "오래된 데이터 정리", "보관기간 지난 scan/adjustment 등 삭제", "주기적", "집계/정리", "cleanup-old-data", False),
+    ("cleanup-purchase-history", "발주내역 정리", "21일 경과 purchase_history 삭제", "매일", "집계/정리", "cleanup-purchase-history", False),
+]
+
+
+def _cron_q(conn, sql, params=()):
+    """크론 상태 조회용 — 테이블/컬럼이 없는 환경(로컬 SQLite 등)에서는 None 반환."""
+    try:
+        return conn.execute(sql, params).fetchone()
+    except Exception:
+        return None
+
+
+def _cron_last_failure(conn, prefix: str):
+    try:
+        return conn.execute(
+            "SELECT cron_name, error_detail, occurred_at FROM cron_failure_log "
+            "WHERE cron_name LIKE ? ORDER BY occurred_at DESC LIMIT 1",
+            (prefix + "%",)
+        ).fetchone()
+    except Exception:
+        return None
+
+
+def _hours_ago(ts):
+    try:
+        from datetime import datetime as _dt
+        return (_dt.now() - _dt.fromisoformat(str(ts)[:19])).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+@app.get("/master/cron-manage", response_class=HTMLResponse)
+async def master_cron_manage_page(session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "cron-manage"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    conn = get_conn()
+    try:
+        pay_logs = {}
+        for slot in PAYMENT_SLOTS:
+            r = _cron_q(conn,
+                "SELECT run_at, status, freshness, error, rows_inserted, target_date "
+                "FROM payment_sync_log WHERE slot=? ORDER BY run_at DESC LIMIT 1",
+                (slot,))
+            if r:
+                pay_logs[slot] = r
+        pay_last_data = _cron_q(conn,
+            "SELECT MAX(created_at) AS t FROM payment_records")
+        sales_last = _cron_q(conn,
+            "SELECT MAX(created_at) AS loaded_at, MAX(sale_date) AS sale_date FROM sales_records")
+        raw_last = _cron_q(conn,
+            "SELECT MAX(uploaded_at) AS t FROM raw_inventory WHERE source='auto_s3'")
+        purch_last = _cron_q(conn,
+            "SELECT MAX(created_at) AS t FROM purchase_records")
+    finally:
+        conn.close()
+
+    def _ago_badge(ts):
+        h = _hours_ago(ts) if ts else None
+        if h is None:
+            return '<span style="color:#888;">기록 없음</span>'
+        txt = f"{h:.1f}시간 전" if h < 48 else f"{h/24:.1f}일 전"
+        color = "#EF4444" if h > 72 else ("#D97706" if h > 36 else "#16A34A")
+        return f'<span style="color:{color};font-weight:bold;">{txt}</span>'
+
+    def _fail_cell(prefix):
+        conn2 = get_conn()
+        try:
+            f = _cron_last_failure(conn2, prefix)
+        finally:
+            conn2.close()
+        if not f:
+            return '<span style="color:#16A34A;">없음</span>'
+        when = str(f["occurred_at"] or "")[:16]
+        detail = (f["error_detail"] or "")[:80]
+        return (f'<span style="color:#EF4444;">{when}</span><br>'
+                f'<span style="font-size:11px;color:#888;">{detail}</span>')
+
+    rows_html = ""
+    current_group = None
+    for path, label, desc, schedule, group, fail_prefix, runnable in CRON_MANAGE_JOBS:
+        if group != current_group:
+            current_group = group
+            rows_html += (f'<tr><td colspan="7" style="background:#F1F5F9;font-weight:bold;'
+                          f'padding:8px;">{group}</td></tr>')
+
+        if path == "sync-payment-records":
+            if pay_logs:
+                lines = []
+                for slot in PAYMENT_SLOTS:
+                    lg = pay_logs.get(slot)
+                    if lg:
+                        st = lg["status"] or "?"
+                        st_color = {"ok": "#16A34A", "fail": "#EF4444"}.get(st, "#D97706")
+                        lines.append(
+                            f'{slot}시: <span style="color:{st_color};">{st}</span> '
+                            f'<span style="color:#888;">{str(lg["run_at"] or "")[:16]}</span>')
+                    else:
+                        lines.append(f'{slot}시: <span style="color:#888;">기록 없음</span>')
+                status_html = "<br>".join(lines)
+            else:
+                status_html = '<span style="color:#888;">로그 없음</span>'
+            last_data = pay_last_data["t"] if pay_last_data else None
+            recent_html = _ago_badge(last_data)
+        elif path == "sync-sales-records":
+            t = sales_last["loaded_at"] if sales_last else None
+            recent_html = _ago_badge(t)
+            sd = sales_last["sale_date"] if sales_last else None
+            status_html = (f'최신 판매일: {sd}<br>' if sd else '') + _ago_badge(t)
+        elif path == "sync-raw-inventory":
+            t = raw_last["t"] if raw_last else None
+            recent_html = _ago_badge(t)
+            status_html = _ago_badge(t)
+        elif path == "sync-purchase-records":
+            t = purch_last["t"] if purch_last else None
+            recent_html = _ago_badge(t)
+            status_html = _ago_badge(t)
+        else:
+            recent_html = '<span style="color:#888;">—</span>'
+            status_html = '<span style="color:#888;">실패만 기록됨</span>'
+
+        if runnable and path == "sync-payment-records":
+            run_html = (
+                '<select id="cm-slot" style="width:56px;padding:4px;">'
+                + "".join(f'<option value="{s}">{s}시</option>' for s in PAYMENT_SLOTS)
+                + '</select> '
+                '<button class="btn" style="padding:4px 10px;font-size:12px;" '
+                'onclick="runCron(\'sync-payment-records\')">지금 실행</button>'
+                '<div id="cm-result-pay" style="margin-top:6px;font-size:12px;"></div>')
+        elif runnable:
+            run_html = (
+                '<button class="btn" style="padding:4px 10px;font-size:12px;" '
+                f'onclick="runCron(\'{path}\')">지금 실행</button>'
+                f'<div id="cm-result-{path}" style="margin-top:6px;font-size:12px;"></div>')
+        else:
+            run_html = '<span style="color:#BBB;">—</span>'
+
+        rows_html += f"""
+        <tr>
+          <td style="font-family:monospace;font-size:12px;">/api/cron/{path}</td>
+          <td><b>{label}</b><br><span style="font-size:11px;color:#888;">{desc}</span></td>
+          <td style="font-size:12px;white-space:nowrap;">{schedule}</td>
+          <td style="font-size:12px;">{status_html}</td>
+          <td style="font-size:12px;white-space:nowrap;">{recent_html}</td>
+          <td style="font-size:12px;">{_fail_cell(fail_prefix)}</td>
+          <td>{run_html}</td>
+        </tr>"""
+
+    cron_secret_set = "설정됨" if os.environ.get("CRON_SECRET") else "미설정"
+    content = f"""
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+      <a href="/master" style="color:#1E2761;">← 마스터</a>
+      <h2>⏱️ 크론 관리</h2>
+    </div>
+    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
+      <p style="font-size:13px;color:#1E40AF;">
+        실행 주기는 외부 스케줄러(cron-job.org 등)가 담당합니다. 이 페이지는 각 작업의
+        <b>최근 실행/데이터 유입 상태</b>와 최근 실패를 보여주고, 외부 데이터 수신 작업을
+        <b>즉시 수동 실행</b>할 수 있게 합니다.<br>
+        CRON_SECRET: <b>{cron_secret_set}</b> · 실패 시 Teams/이메일 알림 +
+        <a href="/master/cron-failure-log">크론 실패 이력</a>에 기록됩니다.
+      </p>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>엔드포인트</th><th>작업</th><th>스케줄</th>
+          <th>최근 상태</th><th>데이터 유입</th><th>최근 실패</th><th>수동 실행</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    <script>
+    async function runCron(job) {{
+      var slot = null;
+      if (job === 'sync-payment-records') {{
+        slot = document.getElementById('cm-slot').value;
+      }}
+      var el = document.getElementById('cm-result-' + (job === 'sync-payment-records' ? 'pay' : job));
+      if (el) {{ el.innerHTML = '<span style="color:#888;">실행 중... (수십 초 걸릴 수 있습니다)</span>'; }}
+      try {{
+        var res = await fetch('/master/cron-manage/run', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{job: job, slot: slot}})
+        }});
+        var data = await res.json();
+        var txt;
+        if (res.ok) {{
+          txt = '<pre style="background:#F0FDF4;border:1px solid #86EFAC;padding:8px;border-radius:6px;max-height:300px;overflow:auto;">'
+              + JSON.stringify(data.result || data, null, 1) + '</pre>';
+        }} else {{
+          txt = '<span style="color:#EF4444;">실패: ' + (data.detail || res.status) + '</span>';
+        }}
+        if (el) el.innerHTML = txt;
+      }} catch (e) {{
+        if (el) el.innerHTML = '<span style="color:#EF4444;">요청 오류: ' + e + '</span>';
+      }}
+    }}
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/cron-manage/run")
+async def master_cron_manage_run(request: Request, session_token: str = Cookie(default=None)):
+    """외부 데이터 수신 크론 수동 실행 (마스터 전용). 실제 크론과 동일한 함수를 직접 호출한다."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    if not has_menu_permission(user["login_id"], "cron-manage"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    job = (data.get("job") or "").strip()
+    slot = (data.get("slot") or "").strip()
+
+    try:
+        if job == "sync-payment-records":
+            if slot not in PAYMENT_SLOTS:
+                return JSONResponse(status_code=400, content={"detail": "slot은 21/22/24 중 하나여야 합니다."})
+            result = await _sync_payment_records(slot, "")
+            snap = _take_stock_snapshot(slot)
+            result["stock_snapshot"] = snap
+        elif job == "sync-sales-records":
+            result = await _sync_sales_records("")
+        elif job == "sync-raw-inventory":
+            result = await _fetch_and_process_s3_csv()
+        elif job == "sync-purchase-records":
+            result = await _fetch_and_process_purchase_records_csv()
+        else:
+            return JSONResponse(status_code=400, content={"detail": "수동 실행을 지원하지 않는 작업입니다."})
+        return JSONResponse(content={"status": "done", "result": result})
+    except Exception as e:
+        err_msg = str(e)[:500]
+        report_cron_failure(f"cron-manage:{job}", err_msg)
+        return JSONResponse(status_code=500, content={"detail": err_msg})
+
 
 if __name__ == "__main__":
     import uvicorn
