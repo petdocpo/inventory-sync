@@ -418,13 +418,14 @@ class TestSave(StockClosingTestBase):
         lines = {l["item_code"]: l for l in self.conn.lines}
         self.assertEqual(lines["I1"]["diff_qty"], 5)
         self.assertEqual(lines["I2"]["diff_qty"], 0)
-        # ups가 None이면 diff도 None
+        # ups가 None이면 불일치 판정 불가 → 마감 목록에서 제외됨
         self.raw_rows.clear()
         self.conn2_items = None
         resp = self.run_save({"date": dstr(TODAY), "mode": "draft",
                               "counts": {"I1": "1", "I2": "2"}})
-        lines = {l["item_code"]: l for l in self.conn.lines}
-        self.assertIsNone(lines["I1"]["diff_qty"])
+        self.assertTrue(self.resp_json(resp)["ok"])
+        self.assertEqual(self.conn.saves[-1]["item_count"], 0)
+        self.assertEqual(self.conn.lines, [])
         self.assertEqual(self.conn.saves[-1]["mismatch_count"], 0)
 
     def test_a7_closer_name_trim_and_30char_limit(self):

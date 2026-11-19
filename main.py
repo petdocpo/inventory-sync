@@ -3650,9 +3650,10 @@ def _stock_closing_editable_dates():
     return today, [today, today - _td(days=1)]
 
 
-def _stock_closing_live_items(target_branch: str, sel_date) -> list:
+def _stock_closing_live_items(target_branch: str, sel_date, mismatch_only: bool = False) -> list:
     """선택 날짜(KST 00~24시)의 QR 입·출고 스캔 합계 + QR 재고 + 유비플러스 재고. QR DB(inventory) 등록 상품만.
-    재고 값은 해당 날짜의 가장 늦은 슬롯(24→22→21) 스냅샷을 쓰고, 스냅샷이 없으면 현재 값을 쓴다."""
+    재고 값은 해당 날짜의 가장 늦은 슬롯(24→22→21) 스냅샷을 쓰고, 스냅샷이 없으면 현재 값을 쓴다.
+    mismatch_only=True이면 스냅샷(없으면 현재값) 시점에 QR≠유비플러스인 품목만 반환."""
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     kst = _tz(_td(hours=9))
     start_kst = _dt(sel_date.year, sel_date.month, sel_date.day, tzinfo=kst)
@@ -3717,6 +3718,41 @@ def _stock_closing_live_items(target_branch: str, sel_date) -> list:
         if slot == "24":
             return "스냅샷 " + (sel_date + _td(days=1)).strftime("%m/%d") + " 00:15"
         return "스냅샷 " + sel_date.strftime("%m/%d") + " " + slot + ":15"
+
+    scan_cnt = {f"{r['branch_code']}|{r['item_code']}": r["cnt"] for r in scan_rows}
+
+    if mismatch_only:
+        # 스냅샷 작성 시점(없으면 현재값)의 QR 재고 ≠ 유비플러스 재고 품목만 선정
+        items = []
+        for key in set(inv_map) | set(snap_map):
+            if key not in inv_map:
+                continue
+            snap = snap_map.get(key)
+            if snap is not None:
+                qr_val = snap["qr_qty"]
+                ups_val = snap["ups_qty"]
+                basis = "snap"
+                basis_label = _basis_label(snap)
+            else:
+                qr_val = inv_map[key]["qty"]
+                ups_val = (raw_map[key] or 0) if key in raw_map else None
+                basis = "live"
+                basis_label = "현재 값(스냅샷 없음)"
+            if qr_val is None or ups_val is None or qr_val == ups_val:
+                continue
+            bc_k, code_k = key.split("|", 1)
+            items.append({
+                "branch_code": bc_k,
+                "item_code": code_k,
+                "item_name": inv_map[key]["name"],
+                "qr_qty": qr_val,
+                "ups": ups_val,
+                "cnt": scan_cnt.get(key, 0),
+                "basis": basis,
+                "basis_label": basis_label,
+            })
+        items.sort(key=lambda x: (str(x["branch_code"]), str(x["item_code"])))
+        return items
 
     items = []
     for r in scan_rows:
@@ -4050,7 +4086,7 @@ async def stock_closing_page(
             )
         empty_msg = "저장된 상품이 없습니다 (해당 날짜에 스캔된 QR 등록 상품이 없었습니다)"
     else:
-        items = _stock_closing_live_items(target_branch, sel_date)
+        items = _stock_closing_live_items(target_branch, sel_date, mismatch_only=True)
         for it in items:
             if can_edit_date or it["basis"] == "snap":
                 qr_disp = _fmt_num(it["qr_qty"])
@@ -4269,7 +4305,7 @@ async def stock_closing_page(
                 '<p style="font-size:11px;color:#888;margin:0 0 8px 0;">'
                 '각 항목 아래에 당일 QR 출고 스캔과 유비플러스 출고를 시간순으로 나열했습니다. '
                 '빨간색은 시간 매칭이 안 된 건으로, 실제 원인과 다를 수 있는 추정입니다.</p>'
-                '<div class="table-scroll-wrap"><table data-colver="2026-11" style="table-layout:auto;min-width:0;"><thead><tr>'
+                '<div class="table-scroll-wrap"><table data-colver="2026-11-20" style="table-layout:fixed;min-width:640px;"><colgroup><col style="width:90px"><col style="width:230px"><col style="width:130px"><col style="width:90px"><col style="width:100px"></colgroup><thead><tr>'
                 '<th style="width:10%">지점</th><th style="width:30%">상품명</th>'
                 '<th style="width:14%">유비플러스 재고수량</th><th style="width:10%">실사수량</th>'
                 '<th style="width:9%">오차</th>'
@@ -4355,7 +4391,7 @@ async def stock_closing_page(
             }
           });
           if (empty > 0) {
-            alert('QR 재고와 유비플러스 재고가 다른 상품 중 실사 수량이 입력되지 않은 것이 ' + empty + '개 있습니다.\n해당 품목만 입력한 뒤 마감해주세요. (오차 없는 품목은 미입력 가능)');
+            alert('QR 재고와 유비플러스 재고가 다른 상품 중 실사 수량이 입력되지 않은 것이 ' + empty + '개 있습니다.\\n해당 품목만 입력한 뒤 마감해주세요. (오차 없는 품목은 미입력 가능)');
             return;
           }
           if (noReason > 0) {
@@ -4623,7 +4659,7 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
         raise HTTPException(status_code=400, detail="저장/마감 가능한 기간(해당 일자 + 익일)이 지났습니다.")
 
     # 서버에서 현재 값을 다시 계산
-    items = _stock_closing_live_items(branch_code, sel_date)
+    items = _stock_closing_live_items(branch_code, sel_date, mismatch_only=True)
     lines = []
     missing = 0
     mismatch = 0
@@ -4999,8 +5035,7 @@ async def daily_stocktake_page(
             + f'<td><input type="number" min="0" class="dst-input" '
             f'data-code="{_html.escape(code)}" data-ups="{ups_attr}"{val_attr}{dis_attr} '
             'placeholder="실사" oninput="dstUpdateDiff(this)" '
-            'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;">'
-            '<div class="dst-total-hint" style="font-size:10px;color:#888;margin-top:2px;white-space:nowrap;"></div></td>'
+            'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
             '<td class="dst-diff" style="font-weight:bold;color:#888;">-</td>'
             + _sc_adjust_cell(target_branch, code, page_can_write)
             + "</tr>"
@@ -5121,10 +5156,7 @@ async def daily_stocktake_page(
         var tr = inp.closest('tr');
         var cell = tr.querySelector('.dst-diff');
         var ups = inp.getAttribute('data-ups') || (tr.querySelector('.dst-input') ? tr.querySelector('.dst-input').getAttribute('data-ups') : '');
-        var hint = tr.querySelector('.dst-total-hint');
         var total = dstRowTotal(tr);
-        var locSum = dstLocSum(tr);
-        if (hint) hint.textContent = (locSum !== null) ? ('위치 합계: ' + locSum) : '';
         if (total === null || ups === '') {
           cell.textContent = '-';
           cell.style.color = '#888';
@@ -17859,7 +17891,12 @@ async def _compute_purchase_order_candidates() -> dict:
         if current_qty >= safety_qty:
             continue
 
-        # 3. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고
+        # 3. 소모품 체크된 품목만 발주 대상 (product-settings '소모품' 체크 = 발주 포함)
+        is_consumable = bool(pm["is_consumable"]) if pm else False
+        if not is_consumable:
+            continue
+
+        # 4. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고
         latest_status = status_map.get((branch_name, item_name))
         if latest_status in PENDING_STATUSES:
             pending_report.append({
@@ -17971,7 +18008,7 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
       <h2>주간 발주 대상 <span class="count-badge">{len(weekly)}건</span>
         <a href="/master/purchase-order/preview/export?order_type=weekly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">엑셀 다운로드</a>
       </h2>
-      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:auto;"><thead>
+      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:780px;"><colgroup><col style="width:140px"><col style="width:110px"><col style="width:240px"><col style="width:90px"><col style="width:70px"><col style="width:130px"></colgroup><thead>
         <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
       </thead><tbody>
         {render_rows(weekly)}
@@ -17980,14 +18017,14 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
       <h2>월간 발주 대상 <span class="count-badge">{len(monthly)}건</span>
         <a href="/master/purchase-order/preview/export?order_type=monthly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">엑셀 다운로드</a>
       </h2>
-      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:auto;"><thead>
+      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:780px;"><colgroup><col style="width:140px"><col style="width:110px"><col style="width:240px"><col style="width:90px"><col style="width:70px"><col style="width:130px"></colgroup><thead>
         <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
       </thead><tbody>
         {render_rows(monthly)}
       </tbody></table></div>
 
       <h2>미입고 보류 (별도 확인 필요) <span class="count-badge">{len(pending_report)}건</span></h2>
-      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:auto;"><thead>
+      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:640px;"><colgroup><col style="width:140px"><col style="width:110px"><col style="width:280px"><col style="width:110px"></colgroup><thead>
         <tr><th>지점</th><th>품번</th><th>품명</th><th>상태</th></tr>
       </thead><tbody>
         {render_pending_rows(pending_report)}
@@ -18712,6 +18749,8 @@ async def purchase_order_settings_guide(
 
         if r["order_excluded"]:
             klass = ("전체 미발주", "#DC2626")
+        elif not r["is_consumable"]:
+            klass = ("소모품 미체크 — 발주 제외", "#D97706")
         elif lt_val >= 35:
             klass = ("월발주 (리드타임 35일↑)", "#7C3AED")
         elif lt_val <= 0:
@@ -18758,7 +18797,7 @@ async def purchase_order_settings_guide(
       <ol style="font-size:13px;color:#1E3A8A;margin:0;padding-left:20px;line-height:1.8;">
         <li><b>전체 미발주</b>(order_excluded=예) → 항상 제외</li>
         <li><b>현재고 ≥ 안전재고</b> → 제외 (재고 충분)</li>
-        <li><b>소모품</b> → 발주 제외 사유 아님. 모든 지점 공통으로 아래 규칙 적용 (제외하려면 '전체 미발주/숨기기' 사용)</li>
+        <li><b>소모품 체크</b> → 체크된 품목만 발주 대상. 미체크 품목은 발주 제외 (모든 지점 공통)</li>
         <li><b>미입고 발주(접수/승인)</b> 존재 → 제외 + 별도 보고</li>
         <li>통과 시 <b>주/월 분류</b>: 리드타임 ≥35일 또는 월예외 등록 → 월발주, 나머지 주발주</li>
         <li>최종수량 = 안전재고를 <b>MOQ 배수</b>로 올림</li>
@@ -18770,7 +18809,7 @@ async def purchase_order_settings_guide(
       · 소모품 / 리드타임 / MOQ / 최소 안전재고 / 전체 미발주(숨기기) →
         <a href="/master/purchase-order/product-settings" style="color:#1E40AF;">상품 설정</a> 페이지 (품번 단위 일괄 적용 권장)<br>
       · 월 1회 예외(지점×상품) → 상품 설정 표의 '지방점 주발주 제외' 열 '설정' 버튼<br>
-      · 소모품 여부는 발주 제외 조건이 아니며 모든 지점에 동일 적용됩니다.</p>
+      · <b>소모품 체크된 품목만 발주 대상</b>입니다. 미체크 품목은 모든 지점에서 발주 제외됩니다.</p>
     </div>
 
     <div class="card">
@@ -18779,11 +18818,11 @@ async def purchase_order_settings_guide(
         <button class="btn" type="submit">검색</button>
         <a href="/master/purchase-order/settings-guide" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
       </form>
-      <table data-colkey="guide-main" data-colw data-colver="2026-11-19" style="table-layout:auto;">
+      <table data-colkey="guide-main" data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:1250px;"><colgroup><col style="width:110px"><col style="width:200px"><col style="width:80px"><col style="width:160px"><col style="width:70px"><col style="width:80px"><col style="width:70px"><col style="width:70px"><col style="width:100px"><col style="width:150px"><col style="width:150px"></colgroup>
         <thead><tr>
           <th>품번</th><th>상품명</th><th>지점행</th><th>적용 분류</th>
           <th>소모품</th><th>전체미발주</th><th>리드타임</th><th>MOQ</th><th>최소안전재고</th>
-          <th>월예외 지점</th><th>소모품 포함 지점(구)</th>
+          <th>월예외 지점</th><th>소모품 지점 예외(미사용)</th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
@@ -23235,7 +23274,10 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                 if cash_keys:
                     ov_html = ['<h3 style="margin:16px 0 8px;">💵 현금시재 현황</h3>',
                                '<div class="card"><div class="table-scroll-wrap"><table data-colw '
-                               'style="table-layout:auto;min-width:640px;"><thead><tr>'
+                               'style="table-layout:fixed;min-width:900px;"><colgroup>'
+                               '<col style="width:170px"><col style="width:130px"><col style="width:170px">'
+                               '<col style="width:160px"><col style="width:150px"><col style="width:100px"><col style="width:90px">'
+                               '</colgroup><thead><tr>'
                                '<th>지점</th><th style="text-align:right;">현금 매출</th>'
                                '<th style="text-align:right;">기타 입금/사용</th>'
                                '<th style="text-align:right;">예상 현금(정답)</th>'
@@ -24616,8 +24658,10 @@ async def closing_payments_page(session_token: str = Cookie(default=None), branc
     else:
         net_cnt = 0
         net_amt = 0
-        h.append('<div class="card"><div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:'
-                 + ('760' if all_branches else '640') + 'px;"><thead><tr>'
+        _pay_cols = (['140px'] if all_branches else []) + ['110px','110px','110px','130px','110px','90px','160px']
+        _pay_cg = ''.join('<col style="width:%s">' % w for w in _pay_cols)
+        h.append('<div class="card"><div class="table-scroll-wrap"><table data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:'
+                 + ('960' if all_branches else '860') + 'px;"><colgroup>' + _pay_cg + '</colgroup><thead><tr>'
                  + ('<th>지점</th>' if all_branches else '')
                  + '<th>시각</th><th>보호자</th><th>결제구분</th><th>구분</th><th style="text-align:right;">금액</th><th>상태</th><th>비고</th>'
                  '</tr></thead><tbody>')
@@ -24895,7 +24939,7 @@ async def closing_verify_page(session_token: str = Cookie(default=None), applied
         '</div>'
     )
     h.append('<div class="card"><div style="font-weight:bold;margin-bottom:8px;">최근 반영 기록</div>'
-             '<div class="table-scroll-wrap"><table style="table-layout:auto;min-width:520px;"><thead><tr>'
+             '<div class="table-scroll-wrap"><table data-colver="2026-11-20" style="table-layout:fixed;min-width:680px;"><colgroup><col style="width:150px"><col style="width:110px"><col style="width:90px"><col style="width:90px"><col style="width:240px"></colgroup><thead><tr>'
              '<th>반영 시각</th><th>일자</th><th>슬롯</th><th style="text-align:right;">행 수</th><th>메모</th>'
              '</tr></thead><tbody>')
     if not logs:
@@ -24993,7 +25037,7 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
                              if not days or applied == 0 else
                              '✅ <b>' + str(applied) + '개 일자</b>를 수정본(슬롯 M)으로 반영했습니다.')
                           + '</div>']
-                    rh.append('<div class="card"><div class="table-scroll-wrap"><table style="table-layout:auto;min-width:520px;"><thead><tr>'
+                    rh.append('<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-20" style="table-layout:fixed;min-width:560px;"><colgroup><col style="width:110px"><col style="width:140px"><col style="width:310px"></colgroup><thead><tr>'
                           '<th>일자</th><th>결과</th><th>사유</th></tr></thead><tbody>')
                     if not days:
                         rh.append('<tr><td colspan="3" style="text-align:center;color:#888;">표시할 일자가 없습니다.</td></tr>')
@@ -25021,7 +25065,10 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
                             a["nc"] += b["new_cnt"]; a["na"] += b["new_amt"]
                     if agg:
                         rh.append('<h3 style="margin:16px 0 8px;">지점별 합계 (반영된 일자 합산)</h3>')
-                        rh.append('<div class="card"><div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:640px;"><thead><tr>'
+                        rh.append('<div class="card"><div class="table-scroll-wrap"><table data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:760px;"><colgroup>'
+                                  '<col style="width:160px"><col style="width:90px"><col style="width:130px">'
+                                  '<col style="width:90px"><col style="width:130px"><col style="width:90px"><col style="width:130px">'
+                                  '</colgroup><thead><tr>'
                                   '<th>지점</th><th colspan="2" style="text-align:center;">기존(현재 슬롯)</th>'
                                   '<th colspan="2" style="text-align:center;">수정본(M)</th>'
                                   '<th colspan="2" style="text-align:center;">차이(수정−기존)</th></tr><tr>'
@@ -25075,8 +25122,10 @@ async def closing_verify_preview(request: Request, session_token: str = Cookie(d
 
         h.append('<form method="post" action="/closing/verify/apply">')
         h.append('<input type="hidden" name="payload" value="' + payload_b64 + '">')
-        h.append('<div class="card"><div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:1080px;"><thead><tr>'
-                 '<th style="width:34px;">반영</th><th>일자</th><th>현재(슬롯)</th><th style="text-align:right;">현재 행수</th>'
+        _vp_cols = ['50px','100px','120px','100px','110px','80px','80px','320px','110px','200px','200px']
+        _vp_cg = ''.join('<col style="width:%s">' % w for w in _vp_cols)
+        h.append('<div class="card"><div class="table-scroll-wrap"><table data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:1400px;"><colgroup>' + _vp_cg + '</colgroup><thead><tr>'
+                 '<th>반영</th><th>일자</th><th>현재(슬롯)</th><th style="text-align:right;">현재 행수</th>'
                  '<th style="text-align:right;">수정본 행수</th><th style="text-align:right;">추가</th><th style="text-align:right;">삭제</th>'
                  '<th>지점별 순건수·순금액 변화</th><th style="text-align:right;">마감 저장 지점</th><th>추가 예시</th><th>삭제 예시</th>'
                  '</tr></thead><tbody>')
