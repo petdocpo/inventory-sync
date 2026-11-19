@@ -2215,6 +2215,38 @@ def init_db():
             if _c not in _existing:
                 conn.execute(f"ALTER TABLE daily_stocktake_saves ADD COLUMN {_c} {_ddl}")
 
+    # daily_stocktake_lines 위치1~3/수동 수량 컬럼 보강 (additive)
+    # counted_qty = 수동(manual_qty) + 위치(loc1~3) 합계. 기존 행은 manual NULL → counted를 수동값으로 간주
+    _dst_line_new_cols = {
+        "manual_qty": "INTEGER",
+        "loc1_qty": "INTEGER",
+        "loc2_qty": "INTEGER",
+        "loc3_qty": "INTEGER",
+    }
+    if USE_POSTGRES:
+        for _c, _ddl in _dst_line_new_cols.items():
+            conn.execute(
+                f"ALTER TABLE daily_stocktake_lines ADD COLUMN IF NOT EXISTS {_c} {_ddl}"
+            )
+    else:
+        _ln_existing = {r[1] for r in conn.execute("PRAGMA table_info(daily_stocktake_lines)").fetchall()}
+        for _c, _ddl in _dst_line_new_cols.items():
+            if _c not in _ln_existing:
+                conn.execute(f"ALTER TABLE daily_stocktake_lines ADD COLUMN {_c} {_ddl}")
+
+    # 페이지 동시편집 presence — 누가 기입 중인지 표시용 (하트비트 기반)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS page_presence (
+            {pk},
+            page TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            login_id TEXT NOT NULL,
+            display_name TEXT,
+            updated_at TEXT,
+            UNIQUE(page, scope_key, login_id)
+        )
+    """)
+
     # stock_closing_saves 오차 사유 컬럼 보강 (additive)
     if USE_POSTGRES:
         conn.execute(
@@ -2421,6 +2453,88 @@ _COLUMN_SETTINGS_HTML = """
         function cvSaveHidden(table, arr) {
           try { localStorage.setItem(cvKey(table), JSON.stringify(arr)); } catch (e) {}
         }
+        // ── 컬럼 순서 변경 (단순 테이블 전용: 모든 셀이 colspan/rowspan 1) ──
+        function cvOrderKey(table) { return 'colOrder_' + cvBaseKey(table); }
+        function cvGetOrder(table) {
+          try {
+            var a = JSON.parse(localStorage.getItem(cvOrderKey(table)) || 'null');
+            if (!Array.isArray(a)) a = (COL_DEFAULTS || {})[cvBaseKey(table) + '_o'];
+            return Array.isArray(a) ? a : null;
+          } catch (e) { return null; }
+        }
+        function cvSaveOrder(table, ord) {
+          try { localStorage.setItem(cvOrderKey(table), JSON.stringify(ord)); } catch (e) {}
+        }
+        function cvReorderable(table) {
+          var n = cvUnits(table).length;
+          if (!n) return false;
+          var rows = table.rows;
+          for (var r = 0; r < rows.length; r++) {
+            if (rows[r].cells.length !== n) return false;
+            for (var c = 0; c < rows[r].cells.length; c++) {
+              var cell = rows[r].cells[c];
+              if ((cell.colSpan || 1) !== 1 || (cell.rowSpan || 1) !== 1) return false;
+            }
+          }
+          return true;
+        }
+        function units_identity(n) { var a = []; for (var i = 0; i < n; i++) a.push(i); return a; }
+        function units_len_check(table) { return cvUnits(table).length; }
+        // 페이지 로드 시 저장된 순서 1회 적용 (원본 컬럼 순서 → ord 순서)
+        function cvApplyOrder(table) {
+          if (table.getAttribute('data-cv-ordered')) return;
+          if (!cvReorderable(table)) { table.setAttribute('data-cv-ordered', '1'); return; }
+          var ord = cvGetOrder(table);
+          if (!ord) { table.setAttribute('data-cv-ordered', '1'); return; }
+          var n = cvUnits(table).length;
+          if (!Array.isArray(ord) || ord.length !== n) { table.setAttribute('data-cv-ordered', '1'); return; }
+          var seen = {}, ok = true, isId = true;
+          for (var i = 0; i < n; i++) {
+            var v = ord[i];
+            if (typeof v !== 'number' || v < 0 || v >= n || seen[v]) { ok = false; break; }
+            seen[v] = true;
+            if (v !== i) isId = false;
+          }
+          if (!ok || isId) { table.setAttribute('data-cv-ordered', '1'); return; }
+          var rows = table.rows;
+          for (var r = 0; r < rows.length; r++) {
+            var cells = Array.prototype.slice.call(rows[r].cells);
+            var reordered = [];
+            for (var i = 0; i < n; i++) reordered.push(cells[ord[i]]);
+            for (var i = 0; i < n; i++) rows[r].appendChild(reordered[i]);
+          }
+          table.setAttribute('data-cv-ordered', '1');
+        }
+        // 인접 컬럼 1칸 이동 — ord/숨김/너비 저장값도 함께 치환
+        function cvMoveUnit(table, pos, dir, onlyTable) {
+          var n = cvUnits(table).length;
+          var q = pos + dir;
+          if (q < 0 || q >= n) return;
+          var ord = cvGetOrder(table) || units_identity(n);
+          var t = ord[pos]; ord[pos] = ord[q]; ord[q] = t;
+          cvSaveOrder(table, ord);
+          var h = cvHidden(table), nh = h.slice();
+          var hi = nh.indexOf(pos), qi = nh.indexOf(q);
+          if (hi >= 0 && qi < 0) { nh.splice(hi, 1); nh.push(q); }
+          else if (qi >= 0 && hi < 0) { nh.splice(qi, 1); nh.push(pos); }
+          cvSaveHidden(table, nh);
+          try {
+            var wk = 'colWidths2_' + window.location.pathname + '_' + cvIndex(table)
+              + ((table.getAttribute('data-colver') || '') ? '_' + table.getAttribute('data-colver') : '');
+            var ws = JSON.parse(localStorage.getItem(wk) || 'null');
+            if (Array.isArray(ws) && ws.length === n) { var tw = ws[pos]; ws[pos] = ws[q]; ws[q] = tw; localStorage.setItem(wk, JSON.stringify(ws)); }
+          } catch (e) {}
+          var rows = table.rows;
+          for (var r = 0; r < rows.length; r++) {
+            var cells = rows[r].cells;
+            if (cells.length !== n) continue;
+            var a = cells[pos], b = cells[q];
+            rows[r].insertBefore(b, a);
+          }
+          cvApply(table);
+          cvApplyFont(table);
+          window.openColSettings(onlyTable);
+        }
         function cvSetCell(cell, hide) {
           var fields = cell.querySelectorAll('input,select,textarea');
           if (hide) {
@@ -2472,7 +2586,10 @@ _COLUMN_SETTINGS_HTML = """
           }
         }
         function cvApplyAll() {
-          document.querySelectorAll('table').forEach(function(t) { cvApply(t); cvApplyFont(t); });
+          document.querySelectorAll('table').forEach(function(t) {
+            if (cvEligible(t)) cvApplyOrder(t);
+            cvApply(t); cvApplyFont(t);
+          });
         }
         // 각 표 우측 위에 ⚙️ 칼럼 버튼을 주입 — 클릭 시 해당 표만 설정 모달로 연다
         function cvInjectButtons() {
@@ -2515,6 +2632,7 @@ _COLUMN_SETTINGS_HTML = """
           });
         }
         window.openColSettings = function(onlyTable) {
+          window.__cvLastOnly = onlyTable || null;
           var body = document.getElementById('colSetBody');
           body.innerHTML = '';
           var any = false;
@@ -2530,17 +2648,37 @@ _COLUMN_SETTINGS_HTML = """
             head.style.cssText = 'font-weight:bold;font-size:13px;margin-bottom:6px;';
             head.textContent = '테이블 ' + (cvIndex(table) + 1) + ' (' + units.length + '개 항목)';
             box.appendChild(head);
-            units.forEach(function(u, ui) {
+            var reorderable = cvReorderable(table);
+            var curOrd = cvGetOrder(table) || units_identity(units.length);
+            curOrd.forEach(function(origUi, pos) {
+              var u = units[origUi];
+              var rowDiv = document.createElement('div');
+              rowDiv.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:13px;padding:2px 0;';
+              if (reorderable) {
+                var mkArr = function(txt, title, disabled, dir) {
+                  var b = document.createElement('button');
+                  b.type = 'button'; b.textContent = txt; b.title = title; b.disabled = disabled;
+                  b.style.cssText = 'border:1px solid #ccc;background:#f5f5f5;border-radius:4px;'
+                    + 'padding:0 6px;font-size:11px;cursor:pointer;min-width:22px;'
+                    + (disabled ? 'opacity:.35;' : '');
+                  b.addEventListener('click', function() {
+                    cvMoveUnit(table, pos, dir, onlyTable);
+                  });
+                  return b;
+                };
+                rowDiv.appendChild(mkArr('↑', '위로 이동', pos === 0, -1));
+                rowDiv.appendChild(mkArr('↓', '아래로 이동', pos === curOrd.length - 1, 1));
+              }
               var lab = document.createElement('label');
-              lab.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;padding:2px 0;';
+              lab.style.cssText = 'display:flex;align-items:center;gap:6px;flex:1;cursor:pointer;';
               var cb = document.createElement('input');
               cb.type = 'checkbox';
-              cb.checked = hidden.indexOf(ui) < 0;
+              cb.checked = hidden.indexOf(pos) < 0;
               cb.addEventListener('change', function() {
                 var h = cvHidden(table).filter(function(i) { return i >= 0 && i < units.length; });
-                var pos = h.indexOf(ui);
-                if (cb.checked && pos >= 0) { h.splice(pos, 1); }
-                if (!cb.checked && pos < 0) { h.push(ui); }
+                var hp = h.indexOf(pos);
+                if (cb.checked && hp >= 0) { h.splice(hp, 1); }
+                if (!cb.checked && hp < 0) { h.push(pos); }
                 if (units.length - h.length === 0) {
                   alert('항목을 모두 숨길 수는 없습니다. 최소 1개는 표시해야 합니다.');
                   cb.checked = true;
@@ -2552,15 +2690,17 @@ _COLUMN_SETTINGS_HTML = """
               });
               lab.appendChild(cb);
               lab.appendChild(document.createTextNode(u.label));
-              box.appendChild(lab);
+              rowDiv.appendChild(lab);
+              box.appendChild(rowDiv);
             });
             var reset = document.createElement('button');
             reset.textContent = '이 테이블 초기화';
             reset.style.cssText = 'margin-top:6px;font-size:12px;padding:4px 10px;border:1px solid #ccc;background:#f5f5f5;border-radius:6px;cursor:pointer;';
             reset.addEventListener('click', function() {
               cvSaveHidden(table, []);
+              try { localStorage.removeItem(cvOrderKey(table)); } catch (e) {}
               cvApply(table);
-              window.openColSettings(onlyTable);
+              location.reload();
             });
             box.appendChild(reset);
             body.appendChild(box);
@@ -2612,6 +2752,16 @@ _COLUMN_SETTINGS_HTML = """
             // 폰트 크기 기본값
             var fs = cvFontSize(table);
             if (fs) { tables[suffix + '_f'] = [fs]; }
+            // 컬럼 순서 기본값 — 기본 순서와 다를 때만 저장
+            try {
+              if (cvReorderable(table)) {
+                var ord2 = cvGetOrder(table);
+                if (ord2 && ord2.length === units_len_check(table)
+                    && !ord2.every(function(v, i) { return v === i; })) {
+                  tables[suffix + '_o'] = ord2;
+                }
+              }
+            } catch (e) {}
           });
           fetch('/api/column-defaults', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -2662,15 +2812,18 @@ async def column_defaults_save(request: Request, session_token: str = Cookie(def
             continue
         if not isinstance(hidden, list):
             continue
+        # 키 접미사별 허용 범위 — _w: 컬럼 너비(px), _f: 폰트 크기, 기본: 숨김 항목 인덱스
+        _lo, _hi = (20, 2000) if suffix.endswith("_w") else ((8, 24) if suffix.endswith("_f") else (0, 100))
         vals = []
-        for v in hidden[:100]:
+        for v in hidden[:200]:
             try:
                 iv = int(v)
             except (TypeError, ValueError):
                 continue
-            if 0 <= iv <= 100:
+            if _lo <= iv <= _hi:
                 vals.append(iv)
-        clean[page + "_" + suffix] = sorted(set(vals))
+        # 너비(_w)/컬럼순서(_o)는 배열 순서가 의미가 있으므로 정렬하지 않는다
+        clean[page + "_" + suffix] = vals if suffix.endswith(("_w", "_o")) else sorted(set(vals))
 
     conn = get_conn()
     try:
@@ -2715,6 +2868,11 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         'style="background:rgba(255,255,255,.15);color:white;border:none;'
         'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">font</button>'
         if (col_settings_enabled and is_master) else ""
+    )
+    ui_mode_btn = (
+        '<button type="button" onclick="toggleUiMode()" title="PC/모바일 화면 전환" '
+        'style="background:rgba(255,255,255,.15);color:white;border:none;'
+        'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">🖥️</button>'
     )
     col_settings_btn = (
         col_font_btn +
@@ -2819,6 +2977,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>재고 관리 시스템</title>
+      <script>try{{if(localStorage.getItem('ui_mode')==='pc')document.documentElement.classList.add('pc-mode');}}catch(e){{}}</script>
       <link rel="manifest" href="/manifest.json">
       <meta name="theme-color" content="#1E2761">
       <link rel="apple-touch-icon" href="/icon-192.png">
@@ -2875,6 +3034,9 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         .topbar {{ background: #1E2761; color: white; padding: 10px 14px;
                   display: flex; justify-content: space-between; align-items: center; }}
         .content {{ max-width: 960px; margin: 0 auto; padding: 10px 14px; }}
+        .pc-mode .content {{ max-width: 1600px; padding: 10px 24px; }}
+        .pc-mode .bottomnav {{ display: none; }}
+        .pc-mode body {{ padding-bottom: 24px; }}
         .card {{ background: white; border-radius: 12px; padding: 16px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }}
         .btn {{ background: #1E2761; color: white; padding: 8px 14px;
@@ -2905,7 +3067,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       <div class="topbar">
         <span style="font-weight:bold;">📦 재고 관리 시스템{role_badge}</span>
         <div style="display:flex;align-items:center;">
-          {col_settings_btn}
+          {ui_mode_btn}{col_settings_btn}
           <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
         </div>
       </div>
@@ -2931,6 +3093,12 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       {submenu_popups_html}
       <nav class="bottomnav">{menu_html}</nav>
       <script>
+        function toggleUiMode() {{
+          var pc = !document.documentElement.classList.contains('pc-mode');
+          document.documentElement.classList.toggle('pc-mode', pc);
+          try {{ localStorage.setItem('ui_mode', pc ? 'pc' : 'mobile'); }} catch(e) {{}}
+          location.reload();
+        }}
         function toggleSubmenu(key) {{
           var target = document.getElementById('submenu-' + key);
           var overlay = document.getElementById('submenuOverlay');
@@ -3165,7 +3333,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
               e.preventDefault();
               e.stopPropagation();
               freezeTable();
-              drag = {{ idx: idx, x0: e.clientX }};
+              drag = {{ idx: (function(){{var a=colHeaderCells(table).indexOf(th);return a>=0?a:idx;}})(), x0: e.clientX }};
               dirty = false;
               try {{ handle.setPointerCapture(e.pointerId); }} catch (err) {{}}
             }});
@@ -3892,11 +4060,13 @@ async def stock_closing_page(
                 ups = it["ups"]
                 ups_disp = _fmt_num(ups)
                 ups_attr = "" if ups is None else str(ups)
+                qr_attr = "" if it["qr_qty"] is None else str(it["qr_qty"])
             else:
                 # 과거 날짜(저장값 없음): QR/유비플러스 재고는 현재 값만 있어 비교 불가
                 qr_disp = "-"
                 ups_disp = "-"
                 ups_attr = ""
+                qr_attr = ""
             cv = draft_counts.get(it["item_code"])
             val_attr = "" if cv is None else f' value="{cv}"'
             rv = draft_reasons.get(it["item_code"], "")
@@ -3911,7 +4081,7 @@ async def stock_closing_page(
                 f"<td>{qr_disp}</td>"
                 f"<td>{ups_disp}</td>"
                 f'<td><input type="number" min="0" class="sc-input" '
-                f'data-code="{_html.escape(str(it["item_code"]))}" data-ups="{ups_attr}"{val_attr} '
+                f'data-code="{_html.escape(str(it["item_code"]))}" data-ups="{ups_attr}" data-qr="{qr_attr}"{val_attr} '
                 f'placeholder="실사" oninput="scUpdateDiff(this)"{dis} '
                 'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
                 '<td class="sc-diff" style="font-weight:bold;color:#888;">-</td>'
@@ -4171,7 +4341,11 @@ async def stock_closing_page(
           var empty = 0;
           var noReason = 0;
           document.querySelectorAll('.sc-input').forEach(function(inp) {
-            if (inp.value === '') empty++;
+            if (inp.value !== '') return;
+            var qr = inp.getAttribute('data-qr');
+            var ups = inp.getAttribute('data-ups');
+            if (qr !== null && qr !== '' && ups !== null && ups !== ''
+                && parseInt(qr, 10) !== parseInt(ups, 10)) empty++;
           });
           document.querySelectorAll('.sc-input').forEach(function(inp) {
             var tr = inp.closest('tr');
@@ -4184,7 +4358,7 @@ async def stock_closing_page(
             }
           });
           if (empty > 0) {
-            alert('실사 수량이 입력되지 않은 상품이 ' + empty + '개 있습니다.\\n모든 상품에 입력한 뒤 마감해주세요.');
+            alert('QR 재고와 유비플러스 재고가 다른 상품 중 실사 수량이 입력되지 않은 것이 ' + empty + '개 있습니다.\n해당 품목만 입력한 뒤 마감해주세요. (오차 없는 품목은 미입력 가능)');
             return;
           }
           if (noReason > 0) {
@@ -4466,9 +4640,11 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
                 raise HTTPException(status_code=400, detail="실사 수량이 숫자가 아닙니다: " + str(it["item_code"]))
             if counted < 0:
                 raise HTTPException(status_code=400, detail="실사 수량은 0 이상이어야 합니다: " + str(it["item_code"]))
-        if counted is None:
-            missing += 1
         ups = it["ups"]
+        if counted is None:
+            # 실사 필수는 QR재고 ≠ 유비플러스재고 오차가 있는 품목뿐
+            if it["qr_qty"] is not None and ups is not None and it["qr_qty"] != ups:
+                missing += 1
         diff = (counted - ups) if (counted is not None and ups is not None) else None
         if diff is not None and diff != 0:
             mismatch += 1
@@ -4478,7 +4654,7 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
     if mode == "close" and missing > 0:
         raise HTTPException(
             status_code=400,
-            detail="실사 수량이 입력되지 않은 상품이 " + str(missing) + "개 있습니다. 화면을 새로고침한 뒤 모두 입력하고 마감해주세요."
+            detail="QR 재고와 유비플러스 재고가 다른 상품 중 실사 수량이 입력되지 않은 것이 " + str(missing) + "개 있습니다. 해당 품목만 입력하고 마감해주세요."
         )
     if mode == "close":
         no_reason = sum(
@@ -4788,7 +4964,15 @@ async def daily_stocktake_page(
             ups_val = line["ups_qty"]
             ups_disp = _fmt_num(ups_val)
             ups_attr = "" if ups_val is None else str(ups_val)
-            cv = line["counted_qty"]
+            mqty = _dst_line_get(line, "manual_qty")
+            loc_vals = [_dst_line_get(line, "loc1_qty"), _dst_line_get(line, "loc2_qty"),
+                        _dst_line_get(line, "loc3_qty")]
+            if mqty is not None:
+                cv = mqty
+            elif any(v is not None for v in loc_vals):
+                cv = None  # 위치값만 입력된 경우 수동 칸은 빈 값
+            else:
+                cv = line["counted_qty"]  # 위치 기능 이전 저장분 → 수동 입력값으로 표시
             badge = ' <span style="font-size:10px;color:#1E40AF;background:#EFF6FF;padding:1px 5px;border-radius:8px;">스냅샷</span>'
         else:
             qr_disp = _fmt_num(it["qr_qty"])
@@ -4796,12 +4980,23 @@ async def daily_stocktake_page(
             ups_disp = _fmt_num(ups_val)
             ups_attr = "" if ups_val is None else str(ups_val)
             cv = None
+            loc_vals = [None, None, None]
             badge = (' <span style="font-size:10px;color:#166534;background:#F0FDF4;padding:1px 5px;border-radius:8px;">현재값</span>'
                      if save else "")
         if ups_val is None:
             badge += ' <span style="font-size:10px;color:#92400E;background:#FFFBEB;padding:1px 5px;border-radius:8px;">UPS 없음</span>'
         val_attr = "" if cv is None else f' value="{cv}"'
         dis_attr = "" if page_can_write else " disabled"
+        loc_html = ""
+        for _li in range(3):
+            _lv = loc_vals[_li]
+            _lv_attr = "" if _lv is None else f' value="{_lv}"'
+            loc_html += (
+                f'<td><input type="number" min="0" class="dst-loc" '
+                f'data-code="{_html.escape(code)}" data-loc="{_li + 1}"{_lv_attr}{dis_attr} '
+                'oninput="dstUpdateDiff(this)" placeholder="위치" '
+                'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
+            )
         rows_html += (
             "<tr>"
             f"<td>{_html.escape(str(target_branch))}</td>"
@@ -4809,10 +5004,12 @@ async def daily_stocktake_page(
             f"<td>{_html.escape(code)}</td>"
             f"<td>{qr_disp}</td>"
             f"<td>{ups_disp}{badge}</td>"
-            f'<td><input type="number" min="0" class="dst-input" '
+            + loc_html
+            + f'<td><input type="number" min="0" class="dst-input" '
             f'data-code="{_html.escape(code)}" data-ups="{ups_attr}"{val_attr}{dis_attr} '
             'placeholder="실사" oninput="dstUpdateDiff(this)" '
-            'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
+            'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;">'
+            '<div class="dst-total-hint" style="font-size:10px;color:#888;margin-top:2px;white-space:nowrap;"></div></td>'
             '<td class="dst-diff" style="font-weight:bold;color:#888;">-</td>'
             + _sc_adjust_cell(target_branch, code, page_can_write)
             + "</tr>"
@@ -4831,6 +5028,7 @@ async def daily_stocktake_page(
             f"<td>{_html.escape(code)}</td>"
             f"<td>{_fmt_num(line['qr_qty'])}</td>"
             f"<td>{_fmt_num(line['ups_qty'])}</td>"
+            + "<td>-</td><td>-</td><td>-</td>"
             f"<td>{_fmt_num(line['counted_qty'])}</td>"
             + _diff_html(line["diff_qty"])
             + "<td>-</td>"
@@ -4839,7 +5037,7 @@ async def daily_stocktake_page(
 
     if not rows_html:
         rows_html = (
-            '<tr><td colspan="8" style="text-align:center;padding:24px;color:#888;">'
+            '<tr><td colspan="11" style="text-align:center;padding:24px;color:#888;">'
             "표시할 품목이 없습니다 (소모품 제외 inventory 등록 품목 기준)</td></tr>"
         )
 
@@ -4915,16 +5113,30 @@ async def daily_stocktake_page(
 
     script = """
     <script>
+      function dstRowTotal(tr) {
+        var total = 0, any = false;
+        var mi = tr.querySelector('.dst-input');
+        if (mi && mi.value !== '') { var mv = parseInt(mi.value, 10); if (!isNaN(mv)) { total += mv; any = true; } }
+        tr.querySelectorAll('.dst-loc').forEach(function(li) {
+          if (li.value !== '') { var lv = parseInt(li.value, 10); if (!isNaN(lv)) { total += lv; any = true; } }
+        });
+        return any ? total : null;
+      }
       function dstUpdateDiff(inp) {
         var tr = inp.closest('tr');
         var cell = tr.querySelector('.dst-diff');
-        var ups = inp.getAttribute('data-ups');
-        if (inp.value === '' || ups === '') {
+        var ups = inp.getAttribute('data-ups') || (tr.querySelector('.dst-input') ? tr.querySelector('.dst-input').getAttribute('data-ups') : '');
+        var hint = tr.querySelector('.dst-total-hint');
+        var total = dstRowTotal(tr);
+        var locUsed = false;
+        tr.querySelectorAll('.dst-loc').forEach(function(li) { if (li.value !== '') locUsed = true; });
+        if (hint) hint.textContent = locUsed && total !== null ? ('합계: ' + total) : '';
+        if (total === null || ups === '') {
           cell.textContent = '-';
           cell.style.color = '#888';
           return;
         }
-        var diff = parseInt(inp.value, 10) - parseInt(ups, 10);
+        var diff = total - parseInt(ups, 10);
         if (isNaN(diff)) {
           cell.textContent = '-';
           cell.style.color = '#888';
@@ -4946,11 +5158,20 @@ async def daily_stocktake_page(
         document.querySelectorAll('.dst-input').forEach(function(inp) {
           if (inp.value !== '') { counts[inp.getAttribute('data-code')] = inp.value; }
         });
+        var locs = {};
+        document.querySelectorAll('.dst-loc').forEach(function(inp) {
+          if (inp.value === '') return;
+          var code = inp.getAttribute('data-code');
+          var idx = parseInt(inp.getAttribute('data-loc'), 10) - 1;
+          if (!locs[code]) locs[code] = ['', '', ''];
+          if (idx >= 0 && idx < 3) locs[code][idx] = inp.value;
+        });
         var branchEl = document.querySelector('select[name="filter_branch"]');
         var payload = {
           date: '__DST_DATE__',
           closer_name: closer,
-          counts: counts
+          counts: counts,
+          locs: locs
         };
         if (branchEl && branchEl.value) payload.branch_code = branchEl.value;
         return payload;
@@ -4959,9 +5180,9 @@ async def daily_stocktake_page(
       async function dstSubmit() {
         var payload = dstCollect();
         if (!payload) return;
-        var filled = Object.keys(payload.counts).length;
+        var filled = Object.keys(payload.counts).length + Object.keys(payload.locs || {}).length;
         if (filled === 0) {
-          alert('실사 수량이 입력된 상품이 없습니다.');
+          alert('실사 수량(수동 또는 위치)이 입력된 상품이 없습니다.');
           return;
         }
         try {
@@ -5060,12 +5281,58 @@ async def daily_stocktake_page(
       }
 
       window.addEventListener('load', function() {
-        document.querySelectorAll('.dst-input').forEach(function(inp) {
+        document.querySelectorAll('.dst-input, .dst-loc').forEach(function(inp) {
           if (inp.value !== '') dstUpdateDiff(inp);
         });
       });
+
+      // ── 동시 편집 presence (쓰기 가능 + 미마감일 때만) ──
+      var DST_PRESENCE = '__DST_PRESENCE__';
+      function dstPresenceName() {
+        var el = document.getElementById('dstCloser');
+        return (el && el.value.trim()) ? el.value.trim() : '__DST_LOGIN__';
+      }
+      function dstPresenceRender(users) {
+        var box = document.getElementById('dstPresence');
+        if (!box) return;
+        if (!users || !users.length) { box.innerHTML = ''; return; }
+        var html = '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:12px;'
+          + 'color:#1E40AF;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:6px 10px;">'
+          + '<span style="font-weight:bold;">✏️ 지금 기입 중:</span>';
+        users.forEach(function(u) {
+          var me = (u.login_id === '__DST_LOGIN__') ? ' <span style="color:#888;">(나)</span>' : '';
+          html += '<span style="background:#fff;border:1px solid #BFDBFE;border-radius:10px;padding:1px 8px;">'
+            + dstEsc(u.display_name || u.login_id) + me + '</span>';
+        });
+        html += '</div>';
+        box.innerHTML = html;
+      }
+      async function dstPresenceBeat() {
+        if (DST_PRESENCE !== '1') return;
+        try {
+          await fetch('/api/presence', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({page: 'daily-stocktake', scope_key: '__DST_SCOPE__',
+                                  name: dstPresenceName()})
+          });
+        } catch (e) {}
+      }
+      async function dstPresencePoll() {
+        if (DST_PRESENCE !== '1') return;
+        try {
+          var res = await fetch('/api/presence?page=daily-stocktake&scope_key='
+            + encodeURIComponent('__DST_SCOPE__'));
+          var data = await res.json();
+          if (res.ok) dstPresenceRender(data.users || []);
+        } catch (e) {}
+      }
+      if (DST_PRESENCE === '1') {
+        dstPresenceBeat(); dstPresencePoll();
+        setInterval(dstPresenceBeat, 20000);
+        setInterval(dstPresencePoll, 20000);
+      }
     </script>
-    """.replace("__DST_DATE__", sel_date_str)
+    """.replace("__DST_DATE__", sel_date_str).replace("__DST_PRESENCE__", "1" if (page_can_write and not is_closed) else "0").replace("__DST_SCOPE__", _html.escape(str(target_branch) + "|" + sel_date_str)).replace("__DST_LOGIN__", _html.escape(str(user.get("login_id") or "")))
 
     content = (
         '<h2 style="margin:0 0 8px 0;">🧮 재고 실사</h2>'
@@ -5074,16 +5341,18 @@ async def daily_stocktake_page(
         + (f' · 제외된 품목 {excluded_count}건' if excluded_count else '')
         + '</p>'
         '<p style="color:#888;font-size:12px;margin-bottom:16px;">'
-        "오차 = 실사 수량 − 유비플러스 재고 · 빈 칸은 저장 시 기존 값 유지 · "
-        "inventory 미등록 품목은 실사 대상이 아닙니다</p>"
+        "오차 = 실사 수량(수동+위치1~3 합계) − 유비플러스 재고 · 빈 칸은 저장 시 기존 값 유지 · "
+        "위치 수량과 수동 입력은 함께 합산됩니다 · inventory 미등록 품목은 실사 대상이 아닙니다</p>"
         + filter_html
         + notices_html
-        + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-16">'
+        + '<div id="dstPresence" style="margin-bottom:12px;"></div>'
+        + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-17">'
         "<thead><tr>"
-        '<th style="width:8%">지점</th><th style="width:24%">상품명</th>'
-        '<th style="width:10%">상품코드</th><th style="width:9%">QR 재고 수량</th>'
-        '<th style="width:11%">유비플러스 재고 수량</th>'
-        '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:10%">QR 수정</th>'
+        '<th style="width:7%">지점</th><th style="width:19%">상품명</th>'
+        '<th style="width:9%">상품코드</th><th style="width:8%">QR 재고 수량</th>'
+        '<th style="width:10%">유비플러스 재고 수량</th>'
+        '<th style="width:5%">위치1</th><th style="width:5%">위치2</th><th style="width:5%">위치3</th>'
+        '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:14%">QR 수정</th>'
         "</tr></thead><tbody>"
         + rows_html
         + "</tbody></table></div>"
@@ -5139,6 +5408,41 @@ def _dst_parse_counts(counts, item_map: dict) -> dict:
     return parsed
 
 
+def _dst_line_get(line, key):
+    """daily_stocktake_lines 행에서 컬럼값 안전 조회 (컬럼 없으면 None)."""
+    try:
+        return line[key]
+    except Exception:
+        return None
+
+
+def _dst_parse_locs(locs, item_map: dict) -> dict:
+    """위치1/2/3 입력 파싱 — {item_code: [v1, v2, v3]} (빈 칸=None)."""
+    from fastapi import HTTPException
+    parsed = {}
+    for code, vals in (locs or {}).items():
+        code = str(code)
+        if code not in item_map or not isinstance(vals, (list, tuple)):
+            continue
+        vv = list(vals)[:3]
+        out = []
+        for i in range(3):
+            raw = vv[i] if i < len(vv) else None
+            if raw is None or str(raw).strip() == "":
+                out.append(None)
+                continue
+            try:
+                v = int(str(raw).strip())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="위치 수량이 숫자가 아닙니다: " + code)
+            if v < 0 or v > 1000000:
+                raise HTTPException(status_code=400, detail="위치 수량은 0~1000000 사이여야 합니다: " + code)
+            out.append(v)
+        if any(v is not None for v in out):
+            parsed[code] = out
+    return parsed
+
+
 def _dst_get_or_create_save(conn, branch_code: str, date_str: str, closer_name: str, login: str, now_str: str):
     """(branch_code, count_date) save 행을 찾아 id 반환. 없으면 생성. 마감 여부는 호출부에서 검사."""
     existing = conn.execute(
@@ -5164,23 +5468,64 @@ def _dst_get_or_create_save(conn, branch_code: str, date_str: str, closer_name: 
     return row["id"], None
 
 
-def _dst_write_counts(conn, save_id, branch_code: str, date_str: str, parsed: dict, item_map: dict):
-    """제출된 실사 수량을 품목별 upsert (qr/ups 스냅샷 갱신) + item/mismatch 재계산."""
-    for code, counted in parsed.items():
+def _dst_write_counts(conn, save_id, branch_code: str, date_str: str, parsed: dict, item_map: dict,
+                      locs: dict = None):
+    """제출된 실사 수량(수동+위치 합계)을 품목별 upsert (qr/ups 스냅샷 갱신) + item/mismatch 재계산.
+    parsed={code:수동값}, locs={code:[위치1,2,3]} — 둘 중 하나만 제출돼도 기존 값과 병합한다."""
+    locs = locs or {}
+    codes = set(parsed.keys()) | set(locs.keys())
+    # 기존 라인 조회 — 한쪽만 제출된 경우 나머지 구성요소 유지용
+    exist = {}
+    if codes:
+        ph = ",".join("?" * len(codes))
+        for r in conn.execute(
+            f"SELECT item_code, manual_qty, loc1_qty, loc2_qty, loc3_qty, counted_qty "
+            f"FROM daily_stocktake_lines WHERE save_id=? AND item_code IN ({ph})",
+            (save_id, *codes)
+        ).fetchall():
+            exist[str(r["item_code"])] = r
+    for code in codes:
         it = item_map[code]
         ups = it["ups"]
-        diff = (counted - ups) if ups is not None else None
+        ex = exist.get(code)
+        # 수동 수량: 제출값 우선, 없으면 기존값 (manual NULL + locs도 없으면 기존 counted를 수동값으로 간주)
+        if code in parsed:
+            manual = parsed[code]
+        elif ex is not None:
+            em = _dst_line_get(ex, "manual_qty")
+            if em is not None:
+                manual = em
+            else:
+                elocs = [_dst_line_get(ex, "loc1_qty"), _dst_line_get(ex, "loc2_qty"),
+                         _dst_line_get(ex, "loc3_qty")]
+                manual = None if any(v is not None for v in elocs) else _dst_line_get(ex, "counted_qty")
+        else:
+            manual = None
+        # 위치 수량: 제출값 우선, 없으면 기존값 유지
+        if code in locs:
+            lv = list(locs[code]) + [None, None]
+            l1, l2, l3 = lv[0], lv[1], lv[2]
+        elif ex is not None:
+            l1, l2, l3 = (_dst_line_get(ex, "loc1_qty"), _dst_line_get(ex, "loc2_qty"),
+                          _dst_line_get(ex, "loc3_qty"))
+        else:
+            l1 = l2 = l3 = None
+        parts = [v for v in [manual, l1, l2, l3] if v is not None]
+        counted = sum(parts) if parts else None
+        diff = (counted - ups) if (counted is not None and ups is not None) else None
         conn.execute(
             "INSERT INTO daily_stocktake_lines "
             "(save_id, branch_code, count_date, item_code, item_name, supplier, category, "
-            " qr_qty, ups_qty, counted_qty, diff_qty) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            " qr_qty, ups_qty, counted_qty, diff_qty, manual_qty, loc1_qty, loc2_qty, loc3_qty) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(save_id, item_code) DO UPDATE SET "
             "item_name=excluded.item_name, supplier=excluded.supplier, category=excluded.category, "
             "qr_qty=excluded.qr_qty, ups_qty=excluded.ups_qty, "
-            "counted_qty=excluded.counted_qty, diff_qty=excluded.diff_qty",
+            "counted_qty=excluded.counted_qty, diff_qty=excluded.diff_qty, "
+            "manual_qty=excluded.manual_qty, loc1_qty=excluded.loc1_qty, "
+            "loc2_qty=excluded.loc2_qty, loc3_qty=excluded.loc3_qty",
             (save_id, branch_code, date_str, code, it["item_name"], it["supplier"], it["category"],
-             it["qr_qty"], ups, counted, diff)
+             it["qr_qty"], ups, counted, diff, manual, l1, l2, l3)
         )
     # item_count/mismatch_count는 DB의 해당 save 전체 라인 기준으로 재계산
     cnt_row = conn.execute(
@@ -5267,11 +5612,15 @@ async def daily_stocktake_save(request: Request, session_token: str = Cookie(def
     counts = body.get("counts") or {}
     if not isinstance(counts, dict):
         raise HTTPException(status_code=400, detail="실사 수량 형식이 올바르지 않습니다.")
+    locs = body.get("locs") or {}
+    if not isinstance(locs, dict):
+        raise HTTPException(status_code=400, detail="위치 수량 형식이 올바르지 않습니다.")
 
     # 서버에서 현재 품목·재고값 재계산 (필터 무관 전체 소모품 제외 품목)
     items, _excluded = _daily_stocktake_items(branch_code)
     item_map = {it["item_code"]: it for it in items}
     parsed = _dst_parse_counts(counts, item_map)
+    parsed_locs = _dst_parse_locs(locs, item_map)
 
     kst = _tz(_td(hours=9))
     now_str = _dt.now(kst).strftime("%Y-%m-%d %H:%M:%S")
@@ -5282,7 +5631,7 @@ async def daily_stocktake_save(request: Request, session_token: str = Cookie(def
         save_id, existing = _dst_get_or_create_save(conn, branch_code, date_str, closer_name, login, now_str)
         if existing and (existing["status"] or "open") == "closed":
             raise HTTPException(status_code=409, detail="이미 마감된 실사입니다. 마감 후에는 수정할 수 없습니다.")
-        _dst_write_counts(conn, save_id, branch_code, date_str, parsed, item_map)
+        _dst_write_counts(conn, save_id, branch_code, date_str, parsed, item_map, parsed_locs)
         conn.commit()
     finally:
         conn.close()
@@ -5313,11 +5662,15 @@ async def daily_stocktake_close(request: Request, session_token: str = Cookie(de
     counts = body.get("counts") or {}
     if not isinstance(counts, dict):
         raise HTTPException(status_code=400, detail="실사 수량 형식이 올바르지 않습니다.")
+    locs = body.get("locs") or {}
+    if not isinstance(locs, dict):
+        raise HTTPException(status_code=400, detail="위치 수량 형식이 올바르지 않습니다.")
     confirm_zero = bool(body.get("confirm_zero"))
 
     items, _excluded = _daily_stocktake_items(branch_code)
     item_map = {it["item_code"]: it for it in items}
     parsed = _dst_parse_counts(counts, item_map)
+    parsed_locs = _dst_parse_locs(locs, item_map)
 
     kst = _tz(_td(hours=9))
     now_str = _dt.now(kst).strftime("%Y-%m-%d %H:%M:%S")
@@ -5330,7 +5683,7 @@ async def daily_stocktake_close(request: Request, session_token: str = Cookie(de
             raise HTTPException(status_code=409, detail="이미 마감된 실사입니다.")
 
         # 제출된 입력값 먼저 저장
-        _dst_write_counts(conn, save_id, branch_code, date_str, parsed, item_map)
+        _dst_write_counts(conn, save_id, branch_code, date_str, parsed, item_map, parsed_locs)
 
         # 전체 대상 품목 기준 미입력 확인 (필터 무관)
         missing = _dst_missing_items(conn, save_id, items)
@@ -5345,9 +5698,11 @@ async def daily_stocktake_close(request: Request, session_token: str = Cookie(de
             })
 
         if missing:
-            # 미입력 품목을 0으로 입력 (스냅샷 갱신, diff = 0 - ups)
+            # 미입력 품목을 0으로 입력 (수동 0 + 위치 비움 → counted=0, diff = 0 - ups)
             zero_parsed = {m["item_code"]: 0 for m in missing}
-            _dst_write_counts(conn, save_id, branch_code, date_str, zero_parsed, item_map)
+            zero_locs = {m["item_code"]: [None, None, None] for m in missing}
+            _dst_write_counts(conn, save_id, branch_code, date_str, zero_parsed, item_map,
+                              {**parsed_locs, **zero_locs})
 
         conn.execute(
             "UPDATE daily_stocktake_saves SET status='closed', closed_at=?, closed_by=?, "
@@ -5448,6 +5803,73 @@ async def daily_stocktake_delete(request: Request, session_token: str = Cookie(d
     finally:
         conn.close()
     return JSONResponse({"ok": True, "message": "실사 기록이 삭제되었습니다."})
+
+
+@app.post("/api/presence")
+async def api_presence_heartbeat(request: Request, session_token: str = Cookie(default=None)):
+    """페이지 동시편집 하트비트 — {page, scope_key, name?}를 upsert. scope_key는 페이지별 범위(예: 지점|날짜)."""
+    from datetime import datetime as _dt, timedelta as _td
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    page = str((body or {}).get("page") or "").strip()[:50]
+    scope_key = str((body or {}).get("scope_key") or "").strip()[:120]
+    if not page or not scope_key:
+        raise HTTPException(status_code=400, detail="page/scope_key가 필요합니다.")
+    name = str((body or {}).get("name") or "").strip()[:30] or str(user.get("login_id") or "")
+    now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+    login = str(user.get("login_id") or "")
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO page_presence (page, scope_key, login_id, display_name, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(page, scope_key, login_id) DO UPDATE SET "
+            "display_name=excluded.display_name, updated_at=excluded.updated_at",
+            (page, scope_key, login, name, now_str)
+        )
+        # 오래된 presence 정리 (10분 이상 무갱신)
+        stale = (_dt.now() - _td(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("DELETE FROM page_presence WHERE updated_at < ?", (stale,))
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/presence")
+async def api_presence_list(page: str = "", scope_key: str = "", session_token: str = Cookie(default=None)):
+    """현재 편집 중인 사용자 목록 — 90초 내 하트비트만 반환."""
+    from datetime import datetime as _dt, timedelta as _td
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not page or not scope_key:
+        raise HTTPException(status_code=400, detail="page/scope_key가 필요합니다.")
+    cutoff = (_dt.now() - _td(seconds=90)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT login_id, display_name, updated_at FROM page_presence "
+            "WHERE page=? AND scope_key=? AND updated_at >= ? ORDER BY updated_at DESC",
+            (page, scope_key, cutoff)
+        ).fetchall()
+    finally:
+        conn.close()
+    users = [{"login_id": r["login_id"], "display_name": r["display_name"] or r["login_id"],
+              "updated_at": r["updated_at"]} for r in rows]
+    return JSONResponse({"ok": True, "users": users})
 
 
 @app.get("/master/daily-stocktake", response_class=HTMLResponse)
@@ -14212,7 +14634,7 @@ async def master_test_eod_alert(request: Request, session_token: str = Cookie(de
             for it in its[:8]
         )
         more = f"\n...외 {len(its) - 8}건" if len(its) > 8 else ""
-        title = f"🧪[테스트] 긴급발주 알림 ({bn})"
+        title = f"🧪[테스트] 🚨 긴급발주 검토 알림 ({bn})"
         body = (
             f"[테스트] 실제 대상 지점: {bn}\n"
             f"기준일 {result['today']} / 도착 예정 {result['arrival']} (D-{result['days_left']}일)\n"
@@ -14344,7 +14766,7 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
                 + "\n".join(lines[:200])
             )
             send_teams_notification(
-                STOCK_CLOSING_TEST_BRANCH_CODE, "🧪[테스트] 🚨 긴급발주 알림", body,
+                STOCK_CLOSING_TEST_BRANCH_CODE, "🧪[테스트] 🚨 긴급발주 검토 알림", body,
                 sent_by="system_cron_eod_alert_test"
             )
             return JSONResponse(content={
@@ -14359,7 +14781,7 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
         for bc, its in by_branch.items():
             bn = its[0]["branch_name"]
             send_teams_notification(
-                bc, "🚨 긴급발주 알림", _eod_body(bn, its),
+                bc, "🚨 긴급발주 검토 알림", _eod_body(bn, its),
                 sent_by="system_cron_eod_alert"
             )
             sent_count += 1
