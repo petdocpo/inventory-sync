@@ -21556,6 +21556,8 @@ async def cron_sync_payment_records(request: Request, slot: str = "", date: str 
     cron_secret = os.environ.get("CRON_SECRET", "")
     if cron_secret and auth_header != f"Bearer {cron_secret}":
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    if not _cron_job_enabled("sync-payment-records"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     slot = (slot or "").strip()
     if slot not in PAYMENT_SLOTS:
@@ -25017,6 +25019,8 @@ async def cron_sync_sales_records(request: Request, date: str = ""):
     cron_secret = os.environ.get("CRON_SECRET", "")
     if cron_secret and auth_header != f"Bearer {cron_secret}":
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    if not _cron_job_enabled("sync-sales-records"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     date = (date or "").strip()
     if date and not re.fullmatch(r"\d{8}", date):
@@ -25034,6 +25038,8 @@ async def cron_sync_raw_inventory(request: Request):
     cron_secret = os.environ.get("CRON_SECRET", "")
     if cron_secret and auth_header != f"Bearer {cron_secret}":
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    if not _cron_job_enabled("sync-raw-inventory"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     result = await _fetch_and_process_s3_csv()
     return JSONResponse(content=result)
@@ -25412,6 +25418,8 @@ async def cron_sync_purchase_records(request: Request):
     cron_secret = os.environ.get("CRON_SECRET", "")
     if cron_secret and auth_header != f"Bearer {cron_secret}":
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    if not _cron_job_enabled("sync-purchase-records"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     result = await _fetch_and_process_purchase_records_csv()
     return JSONResponse(content=result)
@@ -25677,7 +25685,10 @@ async def _process_raw_upload(file: UploadFile, restrict_branch: Optional[str] =
     # 이전 H/Q 반영 이력도 초기화 (재계산 기준점 리셋)
     old_hq_rows = conn.execute("SELECT * FROM hq_bonus_log").fetchall()
     old_hq_map = {f"{r['branch_code']}|{r['item_code']}": r["last_hq_total"] for r in old_hq_rows}
-    conn.execute("DELETE FROM hq_bonus_log")
+    if restrict_branch:
+        conn.execute("DELETE FROM hq_bonus_log WHERE branch_code=?", (restrict_branch,))
+    else:
+        conn.execute("DELETE FROM hq_bonus_log")
     conn.commit()
     
 
@@ -25934,6 +25945,67 @@ async def raw_branch_upload(
 
 # ── 마스터 > QR 재고 업로드(초기화) ────────────────────
 
+def _qr_init_find_header(ws):
+    """QR 초기업로드 헤더 탐색 — 최대 5행 스캔, 지점/상품명/품번 키워드로 컬럼 매핑.
+    반환: (header_row_idx, col_map) 또는 (None, None)"""
+    KEYWORDS = {
+        "branch": ["지점"],
+        "item_name": ["상품명", "품명", "품목명"],
+        "item_code": ["품번", "품목코드", "상품코드"],
+        "qty": ["초기수량", "수량", "현재고", "기말수량"],
+    }
+    QTY_EXCLUDE = ("증가", "조정", "입고", "출고")
+    for row_idx in range(1, 6):
+        row_vals = next(ws.iter_rows(min_row=row_idx, max_row=row_idx, values_only=True), None)
+        if not row_vals:
+            continue
+        found = {}
+        for col_idx, cell_val in enumerate(row_vals):
+            if not cell_val:
+                continue
+            text = str(cell_val).strip()
+            for key in ("branch", "item_name", "item_code", "qty"):
+                if key in found:
+                    continue
+                if key == "qty" and any(x in text for x in QTY_EXCLUDE):
+                    continue
+                if any(kw in text for kw in KEYWORDS[key]):
+                    found[key] = col_idx
+        if all(k in found for k in ("branch", "item_name", "item_code")):
+            return row_idx, found
+    return None, None
+
+
+def _qr_init_data_rows(ws):
+    """(row_idx, branch_name, item_name, item_code, init_qty) 순회.
+    헤더 행이 있으면 컬럼명으로 매핑, 없으면 기존 A~D 고정 컬럼(2행부터) 사용."""
+    header_row, col_map = _qr_init_find_header(ws)
+    if col_map:
+        start = header_row + 1
+        for row_idx, row in enumerate(ws.iter_rows(min_row=start, values_only=True), start=start):
+            def cell(k):
+                ci = col_map.get(k)
+                return row[ci] if ci is not None and ci < len(row) else None
+            branch_name = str(cell("branch") or "").strip()
+            if not branch_name:
+                continue
+            item_name = str(cell("item_name") or "").strip()
+            item_code = str(cell("item_code") or "").strip()
+            q = cell("qty")
+            init_qty = int(float(str(q))) if q not in (None, "") else 0
+            yield row_idx, branch_name, item_name, item_code, init_qty
+    else:
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if not row or not row[0]:
+                continue
+            branch_name = str(row[0]).strip()
+            item_name = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+            item_code = str(row[2]).strip() if len(row) > 2 and row[2] else ""
+            q = row[3] if len(row) > 3 else None
+            init_qty = int(float(str(q))) if q not in (None, "") else 0
+            yield row_idx, branch_name, item_name, item_code, init_qty
+
+
 @app.get("/master/qr-init", response_class=HTMLResponse)
 async def qr_init_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -25955,7 +26027,7 @@ async def qr_init_page(session_token: str = Cookie(default=None)):
     <div class="card">
       <h3 style="margin-bottom:8px;">엑셀 업로드</h3>
       <p style="color:#666;font-size:12px;margin-bottom:12px;">
-        컬럼: <b>A=지점명 / B=상품명 / C=품번 / D=초기수량</b> (1행 헤더)
+        컬럼: <b>지점명 / 상품명 / 품번 / 수량(초기수량)</b> — 헤더명을 자동으로 찾습니다 (1~2행). 헤더가 없으면 A~D 고정 컬럼으로 처리
       </p>
       <div style="display:flex;gap:8px;align-items:center;">
         <input type="file" id="qrInitFile" accept=".xlsx,.xls" style="width:auto;flex:1;">
@@ -26028,19 +26100,12 @@ async def qr_init_upload_ajax(
     now = datetime.now().isoformat()
     success, skipped, errors = 0, 0, []
 
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        if not row[0]:
-            continue
+    for row_idx, branch_name, item_name, item_code, init_qty in _qr_init_data_rows(ws):
         try:
-            branch_name = str(row[0]).strip()
-            item_name = str(row[1]).strip() if row[1] else ""
-            item_code = str(row[2]).strip() if row[2] else ""
-            item_code = str(row[2]).strip() if row[2] else ""
             if not item_code:
                 import hashlib
                 name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
                 item_code = f"미지정_{name_hash}"
-            init_qty = int(float(str(row[3]))) if row[3] is not None else 0
             branch_code = (branch_map.get(branch_name)
                            or branch_map.get(branch_name.replace(" ", ""))
                            or branch_name)
@@ -26097,19 +26162,12 @@ async def qr_init_upload(
     conn = get_conn()
     now = datetime.now().isoformat()
 
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row[0]:
-            continue
+    for row_idx, branch_name, item_name, item_code, init_qty in _qr_init_data_rows(ws):
         try:
-            branch_name = str(row[0]).strip()
-            item_name = str(row[1]).strip() if row[1] else ""
-            item_code = str(row[2]).strip() if row[2] else ""
-            item_code = str(row[2]).strip() if row[2] else ""
             if not item_code:
                 import hashlib
                 name_hash = hashlib.md5(item_name.encode('utf-8')).hexdigest()[:8]
                 item_code = f"미지정_{name_hash}"
-            init_qty = int(float(str(row[3]))) if row[3] is not None else 0
             branch_code = (branch_map.get(branch_name)
                            or branch_map.get(branch_name.replace(" ", ""))
                            or branch_name)
@@ -28358,6 +28416,19 @@ async def cron_failure_log_page(
 # "지금 데이터가 들어오고 있는가"를 보여주고 필요 시 즉시 재수신한다.
 # ══════════════════════════════════════════════════════════
 
+def _cron_job_enabled(job: str) -> bool:
+    """system_settings 'cron_enabled:<job>' — 'off'일 때만 False. 미설정/조회 실패 시 True(기본 켜짐)."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT value FROM system_settings WHERE key=?", (f"cron_enabled:{job}",)
+        ).fetchone()
+        conn.close()
+        return not (row and str(row["value"]).strip().lower() == "off")
+    except Exception:
+        return True
+
+
 # 크론 작업 메타: (path, 이름, 설명, 스케줄, 그룹, 실패로그 prefix, 수동실행 가능)
 CRON_MANAGE_JOBS = [
     # ── 외부 데이터 수신 ──
@@ -28502,19 +28573,32 @@ async def master_cron_manage_page(session_token: str = Cookie(default=None)):
             recent_html = '<span style="color:#888;">—</span>'
             status_html = '<span style="color:#888;">실패만 기록됨</span>'
 
-        if runnable and path == "sync-payment-records":
+        if runnable:
+            enabled = _cron_job_enabled(path)
+            state_txt = "켜짐" if enabled else "꺼짐"
+            state_color = "#16A34A" if enabled else "#EF4444"
+            toggle_label = "자동 실행 중지" if enabled else "자동 실행 재개"
+            toggle_fn = f"toggleCron('{path}', {str(not enabled).lower()})"
+            if path == "sync-payment-records":
+                run_btn = (
+                    "<select id=\"cm-slot\" style=\"width:56px;padding:4px;\">"
+                    + "".join(f"<option value=\"{s}\">{s}시</option>" for s in PAYMENT_SLOTS)
+                    + "</select> "
+                    "<button class=\"btn\" style=\"padding:4px 10px;font-size:12px;\" "
+                    "onclick=\"runCron('sync-payment-records')\">지금 실행</button>")
+                res_id = "cm-result-pay"
+            else:
+                run_btn = (
+                    "<button class=\"btn\" style=\"padding:4px 10px;font-size:12px;\" "
+                    f"onclick=\"runCron('{path}')\">지금 실행</button>")
+                res_id = f"cm-result-{path}"
             run_html = (
-                '<select id="cm-slot" style="width:56px;padding:4px;">'
-                + "".join(f'<option value="{s}">{s}시</option>' for s in PAYMENT_SLOTS)
-                + '</select> '
-                '<button class="btn" style="padding:4px 10px;font-size:12px;" '
-                'onclick="runCron(\'sync-payment-records\')">지금 실행</button>'
-                '<div id="cm-result-pay" style="margin-top:6px;font-size:12px;"></div>')
-        elif runnable:
-            run_html = (
-                '<button class="btn" style="padding:4px 10px;font-size:12px;" '
-                f'onclick="runCron(\'{path}\')">지금 실행</button>'
-                f'<div id="cm-result-{path}" style="margin-top:6px;font-size:12px;"></div>')
+                f'<div style="font-size:12px;margin-bottom:4px;">자동 실행: '
+                f'<b style="color:{state_color};">{state_txt}</b></div>'
+                + run_btn + " "
+                + f'<button class="btn" style="padding:4px 10px;font-size:12px;background:#F59E0B;" '
+                + f'onclick="{toggle_fn}">{toggle_label}</button>'
+                + f'<div id="{res_id}" style="margin-top:6px;font-size:12px;"></div>')
         else:
             run_html = '<span style="color:#BBB;">—</span>'
 
@@ -28554,6 +28638,18 @@ async def master_cron_manage_page(session_token: str = Cookie(default=None)):
       </table>
     </div>
     <script>
+    async function toggleCron(job, enabled) {{
+      try {{
+        var res = await fetch('/master/cron-manage/toggle', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{job: job, enabled: enabled}})
+        }});
+        var data = await res.json();
+        if (res.ok) {{ location.reload(); }}
+        else {{ alert('실패: ' + (data.detail || res.status)); }}
+      }} catch (e) {{ alert('요청 오류: ' + e); }}
+    }}
     async function runCron(job) {{
       var slot = null;
       if (job === 'sync-payment-records') {{
@@ -28618,6 +28714,41 @@ async def master_cron_manage_run(request: Request, session_token: str = Cookie(d
         err_msg = str(e)[:500]
         report_cron_failure(f"cron-manage:{job}", err_msg)
         return JSONResponse(status_code=500, content={"detail": err_msg})
+
+
+CRON_TOGGLEABLE_JOBS = ("sync-payment-records", "sync-sales-records",
+                        "sync-raw-inventory", "sync-purchase-records")
+
+
+@app.post("/master/cron-manage/toggle")
+async def master_cron_manage_toggle(request: Request, session_token: str = Cookie(default=None)):
+    """외부 데이터 수신 크론의 자동 실행 on/off (마스터 전용). system_settings에 저장."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    if not has_menu_permission(user["login_id"], "cron-manage"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    job = (data.get("job") or "").strip()
+    enabled = bool(data.get("enabled"))
+    if job not in CRON_TOGGLEABLE_JOBS:
+        return JSONResponse(status_code=400, content={"detail": "토글을 지원하지 않는 작업입니다."})
+
+    key = f"cron_enabled:{job}"
+    value = "on" if enabled else "off"
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+        if row:
+            conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?", (value, key))
+        else:
+            conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"설정 저장 실패: {str(e)[:200]}"})
+    return JSONResponse(content={"status": "ok", "job": job, "enabled": enabled})
 
 
 if __name__ == "__main__":
