@@ -1867,12 +1867,7 @@ async def purchase_history_page(
             if isinstance(qty, (int, float)):
                 qty = int(qty) if qty == int(qty) else qty
             check_cell = f'<td style="text-align:center;"><input type="checkbox" class="ph-check" value="{oid}" style="width:16px;height:16px;"></td>' if is_master else ""
-            qty_cell = (
-                f'<td style="text-align:right;"><span id="qtyDisplay_{oid}">{qty}</span> '
-                f'<button class="btn" style="font-size:10px;padding:2px 6px;margin-left:4px;" onclick="editQuantity(\'{oid}\', {qty})">수정</button></td>'
-                if is_master else
-                f'<td style="text-align:right;">{qty}</td>'
-            )
+            qty_cell = f'<td style="text-align:right;">{qty}</td>'
             rows_html += f"""
             <tr>
                 {check_cell}
@@ -1959,21 +1954,6 @@ async def purchase_history_page(
         }}
       }})();
 
-      async function editQuantity(orderId, currentQty) {{
-        const newQty = prompt('새 수량을 입력하세요:', currentQty);
-        if (newQty === null) return;
-        if (isNaN(parseFloat(newQty))) {{ alert('숫자를 입력하세요.'); return; }}
-        const res = await fetch('/purchase-history/update-quantity', {{
-          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ order_id: orderId, quantity: parseFloat(newQty) }})
-        }});
-        if (res.ok) {{
-          document.getElementById('qtyDisplay_' + orderId).innerText = newQty;
-        }} else {{
-          const err = await res.json();
-          alert('오류: ' + (err.detail || '수정 실패'));
-        }}
-      }}
     </script>
     """
     return HTMLResponse(content=render_page(content, user, "purchase-history"))
@@ -2342,8 +2322,12 @@ _COLUMN_SETTINGS_HTML = """
           for (var i = 0; i < all.length; i++) { if (all[i] === table) return i; }
           return -1;
         }
+        // data-colkey가 있으면 테이블 순번 대신 사용 — 앞에 조건부 테이블이 생겨도 키가 안 밀린다
+        function cvTableId(table) {
+          return table.getAttribute('data-colkey') || cvIndex(table);
+        }
         function cvBaseKey(table) {
-          var i = cvIndex(table);
+          var i = cvTableId(table);
           var v = table.getAttribute('data-colver') || '';
           return window.location.pathname + '_' + i + (v ? '_' + v : '');
         }
@@ -2519,7 +2503,7 @@ _COLUMN_SETTINGS_HTML = """
           else if (qi >= 0 && hi < 0) { nh.splice(qi, 1); nh.push(pos); }
           cvSaveHidden(table, nh);
           try {
-            var wk = 'colWidths2_' + window.location.pathname + '_' + cvIndex(table)
+            var wk = 'colWidths2_' + window.location.pathname + '_' + cvTableId(table)
               + ((table.getAttribute('data-colver') || '') ? '_' + table.getAttribute('data-colver') : '');
             var ws = JSON.parse(localStorage.getItem(wk) || 'null');
             if (Array.isArray(ws) && ws.length === n) { var tw = ws[pos]; ws[pos] = ws[q]; ws[q] = tw; localStorage.setItem(wk, JSON.stringify(ws)); }
@@ -2720,7 +2704,7 @@ _COLUMN_SETTINGS_HTML = """
           var tables = {};
           document.querySelectorAll('table').forEach(function(table) {
             if (!cvEligible(table)) return;
-            var suffix = String(cvIndex(table)) + ((table.getAttribute('data-colver') || '') ? '_' + table.getAttribute('data-colver') : '');
+            var suffix = String(cvTableId(table)) + ((table.getAttribute('data-colver') || '') ? '_' + table.getAttribute('data-colver') : '');
             tables[suffix + '_f'] = [cvFontSize(table)];
           });
           var orig = btn ? btn.textContent : '';
@@ -2738,7 +2722,7 @@ _COLUMN_SETTINGS_HTML = """
           var tables = {};
           document.querySelectorAll('table').forEach(function(table) {
             if (!cvEligible(table)) return;
-            var suffix = String(cvIndex(table)) + ((table.getAttribute('data-colver') || '') ? '_' + table.getAttribute('data-colver') : '');
+            var suffix = String(cvTableId(table)) + ((table.getAttribute('data-colver') || '') ? '_' + table.getAttribute('data-colver') : '');
             tables[suffix] = cvHidden(table);
             // 컬럼 너비 기본값 — 현재 렌더링된 헤더 셀 너비
             try {
@@ -3034,9 +3018,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         .topbar {{ background: #1E2761; color: white; padding: 10px 14px;
                   display: flex; justify-content: space-between; align-items: center; }}
         .content {{ max-width: 960px; margin: 0 auto; padding: 10px 14px; }}
-        .pc-mode .content {{ max-width: 1600px; padding: 10px 24px; }}
-        .pc-mode .bottomnav {{ display: none; }}
-        .pc-mode body {{ padding-bottom: 24px; }}
+        .pc-mode .content {{ max-width: 1600px; }}
         .card {{ background: white; border-radius: 12px; padding: 16px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }}
         .btn {{ background: #1E2761; color: white; padding: 8px 14px;
@@ -3193,7 +3175,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         }}
         // ==COLW-END==
         function storageKey(table) {{
-          var tIdx = tableIndexOf(table);
+          var tIdx = table.getAttribute('data-colkey') || tableIndexOf(table);
           var ver = table.getAttribute('data-colver') || '';
           return STORAGE_PREFIX + window.location.pathname + '_' + tIdx + (ver ? '_' + ver : '');
         }}
@@ -3279,6 +3261,8 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
               }});
               if (!valid) return;
               ths.forEach(function(th, i) {{ th.style.width = widths[i] + 'px'; }});
+              var cols = table.querySelectorAll('colgroup col');
+              if (cols.length === ths.length) {{ cols.forEach(function(c, i) {{ c.style.width = widths[i] + 'px'; }}); }}
               table.style.width = sum + 'px';
             }} catch (e) {{}}
           }});
@@ -3312,6 +3296,10 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
               th.style.width = w[i] + 'px';
               sum += w[i];
             }});
+            var cols = table.querySelectorAll('colgroup col');
+            if (cols.length === ths.length) {{
+              cols.forEach(function(c, i) {{ c.style.width = w[i] + 'px'; }});
+            }}
             table.style.width = sum + 'px';
           }}
           function freezeTable() {{
@@ -4964,15 +4952,9 @@ async def daily_stocktake_page(
             ups_val = line["ups_qty"]
             ups_disp = _fmt_num(ups_val)
             ups_attr = "" if ups_val is None else str(ups_val)
-            mqty = _dst_line_get(line, "manual_qty")
             loc_vals = [_dst_line_get(line, "loc1_qty"), _dst_line_get(line, "loc2_qty"),
                         _dst_line_get(line, "loc3_qty")]
-            if mqty is not None:
-                cv = mqty
-            elif any(v is not None for v in loc_vals):
-                cv = None  # 위치값만 입력된 경우 수동 칸은 빈 값
-            else:
-                cv = line["counted_qty"]  # 위치 기능 이전 저장분 → 수동 입력값으로 표시
+            cv = line["counted_qty"]  # 실사 수량 칸 = 최종 실사 수량
             badge = ' <span style="font-size:10px;color:#1E40AF;background:#EFF6FF;padding:1px 5px;border-radius:8px;">스냅샷</span>'
         else:
             qr_disp = _fmt_num(it["qr_qty"])
@@ -4994,7 +4976,7 @@ async def daily_stocktake_page(
             loc_html += (
                 f'<td><input type="number" min="0" class="dst-loc" '
                 f'data-code="{_html.escape(code)}" data-loc="{_li + 1}"{_lv_attr}{dis_attr} '
-                'oninput="dstUpdateDiff(this)" placeholder="위치" '
+                'oninput="dstLocInput(this)" placeholder="위치" '
                 'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
             )
         rows_html += (
@@ -5114,13 +5096,17 @@ async def daily_stocktake_page(
     script = """
     <script>
       function dstRowTotal(tr) {
-        var total = 0, any = false;
         var mi = tr.querySelector('.dst-input');
-        if (mi && mi.value !== '') { var mv = parseInt(mi.value, 10); if (!isNaN(mv)) { total += mv; any = true; } }
+        if (!mi || mi.value === '') return null;
+        var v = parseInt(mi.value, 10);
+        return isNaN(v) ? null : v;
+      }
+      function dstLocSum(tr) {
+        var sum = 0, any = false;
         tr.querySelectorAll('.dst-loc').forEach(function(li) {
-          if (li.value !== '') { var lv = parseInt(li.value, 10); if (!isNaN(lv)) { total += lv; any = true; } }
+          if (li.value !== '') { var lv = parseInt(li.value, 10); if (!isNaN(lv)) { sum += lv; any = true; } }
         });
-        return any ? total : null;
+        return any ? sum : null;
       }
       function dstUpdateDiff(inp) {
         var tr = inp.closest('tr');
@@ -5128,9 +5114,8 @@ async def daily_stocktake_page(
         var ups = inp.getAttribute('data-ups') || (tr.querySelector('.dst-input') ? tr.querySelector('.dst-input').getAttribute('data-ups') : '');
         var hint = tr.querySelector('.dst-total-hint');
         var total = dstRowTotal(tr);
-        var locUsed = false;
-        tr.querySelectorAll('.dst-loc').forEach(function(li) { if (li.value !== '') locUsed = true; });
-        if (hint) hint.textContent = locUsed && total !== null ? ('합계: ' + total) : '';
+        var locSum = dstLocSum(tr);
+        if (hint) hint.textContent = (locSum !== null) ? ('위치 합계: ' + locSum) : '';
         if (total === null || ups === '') {
           cell.textContent = '-';
           cell.style.color = '#888';
@@ -5145,6 +5130,27 @@ async def daily_stocktake_page(
         cell.textContent = (diff > 0 ? '+' : '') + diff;
         cell.style.color = diff === 0 ? '#22C55E' : (diff < 0 ? '#EF4444' : '#F59E0B');
       }
+
+      // 위치 칸 입력 → 실사 수량 칸에 위치 합계를 자동 입력 (기존 수동값은 백업 후 복원)
+      function dstLocInput(inp) {
+        var tr = inp.closest('tr');
+        var mi = tr ? tr.querySelector('.dst-input') : null;
+        if (mi) {
+          var sum = dstLocSum(tr);
+          if (sum !== null) {
+            if (mi.getAttribute('data-manual-bak') === null) mi.setAttribute('data-manual-bak', mi.value);
+            mi.value = String(sum);
+          } else if (mi.getAttribute('data-manual-bak') !== null) {
+            mi.value = mi.getAttribute('data-manual-bak');
+            mi.removeAttribute('data-manual-bak');
+          }
+        }
+        dstUpdateDiff(inp);
+      }
+      var dstDirty = false;
+      document.addEventListener('input', function(e) {
+        if (e.target && (e.target.classList.contains('dst-input') || e.target.classList.contains('dst-loc'))) dstDirty = true;
+      });
 
       function dstCollect() {
         var closerEl = document.getElementById('dstCloser');
@@ -5288,6 +5294,8 @@ async def daily_stocktake_page(
 
       // ── 동시 편집 presence (쓰기 가능 + 미마감일 때만) ──
       var DST_PRESENCE = '__DST_PRESENCE__';
+      var DST_SAVE_AT = '__DST_SAVE_AT__';
+      var DST_BRANCH = '__DST_BRANCH__';
       function dstPresenceName() {
         var el = document.getElementById('dstCloser');
         return (el && el.value.trim()) ? el.value.trim() : '__DST_LOGIN__';
@@ -5326,13 +5334,38 @@ async def daily_stocktake_page(
           if (res.ok) dstPresenceRender(data.users || []);
         } catch (e) {}
       }
+      // 다른 사용자가 저장하면 자동 반영 — 입력 중(dirty)이면 알림만 표시
+      async function dstSyncPoll() {
+        if (DST_PRESENCE !== '1') return;
+        try {
+          var res = await fetch('/api/daily-stocktake/status?branch_code='
+            + encodeURIComponent(DST_BRANCH) + '&date=' + encodeURIComponent('__DST_DATE__'));
+          var d = await res.json();
+          if (!res.ok || !d.ok) return;
+          var remote = d.saved_at || '';
+          if (remote && remote !== DST_SAVE_AT) {
+            if (!dstDirty) { location.reload(); return; }
+            var b = document.getElementById('dstPresence');
+            if (b && !document.getElementById('dstSyncNote')) {
+              var n = document.createElement('div');
+              n.id = 'dstSyncNote';
+              n.style.cssText = 'margin-top:6px;color:#B45309;font-weight:bold;';
+              n.innerHTML = '⚠️ 다른 사용자가 저장했습니다. <a href="javascript:location.reload()" style="color:#1E2761;">새로고침</a>';
+              b.appendChild(n);
+            }
+            DST_SAVE_AT = remote;
+          }
+        } catch (e) {}
+      }
       if (DST_PRESENCE === '1') {
-        dstPresenceBeat(); dstPresencePoll();
+        dstPresenceBeat(); dstPresencePoll(); dstSyncPoll();
         setInterval(dstPresenceBeat, 20000);
         setInterval(dstPresencePoll, 20000);
+        setInterval(dstSyncPoll, 20000);
       }
     </script>
-    """.replace("__DST_DATE__", sel_date_str).replace("__DST_PRESENCE__", "1" if (page_can_write and not is_closed) else "0").replace("__DST_SCOPE__", _html.escape(str(target_branch) + "|" + sel_date_str)).replace("__DST_LOGIN__", _html.escape(str(user.get("login_id") or "")))
+    """.replace("__DST_DATE__", sel_date_str).replace("__DST_PRESENCE__", "1" if (page_can_write and not is_closed) else "0").replace("__DST_SCOPE__", _html.escape(str(target_branch) + "|" + sel_date_str)).replace("__DST_LOGIN__", _html.escape(str(user.get("login_id") or ""))).replace("__DST_SAVE_AT__", _html.escape(str(save["saved_at"] or "") if save else "")).replace("__DST_BRANCH__", _html.escape(str(target_branch)))
+
 
     content = (
         '<h2 style="margin:0 0 8px 0;">🧮 재고 실사</h2>'
@@ -5341,8 +5374,9 @@ async def daily_stocktake_page(
         + (f' · 제외된 품목 {excluded_count}건' if excluded_count else '')
         + '</p>'
         '<p style="color:#888;font-size:12px;margin-bottom:16px;">'
-        "오차 = 실사 수량(수동+위치1~3 합계) − 유비플러스 재고 · 빈 칸은 저장 시 기존 값 유지 · "
-        "위치 수량과 수동 입력은 함께 합산됩니다 · inventory 미등록 품목은 실사 대상이 아닙니다</p>"
+        "오차 = 실사 수량 − 유비플러스 재고 · 빈 칸은 저장 시 기존 값 유지 · "
+        "위치1~3에 입력하면 실사 수량에 합계가 자동 입력되고, 실사 수량 직접 입력도 가능합니다 · "
+        "inventory 미등록 품목은 실사 대상이 아닙니다</p>"
         + filter_html
         + notices_html
         + '<div id="dstPresence" style="margin-bottom:12px;"></div>'
@@ -5510,8 +5544,9 @@ def _dst_write_counts(conn, save_id, branch_code: str, date_str: str, parsed: di
                           _dst_line_get(ex, "loc3_qty"))
         else:
             l1 = l2 = l3 = None
-        parts = [v for v in [manual, l1, l2, l3] if v is not None]
-        counted = sum(parts) if parts else None
+        loc_parts = [v for v in (l1, l2, l3) if v is not None]
+        loc_sum = sum(loc_parts) if loc_parts else None
+        counted = manual if manual is not None else loc_sum
         diff = (counted - ups) if (counted is not None and ups is not None) else None
         conn.execute(
             "INSERT INTO daily_stocktake_lines "
@@ -5763,6 +5798,39 @@ async def daily_stocktake_reopen(request: Request, session_token: str = Cookie(d
     if not row:
         raise HTTPException(status_code=404, detail="해당 날짜의 실사 기록이 없습니다.")
     return JSONResponse({"ok": True, "message": "마감이 해제되었습니다."})
+
+
+@app.get("/api/daily-stocktake/status")
+async def api_daily_stocktake_status(
+    branch_code: str = "",
+    date: str = "",
+    session_token: str = Cookie(default=None)
+):
+    from fastapi import HTTPException
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    is_master = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_master:
+        bc = branch_code.strip()
+        valid_codes = {b["branch_code"] for b in get_branches()}
+        if not bc or bc not in valid_codes:
+            raise HTTPException(status_code=400, detail="지점 코드를 선택하세요.")
+    else:
+        bc = user["branch_code"]
+    ds = date.strip()
+    try:
+        datetime.strptime(ds, "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT saved_at, status FROM daily_stocktake_saves WHERE branch_code=? AND count_date=?",
+        (bc, ds)
+    ).fetchone()
+    conn.close()
+    return {"ok": True, "saved_at": row["saved_at"] if row else None,
+            "status": row["status"] if row else None}
 
 
 @app.post("/daily-stocktake/delete")
@@ -16793,16 +16861,6 @@ async def master_page(session_token: str = Cookie(default=None)):
         </div>
       </a>
         """)
-    if menu_allowed("branch-exceptions"):
-        db_inventory_cards.append("""
-      <a href="/master/purchase-order/branch-exceptions" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">🏬</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주서 지점 예외</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">소모품 포함 지점 설정</div>
-        </div>
-      </a>
-        """)
     if menu_allowed("safety-stock"):
         db_inventory_cards.append("""
       <a href="/master/purchase-order/safety-stock" style="text-decoration:none;">
@@ -17491,8 +17549,8 @@ async def _compute_purchase_order_candidates() -> dict:
     판정 순서 (하나라도 걸리면 제외):
       1. product_master.order_excluded = TRUE (전체 미발주로 숨긴 상품)
       2. 현재고(raw_inventory) >= 안전재고(safety_stock) (재고 충분)
-      3. is_consumable=TRUE 이고, 이 지점x상품이 product_branch_order_exclusion에 없음 (소모품 기본 제외)
-      4. 이 지점x상품의 가장 최근 purchase_records.status 가 '접수' 또는 '승인' (미입고 발주 존재, 중복 방지)
+      3. 이 지점x상품의 가장 최근 purchase_records.status 가 '접수' 또는 '승인' (미입고 발주 존재, 중복 방지)
+      (소모품 여부는 발주 제외 사유가 아님 — 모든 지점 공통으로 발주 대상 판정)
 
     남은 대상 분류:
       5. 리드타임 >= 35 또는 purchase_order_monthly_exception에 등록됨 -> 월간
@@ -17543,12 +17601,6 @@ async def _compute_purchase_order_candidates() -> dict:
     monthly_exc_set = {(r["item_code"], r["branch_code"]) for r in monthly_exc_rows if r["item_code"]}
     monthly_exc_name_set = {(r["item_name"], r["branch_code"]) for r in monthly_exc_rows if not r["item_code"]}
 
-    # ── 6) 소모품 지점별 예외(포함 허용) 목록: (item_code, branch_code) 조합 집합 ──
-    consumable_exc_rows = conn.execute(
-        "SELECT item_code, branch_code FROM product_branch_order_exclusion"
-    ).fetchall()
-    consumable_include_set = {(r["item_code"], r["branch_code"]) for r in consumable_exc_rows}
-
     # ── 7) 지점x상품별 가장 최근 발주 상태 맵: (branch_name, item_name) -> 최신 status ──
     status_rows = conn.execute("""
         SELECT DISTINCT ON (branch_name, item_name) branch_name, item_name, status
@@ -17586,12 +17638,7 @@ async def _compute_purchase_order_candidates() -> dict:
         if current_qty >= safety_qty:
             continue
 
-        # 3. 소모품 기본 제외 (지점별 예외 등록 시 포함)
-        is_consumable = bool(pm["is_consumable"]) if pm else False
-        if is_consumable and (item_code, branch_code) not in consumable_include_set:
-            continue
-
-        # 4. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고
+        # 3. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고
         latest_status = status_map.get((branch_name, item_name))
         if latest_status in PENDING_STATUSES:
             pending_report.append({
@@ -17688,63 +17735,45 @@ async def purchase_order_preview_page(session_token: str = Cookie(default=None))
     if message:
         message_html = f'<div style="background:#fff3cd;padding:12px;border-radius:8px;margin-bottom:20px;color:#856404;">{message}</div>'
 
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="ko">
-    <head>
-      <meta charset="UTF-8">
-      <title>발주서 미리보기</title>
-      <style>
-        body {{ font-family: -apple-system, sans-serif; background:#f5f6fa; padding:20px; }}
-        h2 {{ color:#1E2761; }}
-        table {{ width:100%; border-collapse:collapse; background:#fff; margin-bottom:32px; box-shadow:0 1px 3px rgba(0,0,0,0.1); }}
-        th, td {{ padding:10px 12px; border-bottom:1px solid #eee; font-size:11px; }}
-        th {{ background:#1E2761; color:#fff; text-align:left; }}
-        .count-badge {{ display:inline-block; background:#1E2761; color:#fff; border-radius:12px; padding:2px 10px; font-size:12px; margin-left:8px; }}
-        a.back-link {{ color:#1E2761; text-decoration:none; font-size:13px; }}
-      </style>
-    </head>
-    <body>
+    content = f"""
+    <style>
+      .po-prev h2 {{ color:#1E2761; }}
+      .po-prev table {{ width:100%; border-collapse:collapse; background:#fff; margin-bottom:32px; box-shadow:0 1px 3px rgba(0,0,0,0.1); }}
+      .po-prev th, .po-prev td {{ padding:10px 12px; border-bottom:1px solid #eee; font-size:11px; }}
+      .count-badge {{ display:inline-block; background:#1E2761; color:#fff; border-radius:12px; padding:2px 10px; font-size:12px; margin-left:8px; }}
+      a.back-link {{ color:#1E2761; text-decoration:none; font-size:13px; }}
+    </style>
+    <div class="po-prev">
       <a href="/master" class="back-link">&larr; 마스터 대시보드로</a>
       {message_html}
 
       <h2>주간 발주 대상 <span class="count-badge">{len(weekly)}건</span>
-        <a href="/master/purchase-order/preview/export?order_type=weekly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">📥 엑셀 다운로드</a>
+        <a href="/master/purchase-order/preview/export?order_type=weekly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">엑셀 다운로드</a>
       </h2>
-      <table>
-        <thead>
-          <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
-        </thead>
-        <tbody>
-          {render_rows(weekly)}
-        </tbody>
-      </table>
+      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:auto;"><thead>
+        <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
+      </thead><tbody>
+        {render_rows(weekly)}
+      </tbody></table></div>
 
       <h2>월간 발주 대상 <span class="count-badge">{len(monthly)}건</span>
-        <a href="/master/purchase-order/preview/export?order_type=monthly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">📥 엑셀 다운로드</a>
+        <a href="/master/purchase-order/preview/export?order_type=monthly" style="font-size:12px;background:#1E2761;color:#fff;padding:4px 12px;border-radius:6px;text-decoration:none;margin-left:8px;">엑셀 다운로드</a>
       </h2>
-      <table>
-        <thead>
-          <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
-        </thead>
-        <tbody>
-          {render_rows(monthly)}
-        </tbody>
-      </table>
+      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:auto;"><thead>
+        <tr><th>지점</th><th>품번</th><th>품명</th><th>안전재고</th><th>MOQ</th><th>최종발주수량</th></tr>
+      </thead><tbody>
+        {render_rows(monthly)}
+      </tbody></table></div>
 
       <h2>미입고 보류 (별도 확인 필요) <span class="count-badge">{len(pending_report)}건</span></h2>
-      <table>
-        <thead>
-          <tr><th>지점</th><th>품번</th><th>품명</th><th>상태</th></tr>
-        </thead>
-        <tbody>
-          {render_pending_rows(pending_report)}
-        </tbody>
-      </table>
-    </body>
-    </html>
+      <div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:auto;"><thead>
+        <tr><th>지점</th><th>품번</th><th>품명</th><th>상태</th></tr>
+      </thead><tbody>
+        {render_pending_rows(pending_report)}
+      </tbody></table></div>
+    </div>
     """
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=render_page(content, user, "master"))
 
 
 # ── 유비플러스 재고 (RAW 업로드) ────────────────────────
@@ -18063,7 +18092,7 @@ async def purchase_order_product_settings_page(
         <p style="font-size:11px;color:#888;margin:6px 0 0 0;">체크한 행들을 품번 기준으로 묶어 같은 지점 설정을 한 번에 저장합니다. 월예외는 품명 기준으로 묶입니다.</p>
       </div>
 
-      <table class="pm-table">
+      <table class="pm-table" data-colkey="pm-main" data-colw data-colver="2026-11-19" style="table-layout:auto;">
         <thead><tr>
           <th style="text-align:center;"><input type="checkbox" id="pmCheckAll" onclick="togglePmCheckAll(this)" style="width:18px;height:18px;"></th>
           <th class="pm-col-branch">지점</th>
@@ -18435,9 +18464,6 @@ async def purchase_order_settings_guide(
         monthly_exc_rows = conn.execute(
             "SELECT item_code, item_name, branch_code FROM purchase_order_monthly_exception"
         ).fetchall()
-        consumable_exc_rows = conn.execute(
-            "SELECT item_code, branch_code FROM product_branch_order_exclusion"
-        ).fetchall()
     finally:
         conn.close()
 
@@ -18450,11 +18476,6 @@ async def purchase_order_settings_guide(
             monthly_map.setdefault(r["item_code"], set()).add(nm)
         elif r["item_name"]:
             monthly_name_map.setdefault(r["item_name"], set()).add(nm)
-    consumable_map: Dict[str, set] = {}
-    for r in consumable_exc_rows:
-        if r["item_code"]:
-            consumable_map.setdefault(r["item_code"], set()).add(
-                code_to_name.get(r["branch_code"], r["branch_code"] or "?"))
 
     q = (q or "").strip()
     trs = []
@@ -18466,12 +18487,10 @@ async def purchase_order_settings_guide(
         lt = r["lead_time_days"]
         lt_val = int(lt) if lt is not None else 0
         mo = monthly_map.get(code, set()) | monthly_name_map.get(name, set())
-        ci = consumable_map.get(code, set())
+        ci = set()  # 소모품 지점 예외는 발주 판정에 사용하지 않음 (레거시)
 
         if r["order_excluded"]:
             klass = ("전체 미발주", "#DC2626")
-        elif r["is_consumable"]:
-            klass = ("소모품 — 발주 제외" + ("(일부 지점 포함)" if ci else ""), "#D97706")
         elif lt_val >= 35:
             klass = ("월발주 (리드타임 35일↑)", "#7C3AED")
         elif lt_val <= 0:
@@ -18518,7 +18537,7 @@ async def purchase_order_settings_guide(
       <ol style="font-size:13px;color:#1E3A8A;margin:0;padding-left:20px;line-height:1.8;">
         <li><b>전체 미발주</b>(order_excluded=예) → 항상 제외</li>
         <li><b>현재고 ≥ 안전재고</b> → 제외 (재고 충분)</li>
-        <li><b>소모품</b> → 제외. 단 <b>product_branch_order_exclusion</b>에 지점×품번 등록 시 그 지점만 포함</li>
+        <li><b>소모품</b> → 발주 제외 사유 아님. 모든 지점 공통으로 아래 규칙 적용 (제외하려면 '전체 미발주/숨기기' 사용)</li>
         <li><b>미입고 발주(접수/승인)</b> 존재 → 제외 + 별도 보고</li>
         <li>통과 시 <b>주/월 분류</b>: 리드타임 ≥35일 또는 월예외 등록 → 월발주, 나머지 주발주</li>
         <li>최종수량 = 안전재고를 <b>MOQ 배수</b>로 올림</li>
@@ -18530,7 +18549,7 @@ async def purchase_order_settings_guide(
       · 소모품 / 리드타임 / MOQ / 최소 안전재고 / 전체 미발주(숨기기) →
         <a href="/master/purchase-order/product-settings" style="color:#1E40AF;">상품 설정</a> 페이지 (품번 단위 일괄 적용 권장)<br>
       · 월 1회 예외(지점×상품) → 상품 설정 표의 '지방점 주발주 제외' 열 '설정' 버튼<br>
-      · 소모품 지점별 포함 예외 → product_branch_order_exclusion 테이블 (별도 관리 화면 없음)</p>
+      · 소모품 여부는 발주 제외 조건이 아니며 모든 지점에 동일 적용됩니다.</p>
     </div>
 
     <div class="card">
@@ -18539,11 +18558,11 @@ async def purchase_order_settings_guide(
         <button class="btn" type="submit">검색</button>
         <a href="/master/purchase-order/settings-guide" style="padding:10px 14px;background:#eee;border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>
       </form>
-      <table>
+      <table data-colkey="guide-main" data-colw data-colver="2026-11-19" style="table-layout:auto;">
         <thead><tr>
           <th>품번</th><th>상품명</th><th>지점행</th><th>적용 분류</th>
           <th>소모품</th><th>전체미발주</th><th>리드타임</th><th>MOQ</th><th>최소안전재고</th>
-          <th>월예외 지점</th><th>소모품 포함 지점</th>
+          <th>월예외 지점</th><th>소모품 포함 지점(구)</th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
       </table>
@@ -19812,117 +19831,6 @@ async def purchase_tracking_history_page(
     </div>
     """
     return HTMLResponse(content=render_page(content, user, "master"))
-
-@app.get("/master/purchase-order/branch-exceptions", response_class=HTMLResponse)
-async def purchase_order_branch_exceptions_page(session_token: str = Cookie(default=None)):
-    user = get_session(session_token)
-    if not user or user["role"] != "master":
-        return RedirectResponse(url="/login", status_code=303)
-    if not has_menu_permission(user["login_id"], "branch-exceptions"):
-        return RedirectResponse(url="/master", status_code=303)
-
-    conn = get_conn()
-    exception_rows = conn.execute(
-        "SELECT branch_code FROM purchase_order_branch_exception WHERE exception_type='consumable_include'"
-    ).fetchall()
-    conn.close()
-
-    exception_set = {r["branch_code"] for r in exception_rows}
-
-    branches = get_branches(branch_type='branch')
-
-    rows_html = ""
-    for b in branches:
-        consumable_checked = "checked" if b["branch_code"] in exception_set else ""
-        rows_html += f"""
-        <tr>
-          <td>{b['branch_name']}</td>
-          <td style="text-align:center;">
-            <input type="checkbox" class="exc-check" data-branch="{b['branch_code']}" data-type="consumable_include" {consumable_checked} style="width:18px;height:18px;">
-          </td>
-        </tr>
-        """
-
-    content = f"""
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
-      <a href="/master" style="color:#1E2761;">← 마스터</a>
-      <h2>🏬 발주서 지점 예외 설정</h2>
-    </div>
-    <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <p style="font-size:13px;color:#1E40AF;">
-        <b>소모품 포함</b>: 체크된 지점은 소모품도 발주 목록에서 제외하지 않고 포함시킵니다.<br>
-        체크박스를 클릭하면 즉시 저장됩니다.<br>
-        <b>월 1회 예외(지점+상품별 개별 지정)</b>는 <a href="/master/purchase-order/product-settings" style="color:#1E40AF;text-decoration:underline;">상품 설정 페이지</a>에서 상품별로 지정합니다.
-      </p>
-    </div>
-    <div class="card">
-      <table>
-        <thead><tr>
-          <th>지점</th><th style="text-align:center;">소모품 포함</th>
-        </tr></thead>
-        <tbody>{rows_html}</tbody>
-      </table>
-    </div>
-    <script>
-      document.querySelectorAll('.exc-check').forEach(function(cb) {{
-        cb.addEventListener('change', async function() {{
-          const branchCode = cb.dataset.branch;
-          const excType = cb.dataset.type;
-          const enabled = cb.checked;
-          try {{
-            const res = await fetch('/master/purchase-order/branch-exceptions/toggle', {{
-              method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-              body: JSON.stringify({{ branch_code: branchCode, exception_type: excType, enabled: enabled }})
-            }});
-            if (!res.ok) {{
-              alert('저장 실패');
-              cb.checked = !enabled;
-            }}
-          }} catch(e) {{
-            alert('저장 중 오류가 발생했습니다.');
-            cb.checked = !enabled;
-          }}
-        }});
-      }});
-    </script>
-    """
-    return HTMLResponse(content=render_page(content, user, "master"))
-
-
-@app.post("/master/purchase-order/branch-exceptions/toggle")
-async def purchase_order_branch_exceptions_toggle(request: Request, session_token: str = Cookie(default=None)):
-    user = get_session(session_token)
-    if not user or user["role"] != "master":
-        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
-
-    data = await request.json()
-    branch_code = data.get("branch_code", "").strip()
-    exception_type = data.get("exception_type", "").strip()
-    enabled = bool(data.get("enabled", False))
-
-    if not branch_code or exception_type != "consumable_include":
-        return JSONResponse(status_code=400, content={"detail": "잘못된 요청입니다."})
-
-    conn = get_conn()
-    if enabled:
-        existing = conn.execute(
-            "SELECT id FROM purchase_order_branch_exception WHERE branch_code=? AND exception_type=?",
-            (branch_code, exception_type)
-        ).fetchone()
-        if not existing:
-            conn.execute(
-                "INSERT INTO purchase_order_branch_exception (branch_code, exception_type, created_at) VALUES (?, ?, ?)",
-                (branch_code, exception_type, datetime.now().isoformat())
-            )
-    else:
-        conn.execute(
-            "DELETE FROM purchase_order_branch_exception WHERE branch_code=? AND exception_type=?",
-            (branch_code, exception_type)
-        )
-    conn.commit()
-    conn.close()
-    return JSONResponse(content={"status": "ok"})
-
 
 @app.post("/master/raw-upload/ajax")
 async def raw_upload_ajax(
@@ -22490,7 +22398,7 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
         '<div class="card" style="padding:12px 14px;margin-bottom:10px;">'
         '<style>.cash-table input,.cash-table select{padding:5px 6px;border:1px solid #CBD5E1;border-radius:6px;background:#fff;font-size:11px;}.cash-table td{vertical-align:middle;}.cash-table input[name=cl_amt]{text-align:right;}</style>'
         '<div style="font-size:14px;font-weight:bold;margin-bottom:8px;">💵 현금시재</div>'
-        '<div class="table-scroll-wrap"><table class="cash-table" data-colw style="table-layout:auto;min-width:640px;font-size:11px;"><thead><tr>'
+        '<div class="table-scroll-wrap"><table class="cash-table" data-colw style="table-layout:fixed;min-width:810px;font-size:11px;"><colgroup><col style="width:170px"><col style="width:140px"><col style="width:180px"><col style="width:230px"><col style="width:90px"></colgroup><thead><tr>'
         '<th style="width:22%">구분</th><th style="width:18%">금액(원)</th>'
         '<th style="width:22%">고객명</th><th style="width:28%">비고</th><th style="width:10%"></th>'
         '</tr></thead><tbody>' + rows_html + '</tbody></table></div>'
@@ -22671,7 +22579,9 @@ def _closing_compare_table_html(rows: list, has_receipt: bool, memo_mode=None, m
     num = 'style="text-align:right;"'
     bad_style = 'style="text-align:right;color:#DC2626;font-weight:bold;"'
 
-    h = ['<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:' + ('820' if memo_mode else '640') + 'px;">']
+    _cmp_cols = ['150px'] + ['75px', '115px'] * 3 + (['200px'] if memo_mode else [])
+    _cmp_cg = ''.join('<col style="width:%s">' % w for w in _cmp_cols)
+    h = ['<div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:fixed;min-width:' + ('1020' if memo_mode else '660') + 'px;"><colgroup>' + _cmp_cg + '</colgroup>']
     h.append(
         '<thead><tr><th rowspan="2" style="min-width:130px;">구분</th>'
         '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
@@ -22765,7 +22675,9 @@ def _closing_verify_compare_html(pay_groups: dict, rc_groups: dict, has_receipt:
 
     labels = list(CLOSING_COMPARE_ROWS) + sorted(
         (set(pay_groups) | set(rc_groups) | set(m_groups)) - set(CLOSING_COMPARE_ROWS))
-    h = ['<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:980px;">']
+    _ver_cols = ['150px'] + ['75px', '115px'] * 5
+    _ver_cg = ''.join('<col style="width:%s">' % w for w in _ver_cols)
+    h = ['<div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:fixed;min-width:1090px;"><colgroup>' + _ver_cg + '</colgroup>']
     h.append(
         '<thead><tr><th rowspan="2" style="min-width:130px;">구분</th>'
         '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
@@ -22838,7 +22750,9 @@ def _closing_branch_compare_html(rows: list, date: str, notify: bool = False) ->
     bad_style = 'style="text-align:right;color:#DC2626;font-weight:bold;"'
     dash = '<td style="text-align:right;color:#bbb;">-</td>'
 
-    h = ['<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:760px;">']
+    _br_cols = ['150px'] + ['75px', '115px'] * 3 + ['90px', '90px'] + (['60px'] if notify else [])
+    _br_cg = ''.join('<col style="width:%s">' % w for w in _br_cols)
+    h = ['<div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:fixed;min-width:900px;"><colgroup>' + _br_cg + '</colgroup>']
     h.append(
         '<thead><tr><th rowspan="2" style="min-width:110px;">지점</th>'
         '<th colspan="2" style="text-align:center;">결제내역(유비플러스)</th>'
