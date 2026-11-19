@@ -2227,6 +2227,15 @@ def init_db():
         )
     """)
 
+    # daily-stocktake 실시간 입력 드래프트 — 사용자별 미저장 입력값 (저장 전 공유)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS daily_stocktake_drafts (
+            scope_key TEXT PRIMARY KEY,
+            data TEXT NOT NULL DEFAULT '{{}}',
+            updated_at TEXT
+        )
+    """)
+
     # stock_closing_saves 오차 사유 컬럼 보강 (additive)
     if USE_POSTGRES:
         conn.execute(
@@ -5148,9 +5157,99 @@ async def daily_stocktake_page(
         dstUpdateDiff(inp);
       }
       var dstDirty = false;
+      var dstDraftCodes = {};
+      var dstDraftTimer = null;
+      var dstLastApplied = {};
       document.addEventListener('input', function(e) {
-        if (e.target && (e.target.classList.contains('dst-input') || e.target.classList.contains('dst-loc'))) dstDirty = true;
+        if (e.target && (e.target.classList.contains('dst-input') || e.target.classList.contains('dst-loc'))) {
+          dstDirty = true;
+          var code = e.target.getAttribute('data-code');
+          if (code) { dstDraftCodes[code] = true; dstScheduleDraft(); }
+        }
       });
+
+      // 실시간 입력 드래프트: 저장 전 입력값을 다른 사용자에게 실시간 공유
+      function dstScheduleDraft() {
+        clearTimeout(dstDraftTimer);
+        dstDraftTimer = setTimeout(dstSendDraft, 1200);
+      }
+      function dstRowValues(code) {
+        var mi = document.querySelector('.dst-input[data-code="' + code + '"]');
+        if (!mi) return null;
+        var tr = mi.closest('tr');
+        var l = [];
+        tr.querySelectorAll('.dst-loc').forEach(function(li) {
+          var v = li.value.trim();
+          l.push(v === '' ? null : parseInt(v, 10));
+        });
+        while (l.length < 3) l.push(null);
+        var mv = mi.value.trim();
+        return { m: (mv === '' ? null : parseInt(mv, 10)), l: l };
+      }
+      async function dstSendDraft() {
+        if (DST_PRESENCE !== '1') return;
+        var codes = Object.keys(dstDraftCodes);
+        if (!codes.length) return;
+        var items = {};
+        codes.forEach(function(code) {
+          var v = dstRowValues(code);
+          if (v) items[code] = v;
+        });
+        try {
+          var res = await fetch('/api/daily-stocktake/draft', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              branch_code: DST_BRANCH, date: '__DST_DATE__',
+              name: dstPresenceName(), items: items
+            })
+          });
+          if (res.ok) { codes.forEach(function(c) { delete dstDraftCodes[c]; }); }
+        } catch (e) {}
+      }
+      async function dstClearDraft() {
+        if (DST_PRESENCE !== '1') return;
+        try {
+          await fetch('/api/daily-stocktake/draft', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              branch_code: DST_BRANCH, date: '__DST_DATE__', clear: true
+            })
+          });
+        } catch (e) {}
+      }
+      function dstApplyDraftVal(el, val) {
+        if (!el || document.activeElement === el) return;
+        el.value = (val === null || val === undefined) ? '' : String(val);
+      }
+      async function dstDraftPoll() {
+        if (DST_PRESENCE !== '1') return;
+        try {
+          var res = await fetch('/api/daily-stocktake/draft?branch_code='
+            + encodeURIComponent(DST_BRANCH) + '&date=' + encodeURIComponent('__DST_DATE__')
+            + '&login_id=' + encodeURIComponent('__DST_LOGIN__'));
+          var d = await res.json();
+          if (!res.ok || !d.ok) return;
+          var drafts = d.drafts || {};
+          Object.keys(drafts).forEach(function(lid) {
+            var items = (drafts[lid] && drafts[lid].items) || {};
+            Object.keys(items).forEach(function(code) {
+              var it = items[code] || {};
+              var key = lid + '|' + code;
+              if (!it.ts || it.ts <= (dstLastApplied[key] || '')) return;
+              dstLastApplied[key] = it.ts;
+              var mi = document.querySelector('.dst-input[data-code="' + code + '"]');
+              if (!mi) return;
+              var tr = mi.closest('tr');
+              dstApplyDraftVal(mi, it.m);
+              var locs = tr.querySelectorAll('.dst-loc');
+              for (var i = 0; i < locs.length && i < 3; i++) {
+                dstApplyDraftVal(locs[i], it.l ? it.l[i] : null);
+              }
+              dstUpdateDiff(mi);
+            });
+          });
+        } catch (e) {}
+      }
 
       function dstCollect() {
         var closerEl = document.getElementById('dstCloser');
@@ -5203,6 +5302,7 @@ async def daily_stocktake_page(
             return;
           }
           alert(data.message || '저장되었습니다.');
+          dstClearDraft();
           location.reload();
         } catch (e) {
           alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
@@ -5260,6 +5360,7 @@ async def daily_stocktake_page(
           }
           dstHideMissingConfirm();
           alert(data.message || '마감되었습니다.');
+          dstClearDraft();
           location.reload();
         } catch (e) {
           alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
@@ -5358,10 +5459,11 @@ async def daily_stocktake_page(
         } catch (e) {}
       }
       if (DST_PRESENCE === '1') {
-        dstPresenceBeat(); dstPresencePoll(); dstSyncPoll();
+        dstPresenceBeat(); dstPresencePoll(); dstSyncPoll(); dstDraftPoll();
         setInterval(dstPresenceBeat, 20000);
         setInterval(dstPresencePoll, 20000);
         setInterval(dstSyncPoll, 20000);
+        setInterval(dstDraftPoll, 5000);
       }
     </script>
     """.replace("__DST_DATE__", sel_date_str).replace("__DST_PRESENCE__", "1" if (page_can_write and not is_closed) else "0").replace("__DST_SCOPE__", _html.escape(str(target_branch) + "|" + sel_date_str)).replace("__DST_LOGIN__", _html.escape(str(user.get("login_id") or ""))).replace("__DST_SAVE_AT__", _html.escape(str(save["saved_at"] or "") if save else "")).replace("__DST_BRANCH__", _html.escape(str(target_branch)))
@@ -5831,6 +5933,125 @@ async def api_daily_stocktake_status(
     conn.close()
     return {"ok": True, "saved_at": row["saved_at"] if row else None,
             "status": row["status"] if row else None}
+
+
+def _dst_draft_scope(user: dict, branch_code: str, date_str: str):
+    """드래프트/동기화 공용 — (branch_code, date) 유효성 검사 후 (bc, ds, scope_key) 반환."""
+    from fastapi import HTTPException
+    is_master = user["role"] == "master" or user.get("branch_type") == "hq"
+    if is_master:
+        bc = branch_code.strip()
+        valid_codes = {b["branch_code"] for b in get_branches()}
+        if not bc or bc not in valid_codes:
+            raise HTTPException(status_code=400, detail="지점 코드를 선택하세요.")
+    else:
+        bc = user["branch_code"]
+    ds = date_str.strip()
+    try:
+        datetime.strptime(ds, "%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="날짜 형식이 올바르지 않습니다.")
+    return bc, ds, f"{bc}|{ds}"
+
+
+@app.get("/api/daily-stocktake/draft")
+async def api_daily_stocktake_draft_get(
+    branch_code: str = "",
+    date: str = "",
+    login_id: str = "",
+    session_token: str = Cookie(default=None)
+):
+    from fastapi import HTTPException
+    import json as _json
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    bc, ds, scope = _dst_draft_scope(user, branch_code, date)
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT data FROM daily_stocktake_drafts WHERE scope_key=?", (scope,)
+    ).fetchone()
+    conn.close()
+    drafts = {}
+    if row:
+        try:
+            drafts = _json.loads(row["data"] or "{}")
+        except Exception:
+            drafts = {}
+    me = login_id.strip()
+    if me:
+        drafts.pop(me, None)
+    return {"ok": True, "drafts": drafts}
+
+
+@app.post("/api/daily-stocktake/draft")
+async def api_daily_stocktake_draft_post(request: Request, session_token: str = Cookie(default=None)):
+    from fastapi import HTTPException
+    import json as _json
+    from datetime import timedelta as _tdelta
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    bc, ds, scope = _dst_draft_scope(user, str(body.get("branch_code") or ""), str(body.get("date") or ""))
+    login_id = str(user.get("login_id") or "").strip()
+    if not login_id:
+        raise HTTPException(status_code=400, detail="로그인 정보가 없습니다.")
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT data FROM daily_stocktake_drafts WHERE scope_key=?", (scope,)
+    ).fetchone()
+    try:
+        drafts = _json.loads(row["data"] or "{}") if row else {}
+        if not isinstance(drafts, dict):
+            drafts = {}
+    except Exception:
+        drafts = {}
+    # 15분 이상 갱신 없는 사용자 항목 정리
+    cutoff = (datetime.now() - _tdelta(minutes=15)).isoformat()
+    for k in [k for k, v in drafts.items()
+              if not isinstance(v, dict) or str(v.get("updated_at") or "") < cutoff]:
+        drafts.pop(k, None)
+    if body.get("clear"):
+        drafts.pop(login_id, None)
+    else:
+        items_in = body.get("items") or {}
+        if not isinstance(items_in, dict):
+            items_in = {}
+        now_iso = datetime.now().isoformat()
+        entry = drafts.get(login_id)
+        if not isinstance(entry, dict):
+            entry = {"name": "", "items": {}, "updated_at": now_iso}
+        entry["name"] = str(body.get("name") or entry.get("name") or login_id)
+        entry_items = entry.get("items") if isinstance(entry.get("items"), dict) else {}
+        for code, vals in items_in.items():
+            code = str(code)
+            if not isinstance(vals, dict):
+                continue
+            m = vals.get("m")
+            l = vals.get("l")
+            lv = [int(x) if x not in (None, "") else None for x in (l if isinstance(l, (list, tuple)) else [])][:3]
+            while len(lv) < 3:
+                lv.append(None)
+            entry_items[code] = {
+                "m": (int(m) if m not in (None, "") else None),
+                "l": lv,
+                "ts": now_iso,
+            }
+        entry["items"] = entry_items
+        entry["updated_at"] = now_iso
+        drafts[login_id] = entry
+    conn.execute(
+        "INSERT INTO daily_stocktake_drafts (scope_key, data, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(scope_key) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+        (scope, _json.dumps(drafts, ensure_ascii=False), datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 @app.post("/daily-stocktake/delete")
@@ -18092,7 +18313,7 @@ async def purchase_order_product_settings_page(
         <p style="font-size:11px;color:#888;margin:6px 0 0 0;">체크한 행들을 품번 기준으로 묶어 같은 지점 설정을 한 번에 저장합니다. 월예외는 품명 기준으로 묶입니다.</p>
       </div>
 
-      <table class="pm-table" data-colkey="pm-main" data-colw data-colver="2026-11-19" style="table-layout:auto;">
+      <table class="pm-table" data-colkey="pm-main" data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:1500px;"><colgroup><col style="width:44px"><col style="width:100px"><col style="width:180px"><col style="width:110px"><col style="width:100px"><col style="width:120px"><col style="width:80px"><col style="width:90px"><col style="width:70px"><col style="width:100px"><col style="width:70px"><col style="width:100px"><col style="width:90px"><col style="width:110px"><col style="width:140px"><col style="width:130px"><col style="width:140px"></colgroup>
         <thead><tr>
           <th style="text-align:center;"><input type="checkbox" id="pmCheckAll" onclick="togglePmCheckAll(this)" style="width:18px;height:18px;"></th>
           <th class="pm-col-branch">지점</th>
@@ -23221,8 +23442,10 @@ def _closing_receipt_form_html(branch_name: str, branch_param: str, pay_date: st
              '단말기 영수증(일일마감집계)에 찍힌 값을 그대로 입력하세요. 영수증에 없는 카드사는 비워 두면 0으로 저장됩니다. '
              '지점·일자당 1건이며, 마감 저장 전에는 다시 저장해서 수정할 수 있습니다. '
              '※ "현금성"·"카드명 누락" 묶음은 마감 화면 비교표의 영수증 입력 값 칸에서 직접 입력합니다.</div>')
-    h.append('<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:640px;"><thead><tr>'
-             '<th style="min-width:110px;">카드사</th><th>승인건수</th><th>취소건수</th><th>승인금액</th><th>취소금액</th>'
+    h.append('<div class="table-scroll-wrap"><table data-colw data-colver="2026-11-19" style="table-layout:fixed;min-width:720px;"><colgroup>'
+             '<col style="width:160px"><col style="width:90px"><col style="width:90px"><col style="width:120px"><col style="width:120px"><col style="width:80px"><col style="width:120px">'
+             '</colgroup><thead><tr>'
+             '<th>카드사</th><th>승인건수</th><th>취소건수</th><th>승인금액</th><th>취소금액</th>'
              '<th style="text-align:right;">순건수</th><th style="text-align:right;">순금액</th></tr></thead><tbody>')
     for i, card in enumerate(CLOSING_RECEIPT_ROWS):
         h.append('<tr data-rc-row="1"><td>' + _esc(card) + '</td>')
