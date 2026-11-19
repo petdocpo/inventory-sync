@@ -345,6 +345,8 @@ async def cron_cleanup_purchase_history(authorization: str = Header(default=""))
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("cleanup-purchase-history"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     try:
         deleted_count, err = await delete_old_purchase_history(days=21)
@@ -377,6 +379,8 @@ async def cron_cleanup_old_data(authorization: str = Header(default="")):
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("cleanup-old-data"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     targets = [
         ("purchase_records", "created_at", 100, True),
@@ -3123,7 +3127,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         if (!document.getElementById('colWHandleStyle')) {{
           var st = document.createElement('style');
           st.id = 'colWHandleStyle';
-          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;pointer-events:none;}}th:hover>.col-w-handle,td:hover>.col-w-handle{{opacity:.55;pointer-events:auto;}}.col-w-handle:hover{{opacity:.95 !important;}}';
+          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;pointer-events:none;}}th:hover>.col-w-handle,td:hover>.col-w-handle{{opacity:.55;pointer-events:auto;}}.col-w-handle:hover{{opacity:.95 !important;}}@media (pointer:coarse){{.col-w-handle{{opacity:.5;pointer-events:auto;width:14px;}}}}';
           document.head.appendChild(st);
         }}
         document.querySelectorAll('table').forEach(function(table) {{
@@ -6223,6 +6227,8 @@ async def cron_stock_closing_reminder(request: Request):
     cron_secret = os.environ.get("CRON_SECRET", "")
     if cron_secret and auth_header != f"Bearer {cron_secret}":
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    if not _cron_job_enabled("stock-closing-reminder"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     target = (_dt.now(_tz(_td(hours=9))).date() - _td(days=1)).strftime("%Y-%m-%d")
     try:
@@ -13743,6 +13749,8 @@ async def cron_send_scheduled_messages(authorization: str = Header(default="")):
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("send-scheduled-messages"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     try:
         from datetime import date
@@ -13787,6 +13795,8 @@ async def cron_send_unsubmitted_reminder(authorization: str = Header(default="")
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("send-unsubmitted-reminder"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     try:
         from datetime import date
@@ -13861,6 +13871,8 @@ async def cron_send_survey_unsubmitted_reminder(authorization: str = Header(defa
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("send-survey-unsubmitted-reminder"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     from datetime import date
     today = date.today()
@@ -13938,6 +13950,8 @@ async def cron_check_qr_raw_mismatch(authorization: str = Header(default="")):
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("check-qr-raw-mismatch"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     try:
         conn = get_conn()
@@ -13998,6 +14012,8 @@ async def cron_check_new_purchase(authorization: str = Header(default="")):
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("check-new-purchase"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     try:
         conn = get_conn()
@@ -14277,6 +14293,8 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("send-eod-alert"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     try:
         conn = get_conn()
@@ -19857,6 +19875,8 @@ async def cron_compute_purchase_tracking_snapshot(authorization: str = Header(de
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("compute-purchase-tracking-snapshot"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     result = await _compute_purchase_tracking_snapshot()
     return JSONResponse(content=result)
@@ -19866,6 +19886,8 @@ async def cron_select_stocktake_items(authorization: str = Header(default="")):
     expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
     if authorization != expected:
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    if not _cron_job_enabled("select-stocktake-items"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     result = await _select_stocktake_items()
     return JSONResponse(content=result)
@@ -21949,9 +21971,9 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
     # ── 표: 현금 매출 고정행 + 수기 행(기타 입금/시재 사용) ──
     rows_html = (
         '<tr style="background:#F0FDF4;font-weight:bold;">'
-        '<td style="font-size:13px;">현금 매출 (유비플러스 현금 결제)</td>'
-        f'<td style="text-align:right;font-size:13px;">{cash_cnt}건 / {_money(cash_amt)}원</td>'
-        '<td colspan="2" style="color:#888;font-size:12px;">자동 계산 — 수정 불가</td></tr>'
+        '<td style="font-size:11px;">💵 현금 매출 (유비플러스 현금 결제)</td>'
+        f'<td style="text-align:right;font-size:11px;">{cash_cnt}건 / {_money(cash_amt)}원</td>'
+        '<td colspan="3" style="color:#888;font-size:11px;">자동 계산 — 수정 불가</td></tr>'
     )
     for l in lines:
         kind_label = "기타 입금" if l["kind"] == "deposit" else "시재 사용"
@@ -21980,6 +22002,44 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
     expected = _closing_cash_expected(cash_amt, lines)
     actual = cash["actual"]
 
+    # 전일 현금시재 — 자동 조회 (표시 전용)
+    prev_html = ""
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        prev_date = (_dt.strptime(pay_date, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
+        prev_cash = _closing_cash_load(conn, view_key, prev_date)
+        _, prev_amt = _closing_cash_sale(conn, prev_date, "24", view_key)
+        prev_expected = _closing_cash_expected(prev_amt, prev_cash["lines"])
+        prev_actual = prev_cash["actual"]
+        if prev_cash["saved"] and prev_actual is not None:
+            pdiff = prev_actual - prev_expected
+            pdiff_txt = "✅ 일치" if pdiff == 0 else f"⚠️ 오차 {pdiff:+,}원"
+            pc = "#166534" if pdiff == 0 else "#991B1B"
+            prev_actual_js = str(int(prev_actual))
+            prev_html = (
+                '<div style="margin-top:10px;padding:10px 12px;background:#F8FAFC;'
+                'border:1px solid #E2E8F0;border-radius:8px;">'
+                f'<div style="font-size:12px;font-weight:bold;color:#475569;">'
+                f'📅 전일 현금시재 ({prev_date} · 24시 기준)</div>'
+                '<div style="font-size:13px;margin-top:4px;">'
+                f'실제 <b>{_money(prev_actual)}원</b> · 예상 <b>{_money(prev_expected)}원</b> · '
+                f'<b style="color:{pc};">{pdiff_txt}</b></div>'
+                f'<div style="font-size:11px;color:#888;margin-top:2px;">'
+                f'{prev_cash["updated_by"] or "-"} · {_esc(prev_cash["updated_at"] or "")} 저장</div>'
+                '<button type="button" class="btn" style="margin-top:6px;padding:4px 10px;'
+                'font-size:12px;background:#64748B;" data-v="' + prev_actual_js + '" '
+                'onclick="cashFillPrev(this)">전일 실사값 입력</button>'
+                '</div>'
+            )
+        else:
+            prev_html = (
+                '<div style="margin-top:10px;padding:8px 12px;background:#F8FAFC;'
+                'border:1px dashed #CBD5E1;border-radius:8px;font-size:12px;color:#94A3B8;">'
+                f'📅 전일({prev_date}) 현금시재 저장 내역 없음</div>'
+            )
+    except Exception:
+        prev_html = ""
+
     result_html = ""
     if cash["saved"]:
         diff = (actual or 0) - expected
@@ -22000,18 +22060,23 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
 
     return (
         '<div class="card" style="padding:12px 14px;margin-bottom:10px;">'
+        '<style>.cash-table input,.cash-table select{padding:5px 6px;border:1px solid #CBD5E1;border-radius:6px;background:#fff;font-size:11px;}.cash-table td{vertical-align:middle;}.cash-table input[name=cl_amt]{text-align:right;}</style>'
         '<div style="font-size:14px;font-weight:bold;margin-bottom:8px;">💵 현금시재</div>'
-        '<div class="table-scroll-wrap"><table data-colw style="table-layout:auto;min-width:640px;font-size:13px;"><thead><tr>'
+        '<div class="table-scroll-wrap"><table class="cash-table" data-colw style="table-layout:auto;min-width:640px;font-size:11px;"><thead><tr>'
         '<th style="width:22%">구분</th><th style="width:18%">금액(원)</th>'
         '<th style="width:22%">고객명</th><th style="width:28%">비고</th><th style="width:10%"></th>'
         '</tr></thead><tbody>' + rows_html + '</tbody></table></div>'
+        '<div style="font-size:11px;color:#94A3B8;margin-top:4px;">'
+        '예상 현금 = 현금 매출 + 기타 입금 − 시재 사용 (확인 버튼 저장 후 정답/오차 표시)</div>'
         '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
         '<button type="button" class="btn" style="background:#64748B;" onclick="cashAddRow()">+ 행 추가</button>'
         '<span style="font-size:12px;color:#888;">기타 입금/시재 사용 내역을 추가하세요 (선택)</span></div>'
+        + prev_html +
         '<div style="margin-top:10px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
-        '<div><label style="font-size:13px;color:#666;">실제 현금시재(원)</label><br>'
+        '<div><label style="font-size:12px;color:#666;">실제 현금시재(원)</label><br>'
         f'<input type="number" min="0" step="1" inputmode="numeric" name="cash_actual" form="cash-form" '
-        f'value="{actual if actual is not None else ""}" style="width:160px;margin-top:4px;font-size:14px;" placeholder="실사한 현금"></div>'
+        f'id="cash-actual-input" value="{actual if actual is not None else ""}" '
+        'style="width:160px;margin-top:4px;font-size:13px;" placeholder="실사한 현금"></div>'
         '<button type="submit" form="cash-form" class="btn">현금시재 확인</button>'
         '</div>'
         + result_html +
@@ -22031,6 +22096,7 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
         'tr.querySelectorAll("input").forEach(function(i){i.value="";});'
         't.querySelector("tbody").appendChild(tr);'
         '}'
+        'function cashFillPrev(b){var i=document.getElementById("cash-actual-input");if(i)i.value=b.getAttribute("data-v");}window.cashFillPrev=cashFillPrev;'
         'window.cashAddRow=cashAddRow;'
         'var f=document.getElementById("cash-form");'
         'if(f){f.addEventListener("submit",function(){'
@@ -24968,6 +25034,8 @@ async def cron_closing_reminder(request: Request):
     cron_secret = os.environ.get("CRON_SECRET", "")
     if cron_secret and auth_header != f"Bearer {cron_secret}":
         return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    if not _cron_job_enabled("closing-reminder"):
+        return JSONResponse(content={"status": "disabled", "detail": "크론 관리 페이지에서 자동 실행이 꺼져 있습니다."})
 
     target = (_dt.now(_tz(_td(hours=9))).date() - _td(days=1)).strftime("%Y-%m-%d")
     try:
@@ -28573,12 +28641,17 @@ async def master_cron_manage_page(session_token: str = Cookie(default=None)):
             recent_html = '<span style="color:#888;">—</span>'
             status_html = '<span style="color:#888;">실패만 기록됨</span>'
 
+        enabled = _cron_job_enabled(path)
+        state_txt = "켜짐" if enabled else "꺼짐"
+        state_color = "#16A34A" if enabled else "#EF4444"
+        toggle_label = "중지" if enabled else "재개"
+        toggle_fn = f"toggleCron('{path}', {str(not enabled).lower()})"
+        toggle_html = (
+            f'<div style="font-size:12px;margin-bottom:4px;">자동 실행: '
+            f'<b style="color:{state_color};">{state_txt}</b> '
+            f'<button class="btn" style="padding:2px 8px;font-size:11px;background:#F59E0B;" '
+            f'onclick="{toggle_fn}">{toggle_label}</button></div>')
         if runnable:
-            enabled = _cron_job_enabled(path)
-            state_txt = "켜짐" if enabled else "꺼짐"
-            state_color = "#16A34A" if enabled else "#EF4444"
-            toggle_label = "자동 실행 중지" if enabled else "자동 실행 재개"
-            toggle_fn = f"toggleCron('{path}', {str(not enabled).lower()})"
             if path == "sync-payment-records":
                 run_btn = (
                     "<select id=\"cm-slot\" style=\"width:56px;padding:4px;\">"
@@ -28592,15 +28665,10 @@ async def master_cron_manage_page(session_token: str = Cookie(default=None)):
                     "<button class=\"btn\" style=\"padding:4px 10px;font-size:12px;\" "
                     f"onclick=\"runCron('{path}')\">지금 실행</button>")
                 res_id = f"cm-result-{path}"
-            run_html = (
-                f'<div style="font-size:12px;margin-bottom:4px;">자동 실행: '
-                f'<b style="color:{state_color};">{state_txt}</b></div>'
-                + run_btn + " "
-                + f'<button class="btn" style="padding:4px 10px;font-size:12px;background:#F59E0B;" '
-                + f'onclick="{toggle_fn}">{toggle_label}</button>'
-                + f'<div id="{res_id}" style="margin-top:6px;font-size:12px;"></div>')
+            run_html = (toggle_html + run_btn
+                        + f'<div id="{res_id}" style="margin-top:6px;font-size:12px;"></div>')
         else:
-            run_html = '<span style="color:#BBB;">—</span>'
+            run_html = toggle_html
 
         rows_html += f"""
         <tr>
@@ -28716,8 +28784,7 @@ async def master_cron_manage_run(request: Request, session_token: str = Cookie(d
         return JSONResponse(status_code=500, content={"detail": err_msg})
 
 
-CRON_TOGGLEABLE_JOBS = ("sync-payment-records", "sync-sales-records",
-                        "sync-raw-inventory", "sync-purchase-records")
+CRON_TOGGLEABLE_JOBS = tuple(j[0] for j in CRON_MANAGE_JOBS)
 
 
 @app.post("/master/cron-manage/toggle")
