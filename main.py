@@ -3127,7 +3127,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         if (!document.getElementById('colWHandleStyle')) {{
           var st = document.createElement('style');
           st.id = 'colWHandleStyle';
-          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;pointer-events:none;}}th:hover>.col-w-handle,td:hover>.col-w-handle{{opacity:.55;pointer-events:auto;}}.col-w-handle:hover{{opacity:.95 !important;}}@media (pointer:coarse){{.col-w-handle{{opacity:.5;pointer-events:auto;width:14px;}}}}';
+          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;pointer-events:none;}}th:hover>.col-w-handle,td:hover>.col-w-handle{{opacity:.55;pointer-events:auto;}}.col-w-handle:hover{{opacity:.95 !important;}}@media (pointer:coarse),(hover:none){{.col-w-handle{{opacity:.55;pointer-events:auto;width:16px;right:-4px;}}}}';
           document.head.appendChild(st);
         }}
         document.querySelectorAll('table').forEach(function(table) {{
