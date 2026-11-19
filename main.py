@@ -19683,7 +19683,7 @@ async def _fetch_and_process_s3_csv():
     import io as io_module
 
     try:
-        CSV_URL = "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/stock/유비플러스_재고현황.csv"
+        CSV_URL = _cron_source_url("sync-raw-inventory")
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(CSV_URL)
@@ -20930,7 +20930,10 @@ async def _sync_sales_records(target_date: str = "") -> dict:
     if not target_date:
         target_date = (kst_now - timedelta(days=1)).strftime("%Y%m%d")
     filename = f"유비플러스_판매내역_{target_date}.csv"
-    url = SALES_S3_BASE_URL + urllib.parse.quote(filename)
+    _src_base = (_cron_source_url("sync-sales-records") or SALES_S3_BASE_URL).strip()
+    if _src_base and not _src_base.endswith("/"):
+        _src_base += "/"
+    url = _src_base + urllib.parse.quote(filename)
     result = {"target_date": target_date, "url": url}
 
     # 1) 다운로드 + 적재
@@ -21419,7 +21422,10 @@ async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
         target_date = base_day.strftime("%Y%m%d")
     target_iso = f"{target_date[0:4]}-{target_date[4:6]}-{target_date[6:8]}"
     filename = f"유비플러스_결제내역_{target_date}.csv"
-    url = PAYMENT_S3_BASE_URL + urllib.parse.quote(filename)
+    _src_base = (_cron_source_url("sync-payment-records") or PAYMENT_S3_BASE_URL).strip()
+    if _src_base and not _src_base.endswith("/"):
+        _src_base += "/"
+    url = _src_base + urllib.parse.quote(filename)
     result = {"slot": slot, "target_date": target_date, "url": url}
     log = {
         "run_at": kst_now.strftime("%Y-%m-%d %H:%M:%S"), "slot": slot, "target_date": target_iso,
@@ -21429,8 +21435,8 @@ async def _sync_payment_records(slot: str, target_date: str = "") -> dict:
 
     # 1) 다운로드 + 적재
     try:
-        if not PAYMENT_S3_BASE_URL:
-            raise RuntimeError("PAYMENT_S3_BASE_URL이 설정되지 않았습니다(main.py의 결제내역 S3 폴더 주소).")
+        if not _src_base:
+            raise RuntimeError("결제내역 수신 주소가 설정되지 않았습니다(크론 관리 페이지 또는 main.py).")
         try:
             raw, meta = await asyncio.to_thread(_payment_http_get_meta, url)
         except urllib.error.HTTPError as he:
@@ -25398,9 +25404,9 @@ async def _fetch_and_process_purchase_records_csv():
     import io as io_module
 
     try:
-        csv_url = os.environ.get("PURCHASE_RECORDS_CSV_URL", "")
+        csv_url = (_cron_source_url("sync-purchase-records") or "").strip()
         if not csv_url:
-            return {"success": 0, "skipped": 0, "errors": ["PURCHASE_RECORDS_CSV_URL 환경변수가 설정되지 않았습니다."]}
+            return {"success": 0, "skipped": 0, "errors": ["구매내역 수신 주소가 설정되지 않았습니다(크론 관리 페이지 또는 PURCHASE_RECORDS_CSV_URL 환경변수)."]}
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(csv_url)
@@ -28497,6 +28503,37 @@ def _cron_job_enabled(job: str) -> bool:
         return True
 
 
+def _cron_source_default(job: str) -> str:
+    """외부 데이터 수신 주소 기본값 (코드/환경변수)."""
+    if job == "sync-sales-records":
+        return SALES_S3_BASE_URL
+    if job == "sync-payment-records":
+        return PAYMENT_S3_BASE_URL
+    if job == "sync-raw-inventory":
+        return "https://petdoc-ubiplus.s3.ap-northeast-2.amazonaws.com/stock/유비플러스_재고현황.csv"
+    if job == "sync-purchase-records":
+        return os.environ.get("PURCHASE_RECORDS_CSV_URL", "")
+    return ""
+
+
+def _cron_source_custom(job: str) -> str:
+    """system_settings 'cron_src:<job>'에 저장된 사용자 지정 주소 (없으면 '')."""
+    try:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT value FROM system_settings WHERE key=?", (f"cron_src:{job}",)
+        ).fetchone()
+        conn.close()
+        return str(row["value"]).strip() if row else ""
+    except Exception:
+        return ""
+
+
+def _cron_source_url(job: str) -> str:
+    """실제 사용할 수신 주소 — 사용자 지정 우선, 없으면 기본값."""
+    return _cron_source_custom(job) or _cron_source_default(job)
+
+
 # 크론 작업 메타: (path, 이름, 설명, 스케줄, 그룹, 실패로그 prefix, 수동실행 가능)
 CRON_MANAGE_JOBS = [
     # ── 외부 데이터 수신 ──
@@ -28682,6 +28719,34 @@ async def master_cron_manage_page(session_token: str = Cookie(default=None)):
         </tr>"""
 
     cron_secret_set = "설정됨" if os.environ.get("CRON_SECRET") else "미설정"
+
+    from html import escape as _esc_src
+    src_rows_html = ""
+    for job, label, note in [
+        ("sync-payment-records", "결제내역", "S3 폴더 주소 — 파일명이 뒤에 자동으로 붙습니다 (끝에 / 포함)"),
+        ("sync-sales-records", "판매내역", "S3 폴더 주소 — 파일명이 뒤에 자동으로 붙습니다 (끝에 / 포함)"),
+        ("sync-raw-inventory", "재고현황", "CSV 파일 전체 주소"),
+        ("sync-purchase-records", "구매내역", "CSV 파일 전체 주소"),
+    ]:
+        custom = _cron_source_custom(job)
+        effective = _cron_source_url(job)
+        badge = ('<span style="color:#D97706;font-size:11px;">사용자 지정</span>' if custom
+                 else '<span style="color:#888;font-size:11px;">기본값</span>')
+        shown = effective or "(미설정 — 아래에 주소 입력 후 저장)"
+        src_rows_html += f"""
+        <tr>
+          <td style="white-space:nowrap;"><b>{label}</b><br>
+            <span style="font-size:11px;color:#888;">{note}</span></td>
+          <td><input type="text" id="src-{job}" value="{_esc_src(effective)}"
+            placeholder="{_esc_src(shown)}"
+            style="width:100%;min-width:300px;font-family:monospace;font-size:12px;"></td>
+          <td style="white-space:nowrap;">{badge}</td>
+          <td style="white-space:nowrap;">
+            <button class="btn" style="padding:4px 10px;font-size:12px;" onclick="saveSource('{job}')">저장</button>
+            <button class="btn" style="padding:4px 10px;font-size:12px;background:#94A3B8;" onclick="resetSource('{job}')">기본값</button>
+          </td>
+        </tr>"""
+
     content = f"""
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
       <a href="/master" style="color:#1E2761;">← 마스터</a>
@@ -28695,6 +28760,18 @@ async def master_cron_manage_page(session_token: str = Cookie(default=None)):
         CRON_SECRET: <b>{cron_secret_set}</b> · 실패 시 Teams/이메일 알림 +
         <a href="/master/cron-failure-log">크론 실패 이력</a>에 기록됩니다.
       </p>
+    </div>
+    <div class="card">
+      <div style="font-size:14px;font-weight:bold;margin-bottom:4px;">🔗 외부 데이터 수신 주소</div>
+      <p style="font-size:12px;color:#888;margin-bottom:10px;">
+        각 작업이 데이터를 <b>가져오는</b> 주소입니다. 외부 제공처(S3/CSV) 주소가 바뀌면 여기서 바로 수정하세요.
+        비워두고 "기본값"을 누르면 코드/환경변수의 원래 주소로 돌아갑니다.
+        ※ 스케줄러가 호출하는 <b>이 페이지의 엔드포인트 주소</b>는 여기서 바뀌지 않습니다.
+      </p>
+      <table>
+        <thead><tr><th>작업</th><th>수신 주소</th><th>상태</th><th></th></tr></thead>
+        <tbody>{src_rows_html}</tbody>
+      </table>
     </div>
     <div class="card">
       <table>
@@ -28712,6 +28789,37 @@ async def master_cron_manage_page(session_token: str = Cookie(default=None)):
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
           body: JSON.stringify({{job: job, enabled: enabled}})
+        }});
+        var data = await res.json();
+        if (res.ok) {{ location.reload(); }}
+        else {{ alert('실패: ' + (data.detail || res.status)); }}
+      }} catch (e) {{ alert('요청 오류: ' + e); }}
+    }}
+    async function saveSource(job) {{
+      var input = document.getElementById('src-' + job);
+      var url = (input.value || '').trim();
+      if (url && !/^https?:/i.test(url)) {{
+        alert('주소는 http:// 또는 https:// 로 시작해야 합니다.');
+        return;
+      }}
+      try {{
+        var res = await fetch('/master/cron-manage/source-url', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{job: job, url: url}})
+        }});
+        var data = await res.json();
+        if (res.ok) {{ location.reload(); }}
+        else {{ alert('실패: ' + (data.detail || res.status)); }}
+      }} catch (e) {{ alert('요청 오류: ' + e); }}
+    }}
+    async function resetSource(job) {{
+      if (!confirm('이 작업의 수신 주소를 기본값으로 되돌릴까요?')) return;
+      try {{
+        var res = await fetch('/master/cron-manage/source-url', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{job: job, url: ''}})
         }});
         var data = await res.json();
         if (res.ok) {{ location.reload(); }}
@@ -28816,6 +28924,47 @@ async def master_cron_manage_toggle(request: Request, session_token: str = Cooki
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": f"설정 저장 실패: {str(e)[:200]}"})
     return JSONResponse(content={"status": "ok", "job": job, "enabled": enabled})
+
+
+CRON_SOURCE_JOBS = ("sync-payment-records", "sync-sales-records",
+                    "sync-raw-inventory", "sync-purchase-records")
+
+
+@app.post("/master/cron-manage/source-url")
+async def master_cron_manage_source_url(request: Request, session_token: str = Cookie(default=None)):
+    """외부 데이터 수신 주소 변경 (마스터 전용). url이 비어 있으면 기본값으로 초기화."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    if not has_menu_permission(user["login_id"], "cron-manage"):
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+
+    data = await request.json()
+    job = (data.get("job") or "").strip()
+    url = (data.get("url") or "").strip()
+    if job not in CRON_SOURCE_JOBS:
+        return JSONResponse(status_code=400, content={"detail": "수신 주소를 지원하지 않는 작업입니다."})
+    if url and not (url.startswith("http://") or url.startswith("https://")):
+        return JSONResponse(status_code=400, content={"detail": "주소는 http:// 또는 https:// 로 시작해야 합니다."})
+    if len(url) > 500:
+        return JSONResponse(status_code=400, content={"detail": "주소가 너무 깁니다."})
+
+    key = f"cron_src:{job}"
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+        if url:
+            if row:
+                conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?", (url, key))
+            else:
+                conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)", (key, url))
+        elif row:
+            conn.execute("DELETE FROM system_settings WHERE key=?", (key,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"설정 저장 실패: {str(e)[:200]}"})
+    return JSONResponse(content={"status": "ok", "job": job, "url": url or _cron_source_default(job)})
 
 
 if __name__ == "__main__":
