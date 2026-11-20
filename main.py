@@ -3,6 +3,7 @@
 FastAPI 기반 / SQLite ↔ Supabase(PostgreSQL) 겸용 / 지점별 로그인
 """
 import os
+import re
 import socket
 import json
 import httpx
@@ -2448,6 +2449,10 @@ _COLUMN_SETTINGS_HTML = """
         }
         // ── 컬럼 순서 변경 (단순 테이블 전용: 모든 셀이 colspan/rowspan 1) ──
         function cvOrderKey(table) { return 'colOrder_' + cvBaseKey(table); }
+        // colgroup col 요소 목록 — fixed 레이아웃에서 실제 열 너비를 결정하므로 셀 순서와 항상 동기화 필요
+        function cvCols(table) {
+          return Array.prototype.slice.call(table.querySelectorAll('colgroup col'));
+        }
         function cvGetOrder(table) {
           try {
             var a = JSON.parse(localStorage.getItem(cvOrderKey(table)) || 'null');
@@ -2496,6 +2501,14 @@ _COLUMN_SETTINGS_HTML = """
             for (var i = 0; i < n; i++) reordered.push(cells[ord[i]]);
             for (var i = 0; i < n; i++) rows[r].appendChild(reordered[i]);
           }
+          // colgroup도 같은 순열로 재배치 — 셀만 바꾸면 fixed 레이아웃의 열 너비가 어긋남
+          var cols = cvCols(table);
+          if (cols.length === n) {
+            var colRe = [];
+            for (var i = 0; i < n; i++) colRe.push(cols[ord[i]]);
+            var cg = table.querySelector('colgroup');
+            for (var i = 0; i < n; i++) cg.appendChild(colRe[i]);
+          }
           table.setAttribute('data-cv-ordered', '1');
         }
         // 인접 컬럼 1칸 이동 — ord/숨김/너비 저장값도 함께 치환
@@ -2523,6 +2536,15 @@ _COLUMN_SETTINGS_HTML = """
             if (cells.length !== n) continue;
             var a = cells[pos], b = cells[q];
             rows[r].insertBefore(b, a);
+          }
+          // colgroup도 같은 위치끼리 스왑 — 셀 순서와 열 너비 동기화 유지
+          var mvCols = cvCols(table);
+          if (mvCols.length === n) {
+            var cgEl = table.querySelector('colgroup');
+            var colA = mvCols[pos], colB = mvCols[q];
+            // 인접 스왑: q>pos면 colB가 colA 뒤 → colB를 colA 앞으로, 아니면 반대
+            if (q > pos) cgEl.insertBefore(colB, colA);
+            else cgEl.insertBefore(colA, colB);
           }
           cvApply(table);
           cvApplyFont(table);
@@ -2576,6 +2598,17 @@ _COLUMN_SETTINGS_HTML = """
               cvSetCell(cell, allHidden);
               col += cs;
             }
+          }
+          // colgroup col도 함께 숨김/표시 — fixed 레이아웃에서 셀만 숨기면 열 공간이 남아 빈 칼럼처럼 보임
+          var colEls = cvCols(table);
+          if (colEls.length) {
+            units.forEach(function(u, ui) {
+              var isHidden = hidden.indexOf(ui) >= 0;
+              u.cols.forEach(function(ci) {
+                var colEl = colEls[ci];
+                if (colEl) colEl.style.display = isHidden ? 'none' : '';
+              });
+            });
           }
         }
         function cvApplyAll() {
@@ -2841,6 +2874,145 @@ async def column_defaults_save(request: Request, session_token: str = Cookie(def
     return JSONResponse({"ok": True, "message": "기본값이 저장되었습니다."})
 
 
+
+# ── 페이지 설명글 인라인 편집 (마스터 전용) ──
+# render_page에서 설명글 <p>에 data-desc 키를 부여하고, system_settings 'pagedesc:<key>'
+# override가 있으면 내용을 교체한다. 키는 active 메뉴키+기본 텍스트 해시라 코드 수정 시 자동 무효화.
+_PAGEDESC_PREFIX = "pagedesc:"
+_PAGEDESC_P_RE = re.compile(r"<p\b([^>]*)>([^<]{8,800})</p>", re.IGNORECASE)
+_PAGEDESC_TAG_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_PAGEDESC_SKIP_RE = re.compile(r"onclick|data-desc|contenteditable|ondblclick", re.IGNORECASE)
+_PAGEDESC_STYLE_RE = re.compile(
+    r"font-size\s*:\s*1[0-5](?:\.\d+)?px"
+    r"|color\s*:\s*#(?:888|999|666|555|64748B|6B7280|94A3B8|9CA3AF|D1D5DB)\b",
+    re.IGNORECASE)
+
+
+def _pagedesc_key(active: str, text: str) -> str:
+    import hashlib
+    norm = " ".join(str(text).split())
+    return "d" + hashlib.sha1(((active or "") + "|" + norm).encode("utf-8")).hexdigest()[:16]
+
+
+def _pagedesc_fetch(keys):
+    """pagedesc:<key> override 조회 → {짧은키: 텍스트}"""
+    if not keys:
+        return {}
+    try:
+        conn = get_conn()
+        ph = ",".join("?" * len(keys))
+        rows = conn.execute(
+            f"SELECT key, value FROM system_settings WHERE key IN ({ph})",
+            [_PAGEDESC_PREFIX + k for k in keys]
+        ).fetchall()
+        conn.close()
+        return {str(r["key"])[len(_PAGEDESC_PREFIX):]: str(r["value"]) for r in rows}
+    except Exception:
+        return {}
+
+
+def _mark_desc_paragraphs(content: str, active: str):
+    """설명글 <p>에 data-desc 부여 + override 반영. 반환: (html, 사용된키목록)"""
+    if not content or "<p" not in content.lower():
+        return content, []
+    # script/style 블록은 공백으로 마스킹 — 내부의 <p> 문자열 오인 방지
+    masked = list(content)
+    for m in _PAGEDESC_TAG_RE.finditer(content):
+        for i in range(m.start(), m.end()):
+            masked[i] = " "
+    masked = "".join(masked)
+
+    import html as _html
+    found = []  # (start, end, key)
+    for m in _PAGEDESC_P_RE.finditer(masked):
+        attrs, inner = m.group(1), m.group(2)
+        text = " ".join(inner.split())
+        if len(text) < 8 or len(text) > 800:
+            continue
+        if _PAGEDESC_SKIP_RE.search(attrs):
+            continue
+        if not re.search(r"[가-힣A-Za-z]", text):
+            continue
+        # 날짜/시간이 박힌 동적 문구는 편집 대상에서 제외 (날짜가 바뀌면 키도 바뀌어 override가 무의미해짐)
+        if re.search(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}", text):
+            continue
+        # 스타일 힌트: 작은 글씨 or 회색 계열 — 일반 본문/사용자 생성 콘텐츠는 제외
+        if "style=" not in attrs.lower() or not _PAGEDESC_STYLE_RE.search(attrs):
+            continue
+        found.append((m.start(), m.end(), _pagedesc_key(active, text)))
+    if not found:
+        return content, []
+
+    overrides = _pagedesc_fetch(sorted({k for _, _, k in found}))
+    parts, pos = [], 0
+    for start, end, key in found:
+        parts.append(content[pos:start])
+        tag = content[start:end]
+        gt = tag.find(">")
+        open_tag = tag[:gt].replace("<p", '<p data-desc="' + key + '"', 1)
+        ov = overrides.get(key)
+        if ov is not None:
+            parts.append(open_tag + ">" + _html.escape(ov) + "</p>")
+        else:
+            parts.append(open_tag + tag[gt:])
+        pos = end
+    parts.append(content[pos:])
+    return "".join(parts), sorted({k for _, _, k in found})
+
+
+_PAGE_DESC_EDIT_HTML = """<style>[data-desc]{cursor:text;}[data-desc]:hover{outline:1px dashed #93C5FD;outline-offset:2px;}</style>
+<script>
+(function(){
+  document.addEventListener('click', function(e){
+    var el = e.target && e.target.closest ? e.target.closest('[data-desc]') : null;
+    if (!el || el.querySelector('.pdesc-editor')) return;
+    var key = el.getAttribute('data-desc');
+    var cur = el.textContent || '';
+    var holder = document.createElement('span');
+    holder.className = 'pdesc-editor';
+    holder.style.cssText = 'display:block;';
+    holder.innerHTML =
+      '<textarea class="pdesc-ta" style="width:100%;min-height:80px;font-size:12px;border:1px solid #93C5FD;'
+      + 'border-radius:6px;padding:8px;box-sizing:border-box;font-family:inherit;"></textarea>'
+      + '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">'
+      + '<button type="button" class="btn pdesc-save" style="font-size:12px;padding:5px 12px;">저장</button>'
+      + '<button type="button" class="btn pdesc-cancel" style="font-size:12px;padding:5px 12px;background:#64748B;">취소</button>'
+      + '<button type="button" class="btn pdesc-reset" style="font-size:12px;padding:5px 12px;background:#94A3B8;">기본값으로</button>'
+      + '</div>';
+    el.textContent = '';
+    el.appendChild(holder);
+    var ta = holder.querySelector('.pdesc-ta');
+    ta.value = cur;
+    ta.focus();
+    function done() { location.reload(); }
+    async function post(text) {
+      var res = await fetch('/api/page-desc', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: key, text: text})
+      });
+      if (!res.ok) {
+        var d = await res.json().catch(function(){return {};});
+        alert(d.detail || '저장에 실패했습니다.');
+        return false;
+      }
+      return true;
+    }
+    holder.querySelector('.pdesc-save').addEventListener('click', async function(ev){
+      ev.stopPropagation();
+      if (await post(ta.value)) done();
+    });
+    holder.querySelector('.pdesc-cancel').addEventListener('click', function(ev){
+      ev.stopPropagation(); done();
+    });
+    holder.querySelector('.pdesc-reset').addEventListener('click', async function(ev){
+      ev.stopPropagation();
+      if (!confirm('설명 글을 기본 문구로 되돌릴까요?')) return;
+      if (await post('')) done();
+    });
+  });
+})();
+</script>"""
+
 def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> str:
     """공통 레이아웃 — 상단 타이틀 + 하단 메뉴 포함"""
     # ⚠️ 모바일 전용 테이블 글씨 축소 — f-string 중괄호 충돌 방지를 위해 별도 문자열로 조립
@@ -2992,6 +3164,10 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         </a>
             """
 
+    # 설명글 인라인 편집 대상 마킹 (override는 전체 사용자에게 적용, 편집 UI는 마스터만)
+    content, _desc_keys = _mark_desc_paragraphs(content, active or "")
+    desc_edit_html = _PAGE_DESC_EDIT_HTML if (is_master and _desc_keys) else ""
+
     return f"""
     <html><head>
       <meta charset="utf-8">
@@ -3091,6 +3267,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         </div>
       </div>
       <div class="content">{content}</div>
+      {desc_edit_html}
       <div id="noticePopupOverlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
            background:rgba(0,0,0,0.5);z-index:300;"></div>
       <div id="noticePopupModal" style="display:none;position:fixed;top:50%;left:50%;
@@ -6391,6 +6568,42 @@ async def daily_stocktake_delete(request: Request, session_token: str = Cookie(d
     finally:
         conn.close()
     return JSONResponse({"ok": True, "message": "실사 기록이 삭제되었습니다."})
+
+
+@app.post("/api/page-desc")
+async def api_page_desc(request: Request, session_token: str = Cookie(default=None)):
+    """페이지 설명글 저장 — 마스터 전용. text가 비어있으면 기본 문구로 복원."""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        raise HTTPException(status_code=403, detail="마스터 계정만 수정할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    key = str((body or {}).get("key") or "").strip()
+    text = str((body or {}).get("text") or "").strip()[:4000]
+    if not re.fullmatch(r"d[0-9a-f]{16}", key):
+        raise HTTPException(status_code=400, detail="잘못된 항목입니다.")
+    skey = _PAGEDESC_PREFIX + key
+    conn = get_conn()
+    try:
+        if not text:
+            conn.execute("DELETE FROM system_settings WHERE key=?", (skey,))
+        else:
+            _upd = conn.execute(
+                "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?", (text, skey)
+            )
+            if getattr(_upd, "rowcount", 0) == 0:
+                try:
+                    conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)", (skey, text))
+                except Exception:
+                    conn.execute("UPDATE system_settings SET value=? WHERE key=?", (text, skey))
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/presence")
@@ -29624,7 +29837,7 @@ CRON_MANAGE_JOBS = [
     # ── 외부 데이터 수신 ──
     ("sync-payment-records", "결제내역 수신", "유비플러스 결제내역 CSV → payment_records (21/22/24시 슬롯)", "슬롯별 매일", "외부 데이터 수신", "sync-payment-records", True),
     ("sync-sales-records", "판매내역 수신", "유비플러스 판매내역 CSV → sales_records (전날분)", "매일", "외부 데이터 수신", "sync-sales-records", True),
-    ("sync-raw-inventory", "재고현황 수신", "유비플러스 재고현황 CSV(S3) → raw_inventory", "주기적", "외부 데이터 수신", "sync-raw-inventory", True),
+    ("sync-raw-inventory", "재고현황 수신", "유비플러스 재고현황 CSV(S3) → raw_inventory", "15분마다", "외부 데이터 수신", "sync-raw-inventory", True),
     ("sync-purchase-records", "구매내역 수신", "구매내역 CSV → purchase_records", "주기적", "외부 데이터 수신", "sync-purchase-records", True),
     # ── 알림/리마인더 ──
     ("stock-closing-reminder", "재고 마감 리마인더", "전일 재고 마감 미제출 지점 자동 발송", "매일 10:00", "알림/리마인더", "stock-closing-reminder", False),
