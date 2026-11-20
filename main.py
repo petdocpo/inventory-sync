@@ -2848,8 +2848,28 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         "@media (max-width: 480px) {"
         "table { table-layout: auto; min-width: 560px; }"
         "table[data-colw], table[data-colkey] { table-layout: fixed !important; }"
-        "th { font-size: 8px; padding: 3px 2px; resize: none; min-width: 48px; }"
-        "td { font-size: 8px; padding: 3px 2px; }"
+        "th { font-size: 9px; padding: 4px 3px; resize: none; min-width: 52px; }"
+        "td { font-size: 10px; padding: 5px 4px; }"
+        "}"
+    )
+    # 모바일 공통 UI — 768px 이하에서만 적용 (PC 무영향)
+    mobile_ui_css = (
+        "@media (max-width: 768px) {"
+        "body { font-size: 12px; -webkit-text-size-adjust: 100%; }"
+        ".content { padding: 8px 10px; }"
+        ".card { padding: 12px; margin-bottom: 12px; border-radius: 10px; }"
+        ".btn { min-height: 40px; padding: 10px 14px; font-size: 13px; }"
+        "h2 { font-size: 17px !important; }"
+        "h3 { font-size: 15px !important; }"
+        "input, select, textarea { font-size: 16px !important; }"
+        ".topbar { padding: 8px 10px; flex-wrap: wrap; row-gap: 4px; }"
+        ".topbar > div { flex-wrap: wrap; row-gap: 4px; }"
+        ".topbar button, .topbar a { padding: 6px 8px !important; font-size: 12px !important; }"
+        ".bottomnav { padding: 4px 4px; }"
+        ".bottomnav a, .bottomnav div[onclick] { padding: 9px 2px !important; font-size: 11px !important; }"
+        ".bottomnav a > div:first-child, .bottomnav div[onclick] > div:first-child { font-size: 19px !important; }"
+        "form { display: block; }"
+        "form > div[style*='display:flex'], form > div[style*='display: flex'] { flex-wrap: wrap; }"
         "}"
     )
     branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")    
@@ -3051,6 +3071,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         td {{ padding: 6px 5px; border-bottom: 1px solid #eee; font-size: 11px;
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
         {mobile_table_css}
+        {mobile_ui_css}
         .badge-green {{ background:#D1FAE5;color:#065F46;padding:2px 8px;
                        border-radius:10px;font-size:11px; }}
         .badge-red {{ background:#FEE2E2;color:#991B1B;padding:2px 8px;
