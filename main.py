@@ -5050,10 +5050,6 @@ async def daily_stocktake_page(
             return not val
         return val == flt
 
-    filtered_items = [
-        it for it in items
-        if _match(it["supplier"], vendor) and _match(it["category"], category)
-    ]
 
     def _fmt_num(v):
         return "-" if v is None else str(v)
@@ -5066,7 +5062,7 @@ async def daily_stocktake_page(
         return f'<td class="dst-diff" style="font-weight:bold;color:{color};">{txt}</td>'
 
     rows_html = ""
-    for it in filtered_items:
+    for _di, it in enumerate(items):
         code = it["item_code"]
         line = line_map.get(code)
         if line is not None:
@@ -5103,7 +5099,12 @@ async def daily_stocktake_page(
                 'style="width:100%;padding:4px;border:1px solid #ccc;border-radius:6px;"></td>'
             )
         rows_html += (
-            "<tr>"
+            "<tr class=\"dst-row\""
+            f" data-idx=\"{_di}\""
+            f" data-supplier=\"{_html.escape(str(it.get('supplier') or ''), quote=True)}\""
+            f" data-category=\"{_html.escape(str(it.get('category') or ''), quote=True)}\""
+            f" data-name=\"{_html.escape(str(it['item_name'] or ''), quote=True)}\""
+            f" data-code=\"{_html.escape(str(code), quote=True)}\">"
             f"<td>{_html.escape(str(target_branch))}</td>"
             f"<td>{_html.escape(str(it['item_name'] or ''))}</td>"
             f"<td>{_html.escape(code)}</td>"
@@ -5126,7 +5127,11 @@ async def daily_stocktake_page(
         if code in eligible_codes:
             continue
         rows_html += (
-            "<tr style=\"background:#F9FAFB;color:#888;\">"
+            "<tr class=\"dst-row dst-deleted\" style=\"background:#F9FAFB;color:#888;\""
+            f" data-idx=\"99999\""
+            f" data-supplier=\"\" data-category=\"\""
+            f" data-name=\"{_html.escape(str(line['item_name'] or ''), quote=True)}\""
+            f" data-code=\"{_html.escape(str(code), quote=True)}\">"
             f"<td>{_html.escape(str(target_branch))}</td>"
             f"<td>{_html.escape(str(line['item_name'] or ''))} <span style=\"font-size:10px;\">(삭제된 품목)</span></td>"
             f"<td>{_html.escape(code)}</td>"
@@ -5171,11 +5176,25 @@ async def daily_stocktake_page(
         "</div>"
         '<div style="flex:1;min-width:120px;max-width:180px;">'
         '<label style="font-size:12px;color:#888;">거래처</label>'
-        f'<select name="vendor" style="margin-top:4px;">{vendor_options}</select>'
+        f'<select name="vendor" id="dstVendor" onchange="dstApplyView()" style="margin-top:4px;">{vendor_options}</select>'
         "</div>"
         '<div style="flex:1;min-width:110px;max-width:160px;">'
         '<label style="font-size:12px;color:#888;">품류</label>'
-        f'<select name="category" style="margin-top:4px;">{category_options}</select>'
+        f'<select name="category" id="dstCategory" onchange="dstApplyView()" style="margin-top:4px;">{category_options}</select>'
+        "</div>"
+        '<div style="flex:1;min-width:140px;max-width:200px;">'
+        '<label style="font-size:12px;color:#888;">검색</label>'
+        '<input id="dstSearch" type="text" placeholder="상품명/상품코드 일부 입력" '
+        'oninput="dstApplyView()" onkeydown="if(event.key===\'Enter\')event.preventDefault();" '
+        'style="margin-top:4px;">'
+        "</div>"
+        '<div style="flex:1;min-width:110px;max-width:150px;">'
+        '<label style="font-size:12px;color:#888;">정렬</label>'
+        '<select id="dstSortMode" onchange="dstApplyView()" style="margin-top:4px;">'
+        '<option value="default">기본 순서</option>'
+        '<option value="size">사이즈별 정렬</option>'
+        '<option value="color">색상별 정렬</option>'
+        "</select>"
         "</div>"
         '<button class="btn" type="submit">조회</button>'
         '<a href="/daily-stocktake" style="padding:10px 14px;background:#eee;'
@@ -5265,6 +5284,103 @@ async def daily_stocktake_page(
           }
         }
         dstUpdateDiff(inp);
+      }
+
+      // ── 클라이언트 필터/검색/정렬 ──
+      var DST_SORT_COL = {name:1, code:2, qr:3, ups:4};
+      var DST_SORT_STATE = {col: null, dir: 1};
+      var DST_SIZE_RE = /(소형|중형|대형|특대)/;
+      var DST_COLOR_RE = /(핑크|퍼플|화이트|블랙|레드|블루|그린|베이지|그레이|네이비|옐로우|오렌지|브라운|골드|실버|라벤더|민트|카키)/;
+      var DST_SIZE_ORD = ['소형','중형','대형','특대'];
+      var DST_COLOR_ORD = ['핑크','퍼플','화이트','블랙','레드','블루','그린','베이지','그레이','네이비','옐로우','오렌지','브라운','골드','실버','라벤더','민트','카키'];
+      function dstTokRank(name, ord) {
+        var m = name.match(DST_SIZE_RE) || name.match(DST_COLOR_RE);
+        return m ? ord.indexOf(m[1]) : -1;
+      }
+      function dstGroupRank(tr, primary) {
+        var name = tr.getAttribute('data-name') || '';
+        var sr = DST_SIZE_ORD.indexOf((name.match(DST_SIZE_RE) || [])[1] || '');
+        var cr = DST_COLOR_ORD.indexOf((name.match(DST_COLOR_RE) || [])[1] || '');
+        if (sr < 0) sr = 99;
+        if (cr < 0) cr = 99;
+        return primary === 'size' ? [sr, cr] : [cr, sr];
+      }
+      function dstCellText(tr, idx) {
+        var td = tr.children[idx];
+        return td ? td.textContent.trim() : '';
+      }
+      function dstCmpRows(a, b) {
+        if (DST_SORT_STATE.col) {
+          var ti = DST_SORT_COL[DST_SORT_STATE.col];
+          var va = dstCellText(a, ti), vb = dstCellText(b, ti);
+          var na = parseFloat(String(va).replace(/,/g, '')), nb = parseFloat(String(vb).replace(/,/g, ''));
+          var cmp;
+          if (!isNaN(na) && !isNaN(nb)) cmp = na - nb;
+          else cmp = va.localeCompare(vb, 'ko');
+          return cmp === 0 ? 0 : (cmp < 0 ? -1 : 1) * DST_SORT_STATE.dir;
+        }
+        var modeEl = document.getElementById('dstSortMode');
+        var mode = modeEl ? modeEl.value : 'default';
+        if (mode === 'size' || mode === 'color') {
+          var ra = dstGroupRank(a, mode), rb = dstGroupRank(b, mode);
+          for (var i = 0; i < 2; i++) {
+            if (ra[i] !== rb[i]) return ra[i] < rb[i] ? -1 : 1;
+          }
+          var na2 = (a.getAttribute('data-name') || '').localeCompare(b.getAttribute('data-name') || '', 'ko');
+          return na2;
+        }
+        return (parseInt(a.getAttribute('data-idx'), 10) || 0) - (parseInt(b.getAttribute('data-idx'), 10) || 0);
+      }
+      function dstSortMarks() {
+        document.querySelectorAll('.dst-sm').forEach(function(sp) {
+          var forCol = sp.getAttribute('data-for');
+          sp.textContent = (DST_SORT_STATE.col === forCol)
+            ? (DST_SORT_STATE.dir > 0 ? ' ▲' : ' ▼') : '';
+        });
+      }
+      function dstSortCol(th, col) {
+        if (DST_SORT_STATE.col === col) {
+          if (DST_SORT_STATE.dir === 1) DST_SORT_STATE.dir = -1;
+          else { DST_SORT_STATE.col = null; DST_SORT_STATE.dir = 1; }
+        } else {
+          DST_SORT_STATE.col = col;
+          DST_SORT_STATE.dir = 1;
+        }
+        var modeEl = document.getElementById('dstSortMode');
+        if (modeEl) modeEl.value = 'default';
+        dstApplyView();
+      }
+      function dstApplyView() {
+        var table = document.querySelector('.dst-input') ? document.querySelector('.dst-input').closest('table') : null;
+        if (!table || !table.tBodies.length) return;
+        var tb = table.tBodies[0];
+        var vendorEl = document.getElementById('dstVendor');
+        var catEl = document.getElementById('dstCategory');
+        var searchEl = document.getElementById('dstSearch');
+        var vendor = vendorEl ? vendorEl.value : '';
+        var category = catEl ? catEl.value : '';
+        var q = searchEl ? searchEl.value.trim().toLowerCase() : '';
+        var modeEl = document.getElementById('dstSortMode');
+        var mode = modeEl ? modeEl.value : 'default';
+        if (mode !== 'default') { DST_SORT_STATE.col = null; DST_SORT_STATE.dir = 1; }
+        var rows = Array.prototype.slice.call(tb.querySelectorAll('tr.dst-row'));
+        rows.forEach(function(tr) {
+          var sv = tr.getAttribute('data-supplier') || '';
+          var cv = tr.getAttribute('data-category') || '';
+          var nm = (tr.getAttribute('data-name') || '') + ' ' + (tr.getAttribute('data-code') || '');
+          var ok = true;
+          if (vendor === '__none__') ok = ok && !sv;
+          else if (vendor) ok = ok && sv === vendor;
+          if (category === '__none__') ok = ok && !cv;
+          else if (category) ok = ok && cv === category;
+          if (q) ok = ok && nm.toLowerCase().indexOf(q) >= 0;
+          tr.style.display = ok ? '' : 'none';
+        });
+        var normal = rows.filter(function(r) { return !r.classList.contains('dst-deleted'); });
+        var deleted = rows.filter(function(r) { return r.classList.contains('dst-deleted'); });
+        normal.sort(dstCmpRows);
+        normal.concat(deleted).forEach(function(tr) { tb.appendChild(tr); });
+        dstSortMarks();
       }
       var dstDirty = false;
       var dstDraftCodes = {};
@@ -5501,6 +5617,7 @@ async def daily_stocktake_page(
         document.querySelectorAll('.dst-input, .dst-loc').forEach(function(inp) {
           if (inp.value !== '') dstUpdateDiff(inp);
         });
+        dstApplyView();
       });
 
       // ── 동시 편집 presence (쓰기 가능 + 미마감일 때만) ──
@@ -5594,9 +5711,11 @@ async def daily_stocktake_page(
         + '<div id="dstPresence" style="margin-bottom:12px;"></div>'
         + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-17">'
         "<thead><tr>"
-        '<th style="width:7%">지점</th><th style="width:19%">상품명</th>'
-        '<th style="width:9%">상품코드</th><th style="width:8%">QR 재고 수량</th>'
-        '<th style="width:10%">유비플러스 재고 수량</th>'
+        '<th style="width:7%">지점</th>'
+        '<th style="width:19%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'name\')">상품명 <span class="dst-sm" data-for="name"></span></th>'
+        '<th style="width:9%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'code\')">상품코드 <span class="dst-sm" data-for="code"></span></th>'
+        '<th style="width:8%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'qr\')">QR 재고 수량 <span class="dst-sm" data-for="qr"></span></th>'
+        '<th style="width:10%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'ups\')">유비플러스 재고 수량 <span class="dst-sm" data-for="ups"></span></th>'
         '<th style="width:5%">위치1</th><th style="width:5%">위치2</th><th style="width:5%">위치3</th>'
         '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:14%">QR 수정</th>'
         "</tr></thead><tbody>"
@@ -6449,6 +6568,51 @@ _SC_NOTIFY_JS = """<script>
     }
     btn.disabled = false;
   }
+
+  function scEditDesc() {
+    var wrap = document.getElementById('scNotifyDesc');
+    if (!wrap || wrap.getAttribute('data-editing')) return;
+    wrap.setAttribute('data-editing', '1');
+    wrap.innerHTML = '<textarea id="scNotifyDescInput" style="width:100%;min-height:100px;font-size:12px;'
+      + 'border:1px solid #93C5FD;border-radius:6px;padding:8px;box-sizing:border-box;font-family:inherit;"></textarea>'
+      + '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">'
+      + '<button class="btn" type="button" style="font-size:12px;padding:5px 12px;" onclick="scSaveDesc(this)">저장</button>'
+      + '<button class="btn" type="button" style="font-size:12px;padding:5px 12px;background:#64748B;" onclick="location.reload()">취소</button>'
+      + '<button class="btn" type="button" style="font-size:12px;padding:5px 12px;background:#94A3B8;" onclick="scResetDesc(this)">기본값으로</button>'
+      + '</div>';
+    document.getElementById('scNotifyDescInput').value = wrap.getAttribute('data-raw') || '';
+    document.getElementById('scNotifyDescInput').focus();
+  }
+  async function scSaveDesc(btn) {
+    var ta = document.getElementById('scNotifyDescInput');
+    btn.disabled = true;
+    try {
+      var res = await fetch('/stock-closing/notify-desc', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: ta.value})
+      });
+      var data = await res.json();
+      if (!res.ok) { alert(data.detail || '저장에 실패했습니다.'); btn.disabled = false; return; }
+      location.reload();
+    } catch (e) {
+      alert('오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
+      btn.disabled = false;
+    }
+  }
+  async function scResetDesc(btn) {
+    if (!confirm('설명 글을 기본 문구로 되돌릴까요?')) return;
+    btn.disabled = true;
+    try {
+      var res = await fetch('/stock-closing/notify-desc', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: ''})
+      });
+      if (res.ok) location.reload();
+      else { var d = await res.json(); alert(d.detail || '실패'); btn.disabled = false; }
+    } catch (e) { alert('오류가 발생했습니다.'); btn.disabled = false; }
+  }
 </script>"""
 
 
@@ -6458,6 +6622,22 @@ def _sc_setting_on(key: str) -> bool:
     row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
     conn.close()
     return bool(row and str(row["value"]).strip().lower() == "on")
+
+
+_SC_NOTIFY_DESC_KEY = "stock_closing_notify_desc"
+_SC_NOTIFY_DESC_DEFAULT = (
+    "매일 오전 10시(KST) 전일 미제출 지점을 자동 발송합니다. "
+    "지점 채널 발송은 '지점 발송' 스위치와 해당 지점 '알림' 체크가 모두 켜져 있을 때만 나갑니다(자동·수동 '제출 요청' 공통). "
+    "'테스트 발송' 스위치가 켜져 있으면 테스트 채널 사본도 함께 발송됩니다. "
+    "'테스트'·'자동 알림 테스트' 버튼은 스위치와 무관하게 테스트 채널로만 발송됩니다(자동 알림 테스트는 테스트 메일도 발송)."
+)
+
+
+def _sc_setting_text(key: str):
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return str(row["value"]) if row and row["value"] is not None else None
 
 
 _SC_TEST_JS = """<script>
@@ -6556,10 +6736,20 @@ def _sc_request_button(code, name, status) -> str:
     )
 
 
-def _sc_notify_panel(sel_date_str: str) -> str:
+def _sc_notify_panel(sel_date_str: str, can_edit_desc: bool = True) -> str:
+    import html as _html
     branch_on = _sc_setting_on("stock_closing_notify_branch")
     test_on = _sc_setting_on("stock_closing_notify_test")
     mis_on = _sc_setting_on("stock_closing_notify_mismatch")
+
+    _desc_raw = (_sc_setting_text(_SC_NOTIFY_DESC_KEY) or "").strip() or _SC_NOTIFY_DESC_DEFAULT
+    _desc_html = (
+        '<div id="scNotifyDesc" style="font-size:12px;color:#888;margin-bottom:8px;white-space:pre-wrap;'
+        + ('cursor:pointer;' if can_edit_desc else '') + '"'
+        + (' data-raw="' + _html.escape(_desc_raw, quote=True) + '" onclick="scEditDesc()" title="클릭하면 설명 수정"' if can_edit_desc else '')
+        + '>' + _html.escape(_desc_raw) + '</div>'
+        + ('<div style="font-size:10px;color:#1E2761;margin:-4px 0 8px 0;">✏️ 설명 글을 수정하려면 위 문단을 클릭하세요</div>' if can_edit_desc else '')
+    )
 
     def _row(key, label, desc, on):
         checked = " checked" if on else ""
@@ -6572,10 +6762,7 @@ def _sc_notify_panel(sel_date_str: str) -> str:
     return (
         '<div class="card" style="margin-bottom:12px;">'
         '<div style="font-size:13px;font-weight:bold;margin-bottom:4px;">📨 자동 발송 설정 (기본 꺼짐)</div>'
-        '<div style="font-size:12px;color:#888;margin-bottom:8px;">매일 오전 10시(KST) 전일 미제출 지점을 자동 발송합니다. '
-        "지점 채널 발송은 '지점 발송' 스위치와 해당 지점 '알림' 체크가 모두 켜져 있을 때만 나갑니다(자동·수동 '제출 요청' 공통). "
-        "'테스트 발송' 스위치가 켜져 있으면 테스트 채널 사본도 함께 발송됩니다. "
-        "'테스트'·'자동 알림 테스트' 버튼은 스위치와 무관하게 테스트 채널로만 발송됩니다(자동 알림 테스트는 테스트 메일도 발송).</div>"
+        + _desc_html
         + _row("branch", "지점 발송", "켜면 '알림' 체크가 켜진 지점의 팀즈 채널로 미제출·불일치 알림 발송", branch_on)
         + _row("mismatch", "불일치 발송", "오차 건수가 있는 지점 — 테스트 채널·테스트 메일 + 지점별 알림 체크된 지점 팀즈 채널로 발송", mis_on)
         + _row("test", "테스트 발송", f"켜면 테스트 채널({STOCK_CLOSING_TEST_BRANCH_CODE})로 발송 · 자동 알림은 테스트 메일도 수신", test_on)
@@ -6627,6 +6814,38 @@ async def stock_closing_notify_toggle(request: Request, session_token: str = Coo
         conn.close()
     label = {"branch": "지점 발송", "test": "테스트 발송", "mismatch": "불일치 발송"}.get(key, key)
     return JSONResponse({"ok": True, "message": label + (" 켜짐" if enabled else " 꺼짐")})
+
+
+@app.post("/stock-closing/notify-desc")
+async def stock_closing_notify_desc(request: Request, session_token: str = Cookie(default=None)):
+    """자동 발송 설정 설명 글 저장 — 마스터 전용. 빈 값이면 기본 문구로 복귀."""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    user = get_session(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
+    if not (user.get("role") == "master" or user.get("branch_type") == "hq"):
+        raise HTTPException(status_code=403, detail="마스터 계정만 수정할 수 있습니다.")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="요청 형식이 올바르지 않습니다.")
+    text = str(body.get("text", "")).strip()[:2000]
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (_SC_NOTIFY_DESC_KEY,)).fetchone()
+        if text:
+            if row:
+                conn.execute("UPDATE system_settings SET value=?, updated_at=NOW() WHERE key=?", (text, _SC_NOTIFY_DESC_KEY))
+            else:
+                conn.execute("INSERT INTO system_settings (key, value) VALUES (?, ?)", (_SC_NOTIFY_DESC_KEY, text))
+        elif row:
+            conn.execute("DELETE FROM system_settings WHERE key=?", (_SC_NOTIFY_DESC_KEY,))
+        conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"ok": True, "message": "설명 글이 저장되었습니다." if text else "기본 문구로 되돌렸습니다."})
 
 @app.post("/stock-closing/notify-toggle-branch")
 async def stock_closing_notify_toggle_branch(request: Request, session_token: str = Cookie(default=None)):
