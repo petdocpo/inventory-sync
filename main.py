@@ -2868,6 +2868,11 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         'style="background:rgba(255,255,255,.15);color:white;border:none;'
         'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">🖥️</button>'
     )
+    orient_btn = (
+        '<button type="button" onclick="toggleOrient()" title="화면 가로/세로 전환" '
+        'style="background:rgba(255,255,255,.15);color:white;border:none;'
+        'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">⤢</button>'
+    )
     col_settings_btn = (
         col_font_btn +
         '<button type="button" onclick="openColSettings()" '
@@ -3059,7 +3064,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
       <div class="topbar">
         <span style="font-weight:bold;">📦 재고 관리 시스템{role_badge}</span>
         <div style="display:flex;align-items:center;">
-          {ui_mode_btn}{col_settings_btn}
+          {ui_mode_btn}{orient_btn}{col_settings_btn}
           <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
         </div>
       </div>
@@ -3090,6 +3095,23 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           document.documentElement.classList.toggle('pc-mode', pc);
           try {{ localStorage.setItem('ui_mode', pc ? 'pc' : 'mobile'); }} catch(e) {{}}
           location.reload();
+        }}
+        function toggleOrient() {{
+          try {{
+            if (screen.orientation && screen.orientation.lock) {{
+              var cur = screen.orientation.type || '';
+              if (cur.indexOf('landscape') === 0) {{
+                screen.orientation.unlock();
+              }} else {{
+                var p = screen.orientation.lock('landscape');
+                if (p && p.catch) p.catch(function() {{ alert('이 기기에서는 화면 방향 잠금을 지원하지 않습니다.\\n기기 자체의 회전 잠금을 풀고 가로로 돌려주세요.'); }});
+              }}
+            }} else {{
+              alert('이 브라우저는 화면 방향 잠금을 지원하지 않습니다.\\n(iPhone Safari 미지원 — 기기를 직접 가로로 돌려주세요)');
+            }}
+          }} catch(e) {{
+            alert('화면 방향 전환을 지원하지 않는 브라우저입니다.');
+          }}
         }}
         function toggleSubmenu(key) {{
           var target = document.getElementById('submenu-' + key);
@@ -3333,6 +3355,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             th.appendChild(handle);
             var drag = null;
             handle.addEventListener('pointerdown', function(e) {{
+              if (e.pointerType === 'touch') return;
               if (e.button !== 0) return;
               e.preventDefault();
               e.stopPropagation();
@@ -3364,6 +3387,32 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             }}
             handle.addEventListener('pointerup', endDrag);
             handle.addEventListener('pointercancel', endDrag);
+            // 터치 전용 드래그 — 일부 모바일 브라우저에서 pointer 이벤트가 불안정해 별도 처리
+            handle.addEventListener('touchstart', function(e) {{
+              if (e.touches.length !== 1) return;
+              e.preventDefault();
+              freezeTable();
+              drag = {{ idx: (function(){{var a=colHeaderCells(table).indexOf(th);return a>=0?a:idx;}})(), x0: e.touches[0].clientX }};
+              dirty = false;
+            }}, {{passive:false}});
+            handle.addEventListener('touchmove', function(e) {{
+              if (!drag || !widths) return;
+              e.preventDefault();
+              var next = colDragWidths(widths, drag.idx, e.touches[0].clientX - drag.x0, mins);
+              if (Math.abs(next[drag.idx] - shown[drag.idx]) > 0.5) {{
+                shown = next;
+                applyWidths(next);
+                dirty = true;
+                saveTable(table);
+              }}
+            }}, {{passive:false}});
+            function endDragTouch() {{
+              if (!drag) return;
+              drag = null;
+              if (dirty) saveTable(table);
+            }}
+            handle.addEventListener('touchend', endDragTouch);
+            handle.addEventListener('touchcancel', endDragTouch);
           }});
         }});
       }})();
