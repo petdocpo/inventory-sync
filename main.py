@@ -5196,6 +5196,10 @@ async def daily_stocktake_page(
         '<option value="color">색상별 정렬</option>'
         "</select>"
         "</div>"
+        '<div style="display:flex;align-items:flex-end;padding-bottom:4px;">'
+        '<label style="font-size:12px;color:#444;display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;">'
+        '<input type="checkbox" id="dstDiffOnly" onchange="dstApplyView()"> 오차만 보기</label>'
+        "</div>"
         '<button class="btn" type="submit">조회</button>'
         '<a href="/daily-stocktake" style="padding:10px 14px;background:#eee;'
         'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>'
@@ -5249,6 +5253,10 @@ async def daily_stocktake_page(
         });
         return any ? sum : null;
       }
+      function dstDiffFilterTick() {
+        var el = document.getElementById('dstDiffOnly');
+        if (el && el.checked) dstApplyView();
+      }
       function dstUpdateDiff(inp) {
         var tr = inp.closest('tr');
         var cell = tr.querySelector('.dst-diff');
@@ -5257,16 +5265,19 @@ async def daily_stocktake_page(
         if (total === null || ups === '') {
           cell.textContent = '-';
           cell.style.color = '#888';
+          dstDiffFilterTick();
           return;
         }
         var diff = total - parseInt(ups, 10);
         if (isNaN(diff)) {
           cell.textContent = '-';
           cell.style.color = '#888';
+          dstDiffFilterTick();
           return;
         }
         cell.textContent = (diff > 0 ? '+' : '') + diff;
         cell.style.color = diff === 0 ? '#22C55E' : (diff < 0 ? '#EF4444' : '#F59E0B');
+        dstDiffFilterTick();
       }
 
       // 위치 칸 입력 → 실사 수량 칸에 위치 합계를 자동 입력 (기존 수동값은 백업 후 복원)
@@ -5350,7 +5361,45 @@ async def daily_stocktake_page(
         if (modeEl) modeEl.value = 'default';
         dstApplyView();
       }
+      // 선택된 거래처에 실제 존재하는 품류만 남도록 품류 셀렉트 옵션 재구성
+      function dstSyncCategoryOptions() {
+        var catEl = document.getElementById('dstCategory');
+        var vendorEl = document.getElementById('dstVendor');
+        if (!catEl || !vendorEl) return;
+        var vendor = vendorEl.value;
+        var table = document.querySelector('.dst-input') ? document.querySelector('.dst-input').closest('table') : null;
+        if (!table || !table.tBodies.length) return;
+        var cats = {};
+        var hasNone = false;
+        table.tBodies[0].querySelectorAll('tr.dst-row:not(.dst-deleted)').forEach(function(tr) {
+          var sv = tr.getAttribute('data-supplier') || '';
+          var vok = true;
+          if (vendor === '__none__') vok = !sv;
+          else if (vendor) vok = sv === vendor;
+          if (!vok) return;
+          var cv = tr.getAttribute('data-category') || '';
+          if (cv) cats[cv] = true; else hasNone = true;
+        });
+        var prev = catEl.value;
+        catEl.innerHTML = '';
+        var o0 = document.createElement('option');
+        o0.value = ''; o0.textContent = '전체';
+        catEl.appendChild(o0);
+        if (hasNone) {
+          var on = document.createElement('option');
+          on.value = '__none__'; on.textContent = '(미등록)';
+          catEl.appendChild(on);
+        }
+        Object.keys(cats).sort(function(a, b) { return a.localeCompare(b, 'ko'); }).forEach(function(cv) {
+          var o = document.createElement('option');
+          o.value = cv; o.textContent = cv;
+          catEl.appendChild(o);
+        });
+        var valid = prev === '' || prev === '__none__' || cats[prev];
+        catEl.value = valid ? prev : '';
+      }
       function dstApplyView() {
+        dstSyncCategoryOptions();
         var table = document.querySelector('.dst-input') ? document.querySelector('.dst-input').closest('table') : null;
         if (!table || !table.tBodies.length) return;
         var tb = table.tBodies[0];
@@ -5363,6 +5412,8 @@ async def daily_stocktake_page(
         var modeEl = document.getElementById('dstSortMode');
         var mode = modeEl ? modeEl.value : 'default';
         if (mode !== 'default') { DST_SORT_STATE.col = null; DST_SORT_STATE.dir = 1; }
+        var diffEl = document.getElementById('dstDiffOnly');
+        var diffOnly = diffEl ? diffEl.checked : false;
         var rows = Array.prototype.slice.call(tb.querySelectorAll('tr.dst-row'));
         rows.forEach(function(tr) {
           var sv = tr.getAttribute('data-supplier') || '';
@@ -5374,6 +5425,11 @@ async def daily_stocktake_page(
           if (category === '__none__') ok = ok && !cv;
           else if (category) ok = ok && cv === category;
           if (q) ok = ok && nm.toLowerCase().indexOf(q) >= 0;
+          if (diffOnly) {
+            var dc = tr.querySelector('.dst-diff');
+            var dv = dc ? parseInt(dc.textContent.trim().replace(/^\+/, ''), 10) : NaN;
+            ok = ok && !isNaN(dv) && dv !== 0;
+          }
           tr.style.display = ok ? '' : 'none';
         });
         var normal = rows.filter(function(r) { return !r.classList.contains('dst-deleted'); });
@@ -5383,14 +5439,23 @@ async def daily_stocktake_page(
         dstSortMarks();
       }
       var dstDirty = false;
+      // 브라우저별 고유 ID — 같은 계정(마스터 공용 등)으로 동시 접속해도 드래프트/presence가 섞이지 않게 함
+      var DST_CID = '';
+      try { DST_CID = localStorage.getItem('dst_cid') || ''; } catch (e) {}
+      if (!DST_CID) {
+        DST_CID = 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+        try { localStorage.setItem('dst_cid', DST_CID); } catch (e) {}
+      }
+      var DST_LOGIN_CID = '__DST_LOGIN__' + '|' + DST_CID;
       var dstDraftCodes = {};
+      var dstTouched = {};
       var dstDraftTimer = null;
       var dstLastApplied = {};
       document.addEventListener('input', function(e) {
         if (e.target && (e.target.classList.contains('dst-input') || e.target.classList.contains('dst-loc'))) {
           dstDirty = true;
           var code = e.target.getAttribute('data-code');
-          if (code) { dstDraftCodes[code] = true; dstScheduleDraft(); }
+          if (code) { dstDraftCodes[code] = true; dstTouched[code] = true; dstScheduleDraft(); }
         }
       });
 
@@ -5412,9 +5477,9 @@ async def daily_stocktake_page(
         var mv = mi.value.trim();
         return { m: (mv === '' ? null : parseInt(mv, 10)), l: l };
       }
-      async function dstSendDraft() {
+      async function dstSendDraft(force) {
         if (DST_PRESENCE !== '1') return;
-        var codes = Object.keys(dstDraftCodes);
+        var codes = force ? Object.keys(dstTouched) : Object.keys(dstDraftCodes);
         if (!codes.length) return;
         var items = {};
         codes.forEach(function(code) {
@@ -5426,7 +5491,7 @@ async def daily_stocktake_page(
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
               branch_code: DST_BRANCH, date: '__DST_DATE__',
-              name: dstPresenceName(), items: items
+              name: dstPresenceName(), cid: DST_CID, items: items
             })
           });
           if (res.ok) { codes.forEach(function(c) { delete dstDraftCodes[c]; }); }
@@ -5438,7 +5503,7 @@ async def daily_stocktake_page(
           await fetch('/api/daily-stocktake/draft', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
-              branch_code: DST_BRANCH, date: '__DST_DATE__', clear: true
+              branch_code: DST_BRANCH, date: '__DST_DATE__', clear: true, cid: DST_CID
             })
           });
         } catch (e) {}
@@ -5452,7 +5517,7 @@ async def daily_stocktake_page(
         try {
           var res = await fetch('/api/daily-stocktake/draft?branch_code='
             + encodeURIComponent(DST_BRANCH) + '&date=' + encodeURIComponent('__DST_DATE__')
-            + '&login_id=' + encodeURIComponent('__DST_LOGIN__'));
+            + '&cid=' + encodeURIComponent(DST_CID));
           var d = await res.json();
           if (!res.ok || !d.ok) return;
           var drafts = d.drafts || {};
@@ -5636,7 +5701,7 @@ async def daily_stocktake_page(
           + 'color:#1E40AF;background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;padding:6px 10px;">'
           + '<span style="font-weight:bold;">✏️ 지금 기입 중:</span>';
         users.forEach(function(u) {
-          var me = (u.login_id === '__DST_LOGIN__') ? ' <span style="color:#888;">(나)</span>' : '';
+          var me = (u.login_id === DST_LOGIN_CID) ? ' <span style="color:#888;">(나)</span>' : '';
           html += '<span style="background:#fff;border:1px solid #BFDBFE;border-radius:10px;padding:1px 8px;">'
             + dstEsc(u.display_name || u.login_id) + me + '</span>';
         });
@@ -5649,7 +5714,7 @@ async def daily_stocktake_page(
           await fetch('/api/presence', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({page: 'daily-stocktake', scope_key: '__DST_SCOPE__',
-                                  name: dstPresenceName()})
+                                  name: dstPresenceName(), cid: DST_CID})
           });
         } catch (e) {}
       }
@@ -5691,6 +5756,7 @@ async def daily_stocktake_page(
         setInterval(dstPresencePoll, 20000);
         setInterval(dstSyncPoll, 20000);
         setInterval(dstDraftPoll, 5000);
+        setInterval(function() { dstSendDraft(true); }, 30000);
       }
     </script>
     """.replace("__DST_DATE__", sel_date_str).replace("__DST_PRESENCE__", "1" if (page_can_write and not is_closed) else "0").replace("__DST_SCOPE__", _html.escape(str(target_branch) + "|" + sel_date_str)).replace("__DST_LOGIN__", _html.escape(str(user.get("login_id") or ""))).replace("__DST_SAVE_AT__", _html.escape(str(save["saved_at"] or "") if save else "")).replace("__DST_BRANCH__", _html.escape(str(target_branch)))
@@ -5886,7 +5952,8 @@ def _dst_write_counts(conn, save_id, branch_code: str, date_str: str, parsed: di
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(save_id, item_code) DO UPDATE SET "
             "item_name=excluded.item_name, supplier=excluded.supplier, category=excluded.category, "
-            "qr_qty=excluded.qr_qty, ups_qty=excluded.ups_qty, "
+            "qr_qty=COALESCE(daily_stocktake_lines.qr_qty, excluded.qr_qty), "
+            "ups_qty=COALESCE(daily_stocktake_lines.ups_qty, excluded.ups_qty), "
             "counted_qty=excluded.counted_qty, diff_qty=excluded.diff_qty, "
             "manual_qty=excluded.manual_qty, loc1_qty=excluded.loc1_qty, "
             "loc2_qty=excluded.loc2_qty, loc3_qty=excluded.loc3_qty",
@@ -6188,6 +6255,7 @@ async def api_daily_stocktake_draft_get(
     branch_code: str = "",
     date: str = "",
     login_id: str = "",
+    cid: str = "",
     session_token: str = Cookie(default=None)
 ):
     from fastapi import HTTPException
@@ -6207,7 +6275,7 @@ async def api_daily_stocktake_draft_get(
             drafts = _json.loads(row["data"] or "{}")
         except Exception:
             drafts = {}
-    me = login_id.strip()
+    me = (cid.strip()[:60] or login_id.strip())
     if me:
         drafts.pop(me, None)
     return {"ok": True, "drafts": drafts}
@@ -6229,6 +6297,8 @@ async def api_daily_stocktake_draft_post(request: Request, session_token: str = 
     login_id = str(user.get("login_id") or "").strip()
     if not login_id:
         raise HTTPException(status_code=400, detail="로그인 정보가 없습니다.")
+    # 브라우저별 고유 ID 우선 — 같은 계정 동시 접속 시 서로의 드래프트가 섞이지 않도록
+    dkey = str(body.get("cid") or "").strip()[:60] or login_id
     conn = get_conn()
     row = conn.execute(
         "SELECT data FROM daily_stocktake_drafts WHERE scope_key=?", (scope,)
@@ -6245,13 +6315,13 @@ async def api_daily_stocktake_draft_post(request: Request, session_token: str = 
               if not isinstance(v, dict) or str(v.get("updated_at") or "") < cutoff]:
         drafts.pop(k, None)
     if body.get("clear"):
-        drafts.pop(login_id, None)
+        drafts.pop(dkey, None)
     else:
         items_in = body.get("items") or {}
         if not isinstance(items_in, dict):
             items_in = {}
         now_iso = datetime.now().isoformat()
-        entry = drafts.get(login_id)
+        entry = drafts.get(dkey)
         if not isinstance(entry, dict):
             entry = {"name": "", "items": {}, "updated_at": now_iso}
         entry["name"] = str(body.get("name") or entry.get("name") or login_id)
@@ -6272,7 +6342,7 @@ async def api_daily_stocktake_draft_post(request: Request, session_token: str = 
             }
         entry["items"] = entry_items
         entry["updated_at"] = now_iso
-        drafts[login_id] = entry
+        drafts[dkey] = entry
     conn.execute(
         "INSERT INTO daily_stocktake_drafts (scope_key, data, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(scope_key) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
@@ -6344,6 +6414,11 @@ async def api_presence_heartbeat(request: Request, session_token: str = Cookie(d
     name = str((body or {}).get("name") or "").strip()[:30] or str(user.get("login_id") or "")
     now_str = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
     login = str(user.get("login_id") or "")
+    cid = str((body or {}).get("cid") or "").strip()[:60]
+    # 같은 계정을 여러 브라우저/기기가 동시에 쓰는 경우 구분 — presence 키와 표시 이름에 기기 ID 반영
+    login_key = (login + "|" + cid) if cid else login
+    if cid and name == login:
+        name = (name + "#" + cid[-4:])[:30]
 
     conn = get_conn()
     try:
@@ -6352,7 +6427,7 @@ async def api_presence_heartbeat(request: Request, session_token: str = Cookie(d
             "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(page, scope_key, login_id) DO UPDATE SET "
             "display_name=excluded.display_name, updated_at=excluded.updated_at",
-            (page, scope_key, login, name, now_str)
+            (page, scope_key, login_key, name, now_str)
         )
         # 오래된 presence 정리 (10분 이상 무갱신)
         stale = (_dt.now() - _td(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
@@ -6434,6 +6509,16 @@ async def master_daily_stocktake_page(
             f'{_html.escape(str(b["branch_name"]))}</option>'
         )
 
+    def _dsx_export_href(fb, dt):
+        qs = []
+        if fb:
+            qs.append("filter_branch=" + _html.escape(fb, quote=True))
+        if dt:
+            qs.append("date=" + _html.escape(dt, quote=True))
+        href = "/master/daily-stocktake/export" + (("?" + "&".join(qs)) if qs else "")
+        return ('<a href="' + href + '" style="padding:10px 14px;background:#166534;color:white;'
+                'border-radius:8px;font-size:13px;text-decoration:none;">📥 엑셀</a>')
+
     filter_html = (
         '<form method="get" action="/master/daily-stocktake" style="margin-bottom:16px;">'
         '<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
@@ -6450,7 +6535,8 @@ async def master_daily_stocktake_page(
         'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">초기화</a>'
         '<a href="/daily-stocktake" style="padding:10px 14px;background:#1E2761;color:white;'
         'border-radius:8px;font-size:13px;text-decoration:none;">🧮 실사하기</a>'
-        "</div></form>"
+        + _dsx_export_href(filter_branch, date)
+        + "</div></form>"
     )
 
     rows_html = ""
@@ -6523,6 +6609,100 @@ async def master_daily_stocktake_page(
         </script>"""
     )
     return HTMLResponse(render_page(content, user, active="master"))
+
+
+@app.get("/master/daily-stocktake/export")
+async def master_daily_stocktake_export(
+    session_token: str = Cookie(default=None),
+    filter_branch: str = "",
+    date: str = "",
+):
+    """재고 실사 결과 엑셀 다운로드 — 저장된 라인 전체 (지점/날짜 필터 동일 적용)."""
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from urllib.parse import quote
+
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return RedirectResponse(url="/login", status_code=303)
+    if not has_menu_permission(user["login_id"], "daily-stocktake"):
+        return RedirectResponse(url="/master", status_code=303)
+
+    branch_name_map = {b["branch_code"]: b["branch_name"] for b in get_branches(branch_type=None)}
+
+    query = (
+        "SELECT l.*, s.closer_name AS save_closer, s.saved_by AS save_by, s.saved_at AS save_at, "
+        "s.status AS save_status FROM daily_stocktake_lines l "
+        "JOIN daily_stocktake_saves s ON s.id = l.save_id WHERE 1=1"
+    )
+    params = []
+    if filter_branch:
+        query += " AND l.branch_code=?"
+        params.append(filter_branch)
+    if date:
+        query += " AND l.count_date=?"
+        params.append(date)
+    query += " ORDER BY l.count_date DESC, l.branch_code, l.supplier, l.category, l.item_name"
+
+    conn = get_conn()
+    try:
+        lines = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "재고실사"
+    headers = ["실사일", "지점", "담당자", "상태", "거래처", "품류", "상품코드", "상품명",
+               "QR재고", "유비플러스", "위치1", "위치2", "위치3", "실사수량", "오차",
+               "저장자", "저장일시"]
+    ws.append(headers)
+    hfill = PatternFill("solid", fgColor="1E2761")
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = hfill
+        c.alignment = Alignment(horizontal="center")
+
+    for l in lines:
+        ws.append([
+            str(l["count_date"] or ""),
+            branch_name_map.get(str(l["branch_code"]), str(l["branch_code"] or "")),
+            str(l["save_closer"] or ""),
+            "마감" if (l["save_status"] or "open") == "closed" else "진행중",
+            str(l["supplier"] or ""),
+            str(l["category"] or ""),
+            str(l["item_code"] or ""),
+            str(l["item_name"] or ""),
+            l["qr_qty"],
+            l["ups_qty"],
+            _dst_line_get(l, "loc1_qty"),
+            _dst_line_get(l, "loc2_qty"),
+            _dst_line_get(l, "loc3_qty"),
+            l["counted_qty"],
+            l["diff_qty"],
+            str(l["save_by"] or ""),
+            str(l["save_at"] or ""),
+        ])
+
+    widths = [12, 12, 10, 8, 14, 12, 16, 30, 8, 10, 8, 8, 8, 8, 8, 10, 18]
+    for i, w in enumerate(widths, 1):
+        col = chr(64 + i) if i <= 26 else "A" + chr(64 + i - 26)
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    bname = branch_name_map.get(filter_branch, filter_branch or "전체")
+    filename = f"재고실사_{bname}_{date or '전체'}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)}
+    )
 
 # 재고 마감 "제출 요청" 테스트 수신 채널(teams_webhook의 branch_code). 목록에 '테스트용지점' 행이 없어서 우선 유한서 채널로 지정 — 바꾸려면 이 한 줄만 수정
 STOCK_CLOSING_TEST_BRANCH_CODE = "admin_hs"
