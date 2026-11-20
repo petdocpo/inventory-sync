@@ -2407,7 +2407,7 @@ _COLUMN_SETTINGS_HTML = """
           } catch (e) { return []; }
         }
         // 폰트 크기 — localStorage 개인 설정 우선, 없으면 서버 기본값, 둘 다 없으면 미적용
-        var FONT_MIN = 8, FONT_MAX = 24;
+        var FONT_MIN = 6, FONT_MAX = 24;
         function cvFontStoreKey(table) { return 'colFont_' + cvBaseKey(table); }
         function cvFontDefault(table) {
           try {
@@ -2806,7 +2806,7 @@ async def column_defaults_save(request: Request, session_token: str = Cookie(def
         if not isinstance(hidden, list):
             continue
         # 키 접미사별 허용 범위 — _w: 컬럼 너비(px), _f: 폰트 크기, 기본: 숨김 항목 인덱스
-        _lo, _hi = (20, 2000) if suffix.endswith("_w") else ((8, 24) if suffix.endswith("_f") else (0, 100))
+        _lo, _hi = (20, 2000) if suffix.endswith("_w") else ((6, 24) if suffix.endswith("_f") else (0, 100))
         vals = []
         for v in hidden[:200]:
             try:
@@ -2846,7 +2846,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     # ⚠️ 모바일 전용 테이블 글씨 축소 — f-string 중괄호 충돌 방지를 위해 별도 문자열로 조립
     mobile_table_css = (
         "@media (max-width: 480px) {"
-        "table { table-layout: auto; min-width: 560px; }"
+        "table { min-width: 560px; }"
         "table[data-colw], table[data-colkey] { table-layout: fixed !important; }"
         "th { font-size: 9px; padding: 4px 3px; resize: none; min-width: 52px; }"
         "td { font-size: 10px; padding: 5px 4px; }"
