@@ -2847,6 +2847,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     mobile_table_css = (
         "@media (max-width: 480px) {"
         "table { table-layout: auto; min-width: 560px; }"
+        "table[data-colw], table[data-colkey] { table-layout: fixed !important; }"
         "th { font-size: 8px; padding: 3px 2px; resize: none; min-width: 48px; }"
         "td { font-size: 8px; padding: 3px 2px; }"
         "}"
@@ -3273,6 +3274,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
               var cols = table.querySelectorAll('colgroup col');
               if (cols.length === ths.length) {{ cols.forEach(function(c, i) {{ c.style.width = widths[i] + 'px'; }}); }}
               table.style.width = sum + 'px';
+            table.style.minWidth = sum + 'px';
             }} catch (e) {{}}
           }});
         }}
@@ -3288,12 +3290,16 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         if (!document.getElementById('colWHandleStyle')) {{
           var st = document.createElement('style');
           st.id = 'colWHandleStyle';
-          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;pointer-events:none;}}th:hover>.col-w-handle,td:hover>.col-w-handle{{opacity:.55;pointer-events:auto;}}.col-w-handle:hover{{opacity:.95 !important;}}@media (pointer:coarse),(hover:none){{.col-w-handle{{opacity:.55;pointer-events:auto;width:16px;right:-4px;}}}}';
+          st.textContent = '.col-w-handle{{position:absolute;right:0;top:25%;height:50%;width:6px;cursor:col-resize;background:rgba(255,255,255,.55);border-radius:2px;z-index:5;touch-action:none;opacity:0;transition:opacity .15s;pointer-events:none;user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent;}}th:hover>.col-w-handle,td:hover>.col-w-handle{{opacity:.55;pointer-events:auto;}}.col-w-handle:hover{{opacity:.95 !important;}}@media (pointer:coarse),(hover:none){{.col-w-handle{{opacity:.7;pointer-events:auto;width:20px;right:0;}}}}';
           document.head.appendChild(st);
         }}
         document.querySelectorAll('table').forEach(function(table) {{
           if (!isResizableTable(table)) return;
           var ths = colHeaderCells(table);
+          var _cgCols = table.querySelectorAll('colgroup col');
+          if (_cgCols.length && _cgCols.length !== ths.length) {{
+            console.warn('[colw] colgroup/th 개수 불일치 — col 동기화가 적용되지 않을 수 있습니다:', table, _cgCols.length, ths.length);
+          }}
           ths.forEach(function(th) {{ th.style.resize = 'none'; th.style.position = 'relative'; }});
           var widths = null;
           var shown = null;
@@ -3310,6 +3316,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
               cols.forEach(function(c, i) {{ c.style.width = w[i] + 'px'; }});
             }}
             table.style.width = sum + 'px';
+            table.style.minWidth = sum + 'px';
           }}
           function freezeTable() {{
             ths = colHeaderCells(table);
