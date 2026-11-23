@@ -105,6 +105,7 @@ MENU_DEFINITIONS = {
     "purchase-tracking": "발주 주기 트래킹",
     "purchase-order-preview": "발주서 미리보기",
     "purchase-order-verify": "발주서 검수(기존 양식 비교)",
+    "statement-check": "거래명세서 확인",
     "product-settings": "상품 설정",
     "branch-exceptions": "발주서 지점 예외",
     "safety-stock": "안전재고 관리",
@@ -2264,6 +2265,47 @@ def init_db():
             _scl_existing = {r[1] for r in conn.execute("PRAGMA table_info(stock_closing_lines)").fetchall()}
             if "reason" not in _scl_existing:
                 conn.execute("ALTER TABLE stock_closing_lines ADD COLUMN reason TEXT")
+
+    # 거래명세서 확인 — 명세서↔상품 별칭, 업로드, 추출 행
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS statement_item_map (
+            {pk},
+            alias_name TEXT NOT NULL,
+            supplier TEXT NOT NULL DEFAULT '',
+            item_code TEXT NOT NULL,
+            item_name TEXT NOT NULL DEFAULT '',
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE(alias_name, supplier, item_code)
+        )
+    """)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS statement_uploads (
+            {pk},
+            filename TEXT,
+            vendor TEXT NOT NULL DEFAULT '',
+            month TEXT NOT NULL DEFAULT '',
+            uploaded_by TEXT,
+            uploaded_at TEXT,
+            parse_note TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS statement_rows (
+            {pk},
+            upload_id INTEGER NOT NULL,
+            row_no INTEGER,
+            stmt_date TEXT NOT NULL DEFAULT '',
+            branch_name TEXT NOT NULL DEFAULT '',
+            raw_name TEXT NOT NULL DEFAULT '',
+            spec TEXT NOT NULL DEFAULT '',
+            qty REAL,
+            unit_price REAL,
+            amount REAL,
+            item_code TEXT NOT NULL DEFAULT '',
+            match_note TEXT NOT NULL DEFAULT ''
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -17772,6 +17814,19 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """
 
+    # ---- 거래명세서 확인 (단독 상단) ----
+    stmt_card_html = ""
+    if menu_allowed("statement-check"):
+        stmt_card_html = """
+      <a href="/master/statement-check" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🧾</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래명세서 확인</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">명세서 ↔ 발주내역 대조</div>
+        </div>
+      </a>
+        """
+
     # ---- 그룹 1: DB재고관리 ----
     db_inventory_cards = []
     if menu_allowed("data"):
@@ -17973,7 +18028,7 @@ async def master_page(session_token: str = Cookie(default=None)):
     content = f"""
     {ACCORDION_CSS_JS}
     <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
-    {f'<div style="display:flex;gap:16px;margin-bottom:14px;">{branch_card_html}{po_preview_card_html}{po_verify_card_html}</div>' if (branch_card_html or po_preview_card_html or po_verify_card_html) else ""}
+    {f'<div style="display:flex;gap:16px;margin-bottom:14px;">{branch_card_html}{po_preview_card_html}{po_verify_card_html}{stmt_card_html}</div>' if (branch_card_html or po_preview_card_html or po_verify_card_html or stmt_card_html) else ""}
     {groups_html}
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -30263,6 +30318,1581 @@ async def master_cron_manage_source_url(request: Request, session_token: str = C
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": f"설정 저장 실패: {str(e)[:200]}"})
     return JSONResponse(content={"status": "ok", "job": job, "url": url or _cron_source_default(job)})
+
+
+
+
+# ════════════════════════════════════════════════════════════════
+# 거래명세서 확인 — 명세서(PDF/Excel) 업로드 → 발주내역 월 대조 → 불일치 수정
+# ════════════════════════════════════════════════════════════════
+
+def _stmt_norm(s) -> str:
+    return re.sub(r"[\s_()\[\]\-·]+", "", str(s or "")).lower()
+
+
+def _stmt_num(v):
+    """셀/문자열 값을 숫자로. 실패 시 None."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).replace(",", "").replace("₩", "").replace("원", "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _stmt_is_num_token(t: str) -> bool:
+    t = t.strip().lstrip("₩").replace(",", "")
+    return bool(re.fullmatch(r"\d+(\.\d+)?", t))
+
+
+def _stmt_split_glued_money(token: str):
+    """'231,00021,000210,000' 같은 붙은 금액 토큰을 ['231,000','21,000','210,000']으로 분리."""
+    t = token.strip().lstrip("₩")
+    if "," not in t:
+        return [t]
+    parts = re.findall(r"\d{1,3}(?:,\d{3})+|\d+", t)
+    return parts if parts and "".join(parts).replace(",", "") == t.replace(",", "") else [t]
+
+
+def _stmt_split_name_nums(s: str):
+    """'이름 수량 단가 금액 세액' 형태의 줄을 (이름, [숫자들])로 분리. 숫자는 왼쪽→오른쪽 순서."""
+    s = (s or "").strip()
+    if not s:
+        return "", []
+    parts = s.split()
+    i = len(parts)
+    while i > 0 and _stmt_is_num_token(parts[i - 1]):
+        i -= 1
+    if i == len(parts):
+        return s, []
+    name = " ".join(parts[:i]).strip()
+    nums = []
+    for tok in parts[i:]:
+        nums.extend(_stmt_split_glued_money(tok))
+    return name, nums
+
+
+_STMT_DATE_RES = [
+    re.compile(r"^(20\d{2})\s*[-./년]\s*(\d{1,2})\s*[-./월]\s*(\d{1,2})\s*일?"),
+    re.compile(r"^(\d{2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})"),
+    re.compile(r"^(\d{1,2})\s*[-./]\s*(\d{1,2})\b"),
+]
+
+
+def _stmt_parse_leading_date(s: str):
+    """줄 앞의 날짜를 제거하고 (날짜문자열, 나머지) 반환. 날짜 형식 아니면 ('', 원문)."""
+    s = s.strip()
+    m = _STMT_DATE_RES[0].match(s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        rest = s[m.end():].strip()
+        return f"{y:04d}-{mo:02d}-{d:02d}", rest
+    m = _STMT_DATE_RES[1].match(s)
+    if m:
+        yy, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        y = 2000 + yy if yy < 70 else 1900 + yy
+        rest = s[m.end():].strip()
+        return f"{y:04d}-{mo:02d}-{d:02d}", rest
+    m = _STMT_DATE_RES[2].match(s)
+    if m:
+        mo, d = int(m.group(1)), int(m.group(2))
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            rest = s[m.end():].strip()
+            return f"{mo:02d}-{d:02d}", rest
+    return "", s
+
+
+_STMT_SKIP_NAME_RE = re.compile(r"(합계|소계|총계|계\s*$|^계\b|vat|잔금|입금|전화|팩스|주소|업태|종목|사업자|등록번호|납품일자|견적|거래처|품명\s*:|기간)", re.I)
+
+
+def _stmt_clean_row_name(name: str) -> str:
+    name = re.sub(r"주식회사?\s*펫닥\s*\([^)]*\)", " ", name or "")
+    name = re.sub(r"\b\d{2},\d{6,}\b", " ", name)          # 하얀나래 품번 코드
+    name = re.sub(r"^\d{1,3},\d{3}\d{5}\s+(?=\S)", "", name)  # 단가+공급처품번 접두 (4,00000139 기본함)
+    name = re.sub(r"^\d{1,4}\s+(?=\S)", "", name)          # 선두 순번/번호
+    name = re.sub(r"\s+", " ", name).strip(" -–—")
+    return name
+
+
+def _stmt_branch_keys(branch_names: list):
+    """지점명 → 매칭용 키 목록 [(key, branch_name)]. 긴 키 우선."""
+    keys = []
+    for b in branch_names:
+        if not b:
+            continue
+        variants = {b, b.replace(" ", ""), b.replace("점", ""), b.replace(" ", "").replace("점", "")}
+        toks = b.split()
+        if toks:
+            last = toks[-1].replace("점", "").strip()
+            if last:
+                variants.add(last)
+        for v in variants:
+            v = v.strip()
+            if len(v) >= 2:
+                keys.append((v, b))
+    keys.sort(key=lambda x: -len(x[0]))
+    return keys
+
+
+def _stmt_branch_from_text(text: str, branch_names: list) -> str:
+    for key, b in _stmt_branch_keys(branch_names):
+        if key in (text or ""):
+            return b
+    m = re.search(r"펫닥\s*\(([^)]+)\)", text or "")
+    if m:
+        cand = m.group(1).strip()
+        for key, b in _stmt_branch_keys(branch_names):
+            if key in cand or cand in key:
+                return b
+        return cand
+    return ""
+
+
+def _stmt_month_candidates(*texts) -> list:
+    """텍스트들에서 YYYY-MM 후보를 순서대로 수집."""
+    out = []
+    joined = "\n".join(t or "" for t in texts)
+    for m in re.finditer(r"(20\d{2})\s*[-./년]\s*(0?[1-9]|1[0-2])\s*(?:[-./월]|\s|$)", joined):
+        out.append(f"{int(m.group(1)):04d}-{int(m.group(2)):02d}")
+    for m in re.finditer(r"(?<!\d)(\d{2})\s*년\s*(0?[1-9]|1[0-2])\s*월", joined):
+        out.append(f"20{int(m.group(1)):02d}-{int(m.group(2)):02d}")
+    for m in re.finditer(r"(?<!\d)(\d{2})(0[1-9]|1[0-2])\d{2}(?!\d)", joined):
+        out.append(f"20{m.group(1)}-{m.group(2)}")
+    for m in re.finditer(r"(?<!\d)(\d{2})\s*[.\-_]\s*(0?[1-9]|1[0-2])(?!\d)", joined):
+        out.append(f"20{int(m.group(1)):02d}-{int(m.group(2)):02d}")
+    for m in re.finditer(r"(?<!\d)(\d{2})(0[1-9]|1[0-2])(?!\d)", joined):
+        out.append(f"20{m.group(1)}-{m.group(2)}")
+    for m in re.finditer(r"(20\d{2})(0[1-9]|1[0-2])(?!\d)", joined):
+        out.append(f"{m.group(1)}-{m.group(2)}")
+    # dedupe preserve order
+    seen, res = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            res.append(x)
+    return res
+
+
+_GENERIC_VENDOR_WORDS = re.compile(
+    r"(거래명세서|매출입력현황|세금계산서|명세서|상세|포포즈|운영기획팀|거래명세표|매입|대행사|추출|양식|\(.*?\)|（.*?）)",
+)
+
+
+def _stmt_vendor_from_filename(fname: str, branch_names: list) -> str:
+    stem = re.sub(r"\.[a-zA-Z0-9]+$", "", fname or "")
+    stem = re.sub(r"\d{6}", " ", stem)
+    stem = re.sub(r"20\d{2}\s*[-./]\s*\d{1,2}(?:\s*[-./]\s*\d{1,2})?", " ", stem)
+    stem = re.sub(r"(?<!\d)\d{2}\s*[.\-_]\s*\d{2}(?!\d)", " ", stem)
+    stem = _GENERIC_VENDOR_WORDS.sub(" ", stem)
+    for key, _b in _stmt_branch_keys(branch_names):
+        stem = stem.replace(key, " ")
+    stem = re.sub(r"[\s_\-]+", " ", stem).strip(" ._-")
+    return stem
+
+
+def _stmt_vendor_from_text(text: str, products: list) -> str:
+    """문서 본문에서 알려진 거래처명(상품 supplier) 검색 → 가장 긴 이름 우선."""
+    t = text or ""
+    sups = sorted(
+        { (p.get("supplier") or "").strip() for p in products if (p.get("supplier") or "").strip() },
+        key=len, reverse=True,
+    )
+    for s in sups:
+        if "삭제된구매처" in s or "삭제" in s:
+            continue
+        if len(s) >= 2 and s in t:
+            return s
+    return ""
+
+
+def _stmt_parse_xlsx(data: bytes, branch_names: list):
+    """엑셀 명세서 파싱 → (rows, meta). rows: dict 리스트."""
+    import io
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    rows_out = []
+    skipped_sheets = []
+    sheet_infos = []
+    all_text_parts = []
+    for ws in wb.worksheets:
+        title = (ws.title or "").strip()
+        grid = [list(r) for r in ws.iter_rows(values_only=True)]
+        for r in grid[:15]:
+            all_text_parts.append(" ".join(str(c) for c in r if c is not None))
+        # 헤더 행 탐색: '수량' + ('품목'|'품명') 포함 행
+        hdr_i, colmap = None, {}
+        for i, r in enumerate(grid[:60]):
+            cells = [str(c).replace(" ", "") if c is not None else "" for c in r]
+            line = " ".join(cells)
+            if "수량" in line and ("품목" in line or "품명" in line):
+                for j, c in enumerate(cells):
+                    if not c:
+                        continue
+                    if ("일자" in c or "납품일" in c) and "date" not in colmap:
+                        colmap["date"] = j
+                    elif ("품목" in c or "품명" in c) and "name" not in colmap:
+                        colmap["name"] = j
+                    elif "규격" in c and "spec" not in colmap:
+                        colmap["spec"] = j
+                    elif "수량" in c and "qty" not in colmap:
+                        colmap["qty"] = j
+                    elif "단가" in c and "price" not in colmap:
+                        colmap["price"] = j
+                    elif ("금액" in c or "공급가액" in c) and "amount" not in colmap:
+                        colmap["amount"] = j
+                    elif ("지점" in c or "거래처" in c) and "branch" not in colmap:
+                        colmap["branch"] = j
+                if "name" in colmap and "qty" in colmap:
+                    hdr_i = i
+                    break
+        if hdr_i is None:
+            continue
+        sheet_branch = ""
+        for b in branch_names:
+            if b and (b in title or title in b):
+                sheet_branch = b
+                break
+        sheet_date = ""
+        # 시트 상단에서 납품일자/일자 찾기
+        for r in grid[:hdr_i]:
+            line = " ".join(str(c) for c in r if c is not None)
+            m = re.search(r"(20\d{2})[-./]\s*(\d{1,2})[-./]\s*(\d{1,2})", line)
+            if m:
+                sheet_date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+                break
+        parsed = []
+        cur_group = ""
+        for r in grid[hdr_i + 1:]:
+            def cell(key):
+                idx = colmap.get(key)
+                return r[idx] if idx is not None and idx < len(r) else None
+            name = str(cell("name") or "").strip()
+            if not name:
+                continue
+            qty = _stmt_num(cell("qty"))
+            if qty is None:
+                # 수량 없는 행 = 품목 그룹 헤더 (예: '오동나무관' 아래 사이즈 행들)
+                if not _STMT_SKIP_NAME_RE.search(name):
+                    cur_group = name
+                continue
+            if _STMT_SKIP_NAME_RE.search(name):
+                continue
+            price = _stmt_num(cell("price"))
+            amount = _stmt_num(cell("amount"))
+            spec_v = str(cell("spec") or "").strip() if "spec" in colmap else ""
+            # 사이즈형 행 판별 — 그룹명은 사이즈 행에만 적용
+            nn = re.sub(r"[\s()]+", "", name)
+            spec_nn = re.sub(r"[\s()]+", "", spec_v)
+            _SIZE_PAT = r"(XXL|XL|XS|소형|중형|대형|특대|^S$|^M$|^L$|^LL$)"
+            is_size_row = bool(re.search(_SIZE_PAT, nn))
+            spec_is_size = bool(re.search(_SIZE_PAT, spec_nn)) and not re.search(r"[*x×]|\d", spec_nn)
+            if not (is_size_row or spec_is_size):
+                cur_group = ""  # 독립 상품 행 → 그룹 해제
+            match_name = name
+            if cur_group and (is_size_row or spec_is_size):
+                match_name = f"{cur_group} {name}"
+            if spec_is_size:
+                match_name += " " + spec_v
+            d_raw = cell("date")
+            d = ""
+            if d_raw is not None:
+                ds = str(d_raw).strip()
+                m = re.match(r"(20\d{2})[-./]\s*(\d{1,2})[-./]\s*(\d{1,2})", ds)
+                if m:
+                    d = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+                else:
+                    m = re.match(r"(\d{1,2})[-./]\s*(\d{1,2})", ds)
+                    if m:
+                        d = f"{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+            br = str(cell("branch") or "").strip() if "branch" in colmap else ""
+            for b in branch_names:
+                if b and b in br:
+                    br = b
+                    break
+            parsed.append({
+                "stmt_date": d or sheet_date,
+                "branch_name": br or sheet_branch,
+                "raw_name": match_name,
+                "spec": spec_v,
+                "qty": qty,
+                "unit_price": price,
+                "amount": amount,
+            })
+        sheet_infos.append({"title": title, "rows": len(parsed), "branch": sheet_branch})
+        rows_out.extend(parsed)
+    # 지점 시트가 있으면 지점명이 없는 요약 시트 행은 제외 (수량 중복 방지)
+    branch_titles = {s["title"] for s in sheet_infos if s["branch"]}
+    if branch_titles and len(sheet_infos) > 1:
+        before = len(rows_out)
+        rows_out = [r for r in rows_out if r["branch_name"]]
+        skipped = before - len(rows_out)
+        if skipped:
+            skipped_sheets.append(f"지점 시트 기준 요약 행 {skipped}건 제외")
+    meta = {
+        "sheets": sheet_infos,
+        "notes": skipped_sheets,
+        "all_text": "\n".join(all_text_parts)[:200000],
+    }
+    return rows_out, meta
+
+
+def _stmt_parse_pdf(data: bytes, branch_names: list):
+    """텍스트 기반 PDF 명세서 파싱 → (rows, meta)."""
+    import io
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return [], {"error": "PDF 파싱 라이브러리(pypdf)가 설치되어 있지 않습니다."}
+    try:
+        reader = PdfReader(io.BytesIO(data))
+    except Exception as e:
+        return [], {"error": f"PDF 열기 실패: {e}"}
+    pages_text = []
+    for p in reader.pages:
+        try:
+            pages_text.append(p.extract_text() or "")
+        except Exception:
+            pages_text.append("")
+    text = "\n".join(pages_text)
+    if not text.strip():
+        return [], {"error": "PDF에서 텍스트를 추출할 수 없습니다(스캔 이미지 PDF). 이미지/PDF 스캔본은 현재 지원하지 않습니다 — 엑셀로 변환하거나 수동 입력해 주세요.", "all_text": ""}
+    lines = [l.strip() for l in text.splitlines()]
+    branch = _stmt_branch_from_text(text, branch_names)
+    rows_out = []
+    last_date = ""
+    for line in lines:
+        if not line or len(line) < 4:
+            continue
+        d, rest = _stmt_parse_leading_date(line)
+        if d and len(d) == 10:
+            last_date = d
+        elif len(d) == 5:  # MM-DD → 연도는 명세서 월로 보정 (저장 시 month로)
+            pass
+        name, nums = _stmt_split_name_nums(rest if d else line)
+        # '4,00000139 기본함' → 공급처 품번 00139을 spec으로, 이름은 정제
+        mcode = re.match(r"^\s*\d{1,3},\d{3}(\d{5})\s+", name or "")
+        spec_code = mcode.group(1) if mcode else ""
+        name = _stmt_clean_row_name(name)
+        if not name or len(nums) < 2:
+            continue
+        if _STMT_SKIP_NAME_RE.search(name):
+            continue
+        qty_f = _stmt_num(nums[0])
+        if qty_f is None or qty_f <= 0:
+            continue
+        price = _stmt_num(nums[1]) if len(nums) > 1 else None
+        amount = _stmt_num(nums[2]) if len(nums) > 2 else None
+        stmt_date = ""
+        if d:
+            if len(d) == 10:
+                stmt_date = d
+            else:
+                stmt_date = d  # MM-DD, 월 보정은 표시 단계
+        elif last_date:
+            stmt_date = last_date
+        rows_out.append({
+            "stmt_date": stmt_date,
+            "branch_name": branch,
+            "raw_name": name,
+            "spec": spec_code,
+            "qty": int(qty_f) if qty_f == int(qty_f) else qty_f,
+            "unit_price": price,
+            "amount": amount,
+        })
+    meta = {"all_text": text[:200000], "branch": branch, "lines": len(lines)}
+    return rows_out, meta
+
+
+def _stmt_parse_file(filename: str, data: bytes, branch_names: list):
+    """파일 확장자별 파싱 → (rows, meta). meta['error'] 있으면 실패."""
+    fname = filename or ""
+    lower = fname.lower()
+    if lower.endswith((".xlsx", ".xlsm")):
+        return _stmt_parse_xlsx(data, branch_names)
+    if lower.endswith(".pdf"):
+        return _stmt_parse_pdf(data, branch_names)
+    return [], {"error": f"지원하지 않는 파일 형식입니다 ({fname}). Excel(.xlsx) 또는 텍스트 기반 PDF만 지원합니다."}
+
+
+def _stmt_products():
+    """product_master 전체 상품(소모품 포함) → item_code별 대표 1행."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT item_code, MIN(item_name) AS item_name, "
+            "MAX(CASE WHEN is_consumable THEN 1 ELSE 0 END) AS is_consumable, "
+            "MIN(NULLIF(trim(COALESCE(supplier, '')), '')) AS supplier "
+            "FROM product_master WHERE item_code IS NOT NULL AND item_code <> '' "
+            "GROUP BY item_code ORDER BY item_name"
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    return [
+        {
+            "code": str(r["item_code"]),
+            "name": r["item_name"] or "",
+            "mname": re.sub(r"^\[[^\]]*\]\s*", "", r["item_name"] or ""),
+            "supplier": r["supplier"] or "",
+            "consumable": bool(r["is_consumable"]),
+        }
+        for r in rows
+    ]
+
+
+def _stmt_alias_rows():
+    conn = get_conn()
+    try:
+        return conn.execute(
+            "SELECT id, alias_name, supplier, item_code, item_name FROM statement_item_map ORDER BY alias_name"
+        ).fetchall()
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def _stmt_tokens(s: str):
+    return frozenset(re.findall(r"[0-9a-zA-Z가-힣]+", str(s or "").lower()))
+
+
+def _stmt_match_item(raw_name: str, vendor: str, products: list, aliases: list):
+    """명세서 품목명 → (item_code, match_note)."""
+    norm = _stmt_norm(raw_name)
+    if not norm:
+        return "", ""
+    sup = _stmt_norm(vendor)
+    # 1) 별칭 정확 일치 (거래처 한정 → 전체 순)
+    for a in aliases:
+        if _stmt_norm(a["alias_name"]) == norm:
+            if _stmt_norm(a["supplier"] or "") == sup or not (a["supplier"] or "").strip():
+                return str(a["item_code"]), "별칭"
+    # 비교용 이름: '[거래처]' 접두사 제거한 mname 우선
+    def pname(p):
+        return p.get("mname") or p["name"]
+    # 2) 상품명 정확 일치
+    exact = [p for p in products if _stmt_norm(pname(p)) == norm]
+    if len(exact) == 1:
+        return exact[0]["code"], "상품명"
+    # 3) 포함 관계 유일 일치
+    sub = [
+        p for p in products
+        if norm and (_stmt_norm(pname(p)) in norm or norm in _stmt_norm(pname(p)))
+    ]
+    if len(sub) == 1:
+        return sub[0]["code"], "유사"
+    # 4) 토큰 집합 포함 관계 — '한지수목함 네이비 소형' vs '한지수목함_소형(S)_네이비'
+    stoks = _stmt_tokens(raw_name)
+    if stoks:
+        cand = []
+        for p in products:
+            ptoks = _stmt_tokens(pname(p))
+            if not ptoks:
+                continue
+            if stoks <= ptoks or ptoks <= stoks:
+                cand.append(p)
+        if len(cand) == 1:
+            return cand[0]["code"], "토큰"
+        if len(cand) > 1 and sup:
+            # 거래처가 일치하는 후보로 좁히기
+            vend_cand = [p for p in cand if _stmt_norm(p.get("supplier") or "") == sup]
+            if len(vend_cand) == 1:
+                return vend_cand[0]["code"], "토큰+거래처"
+    return "", ""
+
+
+async def _stmt_fetch_orders(month: str, vendor: str):
+    """발주내역(Supabase purchase_history)에서 해당 월 rows 조회."""
+    rows, err = await fetch_purchase_history(limit=2000)
+    if err:
+        return [], err, False
+    if not rows:
+        return [], None, False
+    filtered = []
+    for r in rows:
+        dt = str(r.get("order_datetime") or r.get("registered_at") or "")
+        if not dt.startswith(month):
+            continue
+        filtered.append(r)
+    vendor_fallback = False
+    if vendor and filtered:
+        vn = _stmt_norm(vendor)
+        vend = [
+            r for r in filtered
+            if vn and (vn in _stmt_norm(r.get("vendor")) or _stmt_norm(r.get("vendor")) in vn)
+        ]
+        if vend:
+            filtered = vend
+        else:
+            vendor_fallback = True
+    return filtered, None, vendor_fallback
+
+
+def _stmt_order_item_code(order_row: dict, products: list, aliases: list):
+    name = str(order_row.get("product_name") or "")
+    code, _note = _stmt_match_item(name, str(order_row.get("vendor") or ""), products, aliases)
+    return code
+
+
+def _stmt_compare(upload_id: int):
+    """업로드에 대한 비교 결과 계산 → dict."""
+    conn = get_conn()
+    try:
+        up = conn.execute("SELECT * FROM statement_uploads WHERE id=?", (upload_id,)).fetchone()
+        if not up:
+            return None
+        rows = conn.execute(
+            "SELECT * FROM statement_rows WHERE upload_id=? ORDER BY row_no, id", (upload_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return {"upload": dict(up), "rows": [dict(r) for r in rows]}
+
+
+def _stmt_build_comparison(data: dict, orders: list, products: list, aliases: list):
+    """rows + 발주내역 → 행별 상태/품목별 합계."""
+    prod_map = {p["code"]: p for p in products}
+    # 품목별 명세서 수량
+    stmt_qty = {}
+    for r in data["rows"]:
+        code = r.get("item_code") or ""
+        if not code:
+            continue
+        stmt_qty[code] = stmt_qty.get(code, 0) + float(r.get("qty") or 0)
+    # 발주내역 품목별 수량 + 행 정보
+    order_qty = {}
+    order_rows_by_code = {}
+    unmatched_orders = []
+    for o in orders:
+        code = _stmt_order_item_code(o, products, aliases)
+        q = o.get("quantity")
+        try:
+            q = float(q)
+        except (TypeError, ValueError):
+            q = 0
+        oid = str(o.get("order_id") or "")
+        if code:
+            order_qty[code] = order_qty.get(code, 0) + q
+            order_rows_by_code.setdefault(code, []).append({**o, "_item_code": code, "_qty_f": q})
+        else:
+            unmatched_orders.append({**o, "_item_code": "", "_qty_f": q})
+    # 품목별 상태
+    all_codes = set(stmt_qty) | set(order_qty)
+    item_summary = []
+    for code in sorted(all_codes):
+        p = prod_map.get(code, {})
+        sq = stmt_qty.get(code, 0)
+        oq = order_qty.get(code, 0)
+        if sq > 0 and oq <= 0:
+            status = "발주없음"
+        elif oq > 0 and sq <= 0:
+            status = "발주만"
+        elif abs(sq - oq) < 0.0001:
+            status = "일치"
+        else:
+            status = "수량불일치"
+        item_summary.append({
+            "code": code,
+            "name": p.get("name") or "(미등록 상품)",
+            "supplier": p.get("supplier") or "",
+            "consumable": p.get("consumable", False),
+            "stmt_qty": sq,
+            "order_qty": oq,
+            "diff": sq - oq,
+            "status": status,
+            "orders": order_rows_by_code.get(code, []),
+        })
+    # 행별 상태 부여
+    status_by_code = {it["code"]: it["status"] for it in item_summary}
+    month = str(data["upload"].get("month") or "")
+    for r in data["rows"]:
+        # MM-DD 형태 날짜를 업로드 월로 보정
+        sd = str(r.get("stmt_date") or "")
+        if re.fullmatch(r"\d{2}-\d{2}", sd) and month:
+            r["stmt_date"] = f"{month}-{sd}"
+        code = r.get("item_code") or ""
+        if not code:
+            r["row_status"] = "미매칭"
+            r["order_qty"] = None
+        else:
+            r["row_status"] = status_by_code.get(code, "미매칭")
+            r["order_qty"] = order_qty.get(code)
+    counts = {"일치": 0, "수량불일치": 0, "발주없음": 0, "발주만": 0, "미매칭": 0}
+    for r in data["rows"]:
+        counts[r["row_status"]] = counts.get(r["row_status"], 0) + 1
+    return {
+        "rows": data["rows"],
+        "upload": data["upload"],
+        "item_summary": item_summary,
+        "unmatched_orders": unmatched_orders,
+        "counts": counts,
+    }
+
+
+# ── 페이지 렌더링 ─────────────────────────────────────────
+
+def _stmt_fmt_qty(v):
+    if v is None:
+        return "-"
+    f = float(v)
+    return str(int(f)) if f == int(f) else f"{f:g}"
+
+
+def _stmt_status_badge(st: str) -> str:
+    color = {
+        "일치": "#166534", "수량불일치": "#B45309", "발주없음": "#B91C1C",
+        "발주만": "#6D28D9", "미매칭": "#64748B",
+    }.get(st, "#64748B")
+    return f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:{color};color:#fff;font-size:11px;">{st}</span>'
+
+
+def _stmt_product_options(products: list, selected: str = "") -> str:
+    opts = ['<option value="">— 매칭 안 함 —</option>']
+    for p in products:
+        label = p["name"] or p["code"]
+        if p["consumable"]:
+            label += " (소모품)"
+        sel = ' selected' if p["code"] == selected else ""
+        opts.append(f'<option value="{_stmt_esc(p["code"])}"{sel}>{_stmt_esc(label)} [{_stmt_esc(p["code"])}]</option>')
+    return "".join(opts)
+
+
+def _stmt_esc(s) -> str:
+    import html as _html
+    return _html.escape(str(s if s is not None else ""), quote=True)
+
+
+async def _stmt_detail_html(upload_id: int, user) -> str:
+    import html as _html
+    conn = get_conn()
+    try:
+        up = conn.execute("SELECT * FROM statement_uploads WHERE id=?", (upload_id,)).fetchone()
+        if not up:
+            return '<div class="card">업로드 내역을 찾을 수 없습니다.</div>'
+        up = dict(up)
+    finally:
+        conn.close()
+
+    products = _stmt_products()
+    aliases = _stmt_alias_rows()
+    orders, oerr, vendor_fallback = await _stmt_fetch_orders(up.get("month") or "", up.get("vendor") or "")
+    data = _stmt_compare(upload_id)
+    if not data:
+        return '<div class="card">업로드 내역을 찾을 수 없습니다.</div>'
+    cmp_data = _stmt_build_comparison(data, orders or [], products, aliases)
+    rows = cmp_data["rows"]
+    items = cmp_data["item_summary"]
+    counts = cmp_data["counts"]
+
+    month = up.get("month") or ""
+    # 발주내역 수집 기간 안내 (cron이 21일 지난 데이터 삭제)
+    caveat = ""
+    if oerr:
+        caveat = f'<div class="card" style="border-left:4px solid #B91C1C;"><b>발주내역 조회 실패:</b> {_stmt_esc(oerr)}</div>'
+    elif vendor_fallback:
+        caveat = '<div class="card" style="border-left:4px solid #B45309;">⚠️ 거래처명으로 발주내역을 필터링했으나 일치하는 행이 없어 <b>해당 월 전체 발주내역</b>과 비교했습니다.</div>'
+    caveat += '<div class="card" style="font-size:12px;color:#888;">참고: 발주내역은 시스템에 최근 약 3주치만 보관됩니다(자동 삭제). 지난달 명세서는 발주내역이 일부만 남아 있을 수 있습니다.</div>'
+
+    # ── 명세서 행 테이블 (편집 가능) ──
+    prod_opts = _stmt_product_options(products)
+    row_html = ""
+    for r in rows:
+        rid = r.get("id")
+        code = r.get("item_code") or ""
+        st = r.get("row_status") or "미매칭"
+        oq = r.get("order_qty")
+        oq_txt = _stmt_fmt_qty(oq) if oq is not None else "-"
+        row_html += f"""
+        <tr class="stmt-row" data-st="{st}">
+          <td style="text-align:center;"><input type="checkbox" class="stmt-del" data-id="{rid}" style="width:15px;height:15px;"></td>
+          <td><input class="stmt-in" data-f="stmt_date" value="{_stmt_esc(r.get('stmt_date') or '')}" style="width:90px;" placeholder="YYYY-MM-DD"></td>
+          <td><input class="stmt-in" data-f="branch_name" value="{_stmt_esc(r.get('branch_name') or '')}" style="width:80px;"></td>
+          <td><input class="stmt-in" data-f="raw_name" value="{_stmt_esc(r.get('raw_name') or '')}" style="min-width:160px;"></td>
+          <td><input class="stmt-in" data-f="spec" value="{_stmt_esc(r.get('spec') or '')}" style="width:110px;"></td>
+          <td style="text-align:right;"><input class="stmt-in" data-f="qty" type="number" step="any" value="{_stmt_esc(r.get('qty'))}" style="width:70px;text-align:right;"></td>
+          <td style="text-align:right;"><input class="stmt-in" data-f="unit_price" type="number" step="any" value="{_stmt_esc(r.get('unit_price') if r.get('unit_price') is not None else '')}" style="width:80px;text-align:right;"></td>
+          <td><select class="stmt-in stmt-item-sel" data-f="item_code" data-sel="{_stmt_esc(code)}" style="max-width:220px;"></select></td>
+          <td style="text-align:right;">{oq_txt}</td>
+          <td>{_stmt_status_badge(st)}</td>
+        </tr>"""
+
+    # ── 품목별 합계 대조 ──
+    item_html = ""
+    for it in items:
+        item_html += f"""
+        <tr>
+          <td>{_stmt_esc(it['name'])}{' <span style="color:#B45309;font-size:11px;">(소모품)</span>' if it['consumable'] else ''}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(it['code'])}</td>
+          <td style="text-align:right;">{_stmt_fmt_qty(it['stmt_qty'])}</td>
+          <td style="text-align:right;">{_stmt_fmt_qty(it['order_qty'])}</td>
+          <td style="text-align:right;">{_stmt_fmt_qty(it['diff'])}</td>
+          <td>{_stmt_status_badge(it['status'])}</td>
+        </tr>"""
+
+    # ── 발주내역 상세 (수량 수정 가능) ──
+    order_detail_html = ""
+    for it in items:
+        for o in it.get("orders", []):
+            od = str(o.get("order_datetime") or o.get("registered_at") or "")[:10]
+            br = _stmt_esc(o.get("branch") or "-")
+            ven = _stmt_esc(o.get("vendor") or "-")
+            pn = _stmt_esc(o.get("product_name") or "-")
+            oid = _stmt_esc(o.get("order_id") or "")
+            q = o.get("_qty_f", o.get("quantity"))
+            order_detail_html += f"""
+            <tr>
+              <td style="font-size:11px;">{od}</td>
+              <td>{br}</td>
+              <td style="font-size:11px;">{ven}</td>
+              <td>{pn}</td>
+              <td style="font-size:11px;color:#888;">{_stmt_esc(it['code'])}</td>
+              <td style="text-align:right;"><input type="number" step="any" class="po-qty" data-oid="{oid}" value="{_stmt_esc(q)}" style="width:70px;text-align:right;"></td>
+              <td><button type="button" class="btn po-qty-save" data-oid="{oid}" style="padding:3px 8px;font-size:11px;">수정</button></td>
+            </tr>"""
+    for o in cmp_data["unmatched_orders"]:
+        od = str(o.get("order_datetime") or o.get("registered_at") or "")[:10]
+        order_detail_html += f"""
+        <tr style="opacity:.65;">
+          <td style="font-size:11px;">{od}</td>
+          <td>{_stmt_esc(o.get('branch') or '-')}</td>
+          <td style="font-size:11px;">{_stmt_esc(o.get('vendor') or '-')}</td>
+          <td>{_stmt_esc(o.get('product_name') or '-')}</td>
+          <td style="font-size:11px;color:#888;">(매칭 안 됨)</td>
+          <td style="text-align:right;">{_stmt_fmt_qty(o.get('_qty_f'))}</td>
+          <td></td>
+        </tr>"""
+
+    # ── 별칭 관리 테이블 ──
+    alias_html = ""
+    for a in aliases:
+        alias_html += f"""
+        <tr>
+          <td>{_stmt_esc(a['alias_name'])}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(a['supplier'] or '전체')}</td>
+          <td>{_stmt_esc(a['item_name'] or '')}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(a['item_code'])}</td>
+          <td><button type="button" class="btn alias-del" data-id="{a['id']}" style="padding:3px 8px;font-size:11px;">삭제</button></td>
+        </tr>"""
+
+    content = f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+      <h2 style="margin:0;">🧾 거래명세서 확인</h2>
+      <a href="/master/statement-check" style="padding:8px 14px;background:#1E2761;color:#fff;border-radius:8px;font-size:13px;text-decoration:none;">← 목록</a>
+    </div>
+
+    <div class="card">
+      <b>업로드 정보</b>
+      <div style="font-size:13px;margin-top:6px;">
+        파일: {_stmt_esc(up.get('filename'))}<br>
+        거래처: {_stmt_esc(up.get('vendor') or '(미지정)')} · 대상 월: <b>{_stmt_esc(month)}</b> ·
+        업로드: {_stmt_esc(up.get('uploaded_at') or '')} ({_stmt_esc(up.get('uploaded_by') or '')}) ·
+        추출 행: {len(rows)}건
+      </div>
+      {('<div style="font-size:12px;color:#B45309;margin-top:6px;">파싱 참고: ' + _stmt_esc('; '.join(up.get('parse_note','').split('|'))) + '</div>') if up.get('parse_note') else ''}
+    </div>
+
+    {caveat}
+
+    <div class="card" style="display:flex;gap:20px;flex-wrap:wrap;">
+      <div>명세서 행 <b>{len(rows)}</b></div>
+      <div>일치 <b style="color:#166534;">{counts.get('일치',0)}</b></div>
+      <div>수량불일치 <b style="color:#B45309;">{counts.get('수량불일치',0)}</b></div>
+      <div>발주없음 <b style="color:#B91C1C;">{counts.get('발주없음',0)}</b></div>
+      <div>발주만 <b style="color:#6D28D9;">{counts.get('발주만',0)}</b></div>
+      <div>미매칭 <b style="color:#64748B;">{counts.get('미매칭',0)}</b></div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
+        <label style="font-size:12px;"><input type="checkbox" id="stmtOnlyMismatch"> 불일치 항목만 보기</label>
+        <input type="text" id="stmtSearch" placeholder="품목명 검색" style="padding:6px 10px;font-size:12px;width:180px;">
+        <button type="button" class="btn" id="stmtAddRow" style="padding:6px 12px;font-size:12px;">+ 행 추가</button>
+        <button type="button" class="btn" id="stmtSave" style="padding:6px 14px;font-size:12px;background:#166534;">💾 명세서 수정 저장</button>
+        <span id="stmtSaveMsg" style="font-size:12px;color:#166534;"></span>
+      </div>
+      <div class="table-scroll-wrap">
+      <table id="stmtTable" style="width:100%;font-size:12px;">
+        <thead><tr>
+          <th style="width:30px;">삭제</th><th>납품일</th><th>지점</th><th>명세서 품목</th><th>규격</th>
+          <th style="text-align:right;">수량</th><th style="text-align:right;">단가</th><th>매칭 상품</th>
+          <th style="text-align:right;">발주수량(월)</th><th>상태</th>
+        </tr></thead>
+        <tbody>{row_html if row_html else '<tr><td colspan="10" style="text-align:center;color:#888;padding:20px;">추출된 행이 없습니다. 아래 + 행 추가로 직접 입력하세요.</td></tr>'}</tbody>
+      </table>
+      </div>
+      <template id="stmtProdOpts">{prod_opts}</template>
+      <div style="font-size:11px;color:#888;margin-top:6px;">매칭 상품을 선택하고 저장하면 명세서 품목명↔상품 별칭이 자동 등록되어 다음 업로드부터 자동 매칭됩니다. (소모품 포함 전체 상품)</div>
+    </div>
+
+    <div class="card">
+      <b>📊 품목별 합계 대조 ({_stmt_esc(month)} 발주내역 기준)</b>
+      <div class="table-scroll-wrap" style="margin-top:8px;">
+      <table style="width:100%;font-size:12px;">
+        <thead><tr><th>상품명</th><th>품번</th><th style="text-align:right;">명세서 수량</th><th style="text-align:right;">발주 수량</th><th style="text-align:right;">차이</th><th>상태</th></tr></thead>
+        <tbody>{item_html if item_html else '<tr><td colspan="6" style="text-align:center;color:#888;padding:16px;">대조할 품목이 없습니다.</td></tr>'}</tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <b>🧾 발주내역 상세 — 수량 수정</b>
+      <div style="font-size:11px;color:#888;margin:4px 0 8px;">수정 버튼을 누르면 발주내역 메뉴의 해당 발주 건 수량이 실제로 변경됩니다.</div>
+      <div class="table-scroll-wrap">
+      <table style="width:100%;font-size:12px;">
+        <thead><tr><th>발주일</th><th>지점</th><th>거래처</th><th>상품명</th><th>품번</th><th style="text-align:right;">수량</th><th></th></tr></thead>
+        <tbody>{order_detail_html if order_detail_html else '<tr><td colspan="7" style="text-align:center;color:#888;padding:16px;">해당 월 발주내역이 없습니다.</td></tr>'}</tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <b>🔗 명세서 품목 별칭 관리</b>
+      <div style="font-size:11px;color:#888;margin:4px 0 8px;">명세서에 찍히는 품목명 → 우리 상품 매칭. 거래처를 비워두면 모든 거래처에 적용됩니다.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+        <input type="text" id="aliasName" placeholder="명세서 품목명" style="padding:6px 10px;font-size:12px;min-width:180px;">
+        <input type="text" id="aliasVendor" placeholder="거래처(선택)" style="padding:6px 10px;font-size:12px;width:130px;">
+        <select id="aliasItem" style="padding:6px 10px;font-size:12px;max-width:280px;">{prod_opts}</select>
+        <button type="button" class="btn" id="aliasAdd" style="padding:6px 14px;font-size:12px;">별칭 추가</button>
+      </div>
+      <div class="table-scroll-wrap">
+      <table style="width:100%;font-size:12px;">
+        <thead><tr><th>명세서 품목명</th><th>거래처</th><th>우리 상품명</th><th>품번</th><th></th></tr></thead>
+        <tbody>{alias_html if alias_html else '<tr><td colspan="5" style="text-align:center;color:#888;padding:16px;">등록된 별칭이 없습니다.</td></tr>'}</tbody>
+      </table>
+      </div>
+    </div>
+    """
+
+    js = """
+<script>
+(function(){
+  var UID = """ + str(upload_id) + """;
+  function esc(s){var d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
+
+  // 상품 옵션 템플릿 → 모든 매칭 select에 복제
+  var optsTpl = document.getElementById('stmtProdOpts');
+  function fillSelect(sel){
+    if (!optsTpl || sel.options.length) return;
+    var frag = optsTpl.content.cloneNode(true);
+    while (frag.firstChild) sel.appendChild(frag.firstChild);
+    if (sel.getAttribute('data-sel')) sel.value = sel.getAttribute('data-sel');
+  }
+  document.querySelectorAll('.stmt-item-sel').forEach(fillSelect);
+
+  // 동일 명세서 품목명 → 선택된 상품 자동 전파 (화면 표시용, 저장 시 서버에서도 전파)
+  function propagateNames(){
+    var map = {};
+    document.querySelectorAll('#stmtTable .stmt-row').forEach(function(tr){
+      var nmInp = tr.querySelector('[data-f=raw_name]');
+      var sel = tr.querySelector('.stmt-item-sel');
+      if (!nmInp || !sel) return;
+      var key = nmInp.value.replace(/\\s+/g,'').toLowerCase();
+      if (!key) return;
+      if (sel.value) { if (!map[key]) map[key] = sel.value; }
+      else if (map[key]) { sel.value = map[key]; }
+    });
+  }
+  propagateNames();
+  document.querySelector('#stmtTable').addEventListener('change', function(e){
+    if (e.target && e.target.classList.contains('stmt-item-sel')) propagateNames();
+    if (e.target && e.target.classList.contains('stmt-in') && e.target.getAttribute('data-f')==='raw_name') propagateNames();
+  });
+
+  // 불일치만 보기 + 검색
+  var onlyMis = document.getElementById('stmtOnlyMismatch');
+  var searchEl = document.getElementById('stmtSearch');
+  function applyFilter(){
+    var q = (searchEl.value||'').toLowerCase();
+    var misOnly = onlyMis && onlyMis.checked;
+    document.querySelectorAll('#stmtTable .stmt-row').forEach(function(tr){
+      var st = tr.getAttribute('data-st')||'';
+      var name = (tr.querySelector('[data-f=raw_name]')||{}).value||'';
+      var show = true;
+      if (misOnly && (st==='일치')) show = false;
+      if (q && name.toLowerCase().indexOf(q) < 0) show = false;
+      tr.style.display = show ? '' : 'none';
+    });
+  }
+  if (onlyMis) onlyMis.addEventListener('change', applyFilter);
+  if (searchEl) searchEl.addEventListener('input', applyFilter);
+
+  // 행 추가
+  var addBtn = document.getElementById('stmtAddRow');
+  if (addBtn) addBtn.addEventListener('click', function(){
+    var tbody = document.querySelector('#stmtTable tbody');
+    var tr = document.createElement('tr');
+    tr.className = 'stmt-row'; tr.setAttribute('data-st','미매칭');
+    tr.innerHTML = '<td style="text-align:center;"><input type="checkbox" class="stmt-del" style="width:15px;height:15px;"></td>'
+      + '<td><input class="stmt-in" data-f="stmt_date" style="width:90px;" placeholder="YYYY-MM-DD"></td>'
+      + '<td><input class="stmt-in" data-f="branch_name" style="width:80px;"></td>'
+      + '<td><input class="stmt-in" data-f="raw_name" style="min-width:160px;"></td>'
+      + '<td><input class="stmt-in" data-f="spec" style="width:110px;"></td>'
+      + '<td style="text-align:right;"><input class="stmt-in" data-f="qty" type="number" step="any" style="width:70px;text-align:right;"></td>'
+      + '<td style="text-align:right;"><input class="stmt-in" data-f="unit_price" type="number" step="any" style="width:80px;text-align:right;"></td>'
+      + '<td><select class="stmt-in stmt-item-sel" data-f="item_code" style="max-width:220px;"></select></td>'
+      + '<td style="text-align:right;">-</td><td>' + '<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:#64748B;color:#fff;font-size:11px;">미매칭</span>' + '</td>';
+    tbody.appendChild(tr);
+    fillSelect(tr.querySelector('.stmt-item-sel'));
+    tr.querySelector('[data-f=raw_name]').focus();
+  });
+
+  // 명세서 행 저장
+  var saveBtn = document.getElementById('stmtSave');
+  var saveMsg = document.getElementById('stmtSaveMsg');
+  if (saveBtn) saveBtn.addEventListener('click', function(){
+    var delIds = [];
+    document.querySelectorAll('.stmt-del:checked').forEach(function(c){ if(c.dataset.id) delIds.push(parseInt(c.dataset.id)); });
+    var rows = [];
+    document.querySelectorAll('#stmtTable .stmt-row').forEach(function(tr){
+      var del = tr.querySelector('.stmt-del');
+      if (del && del.checked && del.dataset.id) return;
+      var obj = {};
+      tr.querySelectorAll('.stmt-in').forEach(function(inp){
+        var f = inp.getAttribute('data-f');
+        var v = inp.value;
+        if (f==='qty' || f==='unit_price') { v = v===''?null:parseFloat(v); if(isNaN(v)) v=null; }
+        obj[f] = v;
+      });
+      var idInp = tr.querySelector('.stmt-del');
+      if (idInp && idInp.dataset.id) obj.id = parseInt(idInp.dataset.id);
+      // amount는 서버에서 qty*price로 재계산하지 않고 그대로 둠(없으면 null)
+      obj.amount = null;
+      rows.push(obj);
+    });
+    saveBtn.disabled = true;
+    fetch('/master/statement-check/save', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({upload_id: UID, rows: rows, delete_ids: delIds})
+    }).then(function(r){return r.json();}).then(function(d){
+      saveBtn.disabled = false;
+      if (d && d.status==='ok'){ saveMsg.textContent='저장됨 ('+d.saved+'행)'; setTimeout(function(){location.reload();},600); }
+      else { saveMsg.textContent='저장 실패: '+((d&&d.detail)||'오류'); }
+    }).catch(function(e){ saveBtn.disabled=false; saveMsg.textContent='저장 실패: '+e; });
+  });
+
+  // 발주내역 수량 수정
+  document.querySelectorAll('.po-qty-save').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var oid = btn.getAttribute('data-oid');
+      var inp = document.querySelector('.po-qty[data-oid="'+oid+'"]');
+      var q = inp ? parseFloat(inp.value) : NaN;
+      if (isNaN(q)) { alert('수량을 입력하세요.'); return; }
+      btn.disabled = true;
+      fetch('/purchase-history/update-quantity', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({order_id: oid, quantity: q})
+      }).then(function(r){return r.json();}).then(function(d){
+        btn.disabled = false;
+        if (d && d.status==='ok'){ btn.textContent='완료'; setTimeout(function(){location.reload();},600); }
+        else { alert('수정 실패: '+((d&&d.detail)||'오류')); }
+      }).catch(function(e){ btn.disabled=false; alert('수정 실패: '+e); });
+    });
+  });
+
+  // 별칭 삭제
+  document.querySelectorAll('.alias-del').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      if (!confirm('이 별칭을 삭제할까요?')) return;
+      fetch('/master/statement-check/alias/delete', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id: parseInt(btn.getAttribute('data-id'))})
+      }).then(function(r){return r.json();}).then(function(){ location.reload(); });
+    });
+  });
+
+  // 별칭 추가
+  var aliasAdd = document.getElementById('aliasAdd');
+  if (aliasAdd) aliasAdd.addEventListener('click', function(){
+    var name = document.getElementById('aliasName').value.trim();
+    var vendor = document.getElementById('aliasVendor').value.trim();
+    var item = document.getElementById('aliasItem').value;
+    if (!name || !item) { alert('명세서 품목명과 매칭 상품을 선택하세요.'); return; }
+    fetch('/master/statement-check/alias/save', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({alias_name:name, supplier:vendor, item_code:item, upload_id:UID})
+    }).then(function(r){return r.json();}).then(function(d){
+      if (d && d.status==='ok') location.reload();
+      else alert('추가 실패: '+((d&&d.detail)||'오류'));
+    });
+  });
+})();
+</script>
+"""
+    return content + js
+
+
+def _stmt_list_html(uploads: list, err: str = "", aliases: list = None) -> str:
+    import html as _html
+    rows_html = ""
+    for u in uploads:
+        rows_html += f"""
+        <tr>
+          <td><a href="/master/statement-check?id={u['id']}">{_stmt_esc(u['filename'])}</a></td>
+          <td>{_stmt_esc(u['vendor'] or '-')}</td>
+          <td>{_stmt_esc(u['month'] or '-')}</td>
+          <td style="text-align:right;">{u.get('row_count', 0)}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(u['uploaded_at'] or '')}</td>
+          <td><form method="post" action="/master/statement-check/delete" style="display:inline;" onsubmit="return confirm('이 업로드를 삭제할까요?');">
+            <input type="hidden" name="upload_id" value="{u['id']}">
+            <button class="btn" style="padding:3px 8px;font-size:11px;background:#B91C1C;">삭제</button></form></td>
+        </tr>"""
+    err_html = f'<div class="card" style="border-left:4px solid #B91C1C;color:#B91C1C;font-size:13px;">{_stmt_esc(err)}</div>' if err else ""
+    return f"""
+    <h2 style="margin-bottom:16px;">🧾 거래명세서 확인</h2>
+    {err_html}
+    <div class="card">
+      <b>📤 거래명세서 업로드</b>
+      <div style="font-size:12px;color:#888;margin:6px 0 10px;">
+        Excel(.xlsx) 또는 텍스트 기반 PDF를 업로드하면 품목을 추출해 해당 월 발주내역과 대조합니다.
+        스캔 이미지 PDF/JPG는 지원하지 않습니다. 업로드 후 명세서 행을 직접 수정·추가할 수 있습니다.
+      </div>
+      <form method="post" action="/master/statement-check/upload" enctype="multipart/form-data">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;">
+          <div><label style="font-size:12px;color:#888;">파일</label><br>
+            <input type="file" name="file" accept=".xlsx,.xlsm,.pdf" required style="font-size:12px;"></div>
+          <div><label style="font-size:12px;color:#888;">거래처(선택)</label><br>
+            <input type="text" name="vendor" placeholder="비우면 파일명에서 추정" style="padding:8px;font-size:12px;width:160px;"></div>
+          <div><label style="font-size:12px;color:#888;">대상 월</label><br>
+            <input type="month" name="month" style="padding:8px;font-size:12px;"></div>
+          <button class="btn" type="submit" style="padding:10px 18px;">업로드 및 대조</button>
+        </div>
+      </form>
+      <div style="border-top:1px solid #eee;margin-top:14px;padding-top:12px;">
+        <b style="font-size:13px;">📦 폴더/월별 ZIP 업로드</b>
+        <div style="font-size:12px;color:#888;margin:6px 0 10px;">
+          월별 ZIP 파일(예: 거래명세서_2610.zip)을 올리면 내부 폴더 구조로 거래처·월을 자동 인식해
+          파일별로 업로드·매칭합니다. 상위 폴더명이 거래처, 월 폴더명이 대상 월로 사용됩니다.
+          자동매칭 성공분은 별칭 DB에 자동 등록됩니다. 같은 파일은 중복 등록되지 않습니다.
+        </div>
+        <form method="post" action="/master/statement-check/upload-zip" enctype="multipart/form-data">
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;">
+            <div><label style="font-size:12px;color:#888;">ZIP 파일</label><br>
+              <input type="file" name="file" accept=".zip" required style="font-size:12px;"></div>
+            <button class="btn" type="submit" style="padding:10px 18px;background:#166534;">ZIP 일괄 업로드</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <b>📋 업로드 내역</b>
+        <div style="display:flex;gap:8px;">
+          <a href="/master/statement-check/export?kind=uploads" style="padding:6px 12px;background:#166534;color:#fff;border-radius:8px;font-size:12px;text-decoration:none;">📥 업로드 내역 엑셀</a>
+          <a href="/master/statement-check/export?kind=aliases" style="padding:6px 12px;background:#1E2761;color:#fff;border-radius:8px;font-size:12px;text-decoration:none;">📥 별칭 DB 엑셀</a>
+        </div>
+      </div>
+      <div class="table-scroll-wrap" style="margin-top:8px;">
+      <table style="width:100%;font-size:12px;">
+        <thead><tr><th>파일명</th><th>거래처</th><th>대상 월</th><th style="text-align:right;">행 수</th><th>업로드 일시</th><th></th></tr></thead>
+        <tbody>{rows_html if rows_html else '<tr><td colspan="6" style="text-align:center;color:#888;padding:20px;">아직 업로드된 명세서가 없습니다.</td></tr>'}</tbody>
+      </table>
+      </div>
+    </div>
+    <div class="card">
+      <b>🔗 명세서 품목 별칭 DB ({len(aliases or [])}건)</b>
+      <div style="font-size:11px;color:#888;margin:4px 0 8px;">명세서 품목명 → 우리 상품 매칭 정보. 자동매칭/수동 저장으로 누적됩니다.</div>
+      <div class="table-scroll-wrap">
+      <table style="width:100%;font-size:12px;">
+        <thead><tr><th>명세서 품목명</th><th>거래처</th><th>우리 상품명</th><th>품번</th><th>수정일</th></tr></thead>
+        <tbody>{_stmt_alias_table_rows(aliases or [])}</tbody>
+      </table>
+      </div>
+    </div>
+    """
+
+
+def _stmt_alias_table_rows(aliases: list) -> str:
+    if not aliases:
+        return '<tr><td colspan="5" style="text-align:center;color:#888;padding:16px;">등록된 별칭이 없습니다.</td></tr>'
+    out = ""
+    for a in aliases:
+        out += f"""
+        <tr>
+          <td>{_stmt_esc(a['alias_name'])}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(a['supplier'] or '전체')}</td>
+          <td>{_stmt_esc(a['item_name'] or '')}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(a['item_code'])}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(a['updated_at'] or a['created_at'] or '')}</td>
+        </tr>"""
+    return out
+
+
+# ── 라우트 ────────────────────────────────────────────────
+
+def _stmt_master_guard(session_token):
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return None
+    if not has_menu_permission(user["login_id"], "statement-check"):
+        return None
+    return user
+
+
+@app.get("/master/statement-check", response_class=HTMLResponse)
+async def statement_check_page(session_token: str = Cookie(default=None), id: int = 0, err: str = ""):
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    if id:
+        content = await _stmt_detail_html(id, user)
+    else:
+        conn = get_conn()
+        try:
+            uploads = conn.execute(
+                "SELECT u.*, (SELECT COUNT(*) FROM statement_rows r WHERE r.upload_id=u.id) AS row_count "
+                "FROM statement_uploads u ORDER BY u.id DESC LIMIT 100"
+            ).fetchall()
+        finally:
+            conn.close()
+        aliases = _stmt_alias_rows()
+        content = _stmt_list_html([dict(u) for u in uploads], err, [dict(a) for a in aliases])
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+def _stmt_import_file(filename: str, data: bytes, vendor_hint: str = "", month_hint: str = "",
+                      uploaded_by: str = "", seed_alias_notes=None, dedupe: bool = True):
+    """명세서 파일 1개를 파싱·매칭·DB 저장 → (uid, err, n_rows).
+    seed_alias_notes: 자동매칭 note 집합이면 statement_item_map에도 별칭 시드."""
+    fname = filename or ""
+    branch_names = [b["branch_name"] for b in get_branches(branch_type=None) if b.get("branch_name")]
+    products = _stmt_products()
+    fname_base = fname.replace("\\", "/").rsplit("/", 1)[-1]
+    # 알려진 거래처 키 구축: 정식명 + 2~3글자 접두사 (타라→타라그래픽스, 펫네스트→펫네스트(디자인주권) 등)
+    sup_keys = {}
+    for p in products:
+        s = (p.get("supplier") or "").strip()
+        if not s or "삭제" in s or "중단" in s or s == "테스트":
+            continue
+        kn = _stmt_norm(s)
+        if len(kn) < 2:
+            continue
+        sup_keys[kn] = s
+        if len(kn) >= 4:
+            sup_keys.setdefault(kn[:2], s)
+            sup_keys.setdefault(kn[:3], s)
+
+    def _known_in(text):
+        t = _stmt_norm(text)
+        if not t:
+            return ""
+        best, bl = "", 0
+        for kn, canon in sup_keys.items():
+            if kn in t and len(kn) > bl:
+                best, bl = canon, len(kn)
+        return best
+
+    # 거래처 후보 우선순위: 경로 폴더 일치 > 파일명 일치 > 파일명 추정 > 본문 > 최상위 폴더명
+    path_vendor = ""
+    path_parent = ""
+    if "/" in fname or "\\" in fname:
+        parts = [p for p in fname.replace("\\", "/").split("/") if p]
+        if len(parts) >= 2:
+            path_parent = parts[-2]
+            for dp in reversed(parts[:-1]):
+                hit = _known_in(dp)
+                if hit:
+                    path_vendor = hit
+                    break
+    base_vendor = _known_in(fname_base)
+    rows, meta = _stmt_parse_file(fname, data, branch_names)
+    if meta.get("error"):
+        return None, meta["error"], 0
+    all_text = meta.get("all_text", "")
+    detected_months = _stmt_month_candidates(fname) or _stmt_month_candidates(all_text)
+    eff_month = (month_hint or "").strip() or (detected_months[0] if detected_months else "")
+    fname_vendor = _stmt_vendor_from_filename(fname_base, branch_names)
+    # 파일명 추정값 정제 — 숫자/일반어 남으면 폐기
+    fv = re.sub(r"[\s_\-]+", " ", fname_vendor or "").strip(" ._-")
+    fv_tokens = [t for t in fv.split() if t and not re.search(r"\d", t)
+                 and t not in ("거래명세서", "명세서", "지점별", "납품", "현황", "상세", "계산서", "월별", "월", "년")]
+    fname_vendor = " ".join(fv_tokens) if fv_tokens else ""
+    eff_vendor = (vendor_hint or "").strip() or path_vendor or base_vendor or fname_vendor
+    if not eff_vendor:
+        eff_vendor = _stmt_vendor_from_text(all_text, products)
+    if not eff_vendor:
+        eff_vendor = path_parent
+    if not eff_month:
+        eff_month = datetime.now().strftime("%Y-%m")
+    notes = []
+    if meta.get("notes"):
+        notes.extend(meta["notes"])
+    if not rows:
+        notes.append("품목 행을 추출하지 못했습니다 — 업로드 후 + 행 추가로 직접 입력하세요.")
+    aliases = _stmt_alias_rows()
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        if dedupe:
+            ex = conn.execute(
+                "SELECT id FROM statement_uploads WHERE filename=? AND month=? AND vendor=? LIMIT 1",
+                (fname, eff_month, eff_vendor)
+            ).fetchone()
+            if ex:
+                conn.close()
+                return int(ex["id"]), None, -1  # 이미 등록됨
+        if USE_POSTGRES:
+            cur = conn.execute(
+                "INSERT INTO statement_uploads (filename, vendor, month, uploaded_by, uploaded_at, parse_note) "
+                "VALUES (?,?,?,?,?,?) RETURNING id",
+                (fname, eff_vendor, eff_month, uploaded_by, now, " | ".join(notes))
+            )
+            uid = cur.fetchone()["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO statement_uploads (filename, vendor, month, uploaded_by, uploaded_at, parse_note) "
+                "VALUES (?,?,?,?,?,?)",
+                (fname, eff_vendor, eff_month, uploaded_by, now, " | ".join(notes))
+            )
+            uid = cur.lastrowid
+        seed_aliases = []
+        for i, r in enumerate(rows, 1):
+            code, mnote = _stmt_match_item(r.get("raw_name") or "", eff_vendor, products, aliases)
+            if seed_alias_notes and code and mnote in seed_alias_notes:
+                seed_aliases.append((r.get("raw_name") or "", code))
+            conn.execute(
+                "INSERT INTO statement_rows (upload_id, row_no, stmt_date, branch_name, raw_name, spec, qty, unit_price, amount, item_code, match_note) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (uid, i, r.get("stmt_date") or "", r.get("branch_name") or "", r.get("raw_name") or "",
+                 r.get("spec") or "", r.get("qty"), r.get("unit_price"), r.get("amount"), code, mnote)
+            )
+        # 자동매칭 성공분 별칭 시드
+        pname_map = {p["code"]: p["name"] for p in products}
+        sup_key = _stmt_norm(eff_vendor)
+        for raw_name, code in seed_aliases:
+            akey = _stmt_norm(raw_name)
+            if not akey:
+                continue
+            exists = conn.execute(
+                "SELECT 1 AS x FROM statement_item_map WHERE alias_name=? AND supplier=? LIMIT 1",
+                (akey, sup_key)
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO statement_item_map (alias_name, supplier, item_code, item_name, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (akey, sup_key, code, pname_map.get(code, ""), now, now)
+                )
+        conn.commit()
+        conn.close()
+        return uid, None, len(rows)
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        return None, f"저장 실패: {e}", 0
+
+
+@app.post("/master/statement-check/upload")
+async def statement_check_upload(
+    session_token: str = Cookie(default=None),
+    file: UploadFile = File(...),
+    vendor: str = Form(""),
+    month: str = Form(""),
+):
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    data = await file.read()
+    fname = file.filename or ""
+    uid, err, n = _stmt_import_file(
+        fname, data, vendor, month,
+        uploaded_by=user.get("login_id") or user.get("name") or "",
+        seed_alias_notes={"상품명"},
+    )
+    if err:
+        return RedirectResponse(url="/master/statement-check?err=" + _stmt_esc(err), status_code=303)
+    if n == -1:
+        return RedirectResponse(url=f"/master/statement-check?id={uid}", status_code=303)
+    return RedirectResponse(url=f"/master/statement-check?id={uid}", status_code=303)
+
+
+@app.post("/master/statement-check/upload-zip")
+async def statement_check_upload_zip(
+    session_token: str = Cookie(default=None),
+    file: UploadFile = File(...),
+):
+    """ZIP 업로드 — 내부 폴더 구조로 거래처/월 자동 인식."""
+    import io
+    import zipfile
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    data = await file.read()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception as e:
+        return RedirectResponse(url="/master/statement-check?err=" + _stmt_esc(f"ZIP 열기 실패: {e}"), status_code=303)
+    branch_names = [b["branch_name"] for b in get_branches(branch_type=None) if b.get("branch_name")]
+    products = _stmt_products()
+    ok = skipped = failed = dup = 0
+    errors = []
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        rel = info.filename.replace("\\", "/")
+        base = rel.rsplit("/", 1)[-1]
+        lower = base.lower()
+        if lower.startswith("__macosx") or "/__MACOSX/" in rel or base.startswith("."):
+            continue
+        if not lower.endswith((".xlsx", ".xlsm", ".pdf")):
+            skipped += 1
+            continue
+        parts = [p for p in rel.split("/") if p]
+        # 월 폴더명에서 월 추출 (예: (운영기획팀)거래명세서_2610, 2610)
+        month_hint = ""
+        vendor_hint = ""
+        for p in parts[:-1]:
+            m = re.search(r"(20\d{2}|\d{2})(0[1-9]|1[0-2])", p)
+            if m and not month_hint:
+                yy = m.group(1)
+                month_hint = f"20{yy}-{m.group(2)}" if len(yy) == 2 else f"{yy}-{m.group(2)}"
+        if len(parts) >= 3:
+            # 상위 월 폴더 바로 아래 = 거래처 폴더
+            vendor_hint = parts[-2]
+            if re.search(r"\d{4}", vendor_hint) or "거래명세서" in vendor_hint or "세금계산서" in vendor_hint:
+                vendor_hint = ""
+        fdata = zf.read(info)
+        uid, err, n = _stmt_import_file(
+            rel, fdata, vendor_hint, month_hint,
+            uploaded_by=user.get("login_id") or user.get("name") or "",
+            seed_alias_notes={"상품명", "유사", "토큰", "토큰+거래처"},
+        )
+        if err:
+            failed += 1
+            errors.append(f"{rel}: {err}")
+        elif n == -1:
+            dup += 1
+        else:
+            ok += 1
+    zf.close()
+    summary = f"ZIP 처리 완료 — 등록 {ok}건, 중복 {dup}건, 지원외 {skipped}건, 실패 {failed}건"
+    if errors:
+        summary += " | " + " / ".join(errors[:5])
+    return RedirectResponse(url="/master/statement-check?err=" + _stmt_esc(summary), status_code=303)
+
+
+@app.get("/master/statement-check/export")
+async def statement_check_export(kind: str = "aliases", session_token: str = Cookie(default=None)):
+    """별칭 DB / 업로드 내역 엑셀 다운로드."""
+    import io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from urllib.parse import quote
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    conn = get_conn()
+    try:
+        wb = Workbook()
+        ws = wb.active
+        assert ws is not None
+        hfill = PatternFill("solid", fgColor="1E2761")
+        if kind == "aliases":
+            ws.title = "별칭DB"
+            ws.append(["명세서 품목명", "거래처", "우리 상품명", "품번", "등록일", "수정일"])
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF"); c.fill = hfill; c.alignment = Alignment(horizontal="center")
+            for a in conn.execute("SELECT * FROM statement_item_map ORDER BY supplier, alias_name").fetchall():
+                ws.append([a["alias_name"], a["supplier"] or "전체", a["item_name"], a["item_code"], a["created_at"], a["updated_at"]])
+            widths = [40, 14, 40, 16, 20, 20]
+            fname = "거래명세서_별칭DB.xlsx"
+        else:
+            ws.title = "업로드내역"
+            ws.append(["ID", "파일명", "거래처", "대상 월", "업로드자", "업로드 일시", "파싱 메모", "행 수"])
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF"); c.fill = hfill; c.alignment = Alignment(horizontal="center")
+            for u in conn.execute(
+                "SELECT u.*, (SELECT COUNT(*) FROM statement_rows r WHERE r.upload_id=u.id) AS rc "
+                "FROM statement_uploads u ORDER BY u.id DESC"
+            ).fetchall():
+                ws.append([u["id"], u["filename"], u["vendor"], u["month"], u["uploaded_by"], u["uploaded_at"], u["parse_note"], u["rc"]])
+            widths = [6, 50, 14, 10, 12, 20, 30, 8]
+            fname = "거래명세서_업로드내역.xlsx"
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[chr(64 + i) if i <= 26 else "A" + chr(64 + i - 26)].width = w
+        ws.freeze_panes = "A2"
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+    finally:
+        conn.close()
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(fname)},
+    )
+
+
+@app.post("/master/statement-check/save")
+async def statement_check_save(request: Request, session_token: str = Cookie(default=None)):
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    body = await request.json()
+    upload_id = int(body.get("upload_id") or 0)
+    rows = body.get("rows") or []
+    delete_ids = [int(x) for x in (body.get("delete_ids") or [])]
+    conn = get_conn()
+    try:
+        up = conn.execute("SELECT * FROM statement_uploads WHERE id=?", (upload_id,)).fetchone()
+        if not up:
+            conn.close()
+            return JSONResponse(status_code=404, content={"detail": "업로드를 찾을 수 없습니다."})
+        up = dict(up)
+        vendor = up.get("vendor") or ""
+        products = _stmt_products()
+        aliases = _stmt_alias_rows()
+        if delete_ids:
+            ph = ",".join("?" for _ in delete_ids)
+            conn.execute(f"DELETE FROM statement_rows WHERE upload_id=? AND id IN ({ph})", [upload_id] + delete_ids)
+        # 동일 명세서 품목명 전파: 같은 raw_name 그룹에서 매칭된 상품을 미매칭 행에 적용
+        name_to_code = {}
+        for r in rows:
+            nm = _stmt_norm(r.get("raw_name") or "")
+            cd = str(r.get("item_code") or "").strip()
+            if nm and cd and nm not in name_to_code:
+                name_to_code[nm] = cd
+        saved = 0
+        for i, r in enumerate(rows, 1):
+            rid = r.get("id")
+            raw_name = str(r.get("raw_name") or "").strip()
+            item_code = str(r.get("item_code") or "").strip()
+            if not item_code:
+                item_code = name_to_code.get(_stmt_norm(raw_name), "")
+            # 매칭 상품 선택 시 별칭 자동 등록
+            if item_code and raw_name:
+                alias_key = _stmt_norm(raw_name)
+                sup_key = _stmt_norm(vendor)
+                exists = conn.execute(
+                    "SELECT 1 AS x FROM statement_item_map WHERE alias_name=? AND supplier=? AND item_code=? LIMIT 1",
+                    (alias_key, sup_key, item_code)
+                ).fetchone()
+                if not exists:
+                    pname = next((p["name"] for p in products if p["code"] == item_code), "")
+                    conn.execute(
+                        "INSERT INTO statement_item_map (alias_name, supplier, item_code, item_name, created_at, updated_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (alias_key, sup_key, item_code, pname, datetime.now().isoformat(timespec="seconds"),
+                         datetime.now().isoformat(timespec="seconds"))
+                    )
+                # 저장 후 재조회 없이 match_note 갱신
+                mnote = "수동"
+            else:
+                mnote = ""
+            qty = r.get("qty")
+            try:
+                qty = float(qty) if qty not in (None, "") else None
+            except (TypeError, ValueError):
+                qty = None
+            price = r.get("unit_price")
+            try:
+                price = float(price) if price not in (None, "") else None
+            except (TypeError, ValueError):
+                price = None
+            amount = r.get("amount")
+            try:
+                amount = float(amount) if amount not in (None, "") else ((qty or 0) * (price or 0) if qty is not None and price is not None else None)
+            except (TypeError, ValueError):
+                amount = None
+            vals = (
+                upload_id, i, str(r.get("stmt_date") or "")[:10] if r.get("stmt_date") else "",
+                str(r.get("branch_name") or "")[:50], raw_name[:300], str(r.get("spec") or "")[:200],
+                qty, price, amount, item_code, mnote,
+            )
+            if rid:
+                conn.execute(
+                    "UPDATE statement_rows SET row_no=?, stmt_date=?, branch_name=?, raw_name=?, spec=?, qty=?, unit_price=?, amount=?, item_code=?, match_note=? WHERE id=? AND upload_id=?",
+                    vals[1:] + (int(rid), upload_id)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO statement_rows (upload_id, row_no, stmt_date, branch_name, raw_name, spec, qty, unit_price, amount, item_code, match_note) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    vals
+                )
+            saved += 1
+        conn.commit()
+        conn.close()
+        return JSONResponse(content={"status": "ok", "saved": saved})
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+
+@app.post("/master/statement-check/alias/save")
+async def statement_check_alias_save(request: Request, session_token: str = Cookie(default=None)):
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    body = await request.json()
+    alias_name = _stmt_norm(body.get("alias_name"))
+    supplier = _stmt_norm(body.get("supplier"))
+    item_code = str(body.get("item_code") or "").strip()
+    if not alias_name or not item_code:
+        return JSONResponse(status_code=400, content={"detail": "필수 항목이 누락되었습니다."})
+    products = _stmt_products()
+    pname = next((p["name"] for p in products if p["code"] == item_code), "")
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO statement_item_map (alias_name, supplier, item_code, item_name, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(alias_name, supplier, item_code) DO UPDATE SET item_name=excluded.item_name, updated_at=excluded.updated_at",
+            (alias_name, supplier, item_code, pname, now, now)
+        )
+        conn.commit()
+        conn.close()
+        return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+
+@app.post("/master/statement-check/alias/delete")
+async def statement_check_alias_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    body = await request.json()
+    aid = int(body.get("id") or 0)
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM statement_item_map WHERE id=?", (aid,))
+        conn.commit()
+        conn.close()
+        return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+
+@app.post("/master/statement-check/delete")
+async def statement_check_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    form = await request.form()
+    uid = int(form.get("upload_id") or 0)
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM statement_rows WHERE upload_id=?", (uid,))
+        conn.execute("DELETE FROM statement_uploads WHERE id=?", (uid,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        conn.close()
+    return RedirectResponse(url="/master/statement-check", status_code=303)
 
 
 if __name__ == "__main__":

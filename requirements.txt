@@ -9,3 +9,4 @@ psycopg2-binary==2.9.9
 httpx
 
 pywebpush
+pypdf==5.9.0
