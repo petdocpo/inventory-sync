@@ -30749,7 +30749,8 @@ def _stmt_alias_rows():
     conn = get_conn()
     try:
         return conn.execute(
-            "SELECT id, alias_name, supplier, item_code, item_name FROM statement_item_map ORDER BY alias_name"
+            "SELECT id, alias_name, supplier, item_code, item_name, created_at, updated_at "
+            "FROM statement_item_map ORDER BY alias_name"
         ).fetchall()
     except Exception:
         return []
