@@ -23,6 +23,7 @@ load_dotenv(".env")
 app = FastAPI()
 
 from db import get_conn, pk_column, upsert_suffix, USE_POSTGRES  # noqa: E402
+from order_policy import effective_order_cycle  # noqa: E402
 
 def is_item_consumable(conn, branch_code: str, item_code: str) -> bool:
     """items 테이블 기준 소모품 여부 확인 (RAW 자동반영 대상 판별용)"""
@@ -2266,6 +2267,21 @@ def init_db():
             if "reason" not in _scl_existing:
                 conn.execute("ALTER TABLE stock_closing_lines ADD COLUMN reason TEXT")
 
+    # product_master.order_cycle 컬럼 보강 (additive, NULL 허용: weekly/monthly/none)
+    # product_master는 init_db에서 생성하지 않는 테이블이라 존재 여부를 먼저 확인한다.
+    if USE_POSTGRES:
+        conn.execute(
+            "ALTER TABLE IF EXISTS product_master ADD COLUMN IF NOT EXISTS order_cycle TEXT"
+        )
+    else:
+        _pm_tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='product_master'"
+        ).fetchone()
+        if _pm_tbl:
+            _pm_existing = {r[1] for r in conn.execute("PRAGMA table_info(product_master)").fetchall()}
+            if "order_cycle" not in _pm_existing:
+                conn.execute("ALTER TABLE product_master ADD COLUMN order_cycle TEXT")
+
     # 거래명세서 확인 — 명세서↔상품 별칭, 업로드, 추출 행
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS statement_item_map (
@@ -2921,13 +2937,19 @@ async def column_defaults_save(request: Request, session_token: str = Cookie(def
 # render_page에서 설명글 <p>에 data-desc 키를 부여하고, system_settings 'pagedesc:<key>'
 # override가 있으면 내용을 교체한다. 키는 active 메뉴키+기본 텍스트 해시라 코드 수정 시 자동 무효화.
 _PAGEDESC_PREFIX = "pagedesc:"
-_PAGEDESC_P_RE = re.compile(r"<p\b([^>]*)>([^<]{8,800})</p>", re.IGNORECASE)
 _PAGEDESC_TAG_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
-_PAGEDESC_SKIP_RE = re.compile(r"onclick|data-desc|contenteditable|ondblclick", re.IGNORECASE)
+_PAGEDESC_SKIP_RE = re.compile(r"onclick|data-desc|contenteditable|ondblclick|href\s*=", re.IGNORECASE)
 _PAGEDESC_STYLE_RE = re.compile(
     r"font-size\s*:\s*1[0-5](?:\.\d+)?px"
     r"|color\s*:\s*#(?:888|999|666|555|64748B|6B7280|94A3B8|9CA3AF|D1D5DB)\b",
     re.IGNORECASE)
+# 설명글 후보 태그 — p/div 중 인라인 태그만 자식으로 허용 (레이아웃/동적 블록 오인 방지)
+_PAGEDESC_BLOCK_RE = re.compile(r"<(p|div)\b([^>]*)>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
+_PAGEDESC_ALLOWED_INNER = {"br", "b", "i", "em", "strong", "span", "font", "small", "sub", "sup", "u", "s"}
+_PAGEDESC_TAGNAME_RE = re.compile(r"<\s*/?\s*([a-zA-Z][a-zA-Z0-9]*)")
+# 동적 카운터/파일명 등 키가 렌더링마다 바뀌는 문구는 편집 대상에서 제외
+_PAGEDESC_DYNAMIC_RE = re.compile(
+    r"\.\s*(xlsx|xlsm|pdf|zip|csv|png|jpe?g|hwp)\b|\d+\s*(개|건|번|%|px|매|장|회|명|p)\b", re.IGNORECASE)
 
 
 def _pagedesc_key(active: str, text: str) -> str:
@@ -2954,10 +2976,10 @@ def _pagedesc_fetch(keys):
 
 
 def _mark_desc_paragraphs(content: str, active: str):
-    """설명글 <p>에 data-desc 부여 + override 반영. 반환: (html, 사용된키목록)"""
-    if not content or "<p" not in content.lower():
+    """설명글 <p>/<div>에 data-desc 부여 + override 반영. 반환: (html, 사용된키목록)"""
+    if not content or "<p" not in content.lower() and "<div" not in content.lower():
         return content, []
-    # script/style 블록은 공백으로 마스킹 — 내부의 <p> 문자열 오인 방지
+    # script/style 블록은 공백으로 마스킹 — 내부의 태그 문자열 오인 방지
     masked = list(content)
     for m in _PAGEDESC_TAG_RE.finditer(content):
         for i in range(m.start(), m.end()):
@@ -2965,10 +2987,14 @@ def _mark_desc_paragraphs(content: str, active: str):
     masked = "".join(masked)
 
     import html as _html
-    found = []  # (start, end, key)
-    for m in _PAGEDESC_P_RE.finditer(masked):
-        attrs, inner = m.group(1), m.group(2)
-        text = " ".join(inner.split())
+    found = []  # (start, end, tag, key)
+    for m in _PAGEDESC_BLOCK_RE.finditer(masked):
+        tag, attrs, inner = m.group(1).lower(), m.group(2), m.group(3)
+        # 자식 태그는 인라인 태그만 허용 — 블록/링크/이미지 등이 있으면 제외
+        inner_tags = {t.lower() for t in _PAGEDESC_TAGNAME_RE.findall(inner)}
+        if not inner_tags <= _PAGEDESC_ALLOWED_INNER:
+            continue
+        text = " ".join(_html.unescape(re.sub(r"<[^>]+>", " ", inner)).split())
         if len(text) < 8 or len(text) > 800:
             continue
         if _PAGEDESC_SKIP_RE.search(attrs):
@@ -2978,28 +3004,31 @@ def _mark_desc_paragraphs(content: str, active: str):
         # 날짜/시간이 박힌 동적 문구는 편집 대상에서 제외 (날짜가 바뀌면 키도 바뀌어 override가 무의미해짐)
         if re.search(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}", text):
             continue
+        # 동적 카운터·파일명 등 렌더링마다 변하는 문구 제외
+        if _PAGEDESC_DYNAMIC_RE.search(text):
+            continue
         # 스타일 힌트: 작은 글씨 or 회색 계열 — 일반 본문/사용자 생성 콘텐츠는 제외
         if "style=" not in attrs.lower() or not _PAGEDESC_STYLE_RE.search(attrs):
             continue
-        found.append((m.start(), m.end(), _pagedesc_key(active, text)))
+        found.append((m.start(), m.end(), tag, _pagedesc_key(active, text)))
     if not found:
         return content, []
 
-    overrides = _pagedesc_fetch(sorted({k for _, _, k in found}))
+    overrides = _pagedesc_fetch(sorted({k for _, _, _, k in found}))
     parts, pos = [], 0
-    for start, end, key in found:
+    for start, end, tag, key in found:
         parts.append(content[pos:start])
-        tag = content[start:end]
-        gt = tag.find(">")
-        open_tag = tag[:gt].replace("<p", '<p data-desc="' + key + '"', 1)
+        elem = content[start:end]
+        gt = elem.find(">")
+        open_tag = elem[:gt].replace("<" + tag, '<' + tag + ' data-desc="' + key + '"', 1)
         ov = overrides.get(key)
         if ov is not None:
-            parts.append(open_tag + ">" + _html.escape(ov) + "</p>")
+            parts.append(open_tag + ">" + _html.escape(ov) + "</" + tag + ">")
         else:
-            parts.append(open_tag + tag[gt:])
+            parts.append(open_tag + elem[gt:])
         pos = end
     parts.append(content[pos:])
-    return "".join(parts), sorted({k for _, _, k in found})
+    return "".join(parts), sorted({k for _, _, _, k in found})
 
 
 _PAGE_DESC_EDIT_HTML = """<style>[data-desc]{cursor:text;}[data-desc]:hover{outline:1px dashed #93C5FD;outline-offset:2px;}</style>
@@ -3154,6 +3183,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("qr", "/qr", "📷", "QR생성", None),
         ("adjust", "/adjust", "✏️", "수기조정", None),
         ("scanlog", "/scan-log", "📜", "스캔이력", None),
+        ("purchase-app", os.getenv("SMALLBIZ_APP_URL", "http://127.0.0.1:8003"), "🛒", "구매관리", None),
         ("notice-group", None, "📢", "공지&설문", [
             ("공지사항", notice_menu_href),
             ("Q&A 게시판", qna_menu_href),
@@ -3198,8 +3228,9 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         </div>
             """
         else:
+            ext_attr = ' target="_blank" rel="noopener"' if str(href).startswith("http") else ""
             menu_html += f"""
-        <a href="{href}" style="flex:1;text-align:center;padding:8px 0;
+        <a href="{href}"{ext_attr} style="flex:1;text-align:center;padding:8px 0;
            text-decoration:none;font-size:12px;{is_active}border-radius:8px;">
           <div style="font-size:20px;">{icon}</div>
           <div>{label}</div>
@@ -17788,19 +17819,6 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """
 
-    # ---- 발주서 미리보기 (단독 상단, 아코디언 아님) ----
-    po_preview_card_html = ""
-    if menu_allowed("purchase-order-preview"):
-        po_preview_card_html = """
-      <a href="/master/purchase-order/preview" style="text-decoration:none;">
-        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
-          <div style="font-size:32px;">🧮</div>
-          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">발주서 미리보기</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">계산 결과 검증용</div>
-        </div>
-      </a>
-        """
-
     # ---- 발주서 검수 (단독 상단, 아코디언 아님) ----
     po_verify_card_html = ""
     if menu_allowed("purchase-order-verify"):
@@ -17814,18 +17832,36 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """
 
-    # ---- 거래명세서 확인 (단독 상단) ----
-    stmt_card_html = ""
+    # ---- 거래명세서 (아코디언 그룹) ----
+    stmt_cards = []
     if menu_allowed("statement-check"):
-        stmt_card_html = """
+        stmt_cards.append("""
       <a href="/master/statement-check" style="text-decoration:none;">
         <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
           <div style="font-size:32px;">🧾</div>
           <div style="font-weight:bold;color:#1E2761;margin-top:8px;">거래명세서 확인</div>
-          <div style="color:#888;font-size:12px;margin-top:4px;">명세서 ↔ 발주내역 대조</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">명세서 업로드/대조</div>
         </div>
       </a>
-        """
+        """)
+        stmt_cards.append("""
+      <a href="/master/statement-check/month" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">📅</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">월별 대조 결과</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">월 단위 명세서↔발주 비교</div>
+        </div>
+      </a>
+        """)
+        stmt_cards.append("""
+      <a href="/master/statement-check/aliases" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;">🔗</div>
+          <div style="font-weight:bold;color:#1E2761;margin-top:8px;">품목 별칭 DB</div>
+          <div style="color:#888;font-size:12px;margin-top:4px;">명세서 품목↔상품 매칭 관리</div>
+        </div>
+      </a>
+        """)
 
     # ---- 그룹 1: DB재고관리 ----
     db_inventory_cards = []
@@ -17999,6 +18035,12 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """)
 
+    # ---- 바로가기 그룹 (단독 카드들을 아코디언 안으로) ----
+    shortcut_cards = []
+    for _c in (branch_card_html, po_preview_card_html, po_verify_card_html):
+        if _c:
+            shortcut_cards.append(_c)
+
     # ---- 아코디언 그룹 조립 (카드 0개인 그룹은 렌더링 생략) ----
     def render_group(group_id: str, title: str, cards: list) -> str:
         if not cards:
@@ -18019,6 +18061,8 @@ async def master_page(session_token: str = Cookie(default=None)):
         """
 
     groups_html = "".join([
+        render_group("shortcut", "⭐ 바로가기", shortcut_cards),
+        render_group("statement", "🧾 거래명세서", stmt_cards),
         render_group("db-inventory", "📦 DB재고관리", db_inventory_cards),
         render_group("stocktake", "🔍 재고실사", stocktake_cards),
         render_group("vendor", "🏢 거래처관리", vendor_cards),
@@ -18028,7 +18072,6 @@ async def master_page(session_token: str = Cookie(default=None)):
     content = f"""
     {ACCORDION_CSS_JS}
     <h2 style="margin-bottom:16px;">⚙️ 마스터 관리</h2>
-    {f'<div style="display:flex;gap:16px;margin-bottom:14px;">{branch_card_html}{po_preview_card_html}{po_verify_card_html}{stmt_card_html}</div>' if (branch_card_html or po_preview_card_html or po_verify_card_html or stmt_card_html) else ""}
     {groups_html}
     """
     return HTMLResponse(content=render_page(content, user, "master"))
@@ -18585,7 +18628,7 @@ async def _compute_purchase_order_candidates() -> dict:
 
     # ── 4) product_master에서 item_code별 대표 1행 (리드타임/MOQ/소모품여부/전체미발주 - 상품별 공통값) ──
     pm_rows = conn.execute(
-        "SELECT DISTINCT ON (item_code) item_code, lead_time_days, moq, is_consumable, order_excluded "
+        "SELECT DISTINCT ON (item_code) item_code, lead_time_days, moq, is_consumable, order_excluded, order_cycle "
         "FROM product_master WHERE item_code IS NOT NULL AND item_code != '' "
         "ORDER BY item_code, id"
     ).fetchall()
@@ -18673,11 +18716,19 @@ async def _compute_purchase_order_candidates() -> dict:
             "lead_time_days": lead_time_days
         }
 
-        # 5. 주간/월간 분류
-        is_monthly_by_leadtime = lead_time_days >= 35
+        # 5. 발주 방식 분류: order_cycle 명시값 우선, NULL이면 레거시(lead>=35 또는 월예외→월간)
+        #    지점 월 발주 예외는 상품 설정보다 우선. 'none'은 명시 미발주.
         is_monthly_by_exception = ((item_code, branch_code) in monthly_exc_set) or ((item_name, branch_code) in monthly_exc_name_set)
+        cycle = effective_order_cycle(
+            pm["order_cycle"] if pm else None,
+            order_excluded=False,  # order_excluded는 위에서 이미 제외됨
+            lead_time_days=lead_time_days,
+            monthly_exception=is_monthly_by_exception,
+        )
+        if cycle == "none":
+            continue
 
-        if is_monthly_by_leadtime or is_monthly_by_exception:
+        if cycle == "monthly":
             monthly.append(candidate)
         else:
             weekly.append(candidate)
@@ -18965,6 +19016,7 @@ async def purchase_order_product_settings_page(
     branch_options_json = json.dumps(
         [{"code": b["branch_code"], "name": b["branch_name"]} for b in branches], ensure_ascii=False
     )
+    branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
     branch_filter_options = '<option value="">전체 지점</option>'
     for b in branches:
         sel = "selected" if filter_branch == b["branch_name"] else ""
@@ -18991,6 +19043,15 @@ async def purchase_order_product_settings_page(
             safe_item_code = (r["item_code"] or "").replace("'", "")
             item_code_attr = _h.escape(str(r["item_code"] or ""), quote=True)
             item_name_attr = _h.escape(str(r["item_name"] or ""), quote=True)
+            _bc = branch_name_to_code.get(r["branch_name"] or "")
+            _mexc_hit = bool(_bc) and (_bc in monthly_exc_map.get(r["item_code"] or "", [])
+                                       or _bc in monthly_exc_map.get(r["item_name"] or "", []))
+            _eff_cycle = effective_order_cycle(
+                r["order_cycle"] if "order_cycle" in r.keys() else None,
+                order_excluded=bool(r["order_excluded"]),
+                lead_time_days=r["lead_time_days"] or 0,
+                monthly_exception=_mexc_hit,
+            )
             rows_html += f"""
             <tr>
               <td style="text-align:center;"><input type="checkbox" class="pm-row-check" data-id="{r['id']}" data-itemcode="{item_code_attr}" data-itemname="{item_name_attr}" style="width:18px;height:18px;"></td>
@@ -19002,6 +19063,11 @@ async def purchase_order_product_settings_page(
               <td class="pm-col-tax">{r['tax_setting'] or ''}</td>
               <td class="pm-col-leadtime"><input type="number" class="pm-leadtime" data-id="{r['id']}" value="{r['lead_time_days'] or 0}"></td>
               <td class="pm-col-moq"><input type="number" class="pm-moq" data-id="{r['id']}" value="{r['moq'] or 1}"></td>
+              <td class="pm-col-cycle"><select class="pm-cycle" data-id="{r['id']}">
+                <option value="weekly" {'selected' if _eff_cycle == 'weekly' else ''}>정기(격주)</option>
+                <option value="monthly" {'selected' if _eff_cycle == 'monthly' else ''}>월 발주</option>
+                <option value="none" {'selected' if _eff_cycle == 'none' else ''}>미발주</option>
+              </select></td>
               <td class="pm-col-minsafe"><input type="number" class="pm-minsafe" data-id="{r['id']}" value="{r['min_safety_qty'] if r['min_safety_qty'] is not None else ''}" min="0" placeholder="공통" style="width:80px;"></td>
               <td class="pm-col-consumable" style="text-align:center;"><input type="checkbox" class="pm-consumable" data-id="{r['id']}" {consumable_checked} style="width:18px;height:18px;"></td>
               <td class="pm-col-category"><input type="text" class="pm-category" data-id="{r['id']}" value="{r['category'] or ''}"></td>
@@ -19032,6 +19098,7 @@ async def purchase_order_product_settings_page(
 
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">상품별 단가, 거래처, 과세설정, 리드타임, MOQ, 소모품 여부를 관리합니다. 발주서 자동생성 시 이 정보를 사용합니다.</p>
+      <p style="font-size:12px;color:#B45309;margin-top:6px;">발주 방식(정기/월 발주/미발주)은 품번 단위로 모든 지점에 함께 저장됩니다. 미발주는 전체 미발주(숨김)와 연동되며, 지점 월 발주 예외(지방점 주발주 제외)는 상품 설정보다 우선합니다.</p>
     </div>
 
     <div class="card">
@@ -19045,6 +19112,11 @@ async def purchase_order_product_settings_page(
         <input type="text" id="pmTax" placeholder="과세설정(예: 과세)" style="flex:1;min-width:100px;">
         <input type="number" id="pmLeadTime" placeholder="리드타임(일)" style="flex:1;min-width:100px;">
         <input type="number" id="pmMoq" placeholder="MOQ(기본 1)" style="flex:1;min-width:100px;">
+        <select id="pmCycle" style="flex:1;min-width:110px;">
+          <option value="weekly">정기(격주)</option>
+          <option value="monthly">월 발주</option>
+          <option value="none">미발주</option>
+        </select>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="pmConsumable"> 소모품</label>
         <button class="btn" type="button" onclick="addPmItem()">추가</button>
       </div>
@@ -19087,6 +19159,12 @@ async def purchase_order_product_settings_page(
           <input type="number" id="pmBulkLeadTime" placeholder="리드타임 일괄값" style="width:130px;">
           <input type="number" id="pmBulkMoq" placeholder="MOQ 일괄값" style="width:110px;">
           <input type="number" id="pmBulkMin" placeholder="최소 안전재고 일괄값" min="0" style="width:150px;">
+          <select id="pmBulkCycle" style="width:130px;">
+            <option value="">발주 방식 (선택)</option>
+            <option value="weekly">정기(격주)</option>
+            <option value="monthly">월 발주</option>
+            <option value="none">미발주</option>
+          </select>
           <button class="btn" type="button" onclick="applyBulkToChecked()" style="background:#8B5CF6;">✓ 체크 항목에 적용</button>
           <span style="color:#ccc;">|</span>
           <button class="btn" type="button" onclick="openBulkMonthlyExc()" style="background:#8B5CF6;">📦 선택 품목 월예외 설정</button>
@@ -19095,7 +19173,7 @@ async def purchase_order_product_settings_page(
         <p style="font-size:11px;color:#888;margin:6px 0 0 0;">체크한 행들을 품번 기준으로 묶어 같은 지점 설정을 한 번에 저장합니다. 월예외는 품명 기준으로 묶입니다.</p>
       </div>
 
-      <table class="pm-table" data-colkey="pm-main" data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:1500px;"><colgroup><col style="width:44px"><col style="width:100px"><col style="width:180px"><col style="width:110px"><col style="width:100px"><col style="width:120px"><col style="width:80px"><col style="width:90px"><col style="width:70px"><col style="width:100px"><col style="width:70px"><col style="width:100px"><col style="width:90px"><col style="width:110px"><col style="width:140px"><col style="width:130px"><col style="width:140px"></colgroup>
+      <table class="pm-table" data-colkey="pm-main" data-colw data-colver="2026-11-24" style="table-layout:fixed;min-width:1600px;"><colgroup><col style="width:44px"><col style="width:100px"><col style="width:180px"><col style="width:110px"><col style="width:100px"><col style="width:120px"><col style="width:80px"><col style="width:90px"><col style="width:70px"><col style="width:100px"><col style="width:90px"><col style="width:70px"><col style="width:100px"><col style="width:90px"><col style="width:110px"><col style="width:140px"><col style="width:130px"><col style="width:140px"></colgroup>
         <thead><tr>
           <th style="text-align:center;"><input type="checkbox" id="pmCheckAll" onclick="togglePmCheckAll(this)" style="width:18px;height:18px;"></th>
           <th class="pm-col-branch">지점</th>
@@ -19106,6 +19184,7 @@ async def purchase_order_product_settings_page(
           <th class="pm-col-tax">과세설정</th>
           <th class="pm-col-leadtime" style="cursor:pointer;" onclick="sortPm('lead_time_days')">리드타임(일) {'▲' if sort_by=='lead_time_days' and sort_dir=='asc' else ('▼' if sort_by=='lead_time_days' else '')}</th>
           <th class="pm-col-moq" style="cursor:pointer;" onclick="sortPm('moq')">MOQ {'▲' if sort_by=='moq' and sort_dir=='asc' else ('▼' if sort_by=='moq' else '')}</th>
+          <th class="pm-col-cycle" title="발주 방식: 정기(격주)/월 발주/미발주. 미발주는 전체 미발주(숨김)와 연동됩니다. 지점 월 발주 예외(지방점 주발주 제외)는 이 설정보다 우선합니다.">발주 방식</th>
           <th class="pm-col-minsafe" title="상품별 최소 안전재고. 비워두면 안전재고 판매 기반 비교의 공통 최소값을 씁니다.">최소 안전재고</th>
           <th class="pm-col-consumable" style="cursor:pointer;" onclick="sortPm('is_consumable')">소모품 {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
           <th class="pm-col-category">품류</th>
@@ -19285,12 +19364,14 @@ async def purchase_order_product_settings_page(
         const leadTime = parseInt(document.getElementById('pmLeadTime').value) || 0;
         const moq = parseInt(document.getElementById('pmMoq').value) || 1;
         const consumable = document.getElementById('pmConsumable').checked;
+        const cycle = document.getElementById('pmCycle').value;
         if (!branch || !name) {{ alert('지점명과 상품명을 입력하세요.'); return; }}
         const res = await fetch('/master/purchase-order/product-master/save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{
             branch_name: branch, item_name: name, item_code: code, purchase_price: price,
-            supplier: supplier, tax_setting: tax, lead_time_days: leadTime, moq: moq, is_consumable: consumable
+            supplier: supplier, tax_setting: tax, lead_time_days: leadTime, moq: moq, is_consumable: consumable,
+            order_cycle: cycle
           }})
         }});
         if (res.ok) {{ location.reload(); }} else {{
@@ -19305,6 +19386,7 @@ async def purchase_order_product_settings_page(
         const moqEl = document.querySelector('.pm-moq[data-id="' + id + '"]');
         const minEl = document.querySelector('.pm-minsafe[data-id="' + id + '"]');
         const consumableEl = document.querySelector('.pm-consumable[data-id="' + id + '"]');
+        const cycleEl = document.querySelector('.pm-cycle[data-id="' + id + '"]');
         const categoryEl = document.querySelector('.pm-category[data-id="' + id + '"]');
         const ptypeEl = document.querySelector('.pm-ptype[data-id="' + id + '"]');
         const ctypeEl = document.querySelector('.pm-ctype[data-id="' + id + '"]');
@@ -19317,6 +19399,7 @@ async def purchase_order_product_settings_page(
             moq: parseInt(moqEl.value) || 1,
             min_safety_qty: (minEl && minEl.value.trim() !== '') ? Math.max(0, parseInt(minEl.value) || 0) : null,
             is_consumable: consumableEl.checked,
+            order_cycle: cycleEl ? cycleEl.value : 'weekly',
             category: categoryEl.value.trim(),
             product_type: ptypeEl.value.trim(),
             consumable_type: ctypeEl.value.trim()
@@ -19377,6 +19460,7 @@ async def purchase_order_product_settings_page(
           const moqEl = document.querySelector('.pm-moq[data-id="' + id + '"]');
         const minEl = document.querySelector('.pm-minsafe[data-id="' + id + '"]');
           const consumableEl = document.querySelector('.pm-consumable[data-id="' + id + '"]');
+          const cycleEl = document.querySelector('.pm-cycle[data-id="' + id + '"]');
           const categoryEl = document.querySelector('.pm-category[data-id="' + id + '"]');
           const ptypeEl = document.querySelector('.pm-ptype[data-id="' + id + '"]');
           const ctypeEl = document.querySelector('.pm-ctype[data-id="' + id + '"]');
@@ -19387,6 +19471,7 @@ async def purchase_order_product_settings_page(
             moq: parseInt(moqEl.value) || 1,
             min_safety_qty: (minEl && minEl.value.trim() !== '') ? Math.max(0, parseInt(minEl.value) || 0) : null,
             is_consumable: consumableEl.checked,
+            order_cycle: cycleEl ? cycleEl.value : 'weekly',
             category: categoryEl.value.trim(),
             product_type: ptypeEl.value.trim(),
             consumable_type: ctypeEl.value.trim()
@@ -19412,11 +19497,13 @@ async def purchase_order_product_settings_page(
         const leadTimeVal = document.getElementById('pmBulkLeadTime').value;
         const moqVal = document.getElementById('pmBulkMoq').value;
         const minVal = document.getElementById('pmBulkMin').value;
-        if (!leadTimeVal && !moqVal && !minVal) {{ alert('리드타임, MOQ, 최소 안전재고 중 하나 이상을 입력하세요.'); return; }}
+        const cycleVal = document.getElementById('pmBulkCycle').value;
+        if (!leadTimeVal && !moqVal && !minVal && !cycleVal) {{ alert('리드타임, MOQ, 최소 안전재고, 발주 방식 중 하나 이상을 입력하세요.'); return; }}
         const payload = {{ ids: ids }};
         if (leadTimeVal) payload.lead_time_days = parseInt(leadTimeVal);
         if (moqVal) payload.moq = parseInt(moqVal);
         if (minVal) payload.min_safety_qty = Math.max(0, parseInt(minVal) || 0);
+        if (cycleVal) payload.order_cycle = cycleVal;
         if (!confirm(ids.length + '건에 값을 일괄 적용하시겠습니까? (즉시 DB에 저장됩니다)')) return;
         const res = await fetch('/master/purchase-order/product-master/bulk-apply', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
@@ -19893,6 +19980,50 @@ def _set_min_safety_qty(conn, row_ids, value, now):
         )
 
 
+def _parse_order_cycle(v):
+    """발주 방식 입력값 검증. 허용: weekly/monthly/none(별칭 포함). None/빈값 -> None, 그 외 ValueError."""
+    from order_policy import normalize_order_cycle
+    if v is None:
+        return None
+    if isinstance(v, str) and v.strip() == "":
+        return None
+    n = normalize_order_cycle(v)
+    if n is None:
+        raise ValueError("order_cycle must be weekly/monthly/none")
+    return n
+
+
+def _set_order_cycle(conn, row_ids, value, now):
+    """선택한 행과 품번이 같은 모든 지점 행에 발주 방식을 함께 저장하고,
+    order_cycle='none' <-> order_excluded 를 일치시킨다.
+    (품번 단위 공통 속성이므로 _set_min_safety_qty와 같은 동기 저장 규칙)
+    value가 None이면 아무것도 바꾸지 않는다."""
+    if value is None:
+        return
+    ids = [int(i) for i in row_ids]
+    if not ids:
+        return
+    ph = ",".join("?" for _ in ids)
+    found = conn.execute(
+        f"SELECT id, item_code FROM product_master WHERE id IN ({ph})", ids
+    ).fetchall()
+    codes = sorted({r["item_code"] for r in found if (r["item_code"] or "").strip()})
+    no_code_ids = [int(r["id"]) for r in found if not (r["item_code"] or "").strip()]
+    excluded = 1 if value == "none" else 0
+    if codes:
+        cph = ",".join("?" for _ in codes)
+        conn.execute(
+            f"UPDATE product_master SET order_cycle=?, order_excluded=?, updated_at=? WHERE item_code IN ({cph})",
+            [value, excluded, now] + codes
+        )
+    if no_code_ids:
+        nph = ",".join("?" for _ in no_code_ids)
+        conn.execute(
+            f"UPDATE product_master SET order_cycle=?, order_excluded=?, updated_at=? WHERE id IN ({nph})",
+            [value, excluded, now] + no_code_ids
+        )
+
+
 @app.post("/master/purchase-order/product-master/save")
 async def purchase_order_product_master_save(request: Request, session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -19923,6 +20054,15 @@ async def purchase_order_product_master_save(request: Request, session_token: st
         except (ValueError, TypeError):
             return JSONResponse(status_code=400, content={"detail": "최소 안전재고는 0 이상의 정수로 입력하세요."})
 
+    # 발주 방식도 요청에 키가 있을 때만 반영 (weekly/monthly/none, 미발주<->order_excluded 동기화)
+    cycle_provided = "order_cycle" in data
+    order_cycle = None
+    if cycle_provided:
+        try:
+            order_cycle = _parse_order_cycle(data.get("order_cycle"))
+        except (ValueError, TypeError):
+            return JSONResponse(status_code=400, content={"detail": "발주 방식은 정기/월 발주/미발주 중 하나여야 합니다."})
+
     now = datetime.now().isoformat()
     conn = get_conn()
     if row_id:
@@ -19936,6 +20076,8 @@ async def purchase_order_product_master_save(request: Request, session_token: st
         )
         if min_provided:
             _set_min_safety_qty(conn, [row_id], min_safety_qty, now)
+        if cycle_provided:
+            _set_order_cycle(conn, [row_id], order_cycle, now)
     else:
         if not branch_name or not item_name:
             conn.close()
@@ -19961,6 +20103,15 @@ async def purchase_order_product_master_save(request: Request, session_token: st
                 "UPDATE product_master SET min_safety_qty=?, updated_at=? WHERE item_code=?",
                 (min_safety_qty, now, item_code)
             )
+        if cycle_provided:
+            if item_code:
+                _ids = [r["id"] for r in conn.execute(
+                    "SELECT id FROM product_master WHERE item_code=?", (item_code,)).fetchall()]
+            else:
+                _ids = [r["id"] for r in conn.execute(
+                    "SELECT id FROM product_master WHERE branch_name=? AND item_name=?",
+                    (branch_name, item_name)).fetchall()]
+            _set_order_cycle(conn, _ids, order_cycle, now)
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})
@@ -19997,6 +20148,7 @@ async def purchase_order_product_master_bulk_save(request: Request, session_toke
     updated = 0
     errors = []
     min_changes = {}
+    cycle_changes = {}
     for r in rows:
         row_id = r.get("id")
         if not row_id:
@@ -20028,12 +20180,24 @@ async def purchase_order_product_master_bulk_save(request: Request, session_toke
                 continue
             if new_min != snap.get(int(row_id)):
                 min_changes[int(row_id)] = new_min
+        if "order_cycle" in r:
+            try:
+                cycle_changes[int(row_id)] = _parse_order_cycle(r.get("order_cycle"))
+            except (ValueError, TypeError):
+                errors.append(f"id={row_id}: 발주 방식 값이 올바르지 않습니다")
 
     for rid, val in min_changes.items():
         try:
             _set_min_safety_qty(conn, [rid], val, now)
         except Exception as e:
             errors.append(f"id={rid} 최소 안전재고: {str(e)}")
+    # 발주 방식은 행마다 값이 다를 수 있으나 품번 단위 동기 저장이므로
+    # 같은 품번의 마지막 값이 적용된다(화면은 품번당 동일 값을 보낸다).
+    for rid, cyc in cycle_changes.items():
+        try:
+            _set_order_cycle(conn, [rid], cyc, now)
+        except Exception as e:
+            errors.append(f"id={rid} 발주 방식: {str(e)}")
 
     conn.commit()
     conn.close()
@@ -20051,6 +20215,12 @@ async def purchase_order_product_master_bulk_apply(request: Request, session_tok
     ids = data.get("ids", [])
     lead_time_days = data.get("lead_time_days")
     moq = data.get("moq")
+    order_cycle = None
+    if data.get("order_cycle") is not None:
+        try:
+            order_cycle = _parse_order_cycle(data.get("order_cycle"))
+        except (ValueError, TypeError):
+            return JSONResponse(status_code=400, content={"detail": "발주 방식은 정기/월 발주/미발주 중 하나여야 합니다."})
     min_provided = data.get("min_safety_qty") is not None
     min_safety_qty = None
     if min_provided:
@@ -20063,7 +20233,7 @@ async def purchase_order_product_master_bulk_apply(request: Request, session_tok
 
     if not ids:
         return JSONResponse(status_code=400, content={"detail": "선택된 품목이 없습니다."})
-    if lead_time_days is None and moq is None and not min_provided:
+    if lead_time_days is None and moq is None and not min_provided and order_cycle is None:
         return JSONResponse(status_code=400, content={"detail": "변경할 값을 입력하세요."})
     try:
         id_list = [int(i) for i in ids]
@@ -20089,6 +20259,8 @@ async def purchase_order_product_master_bulk_apply(request: Request, session_tok
         )
     if min_provided:
         _set_min_safety_qty(conn, id_list, min_safety_qty, now)
+    if order_cycle is not None:
+        _set_order_cycle(conn, id_list, order_cycle, now)
 
     conn.commit()
     conn.close()
@@ -31344,7 +31516,13 @@ def _stmt_list_html(uploads: list, err: str = "", aliases: list = None) -> str:
         </tr>"""
     err_html = f'<div class="card" style="border-left:4px solid #B91C1C;color:#B91C1C;font-size:13px;">{_stmt_esc(err)}</div>' if err else ""
     return f"""
-    <h2 style="margin-bottom:16px;">🧾 거래명세서 확인</h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+      <h2 style="margin:0;">🧾 거래명세서 확인</h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <a href="/master/statement-check/month" style="padding:8px 14px;background:#166534;color:#fff;border-radius:8px;font-size:13px;text-decoration:none;">📅 월별 대조</a>
+        <a href="/master/statement-check/aliases" style="padding:8px 14px;background:#1E2761;color:#fff;border-radius:8px;font-size:13px;text-decoration:none;">🔗 별칭 DB 관리</a>
+      </div>
+    </div>
     {err_html}
     <div class="card">
       <b>📤 거래명세서 업로드</b>
@@ -31453,6 +31631,359 @@ async def statement_check_page(session_token: str = Cookie(default=None), id: in
         aliases = _stmt_alias_rows()
         content = _stmt_list_html([dict(u) for u in uploads], err, [dict(a) for a in aliases])
     return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.get("/master/statement-check/month", response_class=HTMLResponse)
+async def statement_check_month_page(
+    session_token: str = Cookie(default=None), month: str = "", vendor: str = ""
+):
+    """월별 거래명세서 ↔ 발주내역 대조 요약."""
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    conn = get_conn()
+    try:
+        months = [r["month"] for r in conn.execute(
+            "SELECT DISTINCT month FROM statement_uploads WHERE month<>'' ORDER BY month DESC"
+        ).fetchall()]
+        if not month:
+            month = months[0] if months else datetime.now().strftime("%Y-%m")
+        uploads = conn.execute(
+            "SELECT u.*, (SELECT COUNT(*) FROM statement_rows r WHERE r.upload_id=u.id) AS row_count "
+            "FROM statement_uploads u WHERE u.month=? ORDER BY u.vendor, u.id", (month,)
+        ).fetchall()
+        all_vendors = sorted({(u["vendor"] or "").strip() for u in uploads if (u["vendor"] or "").strip()})
+        if vendor and vendor in all_vendors:
+            uploads = [u for u in uploads if (u["vendor"] or "") == vendor]
+        elif vendor:
+            vendor = ""
+        eff_vendors = [vendor] if vendor else all_vendors
+        uids = [int(u["id"]) for u in uploads]
+        stmt_qty, unmatched_rows = {}, 0
+        if uids:
+            ph = ",".join("?" for _ in uids)
+            for g in conn.execute(
+                f"SELECT item_code, SUM(COALESCE(qty,0)) AS sq, COUNT(*) AS n "
+                f"FROM statement_rows WHERE upload_id IN ({ph}) GROUP BY item_code", uids
+            ).fetchall():
+                code = str(g["item_code"] or "")
+                if not code:
+                    unmatched_rows += int(g["n"] or 0)
+                else:
+                    stmt_qty[code] = stmt_qty.get(code, 0.0) + float(g["sq"] or 0)
+    finally:
+        conn.close()
+
+    products = _stmt_products()
+    aliases = _stmt_alias_rows()
+    orders, oerr, _fb = await _stmt_fetch_orders(month, "")
+    # 해당 월 명세서가 있는 거래처의 발주만 집계 (없으면 전체 + 안내)
+    vn_set = [_stmt_norm(v) for v in eff_vendors if _stmt_norm(v)]
+    order_scope_all = False
+    if vn_set and orders:
+        vend = [
+            o for o in orders
+            if any(vn and (vn in _stmt_norm(o.get("vendor")) or _stmt_norm(o.get("vendor")) in vn)
+                   for vn in vn_set)
+        ]
+        if vend:
+            orders = vend
+        else:
+            order_scope_all = True
+    pseudo_rows = [
+        {"id": -(i + 1), "row_no": i + 1, "stmt_date": "", "branch_name": "",
+         "raw_name": "", "spec": "", "qty": q, "unit_price": None, "amount": None,
+         "item_code": code, "match_note": ""}
+        for i, (code, q) in enumerate(sorted(stmt_qty.items()))
+    ]
+    cmp_data = _stmt_build_comparison(
+        {"rows": pseudo_rows, "upload": {"month": month, "vendor": vendor}},
+        orders or [], products, aliases,
+    )
+    items = cmp_data["item_summary"]
+    counts = {"일치": 0, "수량불일치": 0, "발주없음": 0, "발주만": 0}
+    for it in items:
+        counts[it["status"]] = counts.get(it["status"], 0) + 1
+
+    # 월 선택 옵션
+    month_opts = "".join(
+        f'<option value="{_stmt_esc(m)}"{" selected" if m == month else ""}>{_stmt_esc(m)}</option>'
+        for m in months
+    )
+    vendor_opts = '<option value="">전체 거래처</option>' + "".join(
+        f'<option value="{_stmt_esc(v)}"{" selected" if v == vendor else ""}>{_stmt_esc(v)}</option>'
+        for v in all_vendors
+    )
+
+    item_html = ""
+    for it in items:
+        item_html += f"""
+        <tr>
+          <td>{_stmt_esc(it['name'])}{' <span style="color:#B45309;font-size:11px;">(소모품)</span>' if it['consumable'] else ''}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(it['code'])}</td>
+          <td style="text-align:right;">{_stmt_fmt_qty(it['stmt_qty'])}</td>
+          <td style="text-align:right;">{_stmt_fmt_qty(it['order_qty'])}</td>
+          <td style="text-align:right;">{_stmt_fmt_qty(it['diff'])}</td>
+          <td>{_stmt_status_badge(it['status'])}</td>
+        </tr>"""
+    if not item_html:
+        item_html = '<tr><td colspan="6" style="text-align:center;color:#888;padding:20px;">해당 월의 명세서 데이터가 없습니다.</td></tr>'
+
+    uploads_html = ""
+    for u in uploads:
+        uploads_html += f"""
+        <tr>
+          <td><a href="/master/statement-check?id={u['id']}">{_stmt_esc(u['filename'])}</a></td>
+          <td>{_stmt_esc(u['vendor'] or '-')}</td>
+          <td style="text-align:right;">{u.get('row_count', 0)}</td>
+          <td style="font-size:11px;color:#888;">{_stmt_esc(u['uploaded_at'] or '')}</td>
+        </tr>"""
+    if not uploads_html:
+        uploads_html = '<tr><td colspan="4" style="text-align:center;color:#888;padding:16px;">해당 월에 업로드된 명세서가 없습니다.</td></tr>'
+
+    caveat = ""
+    if oerr:
+        caveat = f'<div class="card" style="border-left:4px solid #B91C1C;"><b>발주내역 조회 실패:</b> {_stmt_esc(oerr)}</div>'
+    elif order_scope_all:
+        caveat = '<div class="card" style="border-left:4px solid #B45309;">⚠️ 해당 월 명세서 거래처의 발주내역이 없어 <b>월 전체 발주내역</b>과 비교했습니다.</div>'
+    caveat += '<div class="card" style="font-size:12px;color:#888;">참고: 발주내역은 시스템에 최근 약 3주치만 보관됩니다(자동 삭제). 지난달 명세서는 발주내역이 일부만 남아 있을 수 있습니다.</div>'
+
+    content = f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+      <h2 style="margin:0;">📅 월별 명세서 대조</h2>
+      <a href="/master/statement-check" style="padding:8px 14px;background:#1E2761;color:#fff;border-radius:8px;font-size:13px;text-decoration:none;">← 목록</a>
+    </div>
+
+    <div class="card">
+      <form method="get" action="/master/statement-check/month" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;">
+        <div><label style="font-size:12px;color:#888;">대상 월</label><br>
+          <select name="month" style="padding:8px;font-size:12px;min-width:110px;">{month_opts}</select></div>
+        <div><label style="font-size:12px;color:#888;">거래처</label><br>
+          <select name="vendor" style="padding:8px;font-size:12px;min-width:150px;">{vendor_opts}</select></div>
+        <button class="btn" type="submit" style="padding:10px 18px;">조회</button>
+      </form>
+    </div>
+
+    {caveat}
+
+    <div class="card" style="display:flex;gap:20px;flex-wrap:wrap;">
+      <div>명세서 품목 <b>{len(items)}</b></div>
+      <div>일치 <b style="color:#166534;">{counts.get('일치',0)}</b></div>
+      <div>수량불일치 <b style="color:#B45309;">{counts.get('수량불일치',0)}</b></div>
+      <div>발주없음 <b style="color:#B91C1C;">{counts.get('발주없음',0)}</b></div>
+      <div>발주만 <b style="color:#6D28D9;">{counts.get('발주만',0)}</b></div>
+      <div>미매칭 행 <b style="color:#64748B;">{unmatched_rows}</b></div>
+    </div>
+
+    <div class="card">
+      <b>📋 품목별 대조 ({_stmt_esc(month)})</b>
+      <div class="table-scroll-wrap" style="margin-top:8px;">
+      <table style="width:100%;font-size:12px;">
+        <thead><tr><th>상품명</th><th>품번</th><th style="text-align:right;">명세서 수량</th><th style="text-align:right;">발주 수량</th><th style="text-align:right;">차이</th><th>상태</th></tr></thead>
+        <tbody>{item_html}</tbody>
+      </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <b>📤 해당 월 업로드 내역 ({len(uploads)}건)</b>
+      <div class="table-scroll-wrap" style="margin-top:8px;">
+      <table style="width:100%;font-size:12px;">
+        <thead><tr><th>파일명</th><th>거래처</th><th style="text-align:right;">행 수</th><th>업로드 일시</th></tr></thead>
+        <tbody>{uploads_html}</tbody>
+      </table>
+      </div>
+    </div>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.get("/master/statement-check/aliases", response_class=HTMLResponse)
+async def statement_check_aliases_page(
+    session_token: str = Cookie(default=None), vendor: str = "", q: str = ""
+):
+    """명세서 품목 ↔ 상품 별칭 DB 관리 (거래처 필터 + 인라인 수정)."""
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    conn = get_conn()
+    try:
+        suppliers = [r["supplier"] for r in conn.execute(
+            "SELECT DISTINCT supplier FROM statement_item_map ORDER BY supplier"
+        ).fetchall()]
+        query = "SELECT * FROM statement_item_map WHERE 1=1"
+        params = []
+        if vendor:
+            query += " AND supplier=?"
+            params.append(vendor)
+        if q:
+            query += " AND alias_name LIKE ?"
+            params.append(f"%{_stmt_norm(q)}%")
+        query += " ORDER BY supplier, alias_name"
+        aliases = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+    products = _stmt_products()
+
+    vendor_opts = '<option value="">전체 거래처</option>' + "".join(
+        f'<option value="{_stmt_esc(s)}"{" selected" if s == vendor else ""}>{_stmt_esc(s or "(공통)")}</option>'
+        for s in suppliers
+    )
+    rows_html = ""
+    for a in aliases:
+        a = dict(a)
+        rows_html += f"""
+        <tr data-id="{a['id']}">
+          <td><input class="al-in" data-f="alias_name" value="{_stmt_esc(a['alias_name'])}" style="min-width:150px;"></td>
+          <td><input class="al-in" data-f="supplier" value="{_stmt_esc(a['supplier'] or '')}" list="alSuppliers" style="min-width:110px;" placeholder="(공통)"></td>
+          <td><select class="al-in al-item" data-f="item_code" data-sel="{_stmt_esc(a['item_code'])}" style="max-width:240px;"></select></td>
+          <td style="font-size:11px;color:#888;white-space:nowrap;">{_stmt_esc(a['updated_at'] or a['created_at'] or '')}</td>
+          <td style="white-space:nowrap;">
+            <button type="button" class="btn al-save" style="padding:4px 10px;font-size:11px;">저장</button>
+            <button type="button" class="btn al-del" style="padding:4px 10px;font-size:11px;background:#B91C1C;">삭제</button>
+          </td>
+          <td class="al-msg" style="font-size:11px;color:#166534;"></td>
+        </tr>"""
+    if not rows_html:
+        rows_html = '<tr><td colspan="6" style="text-align:center;color:#888;padding:20px;">등록된 별칭이 없습니다.</td></tr>'
+
+    content = f"""
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+      <h2 style="margin:0;">🔗 명세서 품목 별칭 DB</h2>
+      <a href="/master/statement-check" style="padding:8px 14px;background:#1E2761;color:#fff;border-radius:8px;font-size:13px;text-decoration:none;">← 목록</a>
+    </div>
+    <p style="font-size:12px;color:#888;margin:0 0 10px;">명세서에 찍히는 품목명 → 우리 상품 매칭 정보. 거래처를 비워두면 모든 거래처에 적용됩니다. 여기서 직접 수정하면 다음 대조부터 반영됩니다.</p>
+
+    <div class="card">
+      <form method="get" action="/master/statement-check/aliases" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;">
+        <div><label style="font-size:12px;color:#888;">거래처</label><br>
+          <select name="vendor" style="padding:8px;font-size:12px;min-width:150px;">{vendor_opts}</select></div>
+        <div><label style="font-size:12px;color:#888;">품목명 검색</label><br>
+          <input type="text" name="q" value="{_stmt_esc(q)}" placeholder="명세서 품목명" style="padding:8px;font-size:12px;width:180px;"></div>
+        <button class="btn" type="submit" style="padding:10px 18px;">조회</button>
+        <span style="font-size:12px;color:#888;align-self:center;">총 {len(aliases)}건</span>
+      </form>
+    </div>
+
+    <div class="card">
+      <b>➕ 별칭 추가</b>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-top:8px;">
+        <div><label style="font-size:12px;color:#888;">명세서 품목명</label><br>
+          <input type="text" id="alNewName" placeholder="명세서에 찍히는 이름" style="padding:8px;font-size:12px;min-width:180px;"></div>
+        <div><label style="font-size:12px;color:#888;">거래처</label><br>
+          <input type="text" id="alNewSupplier" list="alSuppliers" placeholder="비우면 전체 적용" style="padding:8px;font-size:12px;min-width:140px;"></div>
+        <div><label style="font-size:12px;color:#888;">매칭 상품</label><br>
+          <select id="alNewItem" style="padding:8px;font-size:12px;min-width:220px;"></select></div>
+        <button type="button" class="btn" id="alAdd" style="padding:10px 18px;">추가</button>
+        <span id="alAddMsg" style="font-size:12px;color:#166534;"></span>
+      </div>
+      <datalist id="alSuppliers">{''.join(f'<option value="{_stmt_esc(s)}"></option>' for s in suppliers if s)}</datalist>
+    </div>
+
+    <div class="card">
+      <b>📋 별칭 목록</b>
+      <div class="table-scroll-wrap" style="margin-top:8px;">
+      <table style="width:100%;font-size:12px;">
+        <thead><tr><th>명세서 품목명</th><th>거래처</th><th>매칭 상품</th><th>수정일</th><th></th><th></th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+      </div>
+    </div>
+
+    <script>
+    var AL_PRODUCTS = {json.dumps([{"code": p["code"], "label": (p["name"] or p["code"]) + (" (소모품)" if p["consumable"] else "") + " [" + p["code"] + "]"} for p in products], ensure_ascii=False)};
+    function fillSelect(sel, selected) {{
+      var html = '<option value="">— 매칭 안 함 —</option>';
+      AL_PRODUCTS.forEach(function(p) {{
+        html += '<option value="' + p.code + '"' + (p.code === selected ? ' selected' : '') + '>' + p.label + '</option>';
+      }});
+      sel.innerHTML = html;
+    }}
+    document.querySelectorAll('.al-item').forEach(function(sel) {{
+      fillSelect(sel, sel.getAttribute('data-sel') || '');
+    }});
+    var addSel = document.getElementById('alNewItem');
+    fillSelect(addSel, '');
+    async function post(url, body) {{
+      var res = await fetch(url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+      var d = await res.json().catch(function(){{return {{}};}});
+      if (!res.ok) {{ alert(d.detail || '저장에 실패했습니다.'); return false; }}
+      return true;
+    }}
+    document.querySelectorAll('.al-save').forEach(function(btn) {{
+      btn.addEventListener('click', async function() {{
+        var tr = btn.closest('tr');
+        var msg = tr.querySelector('.al-msg');
+        var body = {{id: parseInt(tr.getAttribute('data-id'), 10)}};
+        tr.querySelectorAll('.al-in').forEach(function(el) {{ body[el.getAttribute('data-f')] = el.value; }});
+        if (await post('/master/statement-check/alias/update', body)) {{ msg.textContent = '저장됨'; setTimeout(function(){{ location.reload(); }}, 400); }}
+      }});
+    }});
+    document.querySelectorAll('.al-del').forEach(function(btn) {{
+      btn.addEventListener('click', async function() {{
+        if (!confirm('이 별칭을 삭제할까요?')) return;
+        var tr = btn.closest('tr');
+        if (await post('/master/statement-check/alias/delete', {{id: parseInt(tr.getAttribute('data-id'), 10)}})) location.reload();
+      }});
+    }});
+    document.getElementById('alAdd').addEventListener('click', async function() {{
+      var msg = document.getElementById('alAddMsg');
+      var body = {{
+        alias_name: document.getElementById('alNewName').value,
+        supplier: document.getElementById('alNewSupplier').value,
+        item_code: document.getElementById('alNewItem').value
+      }};
+      if (await post('/master/statement-check/alias/save', body)) location.reload();
+      else msg.textContent = '';
+    }});
+    </script>
+    """
+    return HTMLResponse(content=render_page(content, user, "master"))
+
+
+@app.post("/master/statement-check/alias/update")
+async def statement_check_alias_update(request: Request, session_token: str = Cookie(default=None)):
+    """별칭 DB 항목 수정 (id 기준)."""
+    user = _stmt_master_guard(session_token)
+    if not user:
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    body = await request.json()
+    aid = int(body.get("id") or 0)
+    alias_name = _stmt_norm(body.get("alias_name"))
+    supplier = _stmt_norm(body.get("supplier"))
+    item_code = str(body.get("item_code") or "").strip()
+    if not alias_name or not item_code:
+        return JSONResponse(status_code=400, content={"detail": "명세서 품목명과 매칭 상품은 필수입니다."})
+    products = _stmt_products()
+    pname = next((p["name"] for p in products if p["code"] == item_code), "")
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = get_conn()
+    try:
+        target = conn.execute("SELECT id FROM statement_item_map WHERE id=?", (aid,)).fetchone()
+        if not target:
+            conn.close()
+            return JSONResponse(status_code=404, content={"detail": "항목을 찾을 수 없습니다."})
+        dup = conn.execute(
+            "SELECT id FROM statement_item_map WHERE alias_name=? AND supplier=? AND item_code=? AND id<>? LIMIT 1",
+            (alias_name, supplier, item_code, aid)
+        ).fetchone()
+        if dup:
+            conn.close()
+            return JSONResponse(status_code=409, content={"detail": "동일한 별칭이 이미 존재합니다."})
+        conn.execute(
+            "UPDATE statement_item_map SET alias_name=?, supplier=?, item_code=?, item_name=?, updated_at=? WHERE id=?",
+            (alias_name, supplier, item_code, pname, now, aid)
+        )
+        conn.commit()
+        conn.close()
+        return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 
 def _stmt_import_file(filename: str, data: bytes, vendor_hint: str = "", month_hint: str = "",

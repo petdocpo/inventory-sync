@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>현금시재 기능 테스트 가이드</title>
+<style>
+  body { font-family:-apple-system,'Segoe UI',sans-serif; background:#f5f7fa; color:#222; margin:0; padding:24px 16px; font-size:14px; line-height:1.6; }
+  .wrap { max-width:900px; margin:0 auto; }
+  h1 { color:#1E2761; font-size:22px; margin-bottom:4px; }
+  h2 { color:#1E2761; font-size:17px; margin-top:32px; border-left:5px solid #1E2761; padding-left:10px; }
+  h3 { font-size:15px; margin-top:20px; color:#333; }
+  .card { background:#fff; border-radius:12px; padding:18px 20px; box-shadow:0 1px 4px rgba(0,0,0,.08); margin-bottom:14px; }
+  code, .mono { font-family:Consolas,monospace; background:#EEF2FF; color:#1E2761; padding:1px 6px; border-radius:5px; font-size:13px; }
+  pre { background:#1E2761; color:#E5E7EB; padding:14px 16px; border-radius:8px; overflow-x:auto; font-size:13px; line-height:1.5; }
+  pre code { background:none; color:inherit; padding:0; }
+  table { width:100%; border-collapse:collapse; background:#fff; font-size:13px; }
+  th { background:#1E2761; color:#fff; padding:8px 10px; text-align:left; }
+  td { padding:8px 10px; border-bottom:1px solid #eee; vertical-align:top; }
+  .ok { color:#065F46; font-weight:bold; }
+  .warn { color:#B45309; font-weight:bold; }
+  .bad { color:#B91C1C; font-weight:bold; }
+  .step { display:flex; gap:10px; margin:10px 0; }
+  .num { flex-shrink:0; width:26px; height:26px; background:#1E2761; color:#fff; border-radius:50%;
+         display:flex; align-items:center; justify-content:center; font-weight:bold; font-size:13px; }
+  .note { background:#FFFBEB; border:1px solid #FCD34D; border-radius:8px; padding:10px 14px; font-size:13px; }
+  ul { margin:6px 0; padding-left:22px; }
+  li { margin:4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>💵 현금시재 기능 테스트 가이드</h1>
+<p style="color:#666;margin-top:0;">매출 마감(<code>/closing</code>)의 현금시재 섹션 + 마스터 현금시재 현황 + 불일치 편입 기능을 처음부터 끝까지 확인하는 절차입니다.</p>
+
+<div class="note">
+<b>사전 준비</b>
+<ul>
+  <li>배포 후 최신 코드가 반영된 상태여야 합니다 (<code>vercel --prod</code> 완료).</li>
+  <li>테스트할 <b>날짜</b>를 정합니다 — 해당 날짜에 <b>유비플러스 '현금' 결제 건이 1건 이상</b> 있는 날을 고르세요. (계좌이체만 있는 날은 현금 매출이 0원으로 나옵니다.)</li>
+  <li>마스터 계정과 지점 계정 <b>둘 다</b> 로그인할 수 있어야 합니다.</li>
+</ul>
+</div>
+
+<h2>0. 용어 정리</h2>
+<div class="card">
+<table>
+  <tr><th style="width:200px;">용어</th><th>의미</th></tr>
+  <tr><td>현금 매출</td><td>유비플러스 <code>payment_records</code>에서 <code>card_company='현금'</code>인 결제만 집계 (계좌이체·소득공제·지출증빙 제외, 취소 건은 음수로 상계)</td></tr>
+  <tr><td>기타 입금</td><td>현금 매출에 포함되지 않는 수기 입금 (예: 현금으로 받은 비카드 매출)</td></tr>
+  <tr><td>시재 사용</td><td>금고에서 나간 현금 (예: 거스름돈 충전, 소모품 구입)</td></tr>
+  <tr><td>예상 현금(정답)</td><td><b>현금 매출 + 기타 입금 − 시재 사용</b> — 이론상 금고에 있어야 할 금액</td></tr>
+  <tr><td>실제 시재</td><td>실제로 금고를 세어본 금액 (직접 입력)</td></tr>
+  <tr><td>오차</td><td><b>실제 시재 − 예상 현금</b>. 0이면 일치, ±이면 차이</td></tr>
+</table>
+</div>
+
+<h2>1. 지점 계정 — 현금시재 입력 및 확인</h2>
+
+<div class="card">
+<p><b>경로:</b> 지점 계정 로그인 → <code>/closing</code> → 테스트 날짜 선택</p>
+<p>페이지에서 <b>영수증 사진 올리기 카드 바로 아래</b>에 <b>"💵 현금시재"</b> 카드가 보여야 합니다.</p>
+</div>
+
+<h3>1-1. 카드 구성 확인</h3>
+<div class="card">
+<ul>
+  <li>상단 표 첫 행: <b>"현금 매출 (유비플러스 현금 결제)"</b> — 고정 행, 금액이 표시됨 (현금 결제 없으면 0원)</li>
+  <li>그 아래 <b>"+ 행 추가"</b> 버튼 — 표 <b>위쪽</b>에 있어야 함 (실제 시재 입력칸 위)</li>
+  <li>행 추가 시 종류 선택: <b>기타 입금 / 시재 사용</b>, 금액·고객명·비고 입력 (전부 선택 입력)</li>
+  <li>하단: <b>"실제 현금시재(원)"</b> 입력칸 + <b>[현금시재 확인]</b> 버튼</li>
+</ul>
+</div>
+
+<h3>1-2. 확인 전 상태 확인</h3>
+<div class="step"><div class="num">1</div><div>실제 시재를 <b>아무것도 입력하지 않고</b> [현금시재 확인]을 눌러보세요.</div></div>
+<div class="step"><div class="num">2</div><div><span class="ok">정상:</span> "실제 현금시재를 입력해주세요" 같은 안내 또는 정답/오차가 <b>표시되지 않아야</b> 합니다. (확인 전에는 "확인을 누르면 표시됩니다" 안내만 있어야 함)</div></div>
+
+<h3>1-3. 정상 저장 테스트 (오차 0 만들기)</h3>
+<div class="step"><div class="num">1</div><div>표에서 <b>현금 매출 금액</b>을 확인합니다. 예: 150,000원</div></div>
+<div class="step"><div class="num">2</div><div>실제 시재 입력칸에 <b>현금 매출과 동일한 금액</b>을 입력합니다 (기타 입금/사용이 없으면 그대로). 예: <code>150000</code></div></div>
+<div class="step"><div class="num">3</div><div>[현금시재 확인] 클릭 → 아래 결과가 나타나야 합니다:
+  <ul>
+    <li><b>예상 현금 = 150,000원</b> (정답)</li>
+    <li><b>실제 − 예상 = 0원</b> → <span class="ok">✅ 일치</span> 표시</li>
+  </ul>
+</div></div>
+<div class="step"><div class="num">4</div><div>페이지를 새로고침(F5) → 입력값이 <b>그대로 복원</b>되는지 확인 (DB 저장 확인)</div></div>
+
+<h3>1-4. 기타 입금/시재 사용 테스트</h3>
+<div class="step"><div class="num">1</div><div>"+ 행 추가" 클릭 → 종류 <b>기타 입금</b>, 금액 <code>10000</code>, 고객명 <code>테스트</code>, 비고 <code>테스트입금</code> 입력</div></div>
+<div class="step"><div class="num">2</div><div>"+ 행 추가" 한 번 더 → 종류 <b>시재 사용</b>, 금액 <code>5000</code> 입력</div></div>
+<div class="step"><div class="num">3</div><div>[현금시재 확인] 클릭 → 예상 현금이 <b>현금매출 + 10,000 − 5,000</b>으로 바뀌는지 확인</div></div>
+<div class="step"><div class="num">4</div><div>새로고침 후 수기 행 2개가 <b>복원</b>되는지 확인</div></div>
+
+<h3>1-5. 오차 테스트</h3>
+<div class="step"><div class="num">1</div><div>실제 시재를 예상 현금과 <b>다른 값</b>으로 바꿉니다. 예: 예상 155,000인데 <code>150000</code> 입력</div></div>
+<div class="step"><div class="num">2</div><div>[현금시재 확인] → <b>오차 −5,000원</b>이 <span class="bad">빨간색</span>으로 표시되어야 합니다.</div></div>
+<div class="step"><div class="num">3</div><div>다시 맞는 값으로 돌려놓고 확인 → 오차 0 ✅ 복귀 확인</div></div>
+
+<h3>1-6. 불일치 편입 테스트 (핵심)</h3>
+<div class="step"><div class="num">1</div><div>실제 시재를 일부러 <b>틀린 값</b>으로 저장해 둡니다 (오차가 생기게).</div></div>
+<div class="step"><div class="num">2</div><div>같은 페이지의 <b>구분별 비교표</b> 맨 아래에 <b>"현금시재(실사)"</b> 행이 생겼는지 확인:
+  <ul>
+    <li>결제내역 칸 = <b>예상 현금</b>, 영수증 칸 = <b>실제 시재</b></li>
+    <li>차이 칸에 오차 금액이 <span class="bad">빨간색</span>으로 표시</li>
+  </ul>
+</div></div>
+<div class="step"><div class="num">3</div><div>페이지 상단 써머리 박스에 <b>"⚠️ 불일치 N건"</b> 목록에 <code>현금시재 ±N원 불일치 — 예상/실사</code> 문구가 포함되는지 확인</div></div>
+<div class="step"><div class="num">4</div><div><b>메모 없이 [마감 저장하기]</b> 클릭 → 메모 입력을 요구하는 안내가 뜨고 저장이 차단되는지 확인 (기존 불일치와 동일 규칙)</div></div>
+<div class="step"><div class="num">5</div><div>현금시재 행의 <b>메모 칸에 사유 입력</b> → 메모 저장 → 마감 저장 → 완료 시 불일치 내역에 현금시재 건이 기록되는지 확인</div></div>
+<div class="step"><div class="num">6</div><div>오차를 0으로 되돌려 저장하면 비교표에서 현금시재 행이 <b>일치</b> 처리되고 불일치 목록에서 빠지는지 확인</div></div>
+
+<h3>1-7. 잠금 확인</h3>
+<div class="step"><div class="num">1</div><div>마감 저장이 완료된 날짜에서는 현금시재 카드가 <b>수정 불가(잠금)</b> 상태인지 확인 — 저장 후 변경 시도 시 안내가 떠야 합니다.</div></div>
+
+<h2>2. 마스터 계정 — 현금시재 현황 테이블</h2>
+
+<div class="card">
+<p><b>경로:</b> 마스터 로그인 → <code>/closing</code> → 지점 <b>"전지점"</b> + 테스트 날짜 → 맨 아래로 스크롤</p>
+<p><b>"💵 현금시재 현황"</b> 테이블이 보여야 합니다.</p>
+</div>
+
+<h3>2-1. 전체 지점 표시 확인 (이번 수정 핵심)</h3>
+<div class="card">
+<ul>
+  <li>테이블 행 = <b>해당 날짜 결제내역이 있는 모든 지점</b> + 시재를 저장한 지점 (합집합)</li>
+  <li><b>시재를 입력하지 않은 지점도 행이 나와야 합니다</b> — 실제 시재/오차 칸이 <code>-</code> 표시</li>
+  <li>컬럼: 지점 / 현금 매출 / 기타 입금·사용 / 예상 현금(정답) / 실제 시재 / 오차 / 링크</li>
+  <li>미입력 지점 링크는 <b>"입력 →"</b>, 입력된 지점은 <b>"수정 →"</b></li>
+</ul>
+</div>
+
+<h3>2-2. 값 정확성 교차 검증</h3>
+<div class="step"><div class="num">1</div><div>아무 지점의 "수정 →" 클릭 → 지점 뷰의 현금시재 카드로 이동하는지 확인</div></div>
+<div class="step"><div class="num">2</div><div>지점 뷰의 <b>예상 현금</b>이 마스터 테이블의 <b>예상 현금(정답)</b>과 <b>동일</b>한지 확인</div></div>
+<div class="step"><div class="num">3</div><div>실제 시재를 바꿔 저장 → 마스터 테이블로 돌아와 <b>오차</b>가 즉시 반영되는지 확인 (F5)</div></div>
+<div class="step"><div class="num">4</div><div>오차 0인 지점은 오차 칸이 <span class="ok">초록 0원</span>, 오차 있는 지점은 <span class="bad">빨간 ±금액</span>인지 확인</div></div>
+
+<h3>2-3. 정렬 확인</h3>
+<div class="step"><div class="num">1</div><div>지점명이 가나다/영문 순으로 정렬되어 있는지 확인 (결제내역 지점명 기준)</div></div>
+
+<h2>3. 알림 패널 UI 확인 (매출 마감 상단, 마스터만)</h2>
+
+<div class="card">
+<p><b>경로:</b> 마스터 → <code>/closing</code> → "📨 마감 알림 설정" 카드</p>
+<p>좌측 4개 행(미제출 발송 / 불일치 발송 / 지점 발송 / 테스트 발송)의 레이아웃을 확인합니다.</p>
+</div>
+
+<h3>3-1. 행 정렬 확인</h3>
+<div class="card">
+<ul>
+  <li>각 행 = <b>체크박스 + 굵은 라벨(1행) + 회색 설명(아래 행)</b> 구조</li>
+  <li>4개 행의 체크박스가 <b>같은 높이(위쪽 정렬)</b>에 맞춰져야 함</li>
+  <li>라벨이 <b>2행으로 잘리지 않아야</b> 함 (nowrap 적용됨)</li>
+  <li>설명 문구는 길면 아래로 펼쳐지되 <b>잘리거나 가로 스크롤이 생기면 안 됨</b></li>
+</ul>
+</div>
+
+<h3>3-2. 지점별 알림 그리드 확인</h3>
+<div class="card">
+<ul>
+  <li>우측 "지점별 알림" 영역에 해당 날짜 결제내역 지점 체크박스들이 카드형으로 나열</li>
+  <li>지점명이 <b>한 줄로 표시</b>되고 체크박스와 간격이 균일해야 함</li>
+</ul>
+</div>
+
+<h2>4. 예외 케이스</h2>
+<div class="card">
+<table>
+  <tr><th style="width:220px;">상황</th><th>기대 결과</th></tr>
+  <tr><td>현금 결제 0건인 지점</td><td>현금 매출 0원, 기타 입금만 입력하면 예상=입금합계</td></tr>
+  <tr><td>기타 행 없이 시재만 입력</td><td>예상=현금매출, 실제=입력값 → 오차 표시</td></tr>
+  <tr><td>행 추가 후 전부 삭제</td><td>기타 입금/사용 0으로 계산, 행은 저장되지 않음</td></tr>
+  <tr><td>마감 저장된 날짜</td><td>현금시재 카드 잠금 — 수정 불가 안내</td></tr>
+  <tr><td>지점 계정으로 타 지점 날짜 조회</td><td>본인 지점 데이터만 표시 (기존 권한 유지)</td></tr>
+  <tr><td>결제내역 없는 날짜</td><td>현금시재 현황 테이블 자체가 안 나옴 (결제내역 없으면 날짜 목록에도 없음)</td></tr>
+</table>
+</div>
+
+<h2>5. 롤백 방법</h2>
+<div class="card">
+<pre><code>cd C:\Users\PETDOC\inventory-sync
+git revert HEAD
+git push
+vercel --prod --force</code></pre>
+<p>신규 테이블(<code>closing_cash</code>, <code>closing_cash_lines</code>)은 데이터만 남고 코드가 롤백되어도 무해합니다. 롤백 후 해당 기능 UI만 사라집니다.</p>
+</div>
+
+<p style="color:#999;font-size:12px;margin-top:30px;">작성 기준: inventory-sync /closing 현금시재 기능 · 알림 패널 UI 수정 · 마스터 현금시재 현황 전체 지점 표시</p>
+
+</div>
+</body>
+</html>
