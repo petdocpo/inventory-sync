@@ -4628,7 +4628,10 @@ async def stock_closing_page(
     if meta_lines:
         meta_text_html = (
             '<div style="flex:1;min-width:280px;font-size:12px;color:#475569;line-height:1.7;">'
-            + " · ".join(_html.escape(ln) for ln in meta_lines)
+            + "".join(
+                '<div>' + _html.escape(ln) + '</div>'
+                for ln in meta_lines
+            )
             + '</div>'
         )
     filter_html = (
@@ -24141,18 +24144,23 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
         prev_actual = prev_cash["actual"]
         if prev_cash["saved"] and prev_actual is not None:
             prev_html = (
-                '<span style="font-size:12px;color:#166534;background:#F0FDF4;border:1px solid #BBF7D0;'
-                'border-radius:8px;padding:6px 10px;white-space:nowrap;align-self:center;">'
-                '📅 ' + prev_date_lbl + ' 실사 <b>' + _money(int(prev_actual)) + '원</b>'
-                ' <span style="color:#888;font-weight:normal;">('
+                '<span style="display:inline-flex;flex-direction:column;justify-content:flex-end;'
+                'padding:4px 10px;background:#F0FDF4;border:1px solid #BBF7D0;border-radius:8px;'
+                'min-height:52px;box-sizing:border-box;white-space:nowrap;">'
+                '<span style="font-size:11px;color:#166534;line-height:1.2;">📅 ' + prev_date_lbl + ' 실사</span>'
+                '<span style="font-size:13px;font-weight:bold;color:#166534;line-height:1.4;">'
+                + _money(int(prev_actual)) + '원'
+                ' <span style="color:#888;font-weight:normal;font-size:11px;">('
                 + _esc(prev_cash["updated_by"] or "-") + ' · '
-                + _esc((prev_cash["updated_at"] or "")[11:16]) + ')</span></span>'
+                + _esc((prev_cash["updated_at"] or "")[11:16]) + ')</span></span></span>'
             )
         else:
             prev_html = (
-                '<span style="font-size:12px;color:#94A3B8;background:#F8FAFC;border:1px dashed #CBD5E1;'
-                'border-radius:8px;padding:6px 10px;white-space:nowrap;align-self:center;">'
-                '📅 ' + prev_date_lbl + ' 실사 미저장</span>'
+                '<span style="display:inline-flex;flex-direction:column;justify-content:flex-end;'
+                'padding:4px 10px;background:#F8FAFC;border:1px dashed #CBD5E1;border-radius:8px;'
+                'min-height:52px;box-sizing:border-box;white-space:nowrap;">'
+                '<span style="font-size:11px;color:#94A3B8;line-height:1.2;">📅 ' + prev_date_lbl + ' 실사</span>'
+                '<span style="font-size:13px;font-weight:bold;color:#94A3B8;line-height:1.4;">미저장</span></span>'
             )
     except Exception:
         prev_html = ""
