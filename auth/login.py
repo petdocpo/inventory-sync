@@ -74,6 +74,17 @@ def init_auth_db():
         except Exception:
             pass
 
+    # ── 마이그레이션: sessions.view_branch_code 컬럼이 없으면 추가 (지점 화면 보기) ──
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS view_branch_code TEXT")
+        conn.commit()
+    except Exception:
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN view_branch_code TEXT")
+            conn.commit()
+        except Exception:
+            pass
+
     existing = conn.execute("SELECT id FROM accounts WHERE login_id=?", (MASTER_ID,)).fetchone()
     if not existing:
         conn.execute(
@@ -230,7 +241,33 @@ def get_session(token: str) -> Optional[Dict]:
         return None
     if datetime.fromisoformat(row["expires_at"]) < datetime.now():
         return None
-    return dict(row)
+    user = dict(row)
+    # 지점 화면 보기(view-as): 마스터/본사가 지점 계정 화면을 읽기 전용으로 조회.
+    # role/branch_code/login_id를 해당 지점 계정으로 바꿔 모든 페이지가 지점 화면처럼 동작하게 한다.
+    view_bc = user.get("view_branch_code")
+    if view_bc:
+        conn = get_conn()
+        acc = conn.execute(
+            "SELECT * FROM accounts WHERE branch_code=? AND role='branch'",
+            (view_bc,)
+        ).fetchone()
+        conn.close()
+        if acc:
+            a = dict(acc)
+            orig_login_id = user.get("login_id")
+            orig_role = user.get("role")
+            user.update({
+                "login_id": a.get("login_id") or user.get("login_id"),
+                "role": "branch",
+                "branch_code": a.get("branch_code") or view_bc,
+                "branch_name": a.get("branch_name"),
+                "branch_type": a.get("branch_type"),
+                "team": a.get("team"),
+                "_view_as": True,
+                "_view_login_id": orig_login_id,
+                "_view_role": orig_role,
+            })
+    return user
 
 
 def delete_session(token: str):
