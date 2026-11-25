@@ -3302,7 +3302,6 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("qr", "/qr", "📷", "QR생성", None),
         ("adjust", "/adjust", "✏️", "수기조정", None),
         ("scanlog", "/scan-log", "📜", "스캔이력", None),
-        ("purchase-app", os.getenv("SMALLBIZ_APP_URL", "http://127.0.0.1:8003"), "🛒", "구매관리", None),
         ("notice-group", None, "📢", "공지&설문", [
             ("공지사항", notice_menu_href),
             ("Q&A 게시판", qna_menu_href),
@@ -3470,6 +3469,9 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         <span style="font-weight:bold;">📦 재고 관리 시스템 <span style="font-size:10px;font-weight:normal;opacity:.75;">v{app.version}</span>{role_badge}</span>
         <div style="display:flex;align-items:center;">
           {ui_mode_btn}{orient_btn}{col_settings_btn}{view_as_top_html}{col_save_btn}{pwa_install_btn}
+          <a href="{os.getenv('SMALLBIZ_APP_URL', 'http://127.0.0.1:8003')}" target="_blank" rel="noopener"
+             style="background:#2E7D32;color:white;padding:5px 12px;border-radius:8px;
+                    font-size:12px;cursor:pointer;margin-right:8px;text-decoration:none;white-space:nowrap;">🛒 구매관리</a>
           <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
         </div>
       </div>
@@ -4418,35 +4420,20 @@ def _sc_adjust_cell(branch_code, item_code, editable) -> str:
     )
 
 def _sc_closer_box(view_mode: str, save, can_write: bool) -> str:
-    """재고 마감 화면 맨 위의 '마감 담당자' + '오차 사유' 입력칸"""
+    """재고 마감 화면의 '마감 담당자' 표시 — 쓰기 모드에서는 필터 행으로 이동해 여기선 표시하지 않음"""
     import html as _html
+    if can_write:
+        return ""
     name = ""
-    reason = ""
     if save:
         try:
             name = str(save["closer_name"] or "")
-            reason = str(save["reason"] or "")
         except Exception:
             name = ""
-            reason = ""
-    esc = _html.escape(name)
-    resc = _html.escape(reason)
-    if can_write:
-        return (
-            '<div class="card" style="margin-bottom:12px;">'
-            '<label style="font-size:13px;font-weight:bold;">마감 담당자 <span style="color:#DC2626;">*</span></label>'
-            f'<input type="text" id="scCloser" maxlength="30" placeholder="마감 담당자 이름 (필수)" value="{esc}" style="margin-top:6px;max-width:260px;">'
-            '<div style="font-size:12px;color:#888;margin-top:4px;">지점 계정과 무관하게 실제 마감하는 사람의 이름을 입력해주세요. 마감할 때 필수입니다.</div>'
-            '<label style="font-size:13px;font-weight:bold;display:block;margin-top:12px;">전체 오차 사유 <span style="color:#888;font-weight:normal;">(선택)</span></label>'
-            f'<input type="text" id="scReason" maxlength="200" placeholder="전체 사유 — 품목별 사유는 표의 \'사유\' 칸에 입력" value="{resc}" style="margin-top:6px;max-width:100%;">'
-            '<div style="font-size:12px;color:#888;margin-top:4px;">오차가 있는 품목은 표의 \'사유\' 칸 입력이 마감 시 필수입니다. 여기는 전체를 덮는 메모입니다.</div>'
-            "</div>"
-        )
-    shown = esc if esc else "-"
-    rshown = resc if resc else "-"
+    shown = _html.escape(name) if name else "-"
     return (
         '<div class="card" style="margin-bottom:12px;font-size:13px;">'
-        f'<b>마감 담당자</b> {shown}<br><b>오차 사유</b> {rshown}</div>'
+        f'<b>마감 담당자</b> {shown}</div>'
     )
 
 
@@ -4594,7 +4581,7 @@ async def stock_closing_page(
             + empty_msg + "</td></tr>"
         )
 
-    # 지점 필터(마스터) + 날짜 필터를 한 폼으로 묶어 서로의 선택값이 유지되도록 함
+    # 지점 필터(마스터) + 날짜 필터 + 마감 담당자를 한 폼/행으로 묶어 서로의 선택값이 유지되도록 함
     branch_select_html = ""
     if is_master_user:
         branch_options = '<option value="">전체 지점</option>'
@@ -4610,10 +4597,28 @@ async def stock_closing_page(
             f'<select name="filter_branch" style="margin-top:4px;">{branch_options}</select>'
             "</div>"
         )
+    closer_field_html = ""
+    if can_write:
+        _closer_val = ""
+        if save:
+            try:
+                _closer_val = str(save["closer_name"] or "")
+            except Exception:
+                _closer_val = ""
+        closer_field_html = (
+            '<div style="flex:1;max-width:200px;">'
+            '<label style="font-size:12px;color:#888;">마감 담당자 <span style="color:#DC2626;">*</span></label>'
+            f'<input type="text" id="scCloser" maxlength="30" placeholder="이름 (필수)" value="{_html.escape(_closer_val)}" '
+            'style="margin-top:4px;width:100%;box-sizing:border-box;">'
+            "</div>"
+        )
+    _out_qty_label = f"{sel_date.month}/{sel_date.day} 출고 수량"
+    _ups_label = "판매등록 후 재고 수량"
     filter_html = (
         '<form method="get" action="/stock-closing" style="margin-bottom:16px;">'
         '<div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
         + branch_select_html
+        + closer_field_html
         + '<div style="flex:1;max-width:170px;">'
         '<label style="font-size:12px;color:#888;">날짜</label>'
         f'<input type="date" name="date" value="{sel_date_str}" max="{today_str}" style="margin-top:4px;">'
@@ -4627,11 +4632,11 @@ async def stock_closing_page(
     # 상단 메타 정보 — 필터 아래, 테이블 위에 표시 (기존 QR/RW 마지막 스캔 카드 대체)
     meta_lines = [
         f"{sel_date_str} (00시~24시) QR 스캔 기준",
-        "금일 출고 수량 = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − 유비플러스 재고",
+        f"{_out_qty_label} = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − {_ups_label}",
     ]
     if view_mode in ("live", "past_live") and items:
         basis_text = ", ".join(sorted({it["basis_label"] for it in items}))
-        meta_lines.append("QR 재고·유비플러스 재고 기준: " + basis_text)
+        meta_lines.append("QR 재고·" + _ups_label + " 기준: " + basis_text)
     if view_mode == "live":
         meta_lines.append(f"마감 가능 기간: {sel_date_str} ~ {window_end_str}")
     cards_html = (
@@ -4770,7 +4775,7 @@ async def stock_closing_page(
                 '빨간색은 시간 매칭이 안 된 건으로, 실제 원인과 다를 수 있는 추정입니다.</p>'
                 '<div class="table-scroll-wrap"><table data-colver="2026-11-20" style="table-layout:fixed;min-width:640px;"><colgroup><col style="width:90px"><col style="width:230px"><col style="width:130px"><col style="width:90px"><col style="width:100px"></colgroup><thead><tr>'
                 '<th style="width:10%">지점</th><th style="width:30%">상품명</th>'
-                '<th style="width:14%">유비플러스 재고수량</th><th style="width:10%">실사수량</th>'
+                '<th style="width:14%">' + _ups_label + '수량</th><th style="width:10%">실사수량</th>'
                 '<th style="width:9%">오차</th>'
                 '</tr></thead><tbody>' + disc_rows + '</tbody></table></div></div>'
             )
@@ -4903,8 +4908,8 @@ async def stock_closing_page(
         + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11">'
         "<thead><tr>"
         '<th style="width:8%">지점</th><th style="width:25%">상품명</th>'
-        '<th style="width:10%">상품코드</th><th style="width:9%">금일 출고 수량</th>'
-        '<th style="width:9%">QR 재고 수량</th><th style="width:11%">유비플러스 재고 수량</th>'
+        f'<th style="width:10%">상품코드</th><th style="width:9%">{_out_qty_label}</th>'
+        f'<th style="width:9%">QR 재고 수량</th><th style="width:11%">{_ups_label}</th>'
         '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:12%">사유</th><th style="width:10%">QR 수정</th>'
         "</tr></thead><tbody>"
         + rows_html
@@ -6292,7 +6297,7 @@ async def daily_stocktake_page(
         + (f' · 제외된 품목 {excluded_count}건' if excluded_count else '')
         + '</p>'
         '<p style="color:#888;font-size:12px;margin-bottom:16px;">'
-        "오차 = 실사 수량 − 유비플러스 재고 · 빈 칸은 저장 시 기존 값 유지 · "
+        "오차 = 실사 수량 − 판매등록 후 재고 · 빈 칸은 저장 시 기존 값 유지 · "
         "위치1~3에 입력하면 실사 수량에 합계가 자동 입력되고, 실사 수량 직접 입력도 가능합니다 · "
         "inventory 미등록 품목은 실사 대상이 아닙니다</p>"
         + filter_html
@@ -6304,7 +6309,7 @@ async def daily_stocktake_page(
         '<th style="width:19%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'name\')">상품명 <span class="dst-sm" data-for="name"></span></th>'
         '<th style="width:9%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'code\')">상품코드 <span class="dst-sm" data-for="code"></span></th>'
         '<th style="width:8%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'qr\')">QR 재고 수량 <span class="dst-sm" data-for="qr"></span></th>'
-        '<th style="width:10%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'ups\')">유비플러스 재고 수량 <span class="dst-sm" data-for="ups"></span></th>'
+        '<th style="width:10%;cursor:pointer;user-select:none;" onclick="dstSortCol(this,\'ups\')">판매등록 후 재고 수량 <span class="dst-sm" data-for="ups"></span></th>'
         '<th style="width:5%">위치1</th><th style="width:5%">위치2</th><th style="width:5%">위치3</th>'
         '<th style="width:11%">실사 수량</th><th style="width:7%">오차</th><th style="width:14%">QR 수정</th>'
         "</tr></thead><tbody>"
@@ -6330,7 +6335,7 @@ async def daily_stocktake_page(
         '<div style="overflow-y:auto;padding:0 16px;"><table style="width:100%;border-collapse:collapse;font-size:13px;">'
         '<thead><tr style="background:#F3F4F6;"><th style="text-align:left;padding:6px;">상품명</th>'
         '<th style="text-align:left;padding:6px;">상품코드</th>'
-        '<th style="text-align:right;padding:6px;">유비플러스 재고</th>'
+        '<th style="text-align:right;padding:6px;">판매등록 후 재고</th>'
         '<th style="text-align:right;padding:6px;">0 입력 시 오차</th></tr></thead>'
         '<tbody id="dstMissingBody"></tbody></table></div>'
         '<div style="display:flex;gap:8px;padding:14px 16px;justify-content:flex-end;">'
@@ -23982,12 +23987,14 @@ def _closing_save_memo(conn, branch_key: str, branch_name: str, pay_date: str, l
 
 def _closing_cash_sale(conn, pay_date: str, slot: str, branch_key: str):
     """해당 지점·일자·슬롯의 유비플러스 '현금' 결제 순건수/순금액 (취소는 음수 상계).
-    계좌·소득공제·지출증빙은 제외 — 현금시재와 맞춰야 하는 건 '현금'뿐이다."""
+    결제구분(pay_type)=현금 전체를 집계한다 — 현금 결제는 카드사 칸에
+    소비자소득공제/사업자지출증빙이 찍혀 card_company='현금'으로는 대부분 누락된다.
+    계좌·카드 결제는 제외 — 현금시재와 맞춰야 하는 건 '현금'뿐이다."""
     row = conn.execute(
         "SELECT SUM(CASE WHEN pay_status='취소' THEN -1 ELSE 1 END) AS net_cnt, "
         "SUM(CASE WHEN pay_status='취소' THEN -approve_amount ELSE approve_amount END) AS net_amt "
         "FROM payment_records WHERE pay_date=? AND snapshot_slot=? "
-        "AND REPLACE(branch_name, ' ', '')=? AND card_company='현금'",
+        "AND REPLACE(branch_name, ' ', '')=? AND pay_type='현금'",
         (pay_date, slot or "", branch_key)
     ).fetchone()
     return int(row["net_cnt"] or 0), int(row["net_amt"] or 0)
@@ -24015,12 +24022,19 @@ def _closing_cash_load(conn, branch_key: str, pay_date: str) -> dict:
 
 
 def _closing_cash_expected(cash_sale_amt: int, lines: list) -> int:
-    """예상 현금 = 현금 매출 + 기타 입금 − 시재 사용"""
-    total = cash_sale_amt
+    """예상 현금 = 현금 매출(수동 수정값이 있으면 그 값) + 기타 입금 − 본사 입금·시재 사용"""
+    base = cash_sale_amt
+    extra = 0
     for l in lines:
+        k = l.get("kind")
         amt = int(l.get("amount") or 0)
-        total += amt if l.get("kind") == "deposit" else -amt
-    return total
+        if k == "sale":
+            base = amt
+        elif k == "deposit":
+            extra += amt
+        else:
+            extra -= amt
+    return base + extra
 
 
 CLOSING_CASH_ROW_LABEL = "현금시재(실사)"
@@ -24048,37 +24062,56 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
     cash_cnt, cash_amt = _closing_cash_sale(conn, pay_date, slot, view_key)
     cash = _closing_cash_load(conn, view_key, pay_date)
     lines = cash["lines"]
+    # 'sale' 행은 현금 매출 수동 수정값 — 입출금 행과 분리해 따로 처리
+    ui_lines = [l for l in lines if l.get("kind") in ("deposit", "use", "hq")]
+    sale_override = None
+    for l in lines:
+        if l.get("kind") == "sale":
+            sale_override = int(l.get("amount") or 0)
+    sale_display = sale_override if sale_override is not None else cash_amt
 
     def _money(n):
         return f"{n:,}"
 
-    # ── 표: 현금 매출 고정행 + 수기 행(기타 입금/시재 사용) ──
+    # ── 표: 현금 매출 행(자동값, 수정 버튼으로만 변경) + 수기 행(기타 입금/본사 입금/시재 사용) ──
+    _sale_badge = ('<span style="font-size:10px;color:#B45309;background:#FFFBEB;'
+                   'border:1px solid #FDE68A;border-radius:8px;padding:0 5px;margin-left:4px;">수동 수정됨</span>'
+                   if sale_override is not None else
+                   '<span style="font-size:10px;color:#888;background:#F1F5F9;'
+                   'border-radius:8px;padding:0 5px;margin-left:4px;">자동</span>')
     rows_html = (
-        '<tr style="background:#F0FDF4;font-weight:bold;">'
-        '<td style="font-size:11px;">💵 현금 매출 (유비플러스 현금 결제)</td>'
-        f'<td style="text-align:right;font-size:11px;">{cash_cnt}건 / {_money(cash_amt)}원</td>'
-        '<td colspan="3" style="color:#888;font-size:11px;">자동 계산 — 수정 불가</td></tr>'
+        '<tr style="background:#F0FDF4;font-weight:bold;" class="cash-sale-row">'
+        '<td style="font-size:11px;">💵 현금 매출 (유비플러스 현금 결제)' + _sale_badge + '</td>'
+        f'<td style="text-align:right;"><input type="text" inputmode="numeric" id="cash-sale-input" '
+        f'data-auto="{cash_amt}" value="{_money(sale_display)}" disabled '
+        'style="width:100%;box-sizing:border-box;text-align:right;font-weight:bold;"></td>'
+        '<td colspan="3" style="color:#888;font-size:11px;">'
+        f'<button type="button" class="btn" style="padding:3px 10px;font-size:11px;background:#64748B;" '
+        'onclick="cashSaleToggle(this)">수정</button> '
+        + ('<button type="button" class="btn" style="padding:3px 10px;font-size:11px;background:#94A3B8;" '
+           'onclick="cashSaleAuto(this)">자동값으로</button>' if sale_override is not None else '')
+        + ' <span style="font-size:10px;">유비플러스 자동값 ' + _money(cash_amt) + '원</span></td></tr>'
     )
-    for l in lines:
-        kind_label = "기타 입금" if l["kind"] == "deposit" else "시재 사용"
+    for l in ui_lines:
         rows_html += (
             '<tr class="cash-line">'
             f'<td><select name="cl_kind" style="width:100%;">'
             f'<option value="deposit"{" selected" if l["kind"] == "deposit" else ""}>기타 입금</option>'
+            f'<option value="hq"{" selected" if l["kind"] == "hq" else ""}>현금 본사 입금</option>'
             f'<option value="use"{" selected" if l["kind"] == "use" else ""}>시재 사용</option></select></td>'
-            f'<td><input type="number" min="0" step="1" inputmode="numeric" name="cl_amt" value="{l["amount"] or ""}" style="width:110px;"></td>'
-            f'<td><input type="text" name="cl_cust" maxlength="50" value="{_esc(l["customer"])}" placeholder="고객명" style="width:100%;"></td>'
-            f'<td><input type="text" name="cl_note" maxlength="100" value="{_esc(l["note"])}" placeholder="비고" style="width:100%;"></td>'
+            f'<td><input type="number" min="0" step="1" inputmode="numeric" name="cl_amt" value="{l["amount"] or ""}" style="width:100%;box-sizing:border-box;"></td>'
+            f'<td><input type="text" name="cl_cust" maxlength="50" value="{_esc(l["customer"])}" placeholder="고객명" style="width:100%;box-sizing:border-box;"></td>'
+            f'<td><input type="text" name="cl_note" maxlength="100" value="{_esc(l["note"])}" placeholder="비고" style="width:100%;box-sizing:border-box;"></td>'
             '<td><button type="button" class="btn" style="background:#DC2626;padding:4px 8px;font-size:11px;" onclick="this.closest(\'tr\').remove()">삭제</button></td></tr>'
         )
-    if not lines:
+    if not ui_lines:
         rows_html += (
             '<tr class="cash-line">'
             '<td><select name="cl_kind" style="width:100%;">'
-            '<option value="deposit">기타 입금</option><option value="use">시재 사용</option></select></td>'
-            '<td><input type="number" min="0" step="1" inputmode="numeric" name="cl_amt" style="width:110px;"></td>'
-            '<td><input type="text" name="cl_cust" maxlength="50" placeholder="고객명" style="width:100%;"></td>'
-            '<td><input type="text" name="cl_note" maxlength="100" placeholder="비고" style="width:100%;"></td>'
+            '<option value="deposit">기타 입금</option><option value="hq">현금 본사 입금</option><option value="use">시재 사용</option></select></td>'
+            '<td><input type="number" min="0" step="1" inputmode="numeric" name="cl_amt" style="width:100%;box-sizing:border-box;"></td>'
+            '<td><input type="text" name="cl_cust" maxlength="50" placeholder="고객명" style="width:100%;box-sizing:border-box;"></td>'
+            '<td><input type="text" name="cl_note" maxlength="100" placeholder="비고" style="width:100%;box-sizing:border-box;"></td>'
             '<td><button type="button" class="btn" style="background:#DC2626;padding:4px 8px;font-size:11px;" onclick="this.closest(\'tr\').remove()">삭제</button></td></tr>'
         )
 
@@ -24136,32 +24169,33 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
                            'border-radius:8px;font-size:14px;"><b style="color:#991B1B;">⚠️ 오차 {diff:+,}원</b> '
                            f'— 예상(정답) {_money(expected)}원 / 실제 시재 {_money(actual or 0)}원</div>')
         result_html += (f'<div style="font-size:11px;color:#888;margin-top:4px;">'
-                        f'마지막 확인: {cash["updated_by"] or "-"} · {_esc(cash["updated_at"] or "")} · '
-                        '값을 수정한 뒤 다시 [현금시재 확인]을 누르면 갱신됩니다.</div>')
+                        f'마지막 저장: {cash["updated_by"] or "-"} · {_esc(cash["updated_at"] or "")} · '
+                        '입력하면 자동 저장되고, 값을 바꾼 뒤 다시 저장하면 갱신됩니다.</div>')
     else:
         result_html = ('<div style="margin-top:10px;font-size:12px;color:#888;">'
-                       '아래 [현금시재 확인]을 누르면 예상 현금(정답)과 오차가 표시됩니다.</div>')
+                       '실제 현금시재를 입력하면 자동으로 저장되고, 예상 현금(정답)과 오차가 표시됩니다.</div>')
 
     return (
         '<div class="card" style="padding:12px 14px;margin-bottom:10px;">'
         '<style>.cash-table input,.cash-table select{padding:5px 6px;border:1px solid #CBD5E1;border-radius:6px;background:#fff;font-size:11px;}.cash-table td{vertical-align:middle;}.cash-table input[name=cl_amt]{text-align:right;}</style>'
         '<div style="font-size:14px;font-weight:bold;margin-bottom:8px;">💵 현금시재</div>'
-        '<div class="table-scroll-wrap"><table class="cash-table" data-colw style="table-layout:fixed;min-width:810px;font-size:11px;"><colgroup><col style="width:170px"><col style="width:140px"><col style="width:180px"><col style="width:230px"><col style="width:90px"></colgroup><thead><tr>'
+        '<div class="table-scroll-wrap"><table class="cash-table" data-colw style="table-layout:fixed;min-width:860px;font-size:11px;"><colgroup><col style="width:180px"><col style="width:175px"><col style="width:175px"><col style="width:240px"><col style="width:90px"></colgroup><thead><tr>'
         '<th style="width:22%">구분</th><th style="width:18%">금액(원)</th>'
         '<th style="width:22%">고객명</th><th style="width:28%">비고</th><th style="width:10%"></th>'
         '</tr></thead><tbody>' + rows_html + '</tbody></table></div>'
         '<div style="font-size:11px;color:#94A3B8;margin-top:4px;">'
-        '예상 현금 = 현금 매출 + 기타 입금 − 시재 사용 (확인 버튼 저장 후 정답/오차 표시)</div>'
+        '예상 현금 = 현금 매출(수정 가능) + 기타 입금 − 본사 입금·시재 사용 · 입력하면 자동 저장됩니다</div>'
         '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
         '<button type="button" class="btn" style="background:#64748B;" onclick="cashAddRow()">+ 행 추가</button>'
-        '<span style="font-size:12px;color:#888;">기타 입금/시재 사용 내역을 추가하세요 (선택)</span></div>'
+        '<span style="font-size:12px;color:#888;">기타 입금/본사 입금/시재 사용 내역을 추가하세요 (선택)</span></div>'
         + prev_html +
         '<div style="margin-top:10px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
         '<div><label style="font-size:12px;color:#666;">실제 현금시재(원)</label><br>'
         f'<input type="number" min="0" step="1" inputmode="numeric" name="cash_actual" form="cash-form" '
         f'id="cash-actual-input" value="{actual if actual is not None else ""}" '
         'style="width:160px;margin-top:4px;font-size:13px;" placeholder="실사한 현금"></div>'
-        '<button type="submit" form="cash-form" class="btn">현금시재 확인</button>'
+        '<button type="submit" form="cash-form" class="btn">💾 저장</button>'
+        '<span id="cash-save-status" style="font-size:12px;color:#888;"></span>'
         '</div>'
         + result_html +
         '</div>'
@@ -24169,10 +24203,13 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
         '<input type="hidden" name="date" value="' + _esc(pay_date) + '">'
         '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
         '<input type="hidden" name="cash_lines" id="cash-lines-json" value="">'
+        '<input type="hidden" name="cash_sale_amt" id="cash-sale-amt" value="">'
+        '<input type="hidden" name="cash_sale_auto" id="cash-sale-auto" value="">'
+        '<input type="hidden" name="ajax" id="cash-ajax" value="">'
         '</form>'
         '<script>(function(){'
+        'function cashNum(v){var n=parseInt(String(v||"").replace(/,/g,""),10);return isNaN(n)?0:n;}'
         'function cashAddRow(){'
-        'var tb=document.querySelector("#cash-form")?null:null;'
         'var tbl=document.querySelectorAll("table");'
         'var t=null;for(var i=0;i<tbl.length;i++){if(tbl[i].querySelector("tr.cash-line")){t=tbl[i];break;}}'
         'if(!t)return;'
@@ -24182,18 +24219,63 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
         '}'
         'function cashFillPrev(b){var i=document.getElementById("cash-actual-input");if(i)i.value=b.getAttribute("data-v");}window.cashFillPrev=cashFillPrev;'
         'window.cashAddRow=cashAddRow;'
-        'var f=document.getElementById("cash-form");'
-        'if(f){f.addEventListener("submit",function(){'
+        # 현금 매출 수동 수정 — 수정 버튼으로만 입력칸 활성화, 자동값으로 복원 가능
+        'window.cashSaleToggle=function(btn){'
+        'var inp=document.getElementById("cash-sale-input");if(!inp)return;'
+        'inp.disabled=!inp.disabled;'
+        'btn.textContent=inp.disabled?"수정":"완료";'
+        'if(!inp.disabled)inp.focus();'
+        '};'
+        'window.cashSaleAuto=function(btn){'
+        'var inp=document.getElementById("cash-sale-input");if(!inp)return;'
+        'inp.value=inp.getAttribute("data-auto");inp.disabled=true;'
+        'var tb=btn.closest("tr");var b=tb?tb.querySelector("button"):null;if(b)b.textContent="수정";'
+        'cashScheduleSave();'
+        '};'
+        'function cashSerialize(){'
         'var rows=document.querySelectorAll("tr.cash-line");var out=[];'
         'rows.forEach(function(tr){'
-        'var kind=tr.querySelector("[name=cl_kind]").value;'
-        'var amt=parseInt((tr.querySelector("[name=cl_amt]").value||"0").replace(/,/g,""),10)||0;'
+        'var ks=tr.querySelector("[name=cl_kind]");if(!ks)return;'
+        'var kind=ks.value;'
+        'var amt=cashNum(tr.querySelector("[name=cl_amt]").value);'
         'var cust=(tr.querySelector("[name=cl_cust]").value||"").trim();'
         'var note=(tr.querySelector("[name=cl_note]").value||"").trim();'
         'if(amt>0||cust||note)out.push({kind:kind,amount:amt,customer:cust,note:note});'
         '});'
+        'var si=document.getElementById("cash-sale-input");'
+        'if(si){'
+        'document.getElementById("cash-sale-amt").value=(si.value||"").trim()===""?"":String(cashNum(si.value));'
+        'document.getElementById("cash-sale-auto").value=si.getAttribute("data-auto")||"";'
+        '}'
         'document.getElementById("cash-lines-json").value=JSON.stringify(out);'
-        '});}'
+        '}'
+        # 자동 저장 — 입력 후 1.2초 뒤 서버 반영 (마감 전 다시 수정해도 계속 갱신됨)
+        'var __cashTimer=null;'
+        'function cashScheduleSave(){clearTimeout(__cashTimer);__cashTimer=setTimeout(cashAutoSave,1200);}'
+        'async function cashAutoSave(){'
+        'var f=document.getElementById("cash-form");if(!f)return;'
+        'var st=document.getElementById("cash-save-status");'
+        'cashSerialize();'
+        'document.getElementById("cash-ajax").value="1";'
+        'try{'
+        'var res=await fetch("/closing/cash-save",{method:"POST",body:new FormData(f)});'
+        'var d=await res.json().catch(function(){return {};});'
+        'if(st)st.textContent=(res.ok&&d.ok)?("✓ 자동 저장됨 "+new Date().toTimeString().slice(0,5)):"저장 실패";'
+        '}catch(e){if(st)st.textContent="저장 실패";}'
+        'document.getElementById("cash-ajax").value="";'
+        '}'
+        'var f=document.getElementById("cash-form");'
+        'if(f){'
+        'f.addEventListener("submit",function(){cashSerialize();});'
+        '}'
+        # cash_actual 입력칸은 form 밖에 있어(form= 속성으로만 연결) 버블링이 form에 닿지 않음 — document에서 위임
+        'document.addEventListener("input",function(e){'
+        'var n=e.target&&(e.target.name||e.target.id);'
+        'if(n==="cash_actual"||n==="cl_amt"||n==="cl_cust"||n==="cl_note"||n==="cl_kind"||n==="cash-sale-input")cashScheduleSave();'
+        '});'
+        'document.addEventListener("change",function(e){'
+        'if(e.target&&e.target.name==="cl_kind")cashScheduleSave();'
+        '});'
         '})();</script>'
     )
 
@@ -24581,9 +24663,10 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
     # 화면 맨 위에 보여 줄 안내(memo_required는 마감 저장 버튼 쪽에 따로 표시한다)
     banners = {
         "saved": ("ok", "✅ 영수증 값을 저장했습니다."),
-        "memo_saved": ("ok", "✅ 메모를 저장했습니다."),
+        "memo_saved": ("ok", "✅ 임시 저장했습니다."),
         "cash_saved": ("ok", "✅ 현금시재를 저장했습니다."),
         "no_receipt": ("bad", "⚠️ 영수증 값을 먼저 입력해야 마감 저장할 수 있습니다."),
+        "cash_required": ("bad", "⚠️ 현금시재를 먼저 저장해야 마감 저장할 수 있습니다. (실제 시재 입력 포함)"),
         "closer_required": ("warn", "⚠️ 마감 담당자 이름을 입력해야 마감 저장할 수 있습니다."),
         "already": ("warn", "이미 마감 저장된 일자입니다."),
         "closed": ("ok", "✅ 마감 저장이 완료되었습니다."),
@@ -24616,15 +24699,38 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
             parts.append(_closing_box([banners[msg][1]], banners[msg][0]))
         parts.append(_closing_guide_bar(user, "closing"))
 
-        form = ['<form method="get" action="/closing" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px;">']
+        data = _closing_load_all(conn, date) if dates else None
+        slot = data["slot"] if data else ""
+        # 마감 담당자 입력은 하단 저장 폼에 속하지만 상단에 표시 — 저장 폼은 id=closingSaveForm
+        _closer_top = bool(
+            data and not (is_all and not branch_sel)
+            and user["role"] != "master"
+            and data["receipts"].get(view_key) is not None
+            and _closing_get_save(conn, view_key, date) is None
+        )
+
+        form = ['<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px;">'
+                '<form method="get" action="/closing" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">']
         if is_all:
             form.append('<div><div style="font-size:12px;color:#666;">지점</div><select name="branch" style="width:auto;min-width:140px;">')
             form.append('<option value=""' + ('' if branch_sel else ' selected') + '>전지점</option>')
             for b in branch_options:
                 form.append('<option value="' + _esc(b) + '"' + (' selected' if b == branch_sel else '') + '>' + _esc(b) + '</option>')
             form.append('</select></div>')
+        if _closer_top:
+            form.append('<div><div style="font-size:12px;color:#666;">마감 담당자 <span style="color:#DC2626;">*</span></div>'
+                        '<input type="text" id="closingCloser" name="closer_name" maxlength="30" '
+                        'placeholder="이름 (필수)" form="closingSaveForm" '
+                        'style="width:auto;min-width:130px;"></div>')
         form.append('<div><div style="font-size:12px;color:#666;">일자</div><input type="date" name="date" value="' + _esc(date) + '" style="width:auto;"></div>')
         form.append('<button class="btn" type="submit">조회</button></form>')
+        if data:
+            form.append(
+                _closing_status_card("마지막 수신", _closing_fmt_ts(data["received_at"]))
+                + _closing_status_card("반영된 시간대", CLOSING_SLOT_LABELS.get(slot, slot or "-"))
+                + _closing_status_card("수신 행 수", f"{data['received_rows']:,}건")
+            )
+        form.append('</div>')
         parts.append("".join(form))
         if user.get("role") == "master":
             parts.append('<div style="margin-bottom:12px;"><a class="btn" href="/closing/verify" '
@@ -24634,16 +24740,6 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
         if not dates:
             parts.append('<div class="card">수신된 결제내역이 없습니다.</div>')
             return HTMLResponse(content=render_page("".join(parts), user, "closing"))
-
-        data = _closing_load_all(conn, date)
-        slot = data["slot"]
-        parts.append(
-            '<div style="display:flex;gap:10px;margin-bottom:12px;">'
-            + _closing_status_card("마지막 수신", _closing_fmt_ts(data["received_at"]))
-            + _closing_status_card("반영된 시간대", CLOSING_SLOT_LABELS.get(slot, slot or "-"))
-            + _closing_status_card("수신 행 수", f"{data['received_rows']:,}건")
-            + '</div>'
-        )
 
         # 가장 최근 수신(크론/수동) 결과와 시각
         try:
@@ -24777,7 +24873,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                         cs_cnt, cs_amt = _closing_cash_sale(conn, date, slot, ck)
                         clines = cash_lines_map.get(ck, [])
                         dep = sum(int(l["amount"] or 0) for l in clines if l["kind"] == "deposit")
-                        use = sum(int(l["amount"] or 0) for l in clines if l["kind"] == "use")
+                        use = sum(int(l["amount"] or 0) for l in clines if l["kind"] in ("use", "hq"))
                         exp = _closing_cash_expected(cs_amt, clines)
                         saved_row = cash_saved.get(ck)
                         act = saved_row["actual_cash"] if saved_row else None
@@ -24805,7 +24901,7 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                         )
                     ov_html.append('</tbody></table></div>'
                                    '<p style="font-size:11px;color:#888;margin:8px 0 0 0;">'
-                                   '예상 현금 = 유비플러스 현금 결제 + 기타 입금 − 시재 사용. '
+                                   '예상 현금 = 유비플러스 현금 결제 + 기타 입금 − 본사 입금·시재 사용. '
                                    '실제 시재가 없는 지점은 "-"로 표시되며, 입력은 해당 지점 뷰에서 가능합니다.</p></div>')
                     parts.append("".join(ov_html))
             except Exception:
@@ -24922,19 +25018,15 @@ async def closing_page(session_token: str = Cookie(default=None), branch: str = 
                             lines_b.append("메모가 비어 있는 항목: " + ", ".join(miss))
                         bottom_box = _closing_box(lines_b, "bad")
                     parts.append(
-                        '<form method="post" action="/closing/save">'
+                        '<form method="post" action="/closing/save" id="closingSaveForm">'
                         '<input type="hidden" name="date" value="' + _esc(date) + '">'
                         '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
                         '<div class="card">' + _closing_compare_table_html(cmp_rows, True, "edit", memos, True)
                         + '<div id="closing-actions" style="margin-top:12px;">' + bottom_box
-                        + ('<div style="margin-bottom:10px;max-width:280px;">'
-                           '<label style="font-size:13px;font-weight:bold;">마감 담당자 <span style="color:#DC2626;">*</span></label>'
-                           '<input type="text" id="closingCloser" maxlength="30" placeholder="마감 담당자 이름 (필수)" '
-                           'style="margin-top:6px;width:100%;box-sizing:border-box;">'
-                           '<div style="font-size:11px;color:#888;margin-top:3px;">마감 저장 시 반드시 입력해야 합니다.</div></div>' if need_closer else '')
+                        + ('<div style="margin-bottom:10px;max-width:420px;font-size:12px;color:#666;">'
+                           '마감 담당자는 위쪽 [마감 담당자] 칸에 입력합니다. 마감 저장 시 반드시 필요합니다.</div>' if need_closer else '')
                         + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
-                        '<button class="btn" type="submit" formaction="/closing/receipt-groups" style="background:#6B7280;">영수증 저장</button>'
-                        '<button class="btn" type="submit" formaction="/closing/memo" style="background:#6B7280;">메모 저장</button>'
+                        '<button class="btn" type="submit" formaction="/closing/memo" style="background:#6B7280;">임시 저장</button>'
                         '<button class="btn" type="submit" formaction="/closing/save" onclick="' + confirm_js + '">마감 저장하기</button>'
                         '</div></div></div></form>'
                     )
@@ -25228,6 +25320,13 @@ async def closing_cash_save(request: Request, session_token: str = Cookie(defaul
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", pay_date):
         return RedirectResponse(url="/closing", status_code=303)
 
+    is_ajax = str(form.get("ajax") or "") == "1"
+
+    def _back(msg):
+        if is_ajax:
+            return JSONResponse({"ok": msg in ("cash_saved",), "detail": msg})
+        return RedirectResponse(url=_closing_back_url(pay_date, branch_param, msg), status_code=303)
+
     actual_raw = str(form.get("cash_actual") or "").replace(",", "").strip()
     actual = None
     if actual_raw:
@@ -25236,6 +25335,18 @@ async def closing_cash_save(request: Request, session_token: str = Cookie(defaul
         except ValueError:
             actual = None
 
+    # 현금 매출 수동 수정값 — 자동값과 같거나 비어 있으면 수동 행을 두지 않는다
+    sale_amt_raw = str(form.get("cash_sale_amt") or "").replace(",", "").strip()
+    sale_auto_raw = str(form.get("cash_sale_auto") or "").replace(",", "").strip()
+    sale_override = None
+    try:
+        _sv = int(float(sale_amt_raw)) if sale_amt_raw else None
+        _av = int(float(sale_auto_raw)) if sale_auto_raw else None
+        if _sv is not None and _sv >= 0 and _sv != _av:
+            sale_override = _sv
+    except ValueError:
+        sale_override = None
+
     lines = []
     try:
         raw_lines = _json.loads(str(form.get("cash_lines") or "[]"))
@@ -25243,7 +25354,8 @@ async def closing_cash_save(request: Request, session_token: str = Cookie(defaul
             for i, l in enumerate(raw_lines[:50]):
                 if not isinstance(l, dict):
                     continue
-                kind = "deposit" if l.get("kind") == "deposit" else "use"
+                _k = str(l.get("kind") or "")
+                kind = _k if _k in ("deposit", "use", "hq") else "use"
                 try:
                     amt = max(0, int(float(str(l.get("amount") or 0))))
                 except (TypeError, ValueError):
@@ -25260,10 +25372,10 @@ async def closing_cash_save(request: Request, session_token: str = Cookie(defaul
     try:
         resolved = _closing_resolve_branch(conn, user, is_all, branch_param)
         if not resolved:
-            return RedirectResponse(url="/closing", status_code=303)
+            return _back("locked")
         key, name = resolved
         if _closing_get_save(conn, key, pay_date):
-            return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "locked"), status_code=303)
+            return _back("locked")
 
         conn.execute(
             "INSERT INTO closing_cash (branch_key, branch_name, pay_date, actual_cash, updated_by, updated_at) "
@@ -25274,6 +25386,13 @@ async def closing_cash_save(request: Request, session_token: str = Cookie(defaul
             (key, name, pay_date, actual, user["login_id"], now_iso)
         )
         conn.execute("DELETE FROM closing_cash_lines WHERE branch_key=? AND pay_date=?", (key, pay_date))
+        if sale_override is not None:
+            conn.execute(
+                "INSERT INTO closing_cash_lines (branch_key, pay_date, kind, amount, customer, note, "
+                "sort_order, updated_by, updated_at) VALUES (?, ?, 'sale', ?, '', ?, -1, ?, ?)",
+                (key, pay_date, sale_override,
+                 "유비플러스 자동값 대신 수동 입력", user["login_id"], now_iso)
+            )
         for kind, amt, cust, note, i in lines:
             conn.execute(
                 "INSERT INTO closing_cash_lines (branch_key, pay_date, kind, amount, customer, note, "
@@ -25283,7 +25402,7 @@ async def closing_cash_save(request: Request, session_token: str = Cookie(defaul
         conn.commit()
     finally:
         conn.close()
-    return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "cash_saved"), status_code=303)
+    return _back("cash_saved")
 
 
 @app.post("/closing/save")
@@ -25327,6 +25446,11 @@ async def closing_save(request: Request, session_token: str = Cookie(default=Non
         rc = data["receipts"].get(key)
         if rc is None:
             return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "no_receipt"), status_code=303)
+
+        # 현금시재 저장(실제 시재 입력 포함)이 있어야 마감 저장 가능
+        _cash_chk = _closing_cash_load(conn, key, pay_date)
+        if not _cash_chk["saved"] or _cash_chk["actual"] is None:
+            return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "cash_required"), status_code=303)
 
         now_iso = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
         # 입력한 메모를 먼저 저장(검사에서 막혀도 입력값이 사라지지 않게)
