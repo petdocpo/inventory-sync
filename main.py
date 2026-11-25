@@ -3171,10 +3171,12 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         "h2 { font-size: 17px !important; }"
         "h3 { font-size: 15px !important; }"
         "input, select, textarea { font-size: 10px !important; }"
-        ".topbar { padding: 6px 10px; flex-wrap: nowrap; }"
-        ".topbar > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }"
-        ".topbar > div { flex-wrap: nowrap; }"
-        ".topbar button, .topbar a { padding: 4px 6px !important; font-size: 11px !important; flex-shrink:0; }"
+        ".topbar { padding: 6px 10px; flex-wrap: wrap; row-gap: 6px; }"
+        ".topbar > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1 1 auto; }"
+        ".topbar > div { flex:1 1 100%; display:flex; flex-wrap:wrap; align-items:center;"
+        " justify-content:flex-end; gap:2px 6px; }"
+        ".topbar form { display:flex; align-items:center; gap:4px; }"
+        ".topbar button, .topbar a { padding: 4px 6px !important; font-size: 11px !important; flex-shrink:0; margin-right:0 !important; }"
         ".bottomnav { padding: 4px 4px; }"
         ".bottomnav a, .bottomnav div[onclick] { padding: 9px 2px !important; font-size: 11px !important; }"
         ".bottomnav a > div:first-child, .bottomnav div[onclick] > div:first-child { font-size: 19px !important; }"
@@ -5875,7 +5877,19 @@ async def daily_stocktake_page(
         var normal = rows.filter(function(r) { return !r.classList.contains('dst-deleted'); });
         var deleted = rows.filter(function(r) { return r.classList.contains('dst-deleted'); });
         normal.sort(dstCmpRows);
-        normal.concat(deleted).forEach(function(tr) { tb.appendChild(tr); });
+        var ordered = normal.concat(deleted);
+        // 목표 순서가 현재 DOM과 같으면 재삽입 생략 — 입력 중 appendChild가 포커스된 행을
+        // DOM에서 제거·재삽입해 모바일에서 키보드가 닫히는 버그 방지
+        var curRows = tb.querySelectorAll('tr.dst-row');
+        var sameOrder = curRows.length === ordered.length;
+        if (sameOrder) {
+          for (var i = 0; i < ordered.length; i++) {
+            if (curRows[i] !== ordered[i]) { sameOrder = false; break; }
+          }
+        }
+        if (!sameOrder) {
+          ordered.forEach(function(tr) { tb.appendChild(tr); });
+        }
         dstSortMarks();
       }
       // 입력 필드에서 포커스가 빠지면 오차만 보기 조건을 다시 적용 (입력 중 숨김 방지와 짝)
