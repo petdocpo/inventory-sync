@@ -38,6 +38,30 @@ QR_DIR = "./qr_codes"
 
 app = FastAPI(title="포포즈 발주_재고", version="1.2.0")
 
+
+@app.middleware("http")
+async def _view_as_readonly_guard(request: Request, call_next):
+    """지점 화면 보기(view-as) 모드에서는 쓰기 요청을 차단해 읽기 전용으로 유지."""
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        token = request.cookies.get("session_token")
+        if token:
+            try:
+                conn = get_conn()
+                row = conn.execute(
+                    "SELECT view_branch_code FROM sessions WHERE session_token=?",
+                    (token,)
+                ).fetchone()
+                conn.close()
+                if row and row["view_branch_code"]:
+                    return JSONResponse(
+                        {"detail": "지점 화면 보기 모드는 조회만 가능합니다. 상단 안내의 '지점 보기 종료'를 눌러주세요."},
+                        status_code=403,
+                    )
+            except Exception:
+                pass
+    return await call_next(request)
+
+
 VENDOR_EVAL_EXCLUDED_BRANCH_CODES = ("admin_hs",)
 
 NOTIFICATION_TYPES = {
@@ -2843,9 +2867,8 @@ _COLUMN_SETTINGS_HTML = """
             if (btn) { btn.textContent = (d && d.ok) ? '✓' : '!'; setTimeout(function() { btn.textContent = orig; }, 1500); }
           }).catch(function() { if (btn) btn.textContent = orig; });
         };
-        // 마스터만: 현재 페이지의 실효 숨김 설정(localStorage+기본값 반영)을 전체 계정 기본값으로 저장
-        window.saveColDefaults = function() {
-          var msg = document.getElementById('colSetDefaultMsg');
+        // 현재 페이지 모든 표의 실효 설정(숨김·너비·폰트·순서)을 수집 — 기기 localStorage와 서버 기본값이 반영된 상태
+        function cvCollectPageTables() {
           var tables = {};
           document.querySelectorAll('table').forEach(function(table) {
             if (!cvEligible(table)) return;
@@ -2874,10 +2897,26 @@ _COLUMN_SETTINGS_HTML = """
               }
             } catch (e) {}
           });
-          fetch('/api/column-defaults', {
+          return tables;
+        }
+        function cvPostDefaults(tables) {
+          return fetch('/api/column-defaults', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({page: window.location.pathname, tables: tables})
-          }).then(function(r) { return r.json(); }).then(function(d) {
+          }).then(function(r) { return r.json(); });
+        }
+        // 헤더 💾 칼럼 버튼 — 이 페이지 칼럼 설정을 전체 계정 기본값으로 즉시 저장
+        window.saveColAll = function(btn) {
+          var orig = btn ? btn.textContent : '';
+          if (btn) btn.textContent = '…';
+          cvPostDefaults(cvCollectPageTables()).then(function(d) {
+            if (btn) { btn.textContent = (d && d.ok) ? '✓' : '!'; setTimeout(function() { btn.textContent = orig; }, 1500); }
+          }).catch(function() { if (btn) btn.textContent = orig; });
+        };
+        // 마스터만: 현재 페이지의 실효 숨김 설정(localStorage+기본값 반영)을 전체 계정 기본값으로 저장
+        window.saveColDefaults = function() {
+          var msg = document.getElementById('colSetDefaultMsg');
+          cvPostDefaults(cvCollectPageTables()).then(function(d) {
             msg.textContent = (d && d.ok) ? '저장되었습니다.' : ((d && d.detail) || '저장 실패');
           }).catch(function() { msg.textContent = '저장 실패'; });
         };
@@ -3143,8 +3182,21 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         "form > div[style*='display:flex'], form > div[style*='display: flex'] { flex-wrap: wrap; }"
         "}"
     )
-    branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")    
+    branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")
     role_badge = f'<span style="background:#4FC3F7;color:white;padding:2px 10px;border-radius:12px;font-size:12px;margin-left:8px;">{branch_name}</span>' if user else ""
+
+    # 지점 화면 보기(view-as) 배너 — 읽기 전용임을 표시하고 종료 링크 제공
+    view_banner_html = ""
+    if user and user.get("_view_as"):
+        import html as _va_html
+        _va_label = _va_html.escape(str(user.get("branch_name") or user.get("branch_code") or ""))
+        view_banner_html = (
+            '<div style="background:#FEF3C7;color:#92400E;padding:8px 14px;font-size:13px;'
+            'text-align:center;font-weight:bold;border-bottom:1px solid #FDE68A;">'
+            f'🔍 {_va_label} 지점 화면으로 보는 중 — 읽기 전용 · '
+            '<a href="/master/view-as/exit" style="color:#B45309;text-decoration:underline;">지점 보기 종료</a>'
+            '</div>'
+        )
 
     is_master = user and (user.get("role") == "master" or user.get("branch_type") == "hq")
     col_settings_enabled = os.getenv("COL_SETTINGS_ENABLED", "on").strip().lower() not in ("off", "0", "false", "no")
@@ -3170,6 +3222,44 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         'style="background:rgba(255,255,255,.15);color:white;border:none;'
         'padding:5px 10px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">🧩 칼럼</button>'
         if col_settings_enabled else ""
+    )
+    # 헤더: 이 페이지 칼럼 설정(표시·너비·폰트·순서)을 전체 계정 기본값으로 저장 — 마스터 전용
+    col_save_btn = ""
+    if col_settings_enabled and is_master:
+        col_save_btn = (
+            '<button type="button" onclick="saveColAll(this)" title="이 페이지의 칼럼 표시·너비·폰트·순서를 전체 계정 기본값으로 저장" '
+            'style="background:rgba(255,255,255,.15);color:white;border:none;'
+            'padding:5px 8px;border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">💾 칼럼</button>'
+        )
+    # 헤더: 지점 화면 보기(읽기 전용) — 마스터/hq 전용, 보기 모드 중에는 숨김(배너의 종료 링크 사용)
+    view_as_top_html = ""
+    if is_master and not (user and user.get("_view_as")):
+        try:
+            _va_top_branches = get_branches(branch_type="branch")
+        except Exception:
+            _va_top_branches = []
+        if _va_top_branches:
+            import html as _va_top_h
+            _va_top_opts = "".join(
+                f'<option value="{_va_top_h.escape(str(b["branch_code"]))}">'
+                f'{_va_top_h.escape(str(b["branch_name"] or b["branch_code"]))}</option>'
+                for b in _va_top_branches
+            )
+            view_as_top_html = (
+                '<form method="get" action="/master/view-as" style="display:flex;align-items:center;'
+                'gap:4px;margin-right:8px;">'
+                '<select name="branch_code" style="width:auto;min-width:0;max-width:104px;padding:4px 4px;'
+                'font-size:11px;border-radius:6px;border:1px solid rgba(255,255,255,.3);'
+                'background:#2a3580;color:white;">' + _va_top_opts + '</select>'
+                '<button type="submit" title="지점 화면 보기 (읽기 전용)" '
+                'style="background:rgba(255,255,255,.15);color:white;border:none;padding:5px 8px;'
+                'border-radius:8px;font-size:12px;cursor:pointer;white-space:nowrap;">👁 보기</button></form>'
+            )
+    # 헤더: PWA 앱 설치 버튼 (beforeinstallprompt 지원 브라우저는 바로 설치, 아니면 안내)
+    pwa_install_btn = (
+        '<button type="button" id="pwaInstallBtn" onclick="pwaInstall()" title="앱으로 설치" '
+        'style="background:rgba(255,255,255,.15);color:white;border:none;padding:5px 8px;'
+        'border-radius:8px;font-size:12px;cursor:pointer;margin-right:8px;">⬇ 설치</button>'
     )
     col_settings_html = ""
     if col_settings_enabled:
@@ -3288,6 +3378,21 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           }});
         }}
 
+        // PWA 설치 — beforeinstallprompt가 오면 즉시 설치, 아니면 브라우저 메뉴 안내
+        var __pwaDeferred = null;
+        window.addEventListener('beforeinstallprompt', function(e) {{
+          e.preventDefault();
+          __pwaDeferred = e;
+        }});
+        window.pwaInstall = function() {{
+          if (__pwaDeferred) {{
+            __pwaDeferred.prompt();
+            __pwaDeferred.userChoice.then(function() {{ __pwaDeferred = null; }});
+          }} else {{
+            alert('앱 설치: 브라우저 메뉴(⋮ 또는 공유)에서 "홈 화면에 추가" / "앱 설치"를 선택해주세요.\\n\\n이미 설치된 경우 홈 화면의 앱 아이콘으로 실행됩니다.');
+          }}
+        }};
+
         function urlBase64ToUint8Array(base64String) {{
           var padding = '='.repeat((4 - base64String.length % 4) % 4);
           var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
@@ -3360,12 +3465,13 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     </head>
     <body>
       <div class="topbar">
-        <span style="font-weight:bold;">📦 재고 관리 시스템{role_badge}</span>
+        <span style="font-weight:bold;">📦 재고 관리 시스템 <span style="font-size:10px;font-weight:normal;opacity:.75;">v{app.version}</span>{role_badge}</span>
         <div style="display:flex;align-items:center;">
-          {ui_mode_btn}{orient_btn}{col_settings_btn}
+          {ui_mode_btn}{orient_btn}{col_settings_btn}{view_as_top_html}{col_save_btn}{pwa_install_btn}
           <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
         </div>
       </div>
+      {view_banner_html}
       <div class="content">{content}</div>
       {desc_edit_html}
       <div id="noticePopupOverlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;
@@ -5115,6 +5221,9 @@ _DST_VENDOR_NAME_MAP = {"펫네스트": "펫네스트(디자인주권)"}
 # 상품 DB상 "구매처 없음"을 의미하는 플레이스홀더 — 거래처 필터에서는 (미등록)으로 취급
 _DST_SUPPLIER_BLANK_VALUES = {"[삭제된구매처]"}
 
+# 거래처 필터에서 제외할 의사 거래처 — 실사 품목 자체는 유지하고 거래처만 (미등록) 처리
+_DST_VENDOR_EXCLUDE = {"본사", "부착", "소장", "벨르앤"}
+
 _DST_NAME_PREFIX_RE = re.compile(r"^\s*\[([^\]]+)\]")
 
 
@@ -5170,6 +5279,8 @@ def _daily_stocktake_pm_map() -> dict:
         if not supplier:
             supplier = _dst_vendor_prefix(r["item_name"] or "")
         supplier = _DST_VENDOR_NAME_MAP.get(supplier, supplier)
+        if supplier in _DST_VENDOR_EXCLUDE:
+            supplier = ""
         pm[str(r["item_code"])] = {
             "supplier": supplier,
             "category": r["category"] or "",
@@ -5220,6 +5331,8 @@ def _daily_stocktake_items(branch_code: str):
             continue
         supplier = info.get("supplier") or _dst_vendor_prefix(r["item_name"])
         supplier = _DST_VENDOR_NAME_MAP.get(supplier, supplier)
+        if supplier in _DST_VENDOR_EXCLUDE:
+            supplier = ""
         items.append({
             "item_code": code,
             "item_name": r["item_name"],
@@ -5732,6 +5845,7 @@ async def daily_stocktake_page(
         var diffEl = document.getElementById('dstDiffOnly');
         var diffOnly = diffEl ? diffEl.checked : false;
         var rows = Array.prototype.slice.call(tb.querySelectorAll('tr.dst-row'));
+        var ae = document.activeElement;
         rows.forEach(function(tr) {
           var sv = tr.getAttribute('data-supplier') || '';
           var cv = tr.getAttribute('data-category') || '';
@@ -5745,8 +5859,17 @@ async def daily_stocktake_page(
           if (diffOnly) {
             var dc = tr.querySelector('.dst-diff');
             var dv = dc ? parseInt(dc.textContent.trim().replace(/^\+/, ''), 10) : NaN;
-            ok = ok && !isNaN(dv) && dv !== 0;
+            var diffBad = !isNaN(dv) && dv !== 0;
+            // 실사 미기입 + UPS재고 있음 → 오차 후보로 표시 (0 입력은 diff로 이미 계산됨)
+            var miEl = tr.querySelector('.dst-input');
+            var countedEmpty = !miEl || miEl.value.trim() === '';
+            var upsTxt = miEl ? (miEl.getAttribute('data-ups') || '') : '';
+            var upsNum = upsTxt === '' ? NaN : parseFloat(upsTxt);
+            var missBad = countedEmpty && !isNaN(upsNum) && upsNum > 0;
+            ok = ok && (diffBad || missBad);
           }
+          // 입력 중인 행은 숨기지 않음 — 오차만 보기에서 한 자리씩 입력할 때 포커스를 잃는 버그 방지
+          if (!ok && ae && tr.contains(ae)) ok = true;
           tr.style.display = ok ? '' : 'none';
         });
         var normal = rows.filter(function(r) { return !r.classList.contains('dst-deleted'); });
@@ -5754,6 +5877,39 @@ async def daily_stocktake_page(
         normal.sort(dstCmpRows);
         normal.concat(deleted).forEach(function(tr) { tb.appendChild(tr); });
         dstSortMarks();
+      }
+      // 입력 필드에서 포커스가 빠지면 오차만 보기 조건을 다시 적용 (입력 중 숨김 방지와 짝)
+      (function() {
+        var firstInp = document.querySelector('.dst-input');
+        var tb0 = firstInp ? firstInp.closest('table').tBodies[0] : null;
+        if (tb0) tb0.addEventListener('focusout', function(e) {
+          if (e.target && (e.target.classList.contains('dst-input') || e.target.classList.contains('dst-loc'))) {
+            dstApplyView();
+          }
+        });
+      })();
+      // 현재 필터/검색/정렬 상태를 URL에 반영 — 저장·새로고침 후에도 선택값이 유지되도록
+      function dstSyncFilterUrl() {
+        try {
+          var p = new URLSearchParams(window.location.search);
+          var set = function(k, v) { if (v) p.set(k, v); else p.delete(k); };
+          var fb = document.querySelector('select[name="filter_branch"]');
+          var dt = document.querySelector('input[name="date"]');
+          var vd = document.getElementById('dstVendor');
+          var cd = document.getElementById('dstCategory');
+          var se = document.getElementById('dstSearch');
+          var sm = document.getElementById('dstSortMode');
+          var df = document.getElementById('dstDiffOnly');
+          set('filter_branch', fb ? fb.value : '');
+          set('date', dt ? dt.value : '');
+          set('vendor', vd ? vd.value : '');
+          set('category', cd ? cd.value : '');
+          set('q', se ? se.value.trim() : '');
+          set('sort', sm && sm.value !== 'default' ? sm.value : '');
+          set('diff_only', (df && df.checked) ? '1' : '');
+          var qs = p.toString();
+          history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+        } catch (e) {}
       }
       var dstDirty = false;
       // 브라우저별 고유 ID — 같은 계정(마스터 공용 등)으로 동시 접속해도 드래프트/presence가 섞이지 않게 함
@@ -5766,20 +5922,21 @@ async def daily_stocktake_page(
       var DST_LOGIN_CID = '__DST_LOGIN__' + '|' + DST_CID;
       var dstDraftCodes = {};
       var dstTouched = {};
+      var dstTyping = {};  // code -> 마지막 입력 시각(ms) — "기입 중" 표시용
       var dstDraftTimer = null;
       var dstLastApplied = {};
       document.addEventListener('input', function(e) {
         if (e.target && (e.target.classList.contains('dst-input') || e.target.classList.contains('dst-loc'))) {
           dstDirty = true;
           var code = e.target.getAttribute('data-code');
-          if (code) { dstDraftCodes[code] = true; dstTouched[code] = true; dstScheduleDraft(); }
+          if (code) { dstDraftCodes[code] = true; dstTouched[code] = true; dstTyping[code] = Date.now(); dstScheduleDraft(); }
         }
       });
 
       // 실시간 입력 드래프트: 저장 전 입력값을 다른 사용자에게 실시간 공유
       function dstScheduleDraft() {
         clearTimeout(dstDraftTimer);
-        dstDraftTimer = setTimeout(dstSendDraft, 1200);
+        dstDraftTimer = setTimeout(dstSendDraft, 400);
       }
       function dstRowValues(code) {
         var mi = document.querySelector('.dst-input[data-code="' + code + '"]');
@@ -5803,12 +5960,18 @@ async def daily_stocktake_page(
           var v = dstRowValues(code);
           if (v) items[code] = v;
         });
+        // 현재 입력 중인 품목 목록 — 상대방 화면에 "기입 중" 표시
+        var nowMs = Date.now();
+        var typing = {};
+        Object.keys(dstTyping).forEach(function(code) {
+          if (nowMs - dstTyping[code] < 20000) typing[code] = true;
+        });
         try {
           var res = await fetch('/api/daily-stocktake/draft', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
               branch_code: DST_BRANCH, date: '__DST_DATE__',
-              name: dstPresenceName(), cid: DST_CID, items: items
+              name: dstPresenceName(), cid: DST_CID, items: items, typing: typing
             })
           });
           if (res.ok) { codes.forEach(function(c) { delete dstDraftCodes[c]; }); }
@@ -5856,7 +6019,34 @@ async def daily_stocktake_page(
               dstUpdateDiff(mi);
             });
           });
+          dstRenderTyping(drafts);
         } catch (e) {}
+      }
+      // 다른 사용자가 지금 입력 중인 품목에 "✏️ 기입 중" 배지 표시 (typing ts 25초 이내만)
+      function dstRenderTyping(drafts) {
+        var typingNow = {};
+        Object.keys(drafts || {}).forEach(function(lid) {
+          var entry = drafts[lid] || {};
+          var ty = entry.typing || {};
+          var who = entry.name || '';
+          Object.keys(ty).forEach(function(code) {
+            var ts = Date.parse(ty[code]);
+            if (!isNaN(ts) && Date.now() - ts < 25000) typingNow[code] = who || lid;
+          });
+        });
+        document.querySelectorAll('.dst-typing-badge').forEach(function(b) { b.remove(); });
+        document.querySelectorAll('tr.dst-row[data-code]').forEach(function(tr) {
+          var who = typingNow[tr.getAttribute('data-code')];
+          if (!who) return;
+          var nameTd = tr.children[1];
+          if (!nameTd) return;
+          var badge = document.createElement('span');
+          badge.className = 'dst-typing-badge';
+          badge.style.cssText = 'font-size:10px;color:#B45309;background:#FFFBEB;'
+            + 'border:1px solid #FDE68A;border-radius:8px;padding:0 5px;margin-left:4px;white-space:nowrap;';
+          badge.textContent = '✏️ ' + who + ' 기입 중';
+          nameTd.appendChild(badge);
+        });
       }
 
       function dstCollect() {
@@ -5910,6 +6100,7 @@ async def daily_stocktake_page(
             return;
           }
           alert(data.message || '저장되었습니다.');
+          dstSyncFilterUrl();
           dstClearDraft();
           location.reload();
         } catch (e) {
@@ -5968,6 +6159,7 @@ async def daily_stocktake_page(
           }
           dstHideMissingConfirm();
           alert(data.message || '마감되었습니다.');
+          dstSyncFilterUrl();
           dstClearDraft();
           location.reload();
         } catch (e) {
@@ -6054,7 +6246,7 @@ async def daily_stocktake_page(
           if (!res.ok || !d.ok) return;
           var remote = d.saved_at || '';
           if (remote && remote !== DST_SAVE_AT) {
-            if (!dstDirty) { location.reload(); return; }
+            if (!dstDirty) { dstSyncFilterUrl(); location.reload(); return; }
             var b = document.getElementById('dstPresence');
             if (b && !document.getElementById('dstSyncNote')) {
               var n = document.createElement('div');
@@ -6072,7 +6264,7 @@ async def daily_stocktake_page(
         setInterval(dstPresenceBeat, 20000);
         setInterval(dstPresencePoll, 20000);
         setInterval(dstSyncPoll, 20000);
-        setInterval(dstDraftPoll, 5000);
+        setInterval(dstDraftPoll, 2000);
         setInterval(function() { dstSendDraft(true); }, 30000);
       }
     </script>
@@ -6577,6 +6769,7 @@ async def api_daily_stocktake_draft_get(
 ):
     from fastapi import HTTPException
     import json as _json
+    from datetime import timedelta as _tdelta
     user = get_session(session_token)
     if not user:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
@@ -6595,6 +6788,14 @@ async def api_daily_stocktake_draft_get(
     me = (cid.strip()[:60] or login_id.strip())
     if me:
         drafts.pop(me, None)
+    # typing(기입 중 표시)은 25초 이상 지난 항목을 응답에서 제외
+    typing_cutoff = (datetime.now() - _tdelta(seconds=25)).isoformat()
+    for entry in drafts.values():
+        if isinstance(entry, dict) and isinstance(entry.get("typing"), dict):
+            entry["typing"] = {
+                c: ts for c, ts in entry["typing"].items()
+                if str(ts) >= typing_cutoff
+            }
     return {"ok": True, "drafts": drafts}
 
 
@@ -6659,6 +6860,14 @@ async def api_daily_stocktake_draft_post(request: Request, session_token: str = 
             }
         entry["items"] = entry_items
         entry["updated_at"] = now_iso
+        # "기입 중" 표시 — typing {code: true}를 ts와 함께 저장 (30초 지난 항목은 제거)
+        typing_in = body.get("typing")
+        if isinstance(typing_in, dict) and typing_in:
+            ty = entry.get("typing") if isinstance(entry.get("typing"), dict) else {}
+            for code in typing_in.keys():
+                ty[str(code)[:40]] = now_iso
+            ty_cut = (datetime.now() - _tdelta(seconds=30)).isoformat()
+            entry["typing"] = {c: ts for c, ts in ty.items() if str(ts) >= ty_cut}
         drafts[dkey] = entry
     conn.execute(
         "INSERT INTO daily_stocktake_drafts (scope_key, data, updated_at) VALUES (?, ?, ?) "
@@ -17841,6 +18050,49 @@ ACCORDION_CSS_JS = """
 """
 
 
+@app.get("/master/view-as")
+async def master_view_as(branch_code: str = "", session_token: str = Cookie(default=None)):
+    """마스터/본사 → 지점 화면 보기 모드 시작 (읽기 전용). 세션에 view_branch_code를 기록."""
+    user = get_session(session_token)
+    if not user or (user["role"] != "master" and user.get("branch_type") != "hq"):
+        return RedirectResponse(url="/login", status_code=303)
+    if not branch_code:
+        return RedirectResponse(url="/master", status_code=303)
+    conn = get_conn()
+    try:
+        acc = conn.execute(
+            "SELECT branch_code FROM accounts WHERE branch_code=? AND role='branch'",
+            (branch_code,)
+        ).fetchone()
+        if acc:
+            conn.execute(
+                "UPDATE sessions SET view_branch_code=? WHERE session_token=?",
+                (branch_code, session_token)
+            )
+            conn.commit()
+    finally:
+        conn.close()
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/master/view-as/exit")
+async def master_view_as_exit(session_token: str = Cookie(default=None)):
+    """지점 화면 보기 모드 종료 — 세션의 view_branch_code를 지운다."""
+    user = get_session(session_token)
+    if user and user.get("_view_as"):
+        conn = get_conn()
+        try:
+            conn.execute(
+                "UPDATE sessions SET view_branch_code=NULL WHERE session_token=?",
+                (session_token,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return RedirectResponse(url="/master", status_code=303)
+    return RedirectResponse(url="/", status_code=303)
+
+
 @app.get("/master", response_class=HTMLResponse)
 async def master_page(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -18102,9 +18354,32 @@ async def master_page(session_token: str = Cookie(default=None)):
       </a>
         """)
 
+    # ---- 지점 화면 보기 (읽기 전용 뷰 — 로그아웃 없이 지점 계정 화면 확인) ----
+    view_as_card_html = ""
+    _va_branches = get_branches(branch_type="branch")
+    if _va_branches:
+        import html as _va_html
+        _va_opts = "".join(
+            f'<option value="{_va_html.escape(str(b["branch_code"]))}">'
+            f'{_va_html.escape(str(b["branch_name"] or b["branch_code"]))}</option>'
+            for b in _va_branches
+        )
+        view_as_card_html = f"""
+      <div class="card" style="text-align:left;padding:20px;">
+        <div style="font-weight:bold;color:#1E2761;margin-bottom:8px;">👁 지점 화면으로 보기</div>
+        <form method="get" action="/master/view-as" style="display:flex;gap:8px;align-items:center;">
+          <select name="branch_code" style="flex:1;min-width:0;padding:8px;border:1px solid #ccc;border-radius:8px;font-size:13px;">
+            {_va_opts}
+          </select>
+          <button class="btn" type="submit" style="white-space:nowrap;">보기</button>
+        </form>
+        <div style="color:#888;font-size:12px;margin-top:8px;">지점 계정과 동일한 화면을 <b>읽기 전용</b>으로 확인합니다. 설정 변경이 필요하면 해당 지점 계정으로 로그인하세요.</div>
+      </div>
+        """
+
     # ---- 바로가기 그룹 (단독 카드들을 아코디언 안으로) ----
     shortcut_cards = []
-    for _c in (branch_card_html, po_preview_card_html, po_verify_card_html):
+    for _c in (branch_card_html, po_preview_card_html, po_verify_card_html, view_as_card_html):
         if _c:
             shortcut_cards.append(_c)
 
