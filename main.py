@@ -25447,16 +25447,16 @@ async def closing_save(request: Request, session_token: str = Cookie(default=Non
         if rc is None:
             return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "no_receipt"), status_code=303)
 
-        # 현금시재 저장(실제 시재 입력 포함)이 있어야 마감 저장 가능
-        _cash_chk = _closing_cash_load(conn, key, pay_date)
-        if not _cash_chk["saved"] or _cash_chk["actual"] is None:
-            return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "cash_required"), status_code=303)
-
         now_iso = _kst_now().strftime("%Y-%m-%d %H:%M:%S")
         # 입력한 메모를 먼저 저장(검사에서 막혀도 입력값이 사라지지 않게)
         for lb, memo in _closing_collect_memos(form).items():
             _closing_save_memo(conn, key, name, pay_date, lb, memo, user["login_id"], now_iso)
         conn.commit()
+
+        # 현금시재 저장(실제 시재 입력 포함)이 있어야 마감 저장 가능
+        _cash_chk = _closing_cash_load(conn, key, pay_date)
+        if not _cash_chk["saved"] or _cash_chk["actual"] is None:
+            return RedirectResponse(url=_closing_back_url(pay_date, branch_param, "cash_required"), status_code=303)
 
         pay = data["pay"].get(key)
         pg = pay["groups"] if pay else {}
