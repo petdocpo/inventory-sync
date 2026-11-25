@@ -4614,7 +4614,7 @@ async def stock_closing_page(
         )
     _out_qty_label = f"{sel_date.month}/{sel_date.day} 출고 수량"
     _ups_label = "판매등록 후 재고 수량"
-    # 상단 메타 정보 — 필터 행 오른쪽에 같은 행으로 붙는 컴팩트 칩
+    # 상단 메타 정보 — 필터 행 오른쪽에 줄글 한 단락으로 표시
     meta_lines = [
         f"{sel_date_str} (00시~24시) QR 스캔 기준",
         f"{_out_qty_label} = 출고(OUT) + 입고(IN) 스캔 합계 · 오차 = 실사 수량 − {_ups_label}",
@@ -4624,14 +4624,13 @@ async def stock_closing_page(
         meta_lines.append("QR 재고·" + _ups_label + " 기준: " + basis_text)
     if view_mode == "live":
         meta_lines.append(f"마감 가능 기간: {sel_date_str} ~ {window_end_str}")
-    meta_chips_html = ""
+    meta_text_html = ""
     if meta_lines:
-        meta_chips_html = '<span style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;">' + "".join(
-            '<span style="display:inline-block;padding:6px 10px;background:#F8FAFC;'
-            'border:1px solid #E2E8F0;border-radius:8px;font-size:12px;color:#475569;">'
-            + _html.escape(ln) + '</span>'
-            for ln in meta_lines
-        ) + '</span>'
+        meta_text_html = (
+            '<div style="flex:1;min-width:280px;font-size:12px;color:#475569;line-height:1.7;">'
+            + " · ".join(_html.escape(ln) for ln in meta_lines)
+            + '</div>'
+        )
     filter_html = (
         '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;">'
         '<form method="get" action="/stock-closing" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
@@ -4645,7 +4644,7 @@ async def stock_closing_page(
         '<a href="/stock-closing" style="padding:10px 14px;background:#eee;'
         'border-radius:8px;font-size:13px;text-decoration:none;color:#555;">오늘로</a>'
         "</div>"
-        + meta_chips_html
+        + meta_text_html
         + "</div>"
     )
 
@@ -24132,43 +24131,29 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
     expected = _closing_cash_expected(cash_amt, lines)
     actual = cash["actual"]
 
-    # 전일 현금시재 — 실제 시재만 입력·저장 (예상/오차는 표시하지 않음)
+    # 전일 현금시재 — 저장된 실제 시재만 조회 표시 (입력/저장은 해당 날짜 화면에서)
     prev_html = ""
     try:
         from datetime import datetime as _dt, timedelta as _td
         _pdt = _dt.strptime(pay_date, "%Y-%m-%d") - _td(days=1)
-        prev_date = _pdt.strftime("%Y-%m-%d")
         prev_date_lbl = f"{_pdt.month}/{_pdt.day}"
-        prev_cash = _closing_cash_load(conn, view_key, prev_date)
+        prev_cash = _closing_cash_load(conn, view_key, _pdt.strftime("%Y-%m-%d"))
         prev_actual = prev_cash["actual"]
-        _prev_saved = prev_cash["saved"] and prev_actual is not None
-        _prev_val = str(int(prev_actual)) if prev_actual is not None else ""
-        _prev_final = (
-            '<span style="font-size:13px;color:#166534;white-space:nowrap;">'
-            '실제 <b>' + _money(int(prev_actual)) + '원</b></span>'
-            if _prev_saved else
-            '<span style="font-size:12px;color:#94A3B8;white-space:nowrap;">미저장</span>'
-        )
-        prev_html = (
-            '<div style="margin-top:10px;padding:10px 12px;background:#F8FAFC;'
-            'border:1px solid #E2E8F0;border-radius:8px;">'
-            '<form method="post" action="/closing/cash-save" '
-            'style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
-            '<input type="hidden" name="date" value="' + prev_date + '">'
-            '<input type="hidden" name="branch" value="' + _esc(branch_param) + '">'
-            '<input type="hidden" name="ret_date" value="' + _esc(pay_date) + '">'
-            '<div style="font-size:12px;font-weight:bold;color:#475569;">📅 ' + prev_date_lbl + ' 현금시재</div>'
-            '<div><label style="font-size:11px;color:#888;">실사한 현금(원)</label><br>'
-            '<input type="number" name="cash_actual" min="0" step="1" inputmode="numeric" '
-            'value="' + _prev_val + '" style="width:140px;margin-top:2px;"></div>'
-            '<button type="submit" class="btn" style="padding:6px 12px;font-size:12px;background:#64748B;">💾 저장</button>'
-            + _prev_final +
-            '</form>'
-            + ('<div style="font-size:11px;color:#888;margin-top:4px;">'
-               + _esc(prev_cash["updated_by"] or "-") + ' · ' + _esc(prev_cash["updated_at"] or "") + ' 저장</div>'
-               if _prev_saved else '')
-            + '</div>'
-        )
+        if prev_cash["saved"] and prev_actual is not None:
+            prev_html = (
+                '<span style="font-size:12px;color:#166534;background:#F0FDF4;border:1px solid #BBF7D0;'
+                'border-radius:8px;padding:6px 10px;white-space:nowrap;align-self:center;">'
+                '📅 ' + prev_date_lbl + ' 실사 <b>' + _money(int(prev_actual)) + '원</b>'
+                ' <span style="color:#888;font-weight:normal;">('
+                + _esc(prev_cash["updated_by"] or "-") + ' · '
+                + _esc((prev_cash["updated_at"] or "")[11:16]) + ')</span></span>'
+            )
+        else:
+            prev_html = (
+                '<span style="font-size:12px;color:#94A3B8;background:#F8FAFC;border:1px dashed #CBD5E1;'
+                'border-radius:8px;padding:6px 10px;white-space:nowrap;align-self:center;">'
+                '📅 ' + prev_date_lbl + ' 실사 미저장</span>'
+            )
     except Exception:
         prev_html = ""
 
@@ -24203,8 +24188,8 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
         '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
         '<button type="button" class="btn" style="background:#64748B;" onclick="cashAddRow()">+ 행 추가</button>'
         '<span style="font-size:12px;color:#888;">기타 입금/본사 입금/시재 사용 내역을 추가하세요 (선택)</span></div>'
-        + prev_html +
         '<div style="margin-top:10px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">'
+        + prev_html +
         '<div><label style="font-size:12px;color:#666;">실제 현금시재(원)</label><br>'
         f'<input type="number" min="0" step="1" inputmode="numeric" name="cash_actual" form="cash-form" '
         f'id="cash-actual-input" value="{actual if actual is not None else ""}" '
@@ -24232,7 +24217,6 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
         'tr.querySelectorAll("input").forEach(function(i){i.value="";});'
         't.querySelector("tbody").appendChild(tr);'
         '}'
-        'function cashFillPrev(b){var i=document.getElementById("cash-actual-input");if(i)i.value=b.getAttribute("data-v");}window.cashFillPrev=cashFillPrev;'
         'window.cashAddRow=cashAddRow;'
         # 현금 매출 수동 수정 — 수정 버튼으로만 입력칸 활성화, 자동값으로 복원 가능
         'window.cashSaleToggle=function(btn){'
