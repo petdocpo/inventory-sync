@@ -1,0 +1,8 @@
+# Vercel 업로드 제외 — 검증 산출물·스냅샷(DB에 고객 판매 데이터 포함)·로컬 DB
+_verify_in/
+_verify_out/
+_sql_out/
+*.db
+*.sqlite
+*.sqlite3
+inventory.db

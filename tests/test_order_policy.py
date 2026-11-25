@@ -14,6 +14,7 @@ from order_policy import (  # noqa: E402
     ORDER_CYCLES, REGULAR_PERIOD_DAYS, REGULAR_LEAD_MAX_DAYS,
     MONTHLY_LEAD_MAX_DAYS, DEFAULT_BUFFER, CYCLE_ANCHOR,
     normalize_order_cycle, effective_order_cycle,
+    normalize_vendor_name, match_vendor_rule, resolve_order_cycle,
     moq_ceil, arrival_stock, regular_order_qty,
     midweek_horizon, midweek_target_stock, midweek_order_qty,
     emergency_eval, tuesday_of_week, next_tuesday,
@@ -442,6 +443,109 @@ class TestCalendar(unittest.TestCase):
         self.assertEqual(REGULAR_LEAD_MAX_DAYS, 3)
         self.assertEqual(MONTHLY_LEAD_MAX_DAYS, 11)
         self.assertEqual(ORDER_CYCLES, ("weekly", "monthly", "none"))
+
+
+class TestNormalizeVendorName(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(normalize_vendor_name("숨의"), "숨의")
+        self.assertEqual(normalize_vendor_name("  블루어  "), "블루어")
+        self.assertEqual(normalize_vendor_name("숨  의"), "숨 의")  # 연속 공백 1개로
+        self.assertEqual(normalize_vendor_name(None), "")
+        self.assertEqual(normalize_vendor_name(""), "")
+
+
+class TestMatchVendorRule(unittest.TestCase):
+    RULES = [
+        {"vendor_name": "숨의", "branch_code": None, "order_cycle": "monthly"},
+        {"vendor_name": "블루어", "branch_code": "김해점", "order_cycle": "monthly"},
+        {"vendor_name": "블루어", "branch_code": "부산점", "order_cycle": "monthly"},
+        {"vendor_name": "블루어", "branch_code": "세종점", "order_cycle": "monthly"},
+        {"vendor_name": "블루어", "branch_code": None, "order_cycle": "weekly"},
+    ]
+
+    def test_soomi_all_branches_monthly(self):
+        for bc in ("김해점", "부산점", "세종점", "경기김포점", "본사"):
+            self.assertEqual(match_vendor_rule(self.RULES, "숨의", bc), "monthly", bc)
+
+    def test_blueur_branch_specific(self):
+        for bc in ("김해점", "부산점", "세종점"):
+            self.assertEqual(match_vendor_rule(self.RULES, "블루어", bc), "monthly", bc)
+        # 지점 미지정 지점은 전 지점 규칙(weekly) 적용
+        self.assertEqual(match_vendor_rule(self.RULES, "블루어", "경기김포점"), "weekly")
+
+    def test_branch_rule_beats_global(self):
+        rules = [
+            {"vendor_name": "X상사", "branch_code": None, "order_cycle": "weekly"},
+            {"vendor_name": "X상사", "branch_code": "김해점", "order_cycle": "monthly"},
+        ]
+        self.assertEqual(match_vendor_rule(rules, "X상사", "김해점"), "monthly")
+        self.assertEqual(match_vendor_rule(rules, "X상사", "부산점"), "weekly")
+
+    def test_whitespace_normalized(self):
+        self.assertEqual(match_vendor_rule(self.RULES, "  숨의 ", "김해점"), "monthly")
+        self.assertEqual(match_vendor_rule(self.RULES, "블 루어", "김해점"), None)  # 내부 공백은 다른 값
+
+    def test_no_match(self):
+        self.assertIsNone(match_vendor_rule(self.RULES, "하얀나래", "김해점"))
+        self.assertIsNone(match_vendor_rule(self.RULES, "", "김해점"))
+        self.assertIsNone(match_vendor_rule(self.RULES, None, "김해점"))
+        self.assertIsNone(match_vendor_rule([], "숨의", "김해점"))
+        self.assertIsNone(match_vendor_rule(None, "숨의", "김해점"))
+
+    def test_invalid_cycle_rule_ignored(self):
+        rules = [{"vendor_name": "숨의", "branch_code": None, "order_cycle": "bogus"}]
+        self.assertIsNone(match_vendor_rule(rules, "숨의", "김해점"))
+
+
+class TestResolveOrderCycleNewMode(unittest.TestCase):
+    """신 모드 우선순위: 미발주 > 상품 명시 > 월 예외 > 거래처 규칙 > 기본 정기."""
+    def r(self, oc=None, exc=False, lead=0, mexc=False, vc=None, mode="new"):
+        return resolve_order_cycle(oc, order_excluded=exc, lead_time_days=lead,
+                                   monthly_exception=mexc, vendor_cycle=vc, mode=mode)
+
+    # 1) 미발주 최우선
+    def test_none_beats_everything(self):
+        self.assertEqual(self.r(oc="weekly", exc=True, mexc=True, vc="monthly"), "none")
+        self.assertEqual(self.r(oc="none", vc="monthly"), "none")
+        self.assertEqual(self.r(oc=None, exc=True), "none")
+
+    # 2) 상품 명시 order_cycle
+    def test_explicit_weekly_beats_exception_and_vendor(self):
+        self.assertEqual(self.r(oc="weekly", mexc=True, vc="monthly"), "weekly")
+    def test_explicit_monthly_beats_everything_but_none(self):
+        self.assertEqual(self.r(oc="monthly", mexc=False, vc="weekly"), "monthly")
+        self.assertEqual(self.r(oc="monthly", exc=False), "monthly")
+
+    # 3) 월 발주 예외
+    def test_monthly_exception_beats_vendor(self):
+        self.assertEqual(self.r(oc=None, mexc=True, vc="weekly"), "monthly")
+    def test_no_exception_vendor_monthly(self):
+        self.assertEqual(self.r(oc=None, mexc=False, vc="monthly"), "monthly")
+
+    # 4) 거래처 규칙
+    def test_vendor_weekly(self):
+        self.assertEqual(self.r(oc=None, vc="weekly"), "weekly")
+
+    # 5) 기본 정기 — lead_time>=35 무시
+    def test_default_weekly_ignores_lead35(self):
+        self.assertEqual(self.r(oc=None, lead=35), "weekly")
+        self.assertEqual(self.r(oc=None, lead=99), "weekly")
+        self.assertEqual(self.r(oc=None, lead=0), "weekly")
+
+    # NULL/이상값 처리
+    def test_null_and_bad_values(self):
+        self.assertEqual(self.r(oc=None), "weekly")
+        self.assertEqual(self.r(oc="bogus", vc="monthly"), "monthly")  # 해석 불가->자동 취급
+        self.assertEqual(self.r(oc="", vc=None), "weekly")
+        self.assertEqual(self.r(vc="bogus"), "weekly")
+
+    # legacy 모드 위임
+    def test_legacy_mode_unchanged(self):
+        self.assertEqual(self.r(oc=None, lead=35, mode="legacy"), "monthly")
+        self.assertEqual(self.r(oc=None, lead=14, mode="legacy"), "weekly")
+        self.assertEqual(self.r(oc=None, lead=14, mexc=True, vc="monthly", mode="legacy"), "monthly")
+        self.assertEqual(self.r(oc="weekly", lead=35, mode="legacy"), "weekly")
+        self.assertEqual(self.r(mode="anything_else"), "weekly")
 
 
 class TestInvariants(unittest.TestCase):

@@ -23,7 +23,7 @@ load_dotenv(".env")
 app = FastAPI()
 
 from db import get_conn, pk_column, upsert_suffix, USE_POSTGRES  # noqa: E402
-from order_policy import effective_order_cycle  # noqa: E402
+from order_policy import effective_order_cycle, resolve_order_cycle, match_vendor_rule  # noqa: E402
 
 def is_item_consumable(conn, branch_code: str, item_code: str) -> bool:
     """items 테이블 기준 소모품 여부 확인 (RAW 자동반영 대상 판별용)"""
@@ -2273,6 +2273,9 @@ def init_db():
         conn.execute(
             "ALTER TABLE IF EXISTS product_master ADD COLUMN IF NOT EXISTS order_cycle TEXT"
         )
+        conn.execute(
+            "ALTER TABLE IF EXISTS product_master ADD COLUMN IF NOT EXISTS order_excluded_auto INTEGER"
+        )
     else:
         _pm_tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='product_master'"
@@ -2281,6 +2284,30 @@ def init_db():
             _pm_existing = {r[1] for r in conn.execute("PRAGMA table_info(product_master)").fetchall()}
             if "order_cycle" not in _pm_existing:
                 conn.execute("ALTER TABLE product_master ADD COLUMN order_cycle TEXT")
+            if "order_excluded_auto" not in _pm_existing:
+                conn.execute("ALTER TABLE product_master ADD COLUMN order_excluded_auto INTEGER")
+
+    # 거래처 단위 발주 방식 규칙 (신 모드 order_cycle_mode='new'에서만 사용)
+    # branch_code NULL = 전 지점. 거래처+지점 조합 UNIQUE (NULL 지점은 부분 유니크 인덱스).
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS order_cycle_vendor_rule (
+            {pk},
+            vendor_name TEXT NOT NULL,
+            branch_code TEXT,
+            order_cycle TEXT NOT NULL,
+            memo TEXT,
+            updated_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_ocvr_vendor_branch
+        ON order_cycle_vendor_rule (vendor_name, branch_code)
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_ocvr_vendor_all
+        ON order_cycle_vendor_rule (vendor_name)
+        WHERE branch_code IS NULL
+    """)
 
     # 거래명세서 확인 — 명세서↔상품 별칭, 업로드, 추출 행
     conn.execute(f"""
@@ -5081,38 +5108,67 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
 
 # ── 지점 재고 실사 (daily stocktake — 소모품 제외 전 품목, 거래처/품류 필터) ──
 
-# 거래처명 정규화 매핑 — 비어 있으면 원본 그대로 사용. "펫네스트"/"펫네스트(디자인주권)" 합치기 여부는
-# 운영 데이터 확인 후 여기 한 곳만 수정하면 된다 (기본: 합치지 않음).
-_DST_VENDOR_NAME_MAP = {}
+# 거래처명 정규화 매핑 — 비어 있으면 원본 그대로 사용. "펫네스트"(상품명 접두사)와
+# "펫네스트(디자인주권)"(구매내역 vendor)를 후자로 통일.
+_DST_VENDOR_NAME_MAP = {"펫네스트": "펫네스트(디자인주권)"}
 
 # 상품 DB상 "구매처 없음"을 의미하는 플레이스홀더 — 거래처 필터에서는 (미등록)으로 취급
 _DST_SUPPLIER_BLANK_VALUES = {"[삭제된구매처]"}
 
+_DST_NAME_PREFIX_RE = re.compile(r"^\s*\[([^\]]+)\]")
+
+
+def _dst_vendor_prefix(item_name: str) -> str:
+    """상품명 '[거래처] 상품명' 접두사에서 거래처 추출 (supplier 컬럼이 비어 있는 DB 대비 보조 소스)."""
+    m = _DST_NAME_PREFIX_RE.match(item_name or "")
+    if not m:
+        return ""
+    v = m.group(1).strip()
+    return "" if v in _DST_SUPPLIER_BLANK_VALUES else v
+
 
 def _daily_stocktake_pm_map() -> dict:
     """item_code -> {supplier, category, consumable}. product_master는 지점별 중복 행이 있어 품번별로 집계.
-    is_consumable은 PostgreSQL(boolean)/SQLite(int) 공통으로 CASE 집계 (COALESCE(x,0)은 PG에서 타입 오류)."""
+    is_consumable은 PostgreSQL(boolean)/SQLite(int) 공통으로 CASE 집계 (COALESCE(x,0)은 PG에서 타입 오류).
+    supplier 보조 소스: 컬럼이 비어 있으면 purchase_records 최신 vendor → 상품명 [거래처] 접두사 순."""
     conn = get_conn()
     try:
-        rows = conn.execute(
-            "SELECT item_code, "
-            "MAX(CASE WHEN is_consumable THEN 1 ELSE 0 END) AS is_consumable, "
-            "min(NULLIF(trim(COALESCE(supplier, '')), '')) AS supplier, "
-            "min(NULLIF(trim(COALESCE(category, '')), '')) AS category "
-            "FROM product_master "
-            "WHERE item_code IS NOT NULL AND item_code <> '' "
-            "GROUP BY item_code"
-        ).fetchall()
-    except Exception:
-        # product_master 테이블이 없는 환경(SQLite 로컬 등)에서는 마스터 정보 없이 진행
-        rows = []
+        try:
+            rows = conn.execute(
+                "SELECT item_code, "
+                "MAX(CASE WHEN is_consumable THEN 1 ELSE 0 END) AS is_consumable, "
+                "min(NULLIF(trim(COALESCE(supplier, '')), '')) AS supplier, "
+                "min(NULLIF(trim(COALESCE(category, '')), '')) AS category, "
+                "min(NULLIF(trim(COALESCE(item_name, '')), '')) AS item_name "
+                "FROM product_master "
+                "WHERE item_code IS NOT NULL AND item_code <> '' "
+                "GROUP BY item_code"
+            ).fetchall()
+        except Exception:
+            # product_master 테이블이 없는 환경(SQLite 로컬 등)에서는 마스터 정보 없이 진행
+            rows = []
+        try:
+            pv_rows = conn.execute(
+                "SELECT item_code, vendor FROM purchase_records "
+                "WHERE vendor IS NOT NULL AND trim(vendor) <> '' "
+                "ORDER BY purchase_datetime DESC"
+            ).fetchall()
+        except Exception:
+            pv_rows = []
     finally:
         conn.close()
+    purchase_vendor = {}
+    for r in pv_rows:
+        purchase_vendor.setdefault(str(r["item_code"]), (r["vendor"] or "").strip())
     pm = {}
     for r in rows:
         supplier = (r["supplier"] or "").strip()
         if supplier in _DST_SUPPLIER_BLANK_VALUES:
             supplier = ""
+        if not supplier:
+            supplier = purchase_vendor.get(str(r["item_code"]), "")
+        if not supplier:
+            supplier = _dst_vendor_prefix(r["item_name"] or "")
         supplier = _DST_VENDOR_NAME_MAP.get(supplier, supplier)
         pm[str(r["item_code"])] = {
             "supplier": supplier,
@@ -5162,10 +5218,12 @@ def _daily_stocktake_items(branch_code: str):
         if ups is None and qr_qty == 0:
             excluded += 1
             continue
+        supplier = info.get("supplier") or _dst_vendor_prefix(r["item_name"])
+        supplier = _DST_VENDOR_NAME_MAP.get(supplier, supplier)
         items.append({
             "item_code": code,
             "item_name": r["item_name"],
-            "supplier": info.get("supplier", ""),
+            "supplier": supplier,
             "category": info.get("category", ""),
             "qr_qty": qr_qty,
             "ups": ups,
@@ -5205,6 +5263,9 @@ async def daily_stocktake_page(
     date: str = "",
     vendor: str = "",
     category: str = "",
+    q: str = "",
+    sort: str = "",
+    diff_only: str = "",
 ):
     """재고 실사 — 날짜/거래처/품류 선택 후 소모품 제외 품목 실사 수량 입력·저장. 마스터는 지점 선택 후 실사 가능."""
     import html as _html
@@ -5228,6 +5289,11 @@ async def daily_stocktake_page(
         sel_date = today_kst
     sel_date_str = sel_date.strftime("%Y-%m-%d")
     today_str = today_kst.strftime("%Y-%m-%d")
+
+    # 검색/정렬/오차필터 상태 — GET 폼 제출(조회) 후에도 유지되도록 URL 파라미터로 복원
+    q = (q or "").strip()[:100]
+    sort = sort if sort in ("size", "color") else "default"
+    diff_only_on = diff_only in ("1", "true", "on")
 
     target_branch = filter_branch if is_master_user else user["branch_code"]
 
@@ -5434,21 +5500,21 @@ async def daily_stocktake_page(
         "</div>"
         '<div style="flex:1;min-width:140px;max-width:200px;">'
         '<label style="font-size:12px;color:#888;">검색</label>'
-        '<input id="dstSearch" type="text" placeholder="상품명/상품코드 일부 입력" '
+        f'<input id="dstSearch" name="q" type="text" value="{_html.escape(q)}" placeholder="상품명/상품코드 일부 입력" '
         'oninput="dstApplyView()" onkeydown="if(event.key===\'Enter\')event.preventDefault();" '
         'style="margin-top:4px;">'
         "</div>"
         '<div style="flex:1;min-width:110px;max-width:150px;">'
         '<label style="font-size:12px;color:#888;">정렬</label>'
-        '<select id="dstSortMode" onchange="dstApplyView()" style="margin-top:4px;">'
-        '<option value="default">기본 순서</option>'
-        '<option value="size">사이즈별 정렬</option>'
-        '<option value="color">색상별 정렬</option>'
+        '<select id="dstSortMode" name="sort" onchange="dstApplyView()" style="margin-top:4px;">'
+        f'<option value="default"{" selected" if sort == "default" else ""}>기본 순서</option>'
+        f'<option value="size"{" selected" if sort == "size" else ""}>사이즈별 정렬</option>'
+        f'<option value="color"{" selected" if sort == "color" else ""}>색상별 정렬</option>'
         "</select>"
         "</div>"
         '<div style="display:flex;align-items:flex-end;padding-bottom:4px;">'
-        '<label style="font-size:12px;color:#444;display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;">'
-        '<input type="checkbox" id="dstDiffOnly" onchange="dstApplyView()"> 오차만 보기</label>'
+        f'<label style="font-size:12px;color:#444;display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;">'
+        f'<input type="checkbox" id="dstDiffOnly" name="diff_only" value="1"{" checked" if diff_only_on else ""} onchange="dstApplyView()"> 오차만 보기</label>'
         "</div>"
         '<button class="btn" type="submit">조회</button>'
         '<a href="/daily-stocktake" style="padding:10px 14px;background:#eee;'
@@ -5550,9 +5616,10 @@ async def daily_stocktake_page(
       // ── 클라이언트 필터/검색/정렬 ──
       var DST_SORT_COL = {name:1, code:2, qr:3, ups:4};
       var DST_SORT_STATE = {col: null, dir: 1};
-      var DST_SIZE_RE = /(소형|중형|대형|특대)/;
-      var DST_COLOR_RE = /(핑크|퍼플|화이트|블랙|레드|블루|그린|베이지|그레이|네이비|옐로우|오렌지|브라운|골드|실버|라벤더|민트|카키)/;
-      var DST_SIZE_ORD = ['소형','중형','대형','특대'];
+      var DST_SIZE_RE = /(초소형|특대|소형|중형|대형)/;
+      // 색상은 한글/영문 경계가 있는 토큰만 매칭 — '[블루어]'의 '블루', '레드오크'의 '레드' 오인 방지
+      var DST_COLOR_RE = /(?:^|[^가-힣A-Za-z0-9])(핑크|퍼플|화이트|블랙|레드|블루|그린|베이지|그레이|네이비|옐로우|오렌지|브라운|골드|실버|라벤더|민트|카키)(?=$|[^가-힣A-Za-z0-9])/;
+      var DST_SIZE_ORD = ['초소형','소형','중형','대형','특대'];
       var DST_COLOR_ORD = ['핑크','퍼플','화이트','블랙','레드','블루','그린','베이지','그레이','네이비','옐로우','오렌지','브라운','골드','실버','라벤더','민트','카키'];
       function dstTokRank(name, ord) {
         var m = name.match(DST_SIZE_RE) || name.match(DST_COLOR_RE);
@@ -18628,11 +18695,30 @@ async def _compute_purchase_order_candidates() -> dict:
 
     # ── 4) product_master에서 item_code별 대표 1행 (리드타임/MOQ/소모품여부/전체미발주 - 상품별 공통값) ──
     pm_rows = conn.execute(
-        "SELECT DISTINCT ON (item_code) item_code, lead_time_days, moq, is_consumable, order_excluded, order_cycle "
+        "SELECT DISTINCT ON (item_code) item_code, lead_time_days, moq, is_consumable, order_excluded, order_cycle, supplier "
         "FROM product_master WHERE item_code IS NOT NULL AND item_code != '' "
         "ORDER BY item_code, id"
     ).fetchall()
     pm_map = {r["item_code"]: r for r in pm_rows}
+
+    # ── 4-b) 발주 방식 모드 + 거래처 규칙 (신 모드 전용, legacy에서는 읽지 않음) ──
+    order_cycle_mode = "legacy"
+    try:
+        _mode_row = conn.execute(
+            "SELECT value FROM system_settings WHERE key='order_cycle_mode'"
+        ).fetchone()
+        if _mode_row and str(_mode_row["value"]).strip().lower() == "new":
+            order_cycle_mode = "new"
+    except Exception:
+        order_cycle_mode = "legacy"  # system_settings 미존재 등 -> 안전하게 legacy
+    vendor_rules = []
+    if order_cycle_mode == "new":
+        try:
+            vendor_rules = [dict(r) for r in conn.execute(
+                "SELECT vendor_name, branch_code, order_cycle FROM order_cycle_vendor_rule"
+            ).fetchall()]
+        except Exception:
+            vendor_rules = []
 
     # ── 5) 월1회예외 목록: (item_name, branch_code) 조합 집합 ──
     monthly_exc_rows = conn.execute(
@@ -18719,11 +18805,16 @@ async def _compute_purchase_order_candidates() -> dict:
         # 5. 발주 방식 분류: order_cycle 명시값 우선, NULL이면 레거시(lead>=35 또는 월예외→월간)
         #    지점 월 발주 예외는 상품 설정보다 우선. 'none'은 명시 미발주.
         is_monthly_by_exception = ((item_code, branch_code) in monthly_exc_set) or ((item_name, branch_code) in monthly_exc_name_set)
-        cycle = effective_order_cycle(
-            pm["order_cycle"] if pm else None,
+        _pm_oc = pm["order_cycle"] if pm else None
+        _pm_supplier = pm["supplier"] if pm else None
+        _vendor_cycle = match_vendor_rule(vendor_rules, _pm_supplier, branch_code) if order_cycle_mode == "new" else None
+        cycle = resolve_order_cycle(
+            _pm_oc,
             order_excluded=False,  # order_excluded는 위에서 이미 제외됨
             lead_time_days=lead_time_days,
             monthly_exception=is_monthly_by_exception,
+            vendor_cycle=_vendor_cycle,
+            mode=order_cycle_mode,
         )
         if cycle == "none":
             continue
@@ -19003,6 +19094,13 @@ async def purchase_order_product_settings_page(
     eod_exc_rows = conn.execute(
         "SELECT item_code, branch_code FROM eod_alert_exclusion"
     ).fetchall()
+    try:
+        vendor_rule_rows = [dict(r) for r in conn.execute(
+            "SELECT id, vendor_name, branch_code, order_cycle, memo, updated_at "
+            "FROM order_cycle_vendor_rule ORDER BY vendor_name, branch_code"
+        ).fetchall()]
+    except Exception:
+        vendor_rule_rows = []
     conn.close()
 
     monthly_exc_map: Dict[str, list] = {}
@@ -19017,6 +19115,23 @@ async def purchase_order_product_settings_page(
         [{"code": b["branch_code"], "name": b["branch_name"]} for b in branches], ensure_ascii=False
     )
     branch_name_to_code = {b["branch_name"]: b["branch_code"] for b in branches}
+    vr_branch_options = '<option value="">전 지점</option>'
+    for b in branches:
+        vr_branch_options += f'<option value="{b["branch_code"]}">{b["branch_name"]}</option>'
+    vr_rules_html = ""
+    if vendor_rule_rows:
+        for vr in vendor_rule_rows:
+            _vr_bc = vr["branch_code"] or "전 지점"
+            vr_rules_html += f"""
+            <tr>
+              <td>{vr['vendor_name']}</td>
+              <td>{_vr_bc}</td>
+              <td>{'월 발주' if vr['order_cycle'] == 'monthly' else '정기'}</td>
+              <td>{vr['memo'] or ''}</td>
+              <td><button class="btn" style="font-size:11px;padding:4px 8px;background:#EF4444;" onclick="delVendorRule({vr['id']})">삭제</button></td>
+            </tr>"""
+    else:
+        vr_rules_html = '<tr><td colspan="5" style="text-align:center;color:#888;">등록된 규칙 없음</td></tr>'
     branch_filter_options = '<option value="">전체 지점</option>'
     for b in branches:
         sel = "selected" if filter_branch == b["branch_name"] else ""
@@ -19052,6 +19167,8 @@ async def purchase_order_product_settings_page(
                 lead_time_days=r["lead_time_days"] or 0,
                 monthly_exception=_mexc_hit,
             )
+            _stored_oc = r["order_cycle"] if ("order_cycle" in r.keys() and r["order_cycle"]) else None
+            _sel_cycle = _stored_oc or ("none" if bool(r["order_excluded"]) else "auto")
             rows_html += f"""
             <tr>
               <td style="text-align:center;"><input type="checkbox" class="pm-row-check" data-id="{r['id']}" data-itemcode="{item_code_attr}" data-itemname="{item_name_attr}" style="width:18px;height:18px;"></td>
@@ -19064,9 +19181,10 @@ async def purchase_order_product_settings_page(
               <td class="pm-col-leadtime"><input type="number" class="pm-leadtime" data-id="{r['id']}" value="{r['lead_time_days'] or 0}"></td>
               <td class="pm-col-moq"><input type="number" class="pm-moq" data-id="{r['id']}" value="{r['moq'] or 1}"></td>
               <td class="pm-col-cycle"><select class="pm-cycle" data-id="{r['id']}">
-                <option value="weekly" {'selected' if _eff_cycle == 'weekly' else ''}>정기(격주)</option>
-                <option value="monthly" {'selected' if _eff_cycle == 'monthly' else ''}>월 발주</option>
-                <option value="none" {'selected' if _eff_cycle == 'none' else ''}>미발주</option>
+                <option value="auto" {'selected' if _sel_cycle == 'auto' else ''}>자동</option>
+                <option value="weekly" {'selected' if _sel_cycle == 'weekly' else ''}>정기</option>
+                <option value="monthly" {'selected' if _sel_cycle == 'monthly' else ''}>월 발주</option>
+                <option value="none" {'selected' if _sel_cycle == 'none' else ''}>미발주</option>
               </select></td>
               <td class="pm-col-minsafe"><input type="number" class="pm-minsafe" data-id="{r['id']}" value="{r['min_safety_qty'] if r['min_safety_qty'] is not None else ''}" min="0" placeholder="공통" style="width:80px;"></td>
               <td class="pm-col-consumable" style="text-align:center;"><input type="checkbox" class="pm-consumable" data-id="{r['id']}" {consumable_checked} style="width:18px;height:18px;"></td>
@@ -19098,7 +19216,27 @@ async def purchase_order_product_settings_page(
 
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
       <p style="font-size:13px;color:#1E40AF;">상품별 단가, 거래처, 과세설정, 리드타임, MOQ, 소모품 여부를 관리합니다. 발주서 자동생성 시 이 정보를 사용합니다.</p>
-      <p style="font-size:12px;color:#B45309;margin-top:6px;">발주 방식(정기/월 발주/미발주)은 품번 단위로 모든 지점에 함께 저장됩니다. 미발주는 전체 미발주(숨김)와 연동되며, 지점 월 발주 예외(지방점 주발주 제외)는 상품 설정보다 우선합니다.</p>
+      <p style="font-size:12px;color:#B45309;margin-top:6px;">발주 방식(자동/정기/월 발주/미발주)은 품번 단위로 모든 지점에 함께 저장됩니다. '자동'은 저장값을 비워 거래처 규칙·월 발주 예외·기본값으로 판정합니다. 미발주는 전체 미발주(숨김)와 연동됩니다.</p>
+    </div>
+
+    <div class="card" style="background:#FAF5FF;border:1px solid #DDD6FE;">
+      <h3 style="margin-bottom:6px;">🏪 거래처별 발주 방식 규칙</h3>
+      <p style="font-size:12px;color:#6D28D9;margin-bottom:10px;">'자동' 상품의 발주 방식을 거래처 단위로 지정합니다. 지점 지정 규칙이 '전 지점' 규칙보다 우선합니다. <b>현재는 신 모드(order_cycle_mode=new)에서만 적용</b>되며, 기본 legacy 모드의 발주 분류에는 영향이 없습니다.</p>
+      <table style="width:100%;font-size:13px;border-collapse:collapse;">
+        <thead><tr style="background:#F3E8FF;"><th style="padding:6px;border:1px solid #E9D5FF;">거래처</th><th style="padding:6px;border:1px solid #E9D5FF;">지점</th><th style="padding:6px;border:1px solid #E9D5FF;">발주 방식</th><th style="padding:6px;border:1px solid #E9D5FF;">메모</th><th style="padding:6px;border:1px solid #E9D5FF;"></th></tr></thead>
+        <tbody>{vr_rules_html}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center;">
+        <input type="text" id="vrVendor" placeholder="거래처명 (예: 숨의)" style="padding:8px;border:1px solid #DDD6FE;border-radius:6px;">
+        <select id="vrBranch">{vr_branch_options}</select>
+        <select id="vrCycle">
+          <option value="monthly">월 발주</option>
+          <option value="weekly">정기</option>
+        </select>
+        <input type="text" id="vrMemo" placeholder="메모(선택)" style="padding:8px;border:1px solid #DDD6FE;border-radius:6px;">
+        <button class="btn" type="button" onclick="addVendorRule()" style="background:#8B5CF6;">+ 규칙 추가</button>
+      </div>
+      <div id="vrResult" style="margin-top:6px;font-size:12px;color:#555;"></div>
     </div>
 
     <div class="card">
@@ -19113,7 +19251,8 @@ async def purchase_order_product_settings_page(
         <input type="number" id="pmLeadTime" placeholder="리드타임(일)" style="flex:1;min-width:100px;">
         <input type="number" id="pmMoq" placeholder="MOQ(기본 1)" style="flex:1;min-width:100px;">
         <select id="pmCycle" style="flex:1;min-width:110px;">
-          <option value="weekly">정기(격주)</option>
+          <option value="auto">자동</option>
+          <option value="weekly">정기</option>
           <option value="monthly">월 발주</option>
           <option value="none">미발주</option>
         </select>
@@ -19161,7 +19300,8 @@ async def purchase_order_product_settings_page(
           <input type="number" id="pmBulkMin" placeholder="최소 안전재고 일괄값" min="0" style="width:150px;">
           <select id="pmBulkCycle" style="width:130px;">
             <option value="">발주 방식 (선택)</option>
-            <option value="weekly">정기(격주)</option>
+            <option value="auto">자동</option>
+            <option value="weekly">정기</option>
             <option value="monthly">월 발주</option>
             <option value="none">미발주</option>
           </select>
@@ -19399,7 +19539,7 @@ async def purchase_order_product_settings_page(
             moq: parseInt(moqEl.value) || 1,
             min_safety_qty: (minEl && minEl.value.trim() !== '') ? Math.max(0, parseInt(minEl.value) || 0) : null,
             is_consumable: consumableEl.checked,
-            order_cycle: cycleEl ? cycleEl.value : 'weekly',
+            order_cycle: cycleEl ? cycleEl.value : undefined,
             category: categoryEl.value.trim(),
             product_type: ptypeEl.value.trim(),
             consumable_type: ctypeEl.value.trim()
@@ -19452,13 +19592,29 @@ async def purchase_order_product_settings_page(
         if (e.target.classList.contains('pm-row-check')) updatePmCheckedCount();
       }});
 
+      // 화면 전체 저장: 페이지 로드 시점 값과 비교해 변경된 행만 전송
+      // (사용자가 건드리지 않은 행에 order_cycle 등 명시값이 생기는 것을 방지)
+      function pmCaptureOriginals() {{
+        document.querySelectorAll('.pm-table input, .pm-table select').forEach(el => {{
+          el.dataset.orig = (el.type === 'checkbox' || el.type === 'radio') ? String(el.checked) : el.value;
+        }});
+      }}
+      function pmRowChanged(id) {{
+        return Array.from(document.querySelectorAll('.pm-table [data-id="' + id + '"]')).some(el => {{
+          const cur = (el.type === 'checkbox' || el.type === 'radio') ? String(el.checked) : el.value;
+          return el.dataset.orig !== undefined && cur !== el.dataset.orig;
+        }});
+      }}
+
       async function saveAllPmRows() {{
-        const ids = Array.from(document.querySelectorAll('.pm-price[data-id]')).map(el => el.dataset.id);
+        const allIds = Array.from(document.querySelectorAll('.pm-price[data-id]')).map(el => el.dataset.id);
+        const ids = allIds.filter(pmRowChanged);
+        if (!ids.length) {{ alert('변경된 항목이 없습니다.'); return; }}
         const rows = ids.map(id => {{
           const priceEl = document.querySelector('.pm-price[data-id="' + id + '"]');
           const leadTimeEl = document.querySelector('.pm-leadtime[data-id="' + id + '"]');
           const moqEl = document.querySelector('.pm-moq[data-id="' + id + '"]');
-        const minEl = document.querySelector('.pm-minsafe[data-id="' + id + '"]');
+          const minEl = document.querySelector('.pm-minsafe[data-id="' + id + '"]');
           const consumableEl = document.querySelector('.pm-consumable[data-id="' + id + '"]');
           const cycleEl = document.querySelector('.pm-cycle[data-id="' + id + '"]');
           const categoryEl = document.querySelector('.pm-category[data-id="' + id + '"]');
@@ -19471,14 +19627,14 @@ async def purchase_order_product_settings_page(
             moq: parseInt(moqEl.value) || 1,
             min_safety_qty: (minEl && minEl.value.trim() !== '') ? Math.max(0, parseInt(minEl.value) || 0) : null,
             is_consumable: consumableEl.checked,
-            order_cycle: cycleEl ? cycleEl.value : 'weekly',
+            order_cycle: cycleEl ? cycleEl.value : undefined,
             category: categoryEl.value.trim(),
             product_type: ptypeEl.value.trim(),
             consumable_type: ctypeEl.value.trim()
           }};
         }});
         if (!rows.length) {{ alert('저장할 항목이 없습니다.'); return; }}
-        if (!confirm(rows.length + '건을 전체 저장하시겠습니까?')) return;
+        if (!confirm(rows.length + '건(변경된 행만)을 전체 저장하시겠습니까?')) return;
         const res = await fetch('/master/purchase-order/product-master/bulk-save', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
           body: JSON.stringify({{ rows: rows }})
@@ -19516,6 +19672,35 @@ async def purchase_order_product_settings_page(
         }} else {{
           alert('적용 실패: ' + (data.detail || '오류'));
         }}
+      }}
+
+      pmCaptureOriginals();
+
+      async function addVendorRule() {{
+        const vendor = document.getElementById('vrVendor').value.trim();
+        if (!vendor) {{ alert('거래처명을 입력하세요.'); return; }}
+        const res = await fetch('/master/purchase-order/vendor-rule/save', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            vendor_name: vendor,
+            branch_code: document.getElementById('vrBranch').value || null,
+            order_cycle: document.getElementById('vrCycle').value,
+            memo: document.getElementById('vrMemo').value.trim()
+          }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{
+          const err = await res.json().catch(() => ({{}}));
+          document.getElementById('vrResult').innerText = '오류: ' + (err.detail || '저장 실패');
+        }}
+      }}
+
+      async function delVendorRule(id) {{
+        if (!confirm('이 규칙을 삭제하시겠습니까?')) return;
+        const res = await fetch('/master/purchase-order/vendor-rule/delete', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ id: id }})
+        }});
+        if (res.ok) {{ location.reload(); }} else {{ alert('삭제 실패'); }}
       }}
     </script>
     """
@@ -19981,23 +20166,34 @@ def _set_min_safety_qty(conn, row_ids, value, now):
 
 
 def _parse_order_cycle(v):
-    """발주 방식 입력값 검증. 허용: weekly/monthly/none(별칭 포함). None/빈값 -> None, 그 외 ValueError."""
+    """발주 방식 입력값 검증. 허용: auto/weekly/monthly/none(별칭 포함).
+    auto/빈값/None -> 'auto'(=order_cycle NULL, 자동 해석). 그 외 ValueError."""
     from order_policy import normalize_order_cycle
     if v is None:
-        return None
+        return "auto"
     if isinstance(v, str) and v.strip() == "":
-        return None
+        return "auto"
+    if isinstance(v, str) and v.strip().lower() in ("auto", "자동"):
+        return "auto"
     n = normalize_order_cycle(v)
     if n is None:
-        raise ValueError("order_cycle must be weekly/monthly/none")
+        raise ValueError("order_cycle must be auto/weekly/monthly/none")
     return n
 
 
 def _set_order_cycle(conn, row_ids, value, now):
-    """선택한 행과 품번이 같은 모든 지점 행에 발주 방식을 함께 저장하고,
-    order_cycle='none' <-> order_excluded 를 일치시킨다.
+    """선택한 행과 품번이 같은 모든 지점 행에 발주 방식을 함께 저장한다.
     (품번 단위 공통 속성이므로 _set_min_safety_qty와 같은 동기 저장 규칙)
-    value가 None이면 아무것도 바꾸지 않는다."""
+
+    value: 'weekly'|'monthly'|'none'|'auto'
+      - 'none': order_cycle='none' + order_excluded=TRUE.
+        단, 이미 order_excluded=TRUE인 행(수동 숨김)은 order_excluded_auto를
+        건드리지 않아 수동 제외를 보존한다.
+      - 'weekly'/'monthly'/'auto': order_cycle=값/'auto'는 NULL.
+        order_excluded_auto=1인 행(미발주 선택으로 자동 설정된 값)만
+        order_excluded를 FALSE로 해제하고 auto를 0으로 되돌린다.
+        수동 숨김(auto=0/NULL)된 행의 order_excluded는 보존한다.
+    value가 None이면 아무것도 바꾸지 않는다(키 미제공과 동일)."""
     if value is None:
         return
     ids = [int(i) for i in row_ids]
@@ -20009,19 +20205,40 @@ def _set_order_cycle(conn, row_ids, value, now):
     ).fetchall()
     codes = sorted({r["item_code"] for r in found if (r["item_code"] or "").strip()})
     no_code_ids = [int(r["id"]) for r in found if not (r["item_code"] or "").strip()]
-    excluded = 1 if value == "none" else 0
-    if codes:
-        cph = ",".join("?" for _ in codes)
-        conn.execute(
-            f"UPDATE product_master SET order_cycle=?, order_excluded=?, updated_at=? WHERE item_code IN ({cph})",
-            [value, excluded, now] + codes
-        )
-    if no_code_ids:
-        nph = ",".join("?" for _ in no_code_ids)
-        conn.execute(
-            f"UPDATE product_master SET order_cycle=?, order_excluded=?, updated_at=? WHERE id IN ({nph})",
-            [value, excluded, now] + no_code_ids
-        )
+
+    def _targets():
+        if codes:
+            cph = ",".join("?" for _ in codes)
+            yield f"item_code IN ({cph})", list(codes)
+        if no_code_ids:
+            nph = ",".join("?" for _ in no_code_ids)
+            yield f"id IN ({nph})", list(no_code_ids)
+
+    for where, params in _targets():
+        if value == "none":
+            conn.execute(
+                f"""UPDATE product_master SET order_cycle='none', order_excluded=TRUE,
+                       order_excluded_auto=CASE
+                         WHEN COALESCE(order_excluded, FALSE) THEN COALESCE(order_excluded_auto, 0)
+                         ELSE 1 END,
+                       updated_at=?
+                    WHERE {where}""",
+                [now] + params
+            )
+        else:
+            oc_val = None if value == "auto" else value
+            conn.execute(
+                f"""UPDATE product_master SET order_cycle=?,
+                       order_excluded=CASE
+                         WHEN COALESCE(order_excluded_auto, 0) = 1 THEN FALSE
+                         ELSE order_excluded END,
+                       order_excluded_auto=CASE
+                         WHEN COALESCE(order_excluded_auto, 0) = 1 THEN 0
+                         ELSE order_excluded_auto END,
+                       updated_at=?
+                    WHERE {where}""",
+                [oc_val, now] + params
+            )
 
 
 @app.post("/master/purchase-order/product-master/save")
@@ -20054,14 +20271,14 @@ async def purchase_order_product_master_save(request: Request, session_token: st
         except (ValueError, TypeError):
             return JSONResponse(status_code=400, content={"detail": "최소 안전재고는 0 이상의 정수로 입력하세요."})
 
-    # 발주 방식도 요청에 키가 있을 때만 반영 (weekly/monthly/none, 미발주<->order_excluded 동기화)
+    # 발주 방식도 요청에 키가 있을 때만 반영 (auto/weekly/monthly/none, 미발주<->order_excluded 동기화)
     cycle_provided = "order_cycle" in data
     order_cycle = None
     if cycle_provided:
         try:
             order_cycle = _parse_order_cycle(data.get("order_cycle"))
         except (ValueError, TypeError):
-            return JSONResponse(status_code=400, content={"detail": "발주 방식은 정기/월 발주/미발주 중 하나여야 합니다."})
+            return JSONResponse(status_code=400, content={"detail": "발주 방식은 자동/정기/월 발주/미발주 중 하나여야 합니다."})
 
     now = datetime.now().isoformat()
     conn = get_conn()
@@ -20216,11 +20433,11 @@ async def purchase_order_product_master_bulk_apply(request: Request, session_tok
     lead_time_days = data.get("lead_time_days")
     moq = data.get("moq")
     order_cycle = None
-    if data.get("order_cycle") is not None:
+    if "order_cycle" in data:
         try:
             order_cycle = _parse_order_cycle(data.get("order_cycle"))
         except (ValueError, TypeError):
-            return JSONResponse(status_code=400, content={"detail": "발주 방식은 정기/월 발주/미발주 중 하나여야 합니다."})
+            return JSONResponse(status_code=400, content={"detail": "발주 방식은 자동/정기/월 발주/미발주 중 하나여야 합니다."})
     min_provided = data.get("min_safety_qty") is not None
     min_safety_qty = None
     if min_provided:
@@ -20281,9 +20498,74 @@ async def purchase_order_product_master_hide(request: Request, session_token: st
     now = datetime.now().isoformat()
     conn = get_conn()
     conn.execute(
-        "UPDATE product_master SET order_excluded=?, updated_at=? WHERE id=?",
+        "UPDATE product_master SET order_excluded=?, order_excluded_auto=0, updated_at=? WHERE id=?",
         (hidden, now, row_id)
     )
+    conn.commit()
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/purchase-order/vendor-rule/save")
+async def purchase_order_vendor_rule_save(request: Request, session_token: str = Cookie(default=None)):
+    """거래처별 발주 방식 규칙 추가/수정 (신 모드 order_cycle_mode='new'에서만 적용)."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    vendor_name = (data.get("vendor_name") or "").strip()
+    branch_code = (data.get("branch_code") or "").strip() or None
+    try:
+        order_cycle = _parse_order_cycle(data.get("order_cycle"))
+    except (ValueError, TypeError):
+        return JSONResponse(status_code=400, content={"detail": "발주 방식 값이 올바르지 않습니다."})
+    if order_cycle not in ("weekly", "monthly"):
+        return JSONResponse(status_code=400, content={"detail": "거래처 규칙은 정기/월 발주만 지정할 수 있습니다."})
+    if not vendor_name:
+        return JSONResponse(status_code=400, content={"detail": "거래처명을 입력하세요."})
+    memo = (data.get("memo") or "").strip() or None
+    rule_id = data.get("id")
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    try:
+        if rule_id:
+            conn.execute(
+                "UPDATE order_cycle_vendor_rule SET vendor_name=?, branch_code=?, order_cycle=?, memo=?, updated_at=? WHERE id=?",
+                (vendor_name, branch_code, order_cycle, memo, now, int(rule_id))
+            )
+        else:
+            conn.execute(
+                """INSERT INTO order_cycle_vendor_rule (vendor_name, branch_code, order_cycle, memo, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT DO NOTHING""",
+                (vendor_name, branch_code, order_cycle, memo, now)
+            )
+            # 유니크 충돌로 삽입이 무시됐으면 기존 행 갱신 (NULL-safe 비교, PG/SQLite 공통)
+            conn.execute(
+                """UPDATE order_cycle_vendor_rule
+                   SET order_cycle=?, memo=?, updated_at=?
+                   WHERE vendor_name=? AND ((branch_code = ?) OR (branch_code IS NULL AND ? IS NULL))""",
+                (order_cycle, memo, now, vendor_name, branch_code, branch_code)
+            )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=400, content={"detail": f"저장 실패: {e}"})
+    conn.close()
+    return JSONResponse(content={"status": "ok"})
+
+
+@app.post("/master/purchase-order/vendor-rule/delete")
+async def purchase_order_vendor_rule_delete(request: Request, session_token: str = Cookie(default=None)):
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=403, content={"detail": "권한이 없습니다."})
+    data = await request.json()
+    rule_id = data.get("id")
+    if not rule_id:
+        return JSONResponse(status_code=400, content={"detail": "규칙이 지정되지 않았습니다."})
+    conn = get_conn()
+    conn.execute("DELETE FROM order_cycle_vendor_rule WHERE id=?", (int(rule_id),))
     conn.commit()
     conn.close()
     return JSONResponse(content={"status": "ok"})

@@ -66,6 +66,70 @@ def effective_order_cycle(order_cycle, order_excluded=False, lead_time_days=0,
     return "monthly" if lead >= 35 else "weekly"
 
 
+def normalize_vendor_name(v):
+    """거래처명 정규화: 앞뒤 공백 제거 + 연속 공백 1개로. 빈값 -> ''."""
+    if v is None:
+        return ""
+    return " ".join(str(v).split())
+
+
+def match_vendor_rule(rules, supplier, branch_code):
+    """거래처 규칙 매칭. rules: [{'vendor_name','branch_code','order_cycle'}, ...]
+    - 거래처명은 normalize_vendor_name으로 정규화 후 정확히 비교
+    - branch_code가 지정된 규칙(지점 지정)이 branch_code=None(전 지점) 규칙보다 우선
+    - 반환: 'weekly'|'monthly'|None (매칭 규칙의 order_cycle 정규화 값)
+    """
+    sup = normalize_vendor_name(supplier)
+    if not sup:
+        return None
+    bc = branch_code or ""
+    best = None  # (우선순위, cycle) — 지점 지정=1, 전 지점=0
+    for r in rules or []:
+        vn = normalize_vendor_name(r.get("vendor_name"))
+        if vn != sup:
+            continue
+        rbc = r.get("branch_code") or ""
+        if rbc and rbc != bc:
+            continue
+        cyc = normalize_order_cycle(r.get("order_cycle"))
+        if cyc not in ("weekly", "monthly"):
+            continue
+        prio = 1 if rbc else 0
+        if best is None or prio > best[0]:
+            best = (prio, cyc)
+    return best[1] if best else None
+
+
+def resolve_order_cycle(order_cycle, order_excluded=False, lead_time_days=0,
+                        monthly_exception=False, vendor_cycle=None, mode="legacy"):
+    """모드별 실효 발주 방식.
+    mode='legacy': effective_order_cycle과 동일 (lead_time_days>=35 규칙 포함).
+    mode='new' 우선순위:
+      1) 미발주(order_excluded 또는 order_cycle='none')
+      2) 상품 명시 order_cycle('weekly'|'monthly')
+      3) 지점×품목 월 발주 예외 -> 'monthly'
+      4) 거래처 규칙(vendor_cycle, 이미 지점지정>전지점으로 해석된 값)
+      5) 기본 'weekly'  — lead_time_days는 사용하지 않음
+    """
+    if mode != "new":
+        return effective_order_cycle(order_cycle, order_excluded=order_excluded,
+                                     lead_time_days=lead_time_days,
+                                     monthly_exception=monthly_exception)
+    if order_excluded:
+        return "none"
+    oc = normalize_order_cycle(order_cycle)
+    if oc == "none":
+        return "none"
+    if oc in ("weekly", "monthly"):
+        return oc
+    if monthly_exception:
+        return "monthly"
+    vc = normalize_order_cycle(vendor_cycle)
+    if vc in ("weekly", "monthly"):
+        return vc
+    return "weekly"
+
+
 # ── 수량 계산 (순수 함수) ──────────────────────────────
 def _f(x):
     """float 변환, 실패/None -> 0.0"""
