@@ -71,7 +71,7 @@ NOTIFICATION_TYPES = {
     "restock_missing":     {"label": "미입고 알림",           "desc": "(준비 중)"},
     "safety_stock_change": {"label": "안전재고 변경 알림",     "desc": "(준비 중)"},
     "eod_alert":           {"label": "긴급발주 알림",         "desc": "목요일 도착 전 수요일 소진 예상 시"},
-    "stocktake_selection": {"label": "재고실사 진행 안내 알림", "desc": "월 재고실사 품목 선정 후 Power Automate로 Teams 공지 발송"},
+    "stocktake_selection": {"label": "재고실사 진행 안내 알림", "desc": "월 재고실사 품목 선정 후 Teams '재고실사 알림' 채널로 공지 발송"},
 }
 
 TEAMS_ALERT_TYPES = {
@@ -121,17 +121,11 @@ TEAMS_ALERT_TYPES = {
         "toggle_route": "/master/toggle-stocktake-notify",
         "test_route": "/master/teams-webhook/test-stocktake-announce",
         "test_js_func": "testStocktakeAnnounce",
-        "on_desc": "월 재고실사 품목 선정 크론 실행 후 Power Automate로 Teams 공지 발송",
+        "on_desc": "월 재고실사 품목 선정 크론 실행 후 Teams '재고실사 알림' 채널로 발송",
         "off_desc": "발송 안 함",
         "default_enabled": False,
     },
 }
-
-# 재고실사 진행 안내 — Power Automate(Teams 공지) 웹훅. system_settings['stocktake_announce_url']이 있으면 그쪽 우선.
-STOCKTAKE_ANNOUNCE_URL = os.environ.get(
-    "STOCKTAKE_ANNOUNCE_URL",
-    "https://default7c7e173a362e45d68e5ba44f2f86cd.15.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/24/workflows/237f5c698fdf4ab6b6185faa20ee787f/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=gm6ISKc1TdrBrKZ21-XO2U3cEk8foN15pBjW5G-HvyE",
-)
 
 MENU_DEFINITIONS = {
     "data": "데이터 관리",
@@ -16232,16 +16226,24 @@ async def master_test_eod_alert(request: Request, session_token: str = Cookie(de
 
 @app.post("/master/teams-webhook/test-stocktake-announce")
 async def master_test_stocktake_announce(request: Request, session_token: str = Cookie(default=None)):
-    """재고실사 진행 안내 테스트 — Power Automate로 [테스트] 메시지 1건 발송."""
+    """재고실사 진행 안내 테스트 — 선택 채널로 [테스트] 메시지 1건 발송."""
     user = get_session(session_token)
     if not user or user["role"] != "master":
         return JSONResponse(status_code=401, content={"detail": "인증 실패"})
 
+    data = await request.json()
+    target_branch_code = data.get("branch_code", "").strip()
+    if not target_branch_code:
+        return JSONResponse(status_code=400, content={"detail": "테스트 대상 채널 코드가 필요합니다."})
+
     year_month = _kst_year_month()
-    ok, detail = await _stocktake_send_announce(year_month, test=True)
+    ok, detail = _stocktake_send_announce(
+        year_month, test=True, target=target_branch_code,
+        sent_by=f"test_by_{user['login_id']}"
+    )
     if not ok:
         return JSONResponse(status_code=502, content={"detail": f"발송 실패: {detail}"})
-    return JSONResponse(content={"success": True, "year_month": year_month, "detail": detail})
+    return JSONResponse(content={"success": True, "year_month": year_month, "channel": target_branch_code, "detail": detail})
 
 
 @app.post("/master/toggle-eod-alert")
@@ -17273,13 +17275,15 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
       }}
 
       async function testStocktakeAnnounce(alertKey) {{
+        const target = document.getElementById('testTarget_' + alertKey).value;
+        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
         const res = await fetch('/master/teams-webhook/test-stocktake-announce', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{}})
+          body: JSON.stringify({{ branch_code: target }})
         }});
         const result = await res.json();
         if (res.ok) {{
-          alert('테스트 발송 완료! Power Automate로 [테스트] 재고 실사 안내가 발송되었습니다.\\nTeams 채널을 확인하세요.');
+          alert('테스트 발송 완료! ' + result.year_month + ' 재고 실사 안내를 ' + result.channel + ' 채널로 발송했습니다.\\nTeams를 확인하세요.');
         }} else {{
           alert('오류: ' + (result.detail || '발송 실패'));
         }}
@@ -22235,23 +22239,22 @@ async def cron_compute_purchase_tracking_snapshot(authorization: str = Header(de
     result = await _compute_purchase_tracking_snapshot()
     return JSONResponse(content=result)
 
-async def _stocktake_send_announce(year_month: str, test: bool = False):
-    """재고실사 진행 안내를 Power Automate 웹훅으로 발송. 반환 (성공여부, 상세)."""
-    import httpx
-
-    url = STOCKTAKE_ANNOUNCE_URL
-    try:
-        conn = get_conn()
-        row = conn.execute(
-            "SELECT value FROM system_settings WHERE key='stocktake_announce_url'"
-        ).fetchone()
-        conn.close()
-        if row and row["value"] and row["value"].strip():
-            url = row["value"].strip()
-    except Exception:
-        pass
-    if not url:
-        return False, "공지 URL 미설정"
+def _stocktake_send_announce(year_month: str, test: bool = False, target: str = "", sent_by: str = "system_cron_stocktake"):
+    """재고실사 진행 안내를 Teams 웹훅으로 발송. 반환 (성공여부, 상세).
+    target 지정 시 해당 채널로, 아니면 system_settings['stocktake_announce_channel'] → 기본 'stocktake_alert'."""
+    channel = (target or "").strip()
+    if not channel:
+        channel = "stocktake_alert"
+        try:
+            conn = get_conn()
+            row = conn.execute(
+                "SELECT value FROM system_settings WHERE key='stocktake_announce_channel'"
+            ).fetchone()
+            conn.close()
+            if row and row["value"] and row["value"].strip():
+                channel = row["value"].strip()
+        except Exception:
+            pass
 
     ym_label = year_month
     try:
@@ -22263,18 +22266,16 @@ async def _stocktake_send_announce(year_month: str, test: bool = False):
     server_url = os.environ.get("PUBLIC_SERVER_URL", "https://inventory-sync-teal.vercel.app")
     link = f"{server_url}/master/stocktake"
     prefix = "[테스트] " if test else ""
-    text = (
-        f"{prefix}재고 실사 알림\n"
-        f"{link}\n"
-        f"{ym_label} 지점 재고실사 진행 부탁드립니다."
+    title = f"{prefix}📦 재고 실사 알림"
+    message = f"{ym_label} 지점 재고실사 진행 부탁드립니다.\n{link}"
+    return send_teams_notification(
+        channel,
+        title,
+        message,
+        link_url=link,
+        link_text="재고실사 바로가기",
+        sent_by=sent_by,
     )
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(url, json={"text": text, "message": text})
-        ok = resp.status_code < 400
-        return ok, f"HTTP {resp.status_code}"
-    except Exception as e:
-        return False, str(e)[:300]
 
 
 @app.get("/api/cron/select-stocktake-items")
@@ -22402,7 +22403,7 @@ async def _select_stocktake_items(year_month: str = None):
             pass
 
         if notify_on and selected_items_map and year_month == _kst_year_month():
-            await _stocktake_send_announce(year_month, test=False)
+            _stocktake_send_announce(year_month, test=False)
 
         return {
             "status": "ok",
