@@ -16101,6 +16101,13 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
         exc_rows = conn.execute(
             "SELECT branch_code, item_code FROM eod_alert_exclusion"
         ).fetchall()
+        # 미입고 발주(최신 상태가 '접수'/'승인')가 있는 지점x품번은 이미 발주된 상태 — 알럿 대상에서 제외
+        pend_rows = conn.execute("""
+            SELECT DISTINCT ON (branch_name, item_code) branch_name, item_code, status
+            FROM purchase_records
+            WHERE item_code IS NOT NULL AND item_code <> ''
+            ORDER BY branch_name, item_code, purchase_datetime DESC
+        """).fetchall()
         ss_rows = conn.execute(
             "SELECT branch_name, item_name, qty, safety_qty FROM safety_stock"
         ).fetchall()
@@ -16114,6 +16121,8 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
         ss_map[(r["branch_name"], r["item_name"])] = v
     pm_map = {r["item_code"]: r for r in pm_rows}
     exc_set = {(r["branch_code"], r["item_code"]) for r in exc_rows}
+    pending_set = {(r["branch_name"], r["item_code"]) for r in pend_rows
+                   if r["status"] in ("접수", "승인")}
     b2c = {b["branch_name"]: b["branch_code"] for b in get_branches(branch_type='branch')}
 
     items = []
@@ -16133,6 +16142,8 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
         if stock >= need:
             continue
         if (bc, ic) in exc_set:
+            continue
+        if (bn, ic) in pending_set:
             continue
         shortage = need - stock
         moq = pm["moq"] or 1
