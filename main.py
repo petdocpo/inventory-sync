@@ -584,7 +584,7 @@ async def notice_detail_page(notice_id: int, request: Request, session_token: st
     body_html = (
         '<h2>' + notice["title"] + '</h2>'
         '<p style="color:#999;font-size:13px;">' + str(notice["created_at"])[:16] + '</p>'
-        '<div style="margin:20px 0;line-height:1.6;">' + content_escaped + '</div>'
+        '<div style="margin:20px 0;line-height:1.6;white-space:pre-wrap;word-break:break-word;">' + content_escaped + '</div>'
         + check_button_html
         + script_block
     )
@@ -1355,7 +1355,7 @@ async def qna_detail_page(post_id: int, request: Request, session_token: str = C
     body_html = (
         '<h2>' + post["title"] + '</h2>'
         '<p style="color:#999;font-size:13px;">작성자: ' + post["author"] + ' · ' + str(post["created_at"])[:16] + '</p>'
-        '<div style="margin:20px 0;line-height:1.6;">' + content_escaped + '</div>'
+        '<div style="margin:20px 0;line-height:1.6;white-space:pre-wrap;word-break:break-word;">' + content_escaped + '</div>'
         + edit_delete_html
         + answer_html
         + delete_script
@@ -1607,7 +1607,7 @@ async def master_qna_detail(post_id: int, request: Request, session_token: str =
     body_html = (
         '<h2>' + post["title"] + secret_badge + '</h2>'
         '<p style="color:#999;font-size:13px;">' + post["branch_code"] + ' · 작성자: ' + post["author"] + ' · ' + str(post["created_at"])[:16] + '</p>'
-        '<div style="margin:20px 0;line-height:1.6;">' + content_escaped + '</div>'
+        '<div style="margin:20px 0;line-height:1.6;white-space:pre-wrap;word-break:break-word;">' + content_escaped + '</div>'
         + master_delete_html
         + answer_section_html
         + script_block
@@ -3187,6 +3187,18 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
     branch_name = user["branch_code"] if user and user["role"] == "branch" else ("마스터" if user else "")
     role_badge = f'<span style="background:#4FC3F7;color:white;padding:2px 10px;border-radius:12px;font-size:12px;margin-left:8px;">{branch_name}</span>' if user else ""
 
+    # 구매관리(smallbiz-app) 버튼 — SMALLBIZ_APP_URL 설정 + 마스터 권한 필요.
+    # Vercel 등 배포 환경에서는 localhost/127.0.0.1 주소를 숨긴다(지점 PC에서 깨진 링크 방지).
+    smallbiz_btn = ""
+    _sbz_url = os.getenv("SMALLBIZ_APP_URL", "").strip()
+    _sbz_local = any(h in _sbz_url for h in ("127.0.0.1", "localhost", "0.0.0.0"))
+    _sbz_on_vercel = bool(os.getenv("VERCEL"))
+    if _sbz_url and user and user["role"] == "master" and not (_sbz_on_vercel and _sbz_local):
+        smallbiz_btn = (
+            f'<a href="{_sbz_url}" target="_blank" rel="noopener" '
+            'style="background:#2E7D32;color:white;padding:5px 12px;border-radius:8px;'
+            'font-size:12px;cursor:pointer;margin-right:8px;text-decoration:none;white-space:nowrap;">🛒 구매관리</a>')
+
     # 지점 화면 보기(view-as) 배너 — 읽기 전용임을 표시하고 종료 링크 제공
     view_banner_html = ""
     if user and user.get("_view_as"):
@@ -3469,9 +3481,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         <span style="font-weight:bold;">📦 재고 관리 시스템 <span style="font-size:10px;font-weight:normal;opacity:.75;">v{app.version}</span>{role_badge}</span>
         <div style="display:flex;align-items:center;">
           {ui_mode_btn}{orient_btn}{col_settings_btn}{view_as_top_html}{col_save_btn}{pwa_install_btn}
-          <a href="{os.getenv('SMALLBIZ_APP_URL', 'http://127.0.0.1:8003')}" target="_blank" rel="noopener"
-             style="background:#2E7D32;color:white;padding:5px 12px;border-radius:8px;
-                    font-size:12px;cursor:pointer;margin-right:8px;text-decoration:none;white-space:nowrap;">🛒 구매관리</a>
+          {smallbiz_btn}
           <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
         </div>
       </div>
@@ -3555,7 +3565,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           var n = noticePopupQueue[0];
           document.getElementById('noticePopupBody').innerHTML =
             '<h3 style="margin-bottom:12px;">' + n.title + '</h3>'
-            + '<div style="line-height:1.6;">' + n.content.replace(/\\n/g, '<br>') + '</div>';
+            + '<div style="line-height:1.6;white-space:pre-wrap;word-break:break-word;">' + n.content.replace(/\\n/g, '<br>') + '</div>';
           document.getElementById('noticePopupModal').dataset.noticeId = n.id;
           document.getElementById('noticePopupOverlay').style.display = 'block';
           document.getElementById('noticePopupModal').style.display = 'block';
