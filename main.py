@@ -3564,11 +3564,16 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
           if (noticePopupQueue.length === 0) return;
           var n = noticePopupQueue[0];
           document.getElementById('noticePopupBody').innerHTML =
-            '<h3 style="margin-bottom:12px;">' + n.title + '</h3>'
-            + '<div style="line-height:1.6;white-space:pre-wrap;word-break:break-word;">' + n.content.replace(/\\n/g, '<br>') + '</div>';
+            '<div onclick="noticePopupGoto()" style="cursor:pointer;" title="클릭하면 공지사항으로 이동">'
+            + '<h3 style="margin-bottom:12px;">' + n.title + '</h3>'
+            + '<div style="line-height:1.6;white-space:pre-wrap;word-break:break-word;">' + n.content.replace(/\\n/g, '<br>') + '</div></div>';
           document.getElementById('noticePopupModal').dataset.noticeId = n.id;
           document.getElementById('noticePopupOverlay').style.display = 'block';
           document.getElementById('noticePopupModal').style.display = 'block';
+        }}
+        function noticePopupGoto() {{
+          var noticeId = document.getElementById('noticePopupModal').dataset.noticeId;
+          if (noticeId) location.href = '/notice/' + noticeId;
         }}
         function closeNoticePopup() {{
           noticePopupQueue.shift();
@@ -7134,7 +7139,7 @@ async def master_daily_stocktake_page(
 
     rows_html = ""
     if not rows:
-        rows_html = '<tr><td colspan="9" style="text-align:center;padding:24px;color:#888;">실사 기록이 없습니다.</td></tr>'
+        rows_html = '<tr><td colspan="10" style="text-align:center;padding:24px;color:#888;">실사 기록이 없습니다.</td></tr>'
     else:
         for s in rows:
             bc = str(s["branch_code"])
@@ -7153,8 +7158,10 @@ async def master_daily_stocktake_page(
                 "/daily-stocktake?filter_branch=" + _html.escape(bc)
                 + "&date=" + _html.escape(str(s["count_date"]))
             )
+            sid = int(s["id"])
             rows_html += (
                 "<tr>"
+                f'<td style="text-align:center;"><input type="checkbox" class="dst-sel" value="{sid}"></td>'
                 f"<td>{_html.escape(bname)}</td>"
                 f"<td>{_html.escape(str(s['count_date']))}</td>"
                 f"<td>{_html.escape(str(s['closer_name'] or '-'))}</td>"
@@ -7165,10 +7172,13 @@ async def master_daily_stocktake_page(
                 f"<td style='text-align:center;'>{status_badge}</td>"
                 f'<td><a href="{detail_url}" style="background:#1E2761;color:white;padding:4px 10px;'
                 'border-radius:6px;font-size:12px;text-decoration:none;">상세</a> '
-                f'<button type="button" onclick="dstDeleteSave({int(s["id"])}, '
+                f'<button type="button" onclick="dstDeleteSave({sid}, '
                 f'\'{_html.escape(bname)}\', \'{_html.escape(str(s["count_date"]))}\')" '
                 'style="background:#DC2626;color:white;border:none;padding:4px 10px;'
-                'border-radius:6px;font-size:12px;cursor:pointer;margin-left:4px;">삭제</button></td>'
+                'border-radius:6px;font-size:12px;cursor:pointer;margin-left:4px;">삭제</button> '
+                f'<a href="/master/daily-stocktake/export?save_ids={sid}" '
+                'style="background:#166534;color:white;padding:4px 10px;border-radius:6px;'
+                'font-size:12px;text-decoration:none;margin-left:4px;display:inline-block;">엑셀</a></td>'
                 "</tr>"
             )
 
@@ -7176,16 +7186,46 @@ async def master_daily_stocktake_page(
         '<h2 style="margin:0 0 8px 0;">🧮 재고 실사 결과</h2>'
         '<p style="color:#888;font-size:13px;margin-bottom:16px;">지점별 일일 재고 실사 기록 (소모품 제외)</p>'
         + filter_html
+        + '<div class="card" style="margin-bottom:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">'
+        '<button type="button" class="btn" style="background:#166534;" onclick="dstExportSelected()">'
+        '📥 선택 항목 엑셀 다운로드</button>'
+        '<span id="dstSelCount" style="font-size:12px;color:#888;">선택된 항목이 없습니다.</span></div>'
         + '<div class="card"><div class="table-scroll-wrap"><table data-colver="2026-11-18">'
         "<thead><tr>"
-        '<th style="width:16%">지점</th><th style="width:11%">실사일</th>'
-        '<th style="width:11%">담당자</th><th style="width:12%">저장자</th>'
-        '<th style="width:14%">저장일시</th><th style="width:7%">품목수</th>'
-        '<th style="width:9%">오차 품목수</th><th style="width:8%">상태</th><th style="width:13%">상세/삭제</th>'
+        '<th style="width:4%"><input type="checkbox" id="dstSelAll" title="전체 선택"></th>'
+        '<th style="width:13%">지점</th><th style="width:10%">실사일</th>'
+        '<th style="width:10%">담당자</th><th style="width:11%">저장자</th>'
+        '<th style="width:13%">저장일시</th><th style="width:7%">품목수</th>'
+        '<th style="width:8%">오차 품목수</th><th style="width:7%">상태</th><th style="width:16%">상세/삭제/엑셀</th>'
         "</tr></thead><tbody>"
         + rows_html
         + "</tbody></table></div></div>"
         + """<script>
+        function dstSelIds() {
+          var out = [];
+          document.querySelectorAll('.dst-sel:checked').forEach(function(c) { out.push(c.value); });
+          return out;
+        }
+        function dstSelRefresh() {
+          var n = dstSelIds().length;
+          var el = document.getElementById('dstSelCount');
+          if (el) el.textContent = n ? n + '개 선택됨' : '선택된 항목이 없습니다.';
+          var all = document.getElementById('dstSelAll');
+          var total = document.querySelectorAll('.dst-sel').length;
+          if (all) all.checked = total > 0 && n === total;
+        }
+        function dstExportSelected() {
+          var ids = dstSelIds();
+          if (!ids.length) { alert('엑셀로 받을 항목을 먼저 선택해주세요.'); return; }
+          location.href = '/master/daily-stocktake/export?save_ids=' + ids.join(',');
+        }
+        document.addEventListener('change', function(e) {
+          if (e.target && e.target.id === 'dstSelAll') {
+            document.querySelectorAll('.dst-sel').forEach(function(c) { c.checked = e.target.checked; });
+          }
+          if (e.target && e.target.classList && e.target.classList.contains('dst-sel')) dstSelRefresh();
+        });
+        document.addEventListener('DOMContentLoaded', dstSelRefresh);
         async function dstDeleteSave(saveId, bname, cdate) {
           if (!confirm(bname + ' ' + cdate + ' 실사 기록을 삭제하시겠습니까?\\n저장된 실사 수량 전체가 삭제되며 되돌릴 수 없습니다.')) return;
           try {
@@ -7209,8 +7249,9 @@ async def master_daily_stocktake_export(
     session_token: str = Cookie(default=None),
     filter_branch: str = "",
     date: str = "",
+    save_ids: str = "",
 ):
-    """재고 실사 결과 엑셀 다운로드 — 저장된 라인 전체 (지점/날짜 필터 동일 적용)."""
+    """재고 실사 결과 엑셀 다운로드 — 저장된 라인 전체 (지점/날짜/선택 save_id 필터 적용)."""
     import io
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -7236,6 +7277,14 @@ async def master_daily_stocktake_export(
     if date:
         query += " AND l.count_date=?"
         params.append(date)
+    sel_ids = []
+    for tok in str(save_ids or "").replace(";", ",").split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            sel_ids.append(int(tok))
+    if sel_ids:
+        query += " AND l.save_id IN (" + ",".join("?" for _ in sel_ids[:200]) + ")"
+        params.extend(sel_ids[:200])
     query += " ORDER BY l.count_date DESC, l.branch_code, l.supplier, l.category, l.item_name"
 
     conn = get_conn()
@@ -7290,7 +7339,10 @@ async def master_daily_stocktake_export(
     buf.seek(0)
 
     bname = branch_name_map.get(filter_branch, filter_branch or "전체")
-    filename = f"재고실사_{bname}_{date or '전체'}.xlsx"
+    if sel_ids:
+        filename = f"재고실사_선택{len(sel_ids)}건.xlsx"
+    else:
+        filename = f"재고실사_{bname}_{date or '전체'}.xlsx"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -18408,9 +18460,24 @@ async def master_page(session_token: str = Cookie(default=None)):
       </div>
         """
 
+    # ---- 소상공인 구매관리(smallbiz-app) 바로가기 — SMALLBIZ_APP_URL 설정 시에만 ----
+    smallbiz_card_html = ""
+    _sbz_card_url = os.getenv("SMALLBIZ_APP_URL", "").strip()
+    if _sbz_card_url:
+        smallbiz_card_html = f"""
+      <a href="{_sbz_card_url}" target="_blank" rel="noopener" style="text-decoration:none;">
+        <div class="card" style="text-align:center;padding:24px;cursor:pointer;">
+          <div style="font-size:32px;margin-bottom:8px;">🛒</div>
+          <div style="font-weight:bold;color:#1E2761;">구매관리</div>
+          <div style="color:#888;font-size:12px;margin-top:6px;">소상공인 프로그램으로 이동 (새 탭)</div>
+        </div>
+      </a>
+        """
+
     # ---- 바로가기 그룹 (단독 카드들을 아코디언 안으로) ----
     shortcut_cards = []
-    for _c in (branch_card_html, po_preview_card_html, po_verify_card_html, view_as_card_html):
+    for _c in (branch_card_html, po_preview_card_html, po_verify_card_html,
+               view_as_card_html, smallbiz_card_html):
         if _c:
             shortcut_cards.append(_c)
 
