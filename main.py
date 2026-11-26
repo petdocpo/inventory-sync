@@ -6455,7 +6455,8 @@ def _dst_write_counts(conn, save_id, branch_code: str, date_str: str, parsed: di
     if codes:
         ph = ",".join("?" * len(codes))
         for r in conn.execute(
-            f"SELECT item_code, manual_qty, loc1_qty, loc2_qty, loc3_qty, counted_qty "
+            f"SELECT item_code, manual_qty, loc1_qty, loc2_qty, loc3_qty, counted_qty, "
+            f"qr_qty, ups_qty "
             f"FROM daily_stocktake_lines WHERE save_id=? AND item_code IN ({ph})",
             (save_id, *codes)
         ).fetchall():
@@ -6489,7 +6490,13 @@ def _dst_write_counts(conn, save_id, branch_code: str, date_str: str, parsed: di
         loc_parts = [v for v in (l1, l2, l3) if v is not None]
         loc_sum = sum(loc_parts) if loc_parts else None
         counted = manual if manual is not None else loc_sum
-        diff = (counted - ups) if (counted is not None and ups is not None) else None
+        # qr/ups는 저장 시점 최신값으로 갱신하되, 신규값이 NULL이면 기존 스냅샷 유지.
+        # diff는 반드시 "저장·표시되는 ups_qty" 기준으로 계산해야 화면의 오차와 일치한다.
+        prev_qr = _dst_line_get(ex, "qr_qty") if ex is not None else None
+        prev_ups = _dst_line_get(ex, "ups_qty") if ex is not None else None
+        qr_v = it["qr_qty"] if it["qr_qty"] is not None else prev_qr
+        ups_v = ups if ups is not None else prev_ups
+        diff = (counted - ups_v) if (counted is not None and ups_v is not None) else None
         conn.execute(
             "INSERT INTO daily_stocktake_lines "
             "(save_id, branch_code, count_date, item_code, item_name, supplier, category, "
@@ -6497,13 +6504,12 @@ def _dst_write_counts(conn, save_id, branch_code: str, date_str: str, parsed: di
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(save_id, item_code) DO UPDATE SET "
             "item_name=excluded.item_name, supplier=excluded.supplier, category=excluded.category, "
-            "qr_qty=COALESCE(daily_stocktake_lines.qr_qty, excluded.qr_qty), "
-            "ups_qty=COALESCE(daily_stocktake_lines.ups_qty, excluded.ups_qty), "
+            "qr_qty=excluded.qr_qty, ups_qty=excluded.ups_qty, "
             "counted_qty=excluded.counted_qty, diff_qty=excluded.diff_qty, "
             "manual_qty=excluded.manual_qty, loc1_qty=excluded.loc1_qty, "
             "loc2_qty=excluded.loc2_qty, loc3_qty=excluded.loc3_qty",
             (save_id, branch_code, date_str, code, it["item_name"], it["supplier"], it["category"],
-             it["qr_qty"], ups, counted, diff, manual, l1, l2, l3)
+             qr_v, ups_v, counted, diff, manual, l1, l2, l3)
         )
     # item_count/mismatch_count는 DB의 해당 save 전체 라인 기준으로 재계산
     cnt_row = conn.execute(
