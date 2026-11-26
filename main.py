@@ -71,6 +71,7 @@ NOTIFICATION_TYPES = {
     "restock_missing":     {"label": "미입고 알림",           "desc": "(준비 중)"},
     "safety_stock_change": {"label": "안전재고 변경 알림",     "desc": "(준비 중)"},
     "eod_alert":           {"label": "긴급발주 알림",         "desc": "목요일 도착 전 수요일 소진 예상 시"},
+    "stocktake_selection": {"label": "재고실사 품목 선정 알림", "desc": "월 재고실사 대상 품목 선정 시 지점별 Teams 발송"},
 }
 
 TEAMS_ALERT_TYPES = {
@@ -111,6 +112,16 @@ TEAMS_ALERT_TYPES = {
         "test_route": "/master/teams-webhook/test-eod-alert",
         "test_js_func": "testEodAlert",
         "on_desc": "매일 계산 후 수요일 전 소진 예상 지점에 Teams 발송",
+        "off_desc": "발송 안 함",
+        "default_enabled": False,
+    },
+    "stocktake_selection": {
+        "label": "재고실사 품목 선정 알림",
+        "toggle_key": "stocktake_notify_enabled",
+        "toggle_route": "/master/toggle-stocktake-notify",
+        "test_route": "/master/teams-webhook/test-stocktake-selection",
+        "test_js_func": "testStocktakeSelection",
+        "on_desc": "월 재고실사 품목 선정 크론 실행 후 지점별 Teams 채널로 발송",
         "off_desc": "발송 안 함",
         "default_enabled": False,
     },
@@ -16213,6 +16224,54 @@ async def master_test_eod_alert(request: Request, session_token: str = Cookie(de
     })
 
 
+@app.post("/master/teams-webhook/test-stocktake-selection")
+async def master_test_stocktake_selection(request: Request, session_token: str = Cookie(default=None)):
+    """재고실사 품목 선정 알림 테스트 — 현재 월 선정 결과를 선택 채널로만 전송."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+
+    data = await request.json()
+    target_branch_code = data.get("branch_code", "").strip()
+    if not target_branch_code:
+        return JSONResponse(status_code=400, content={"detail": "테스트 대상 채널 코드가 필요합니다."})
+
+    year_month = _kst_year_month()
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT branch_code, item_code, item_name FROM stocktake_selection WHERE year_month=? ORDER BY branch_code, item_name",
+        (year_month,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return JSONResponse(status_code=404, content={"detail": f"{year_month}에 선정된 재고실사 품목이 없습니다."})
+
+    by_branch: Dict[str, list] = {}
+    for r in rows:
+        by_branch.setdefault(r["branch_code"], []).append(r)
+
+    lines = []
+    for bc, items in by_branch.items():
+        names = ", ".join(it["item_name"] for it in items)
+        lines.append(f"■ {bc} ({len(items)}개)\n  {names}")
+    body = f"[테스트] {year_month} 재고실사 품목 선정 결과 미리보기입니다.\n\n" + "\n".join(lines)
+
+    send_teams_notification(
+        target_branch_code,
+        f"🧪[테스트] 📦 {year_month} 재고실사 품목 선정",
+        body,
+        sent_by=f"test_by_{user['login_id']}"
+    )
+
+    return JSONResponse(content={
+        "success": True,
+        "year_month": year_month,
+        "item_count": len(rows),
+        "branch_count": len(by_branch),
+    })
+
+
 @app.post("/master/toggle-eod-alert")
 async def master_toggle_eod_alert(session_token: str = Cookie(default=None)):
     user = get_session(session_token)
@@ -16263,6 +16322,35 @@ async def master_toggle_eod_alert_test(session_token: str = Cookie(default=None)
     else:
         conn.execute(
             "INSERT INTO system_settings (key, value) VALUES ('eod_alert_test_enabled', ?)",
+            (new_value,)
+        )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/master/notification-settings", status_code=303)
+
+
+@app.post("/master/toggle-stocktake-notify")
+async def master_toggle_stocktake_notify(session_token: str = Cookie(default=None)):
+    """재고실사 품목 선정 알림 on/off — system_settings['stocktake_notify_enabled']."""
+    user = get_session(session_token)
+    if not user or user["role"] != "master":
+        return RedirectResponse(url="/login", status_code=303)
+
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT value FROM system_settings WHERE key='stocktake_notify_enabled'"
+    ).fetchone()
+    current = (row["value"] == "true") if row else False
+    new_value = "false" if current else "true"
+
+    if row:
+        conn.execute(
+            "UPDATE system_settings SET value=?, updated_at=NOW() WHERE key='stocktake_notify_enabled'",
+            (new_value,)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO system_settings (key, value) VALUES ('stocktake_notify_enabled', ?)",
             (new_value,)
         )
     conn.commit()
@@ -16706,7 +16794,7 @@ async def master_notification_settings_page(session_token: str = Cookie(default=
 
     # 그룹4: 발주·재고 알림 (TEAMS 폼 토글)
     stock_rows = ""
-    for alert_key in ("purchase_new_teams", "qr_raw_mismatch_teams"):
+    for alert_key in ("purchase_new_teams", "qr_raw_mismatch_teams", "stocktake_selection"):
         info, is_enabled = _ns_teams_enabled(alert_key)
         stock_rows += _ns_form_row(info["label"], info["on_desc"] if is_enabled else info["off_desc"], is_enabled, info["toggle_route"])
 
@@ -17207,6 +17295,21 @@ async def master_teams_webhook_page(session_token: str = Cookie(default=None)):
         const result = await res.json();
         if (res.ok) {{
           alert('테스트 발송 완료! 대상 ' + result.item_count + '건(' + result.branch_count + '개 지점) 미리보기 발송\\n도착 예정 ' + result.arrival);
+        }} else {{
+          alert('오류: ' + (result.detail || '발송 실패'));
+        }}
+      }}
+
+      async function testStocktakeSelection(alertKey) {{
+        const target = document.getElementById('testTarget_' + alertKey).value;
+        if (!target) {{ alert('테스트 채널을 선택하세요.'); return; }}
+        const res = await fetch('/master/teams-webhook/test-stocktake-selection', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ branch_code: target }})
+        }});
+        const result = await res.json();
+        if (res.ok) {{
+          alert('테스트 발송 완료! ' + result.year_month + ' 선정 ' + result.item_count + '건(' + result.branch_count + '개 지점) 미리보기 발송\\nTeams 채널을 확인하세요.');
         }} else {{
           alert('오류: ' + (result.detail || '발송 실패'));
         }}
@@ -22211,6 +22314,7 @@ async def _select_stocktake_items(year_month: str = None):
 
         result_summary = {}
         skipped_branches = {}
+        selected_items_map: Dict[str, list] = {}
 
         for branch_code in all_branch_codes:
             prev_items = conn.execute(
@@ -22269,9 +22373,38 @@ async def _select_stocktake_items(year_month: str = None):
                 )
 
             result_summary[branch_code] = len(selected)
+            selected_items_map[branch_code] = selected
 
         conn.commit()
         conn.close()
+
+        notify_on = False
+        try:
+            nconn = get_conn()
+            nrow = nconn.execute(
+                "SELECT value FROM system_settings WHERE key='stocktake_notify_enabled'"
+            ).fetchone()
+            nconn.close()
+            notify_on = bool(nrow and nrow["value"] == "true")
+        except Exception:
+            pass
+
+        if notify_on and selected_items_map:
+            ym_label = f"{ym_year}년 {ym_month}월"
+            server_url = os.environ.get("PUBLIC_SERVER_URL", "https://inventory-sync-teal.vercel.app")
+            for bc, items in selected_items_map.items():
+                listing = "\n".join(f"- {it['item_name']} ({it['item_code']})" for it in items)
+                send_teams_notification(
+                    branch_code=bc,
+                    title=f"📦 {ym_label} 월 재고실사 품목 선정",
+                    message=(
+                        f"이번 달 재고실사 대상 {len(items)}개 품목이 선정되었습니다.\n{listing}\n"
+                        "마감 전까지 실사 수량을 입력해주세요."
+                    ),
+                    link_url=f"{server_url}/master/stocktake/{bc}",
+                    link_text="재고실사 입력 바로가기",
+                    sent_by="system_cron_stocktake",
+                )
 
         return {
             "status": "ok",
