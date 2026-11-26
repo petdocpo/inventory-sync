@@ -7355,6 +7355,103 @@ async def master_daily_stocktake_export(
         headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)}
     )
 
+
+# ── 포포즈(smallbiz-app) 연동 API — CRON_SECRET Bearer 인증, 읽기/계산 결과 제공 ──
+
+def _popose_auth(authorization: str) -> bool:
+    expected = f"Bearer {os.environ.get('CRON_SECRET', '')}"
+    return bool(expected != "Bearer " and authorization == expected)
+
+
+@app.get("/api/popose/po-candidates")
+async def api_popose_po_candidates(authorization: str = Header(default="")):
+    """발주서 후보(주간/월간/미입고발주) JSON — _compute_purchase_order_candidates 재사용."""
+    if not _popose_auth(authorization):
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    try:
+        result = await _compute_purchase_order_candidates()
+        return JSONResponse(content=result)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)[:500]})
+
+
+@app.get("/api/popose/eod-candidates")
+async def api_popose_eod_candidates(authorization: str = Header(default="")):
+    """긴급발주 알림 대상 JSON — _eod_alert_candidates 재사용."""
+    if not _popose_auth(authorization):
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    try:
+        return JSONResponse(content=_eod_alert_candidates())
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)[:500]})
+
+
+@app.get("/api/popose/po-export")
+async def api_popose_po_export(
+    authorization: str = Header(default=""),
+    kind: str = "all",
+    branch_code: str = "",
+    sel: str = "",
+):
+    """발주서 xlsx — kind=weekly|monthly|all|eod.
+    sel: 'bc:ic,bc:ic,...' (eod 선택 품목, kind=eod일 때만). branch_code로 지점 필터."""
+    if not _popose_auth(authorization):
+        return JSONResponse(status_code=401, content={"detail": "인증 실패"})
+    import io
+    from urllib.parse import quote
+    try:
+        candidates = []
+        fname_tag = "발주서"
+        if kind == "eod":
+            eod = _eod_alert_candidates()
+            want = set()
+            for tok in str(sel or "").split(","):
+                tok = tok.strip()
+                if ":" in tok:
+                    bc, ic = tok.split(":", 1)
+                    want.add((bc.strip(), ic.strip()))
+            for it in eod.get("items", []):
+                if want and (str(it["branch_code"]), str(it["item_code"])) not in want:
+                    continue
+                candidates.append({
+                    "branch_code": it["branch_code"],
+                    "branch_name": it["branch_name"],
+                    "item_code": it["item_code"],
+                    "item_name": it["item_name"],
+                    "final_qty": it.get("suggest_qty") or 0,
+                })
+            fname_tag = "긴급발주서"
+        else:
+            result = await _compute_purchase_order_candidates()
+            if kind == "weekly":
+                candidates = list(result.get("weekly", []))
+            elif kind == "monthly":
+                candidates = list(result.get("monthly", []))
+            else:
+                candidates = list(result.get("weekly", [])) + list(result.get("monthly", []))
+            fname_tag = {"weekly": "주간발주서", "monthly": "월간발주서"}.get(kind, "발주서")
+
+        if branch_code:
+            candidates = [c for c in candidates
+                          if str(c.get("branch_code") or "") == branch_code
+                          or str(c.get("branch_name") or "") == branch_code]
+        if not candidates:
+            return JSONResponse(status_code=400, content={"detail": "발주 대상이 없습니다."})
+
+        data = _build_purchase_order_excel(candidates, kind)
+        from datetime import datetime as _dt2
+        stamp = _dt2.now().strftime("%Y%m%d")
+        btag = branch_code or "전체"
+        filename = f"{fname_tag}_{btag}_{stamp}.xlsx"
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)}
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)[:500]})
+
+
 # 재고 마감 "제출 요청" 테스트 수신 채널(teams_webhook의 branch_code). 목록에 '테스트용지점' 행이 없어서 우선 유한서 채널로 지정 — 바꾸려면 이 한 줄만 수정
 STOCK_CLOSING_TEST_BRANCH_CODE = "admin_hs"
 
@@ -15997,7 +16094,7 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
             "SELECT branch_code, item_code, quantity FROM raw_inventory"
         ).fetchall()
         pm_rows = conn.execute("""
-            SELECT DISTINCT ON (item_code) item_code, moq, is_consumable, order_excluded
+            SELECT DISTINCT ON (item_code) item_code, moq, is_consumable, order_excluded, supplier
             FROM product_master WHERE item_code IS NOT NULL AND item_code <> ''
             ORDER BY item_code, id
         """).fetchall()
@@ -16041,6 +16138,10 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
         moq = pm["moq"] or 1
         suggest = math.ceil(shortage / moq) * moq if shortage > 0 else 0
         depletion = today if stock <= 0 else today + timedelta(days=math.ceil(stock / daily))
+        _sup = ((pm["supplier"] or "").strip() if pm else "") or _dst_vendor_prefix(r["item_name"] or "")
+        _sup = _DST_VENDOR_NAME_MAP.get(_sup, _sup)
+        if _sup in _DST_VENDOR_EXCLUDE:
+            _sup = ""
         items.append({
             "branch_name": bn, "branch_code": bc, "item_code": ic,
             "item_name": r["item_name"] or ic,
@@ -16049,6 +16150,7 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
             "safety": ss_map.get((bn, r["item_name"]), 0),
             "depletion": depletion.isoformat(), "arrival": thu.isoformat(),
             "moq": moq, "suggest_qty": suggest,
+            "supplier": _sup,
         })
 
     items.sort(key=lambda x: (x["branch_name"], -x["daily"]))
