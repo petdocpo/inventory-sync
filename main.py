@@ -2172,6 +2172,20 @@ def init_db():
         )
     """)
 
+    # 긴급발주 알림 발송 이력 — 최근 N일 내 알림 보낸 지점×품번은 후보에서 제외 (중복 알림 방지)
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS eod_alert_log (
+            {pk},
+            branch_code TEXT NOT NULL,
+            item_code TEXT NOT NULL,
+            alerted_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_eod_alert_log_bc_ic
+        ON eod_alert_log (branch_code, item_code, alerted_at)
+    """)
+
     # 매출 마감 현금시재 (지점×일자 1건 + 수기 행들)
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS closing_cash (
@@ -3210,6 +3224,15 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
             'style="background:#2E7D32;color:white;padding:5px 12px;border-radius:8px;'
             'font-size:12px;cursor:pointer;margin-right:8px;text-decoration:none;white-space:nowrap;">🛒 구매관리</a>')
 
+    # 임시 — 로컬 smallbiz 서버 바로가기 (개발/테스트용, SMALLBIZ_LOCAL_URL로 주소 변경 가능)
+    sbz_tmp_btn = ""
+    if user and user["role"] == "master":
+        _sbz_tmp_url = os.getenv("SMALLBIZ_LOCAL_URL", "http://10.1.10.85:8003").strip()
+        sbz_tmp_btn = (
+            f'<a href="{_sbz_tmp_url}" target="_blank" rel="noopener" '
+            'style="background:#F59E0B;color:white;padding:5px 12px;border-radius:8px;'
+            'font-size:12px;cursor:pointer;margin-right:8px;text-decoration:none;white-space:nowrap;">🧪 임시</a>')
+
     # 지점 화면 보기(view-as) 배너 — 읽기 전용임을 표시하고 종료 링크 제공
     view_banner_html = ""
     if user and user.get("_view_as"):
@@ -3492,7 +3515,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         <span style="font-weight:bold;">📦 재고 관리 시스템 <span style="font-size:10px;font-weight:normal;opacity:.75;">v{app.version}</span>{role_badge}</span>
         <div style="display:flex;align-items:center;">
           {ui_mode_btn}{orient_btn}{col_settings_btn}{view_as_top_html}{col_save_btn}{pwa_install_btn}
-          {smallbiz_btn}
+          {smallbiz_btn}{sbz_tmp_btn}
           <a href="/logout" style="color:#aaa;font-size:13px;text-decoration:none;">로그아웃</a>
         </div>
       </div>
@@ -16077,10 +16100,14 @@ async def cron_check_new_purchase(authorization: str = Header(default="")):
         report_cron_failure("check-new-purchase", err_msg)
         return JSONResponse(status_code=500, content={"detail": err_msg})
 
+EOD_ALERT_DEDUP_DAYS = 7  # 최근 N일 내 알림 발송된 지점×품번은 긴급발주 후보에서 제외
+
+
 def _eod_alert_candidates(lookback_days: int = 56) -> dict:
     """긴급발주 알럿 대상 계산 — 화요일 발주→목요일 도착 주기 기준, 수요일 전 소진 예상 지점×품번.
     안전재고 무관: 현재고(raw_inventory) < 일평균판매×도착까지일수 이면 대상.
-    제외: product_master 미등록/소모품/전체미발주, 판매 0, eod_alert_exclusion 등록 건.
+    제외: product_master 미등록/소모품/전체미발주, 판매 0, eod_alert_exclusion 등록 건,
+          최근 EOD_ALERT_DEDUP_DAYS일 내 알림 발송된 건(eod_alert_log), 미입고 발주(접수/승인) 존재.
     반환: {"today","arrival","days_left","items":[{branch_name,branch_code,item_code,item_name,daily,stock,need,shortage,depletion,suggest_qty,moq}]}
     """
     import math
@@ -16119,6 +16146,15 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
             WHERE item_code IS NOT NULL AND item_code <> ''
             ORDER BY branch_name, item_code, purchase_datetime DESC
         """).fetchall()
+        # 최근 N일 내 알림 발송 이력 — 발주가 들어간 것으로 보고 중복 알림 방지
+        try:
+            dedup_rows = conn.execute(
+                "SELECT DISTINCT branch_code, item_code FROM eod_alert_log "
+                "WHERE alerted_at >= ?",
+                ((today - timedelta(days=EOD_ALERT_DEDUP_DAYS)).isoformat(),),
+            ).fetchall()
+        except Exception:
+            dedup_rows = []  # 테이블 미생성 등 → 중복 제거 없이 진행
         ss_rows = conn.execute(
             "SELECT branch_name, item_name, qty, safety_qty FROM safety_stock"
         ).fetchall()
@@ -16134,6 +16170,7 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
     exc_set = {(r["branch_code"], r["item_code"]) for r in exc_rows}
     pending_set = {(r["branch_name"], r["item_code"]) for r in pend_rows
                    if r["status"] in ("접수", "승인")}
+    alerted_set = {(r["branch_code"], r["item_code"]) for r in dedup_rows}
     b2c = {b["branch_name"]: b["branch_code"] for b in get_branches(branch_type='branch')}
 
     items = []
@@ -16155,6 +16192,8 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
         if (bc, ic) in exc_set:
             continue
         if (bn, ic) in pending_set:
+            continue
+        if (bc, ic) in alerted_set:
             continue
         shortage = need - stock
         moq = pm["moq"] or 1
@@ -16410,10 +16449,46 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
             )
             sent_count += 1
 
+        # 발송 이력 기록 — 최근 EOD_ALERT_DEDUP_DAYS일 내 동일 지점×품번 재알림 방지
+        # (발주가 실제로 들어간 것으로 간주. UPS 미등록 건도 다음 날 목록에서 빠짐)
+        try:
+            conn = get_conn()
+            try:
+                for it in result["items"]:
+                    conn.execute(
+                        "INSERT INTO eod_alert_log (branch_code, item_code) VALUES (?, ?)",
+                        (it["branch_code"], it["item_code"]),
+                    )
+                conn.execute(
+                    "DELETE FROM eod_alert_log WHERE alerted_at < NOW() - INTERVAL '30 days'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as log_err:
+            print(f"[eod_alert_log] 기록 실패(무시): {log_err}")
+
+        # SMTP 이메일 요약 발송 — 수신: EOD_ALERT_EMAIL_TO env, 미설정 시 STOCK_CLOSING_MAIL_TO
+        # (GMAIL_SENDER_ADDRESS/GMAIL_APP_PASSWORD 미설정 시 send_email이 False 반환 — 발송 실패해도 크론은 정상)
+        mail_to = os.environ.get("EOD_ALERT_EMAIL_TO") or STOCK_CLOSING_MAIL_TO
+        mail_lines = [
+            f"{it['branch_name']} | {it['item_name']} | 현재 {it['stock']} | 필요 {it['need']} | 제안 {it['suggest_qty']}"
+            for it in result["items"][:50]
+        ]
+        mail_body = (
+            f"긴급발주 검토 알림 — 기준일 {result['today']} / 도착 예정 {result['arrival']} (D-{result['days_left']}일)\n"
+            f"대상 {len(result['items'])}건\n\n" + "\n".join(mail_lines)
+            + (f"\n...외 {len(result['items']) - 50}건" if len(result["items"]) > 50 else "")
+        )
+        mail_ok, mail_err = send_email(
+            mail_to, f"🚨 긴급발주 검토 알림 ({result['today']})", mail_body)
+
         return JSONResponse(content={
             "item_count": len(result["items"]),
             "sent_count": sent_count,
             "arrival": result["arrival"],
+            "email_sent": mail_ok,
+            "email_detail": mail_err,
         })
     except Exception as e:
         err_msg = str(e)[:500]
@@ -19219,20 +19294,83 @@ async def purchase_tracking_upload_records(
 # main.py의 구매내역 관련 함수들 근처(예: _process_purchase_records_upload 부근)에 추가
 # ============================================================
 
+# ── 자동 안전재고 계산 상수 (판매 실적 기반, _compute_purchase_order_candidates에서 사용) ──
+AUTO_SAFETY_WINDOW_DAYS = 56      # 일판매량 집계 창
+AUTO_SAFETY_BLEND_28 = 0.6        # 최근 28일 가중치
+AUTO_SAFETY_BLEND_56 = 0.4        # 최근 56일 가중치
+AUTO_SAFETY_FACTOR = 1.0          # 수요 예측 안전계수 (1.0 = 보정 없음 — 급변은 긴급발주가 커버)
+AUTO_SAFETY_MIN_SALE_DAYS = 14    # 이 일수 미만 판매 이력 → 자동값 미사용(수동값만)
+AUTO_SAFETY_FULL_DAYS = 28        # 이 일수 이상 → 자동값 100% 반영, 사이는 판매일수/28 비율로 단계 적용
+AUTO_SAFETY_DAY_CAP_MULT = 3.0    # 일 판매량 캡 = 판매일 중앙값 × 3 (프로모션 급등 완화)
+AUTO_SAFETY_MAX_RATIO = 3.0       # 자동값 상한 = 수동 안전재고 × 3 (수동값>0일 때, 급등 과대발주 방지)
+AUTO_SAFETY_CYCLE_COVER = {"weekly": 14, "monthly": 30}  # 발주주기 커버 일수 (다음 발주까지 버텨야 함) — 주간은 실제 약 2주 간격
+AUTO_SAFETY_MONTHLY_MAX_DAYS = 35  # 월 발주 품목 자동값 상한 = 일평균 × 35일 (실제 도착 5~10일 고려, 최대 35일치 재고)
+
+# 발주 대상 장례용품 카테고리 — 이 카테고리 품목은 소모품 체크 없이도 발주 대상
+# ('기타'·미분류·시범판매는 소모품 체크된 것만 발주)
+FUNERAL_ORDER_CATEGORIES = {"유골함", "수의보", "수의", "스톤함", "관", "기억머문담", "요람"}
+
+
+def _auto_safety_daily_stats(conn, window_days: int = AUTO_SAFETY_WINDOW_DAYS) -> dict:
+    """최근 window_days 일간 지점x품번별 일판매량 통계 — 자동 안전재고 계산용.
+
+    일 판매량은 중앙값×AUTO_SAFETY_DAY_CAP_MULT로 캡해 프로모션 급등이 평균을 끌어올리는 것을 막는다.
+    avg = 0.6×(최근28일 capped 일평균) + 0.4×(최근56일 capped 일평균). 판매 없는 날은 0으로 반영.
+    반환: {(branch_name, item_code): {"avg": float, "sale_days": int}}
+    """
+    import statistics
+    from datetime import timedelta
+
+    today = _kst_now().date()
+    start = (today - timedelta(days=window_days - 1)).isoformat()
+    cutoff28 = (today - timedelta(days=27)).isoformat()
+    rows = conn.execute(
+        "SELECT branch_name, item_code, sale_date, SUM(quantity) AS qty "
+        "FROM sales_records WHERE sale_date >= ? AND item_code <> '' "
+        "GROUP BY branch_name, item_code, sale_date",
+        (start,),
+    ).fetchall()
+
+    series = {}
+    for r in rows:
+        series.setdefault((r["branch_name"], r["item_code"]), {})[r["sale_date"]] = int(r["qty"] or 0)
+
+    out = {}
+    for key, daily in series.items():
+        sold_days = {d: q for d, q in daily.items() if q > 0}
+        if not sold_days:
+            continue
+        cap = max(1, statistics.median(sold_days.values()) * AUTO_SAFETY_DAY_CAP_MULT)
+        s28 = s56 = 0
+        for d, q in daily.items():
+            qc = min(q, cap)
+            s56 += qc
+            if d >= cutoff28:
+                s28 += qc
+        out[key] = {
+            "avg": AUTO_SAFETY_BLEND_28 * (s28 / 28) + AUTO_SAFETY_BLEND_56 * (s56 / window_days),
+            "sale_days": len(sold_days),
+        }
+    return out
+
+
 async def _compute_purchase_order_candidates() -> dict:
     """
     지점x상품 조합별 발주 대상 여부 판정 + 주간/월간 분류 + 최종 발주수량 계산.
 
     판정 순서 (하나라도 걸리면 제외):
       1. product_master.order_excluded = TRUE (전체 미발주로 숨긴 상품)
-      2. 현재고(raw_inventory) >= 안전재고(safety_stock) (재고 충분)
+      2. 현재고(raw_inventory) >= 실효 안전재고 (재고 충분)
+         실효 안전재고 = max(수동 safety_stock.qty, 자동 계산값, 품번별 min_safety_qty)
+         자동값 = 일평균판매(28일60%+56일40%, 일판매량 중앙값×3 캡) × (리드타임+발주주기) — 소모품은 자동 계산 제외(수동값만)
+         (판매일수 14일 미만 자동값 미사용, 14~27일 단계 반영, 자동값 상한=수동값×3)
       3. 이 지점x상품의 가장 최근 purchase_records.status 가 '접수' 또는 '승인' (미입고 발주 존재, 중복 방지)
       (소모품 여부는 발주 제외 사유가 아님 — 모든 지점 공통으로 발주 대상 판정)
 
     남은 대상 분류:
       5. 리드타임 >= 35 또는 purchase_order_monthly_exception에 등록됨 -> 월간
          그 외 -> 주간
-      6. 최종수량 = ceil(안전재고 / moq) * moq  (moq 없으면 1로 취급)
+      6. 최종수량 = ceil(실효 안전재고 / moq) * moq  (moq 없으면 1로 취급)
 
     반환:
       {
@@ -19264,7 +19402,7 @@ async def _compute_purchase_order_candidates() -> dict:
 
     # ── 4) product_master에서 item_code별 대표 1행 (리드타임/MOQ/소모품여부/전체미발주 - 상품별 공통값) ──
     pm_rows = conn.execute(
-        "SELECT DISTINCT ON (item_code) item_code, lead_time_days, moq, is_consumable, order_excluded, order_cycle, supplier "
+        "SELECT DISTINCT ON (item_code) item_code, lead_time_days, moq, is_consumable, order_excluded, order_cycle, supplier, category "
         "FROM product_master WHERE item_code IS NOT NULL AND item_code != '' "
         "ORDER BY item_code, id"
     ).fetchall()
@@ -19297,19 +19435,38 @@ async def _compute_purchase_order_candidates() -> dict:
     monthly_exc_set = {(r["item_code"], r["branch_code"]) for r in monthly_exc_rows if r["item_code"]}
     monthly_exc_name_set = {(r["item_name"], r["branch_code"]) for r in monthly_exc_rows if not r["item_code"]}
 
-    # ── 7) 지점x상품별 가장 최근 발주 상태 맵: (branch_name, item_name) -> 최신 status ──
-    status_rows = conn.execute("""
+    # ── 7) 지점x상품별 가장 최근 발주 상태 맵 ──
+    # 품번 기준 우선 + 상품명 폴백 (품번 미등록 안전재고 행 대비, 상품명 변경 시에도 중복 발주 방지)
+    status_rows_code = conn.execute("""
+        SELECT DISTINCT ON (branch_name, item_code) branch_name, item_code, status
+        FROM purchase_records
+        WHERE item_code IS NOT NULL AND item_code != ''
+        ORDER BY branch_name, item_code, purchase_datetime DESC
+    """).fetchall()
+    status_map_code = {(r["branch_name"], r["item_code"]): r["status"] for r in status_rows_code}
+
+    status_rows_name = conn.execute("""
         SELECT DISTINCT ON (branch_name, item_name) branch_name, item_name, status
         FROM purchase_records
         ORDER BY branch_name, item_name, purchase_datetime DESC
     """).fetchall()
-    status_map = {(r["branch_name"], r["item_name"]): r["status"] for r in status_rows}
+    status_map_name = {(r["branch_name"], r["item_name"]): r["status"] for r in status_rows_name}
+
+    # ── 8) 자동 안전재고용 일판매량 통계(최근 56일) + 품번별 최소 안전재고 ──
+    auto_stats = _auto_safety_daily_stats(conn)
+    min_safe_rows = conn.execute(
+        "SELECT item_code, MAX(min_safety_qty) AS min_safe FROM product_master "
+        "WHERE item_code IS NOT NULL AND item_code <> '' AND min_safety_qty IS NOT NULL "
+        "GROUP BY item_code"
+    ).fetchall()
+    min_safe_map = {r["item_code"]: int(r["min_safe"]) for r in min_safe_rows}
 
     conn.close()
 
     weekly = []
     monthly = []
     pending_report = []
+    auto_detail = []  # 지점x품번별 실효 안전재고 내역 — 포포즈 안전재고 화면 표시용
 
     PENDING_STATUSES = {"접수", "승인"}
 
@@ -19327,52 +19484,18 @@ async def _compute_purchase_order_candidates() -> dict:
 
         # 1. 전체 미발주 제외
         if pm and pm["order_excluded"]:
+            auto_detail.append({
+                "branch_name": branch_name, "item_code": item_code, "item_name": item_name,
+                "manual_qty": int(safety_qty or 0), "auto_qty": 0,
+                "eff_qty": int(safety_qty or 0), "sale_days": 0, "cycle": "excluded"})
             continue
 
-        # 2. 현재고 >= 안전재고면 제외 (재고 충분)
-        current_qty = raw_map.get((branch_code, item_code), 0)
-        if current_qty >= safety_qty:
-            continue
-
-        # 3. 소모품 체크된 품목만 발주 대상 (product-settings '소모품' 체크 = 발주 포함)
-        is_consumable = bool(pm["is_consumable"]) if pm else False
-        if not is_consumable:
-            continue
-
-        # 4. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고
-        latest_status = status_map.get((branch_name, item_name))
-        if latest_status in PENDING_STATUSES:
-            pending_report.append({
-                "branch_code": branch_code,
-                "branch_name": branch_name,
-                "item_code": item_code,
-                "item_name": item_name,
-                "status": latest_status
-            })
-            continue
-
-        # ── 여기까지 통과 = 발주 대상 확정 ──
         lead_time_days = (pm["lead_time_days"] if pm and pm["lead_time_days"] is not None else 0)
         moq = (pm["moq"] if pm and pm["moq"] else 1)
         if moq <= 0:
             moq = 1
 
-        # 6. MOQ 적용 최종 수량
-        final_qty = math.ceil(safety_qty / moq) * moq
-
-        candidate = {
-            "branch_code": branch_code,
-            "branch_name": branch_name,
-            "item_code": item_code,
-            "item_name": item_name,
-            "safety_qty": safety_qty,
-            "moq": moq,
-            "final_qty": final_qty,
-            "lead_time_days": lead_time_days
-        }
-
-        # 5. 발주 방식 분류: order_cycle 명시값 우선, NULL이면 레거시(lead>=35 또는 월예외→월간)
-        #    지점 월 발주 예외는 상품 설정보다 우선. 'none'은 명시 미발주.
+        # 발주 방식 분류 — 실효 안전재고의 발주주기 커버 계산에 필요 ('none' 판정은 기존 위치에서 수행)
         is_monthly_by_exception = ((item_code, branch_code) in monthly_exc_set) or ((item_name, branch_code) in monthly_exc_name_set)
         _pm_oc = pm["order_cycle"] if pm else None
         _pm_supplier = pm["supplier"] if pm else None
@@ -19385,8 +19508,80 @@ async def _compute_purchase_order_candidates() -> dict:
             vendor_cycle=_vendor_cycle,
             mode=order_cycle_mode,
         )
+
+        # ── 실효 안전재고 = max(수동값, 자동값, 품번별 최소값) ──
+        # 자동값 = 일평균판매(최근28일 60% + 56일 40%, 일판매량 중앙값×3 캡) × (리드타임 + 발주주기) — 소모품은 자동 계산 제외(수동값만)
+        # 판매일수 <14 → 자동값 미사용 / 14~27일 → 판매일수/28 비율로 단계 반영 / ≥28일 → 100%
+        # 자동값 상한 = 수동값×3 (프로모션 급등 과대발주 방지)
+        auto_qty = 0
+        stat = auto_stats.get((branch_name, item_code))
+        # 소모품(is_consumable)은 자동 계산 제외 — 수동 안전재고만 사용
+        _is_consumable_item = bool(pm["is_consumable"]) if pm else False
+        if (not _is_consumable_item) and stat and stat["sale_days"] >= AUTO_SAFETY_MIN_SALE_DAYS and lead_time_days > 0:
+            cover_days = lead_time_days + AUTO_SAFETY_CYCLE_COVER.get(cycle, 14)
+            auto_qty = math.ceil(stat["avg"] * cover_days * AUTO_SAFETY_FACTOR)
+            if stat["sale_days"] < AUTO_SAFETY_FULL_DAYS:
+                auto_qty = math.ceil(auto_qty * stat["sale_days"] / AUTO_SAFETY_FULL_DAYS)
+            if cycle == "monthly":
+                auto_qty = min(auto_qty, math.ceil(stat["avg"] * AUTO_SAFETY_MONTHLY_MAX_DAYS))
+            if safety_qty > 0:
+                auto_qty = min(auto_qty, int(safety_qty) * AUTO_SAFETY_MAX_RATIO)
+        item_min = min_safe_map.get(item_code) or 0
+        eff_safety = max(safety_qty, auto_qty, item_min)
+        auto_detail.append({
+            "branch_name": branch_name, "item_code": item_code, "item_name": item_name,
+            "manual_qty": int(safety_qty or 0), "auto_qty": auto_qty,
+            "eff_qty": int(eff_safety), "sale_days": (stat or {}).get("sale_days", 0),
+            "cycle": cycle})
+
+        # 2. 현재고 >= 실효 안전재고면 제외 (재고 충분)
+        current_qty = raw_map.get((branch_code, item_code), 0)
+        if current_qty >= eff_safety:
+            continue
+
+        # 3. 발주 대상 = 장례용품 카테고리 또는 소모품 체크 품목
+        #    (소모품 체크 = 발주 포함, 미체크 소모품·기타/미분류/시범판매 비소모품은 발주 제외)
+        _cat = (pm["category"] or "") if pm else ""
+        is_orderable = ((bool(pm["is_consumable"]) if pm else False)
+                        or (_cat in FUNERAL_ORDER_CATEGORIES))
+        if not is_orderable:
+            continue
+
+        # 4. 미입고 발주(접수/승인) 존재 시 제외 + 별도 보고 (품번 우선, 상품명 폴백)
+        if item_code and (branch_name, item_code) in status_map_code:
+            latest_status = status_map_code[(branch_name, item_code)]
+        else:
+            latest_status = status_map_name.get((branch_name, item_name))
+        if latest_status in PENDING_STATUSES:
+            pending_report.append({
+                "branch_code": branch_code,
+                "branch_name": branch_name,
+                "item_code": item_code,
+                "item_name": item_name,
+                "status": latest_status
+            })
+            continue
+
+        # ── 여기까지 통과 = 발주 대상 확정 ──
         if cycle == "none":
             continue
+
+        # 6. MOQ 적용 최종 수량 (실효 안전재고 기준)
+        final_qty = math.ceil(eff_safety / moq) * moq
+
+        candidate = {
+            "branch_code": branch_code,
+            "branch_name": branch_name,
+            "item_code": item_code,
+            "item_name": item_name,
+            "safety_qty": eff_safety,
+            "manual_qty": safety_qty,
+            "auto_qty": auto_qty,
+            "moq": moq,
+            "final_qty": final_qty,
+            "lead_time_days": lead_time_days,
+            "current_qty": current_qty
+        }
 
         if cycle == "monthly":
             monthly.append(candidate)
@@ -19396,7 +19591,8 @@ async def _compute_purchase_order_candidates() -> dict:
     return {
         "weekly": weekly,
         "monthly": monthly,
-        "pending_report": pending_report
+        "pending_report": pending_report,
+        "auto_detail": auto_detail
     }
 
 
@@ -19895,7 +20091,7 @@ async def purchase_order_product_settings_page(
           <th class="pm-col-moq" style="cursor:pointer;" onclick="sortPm('moq')">MOQ {'▲' if sort_by=='moq' and sort_dir=='asc' else ('▼' if sort_by=='moq' else '')}</th>
           <th class="pm-col-cycle" title="발주 방식: 정기(격주)/월 발주/미발주. 미발주는 전체 미발주(숨김)와 연동됩니다. 지점 월 발주 예외(지방점 주발주 제외)는 이 설정보다 우선합니다.">발주 방식</th>
           <th class="pm-col-minsafe" title="상품별 최소 안전재고. 비워두면 안전재고 판매 기반 비교의 공통 최소값을 씁니다.">최소 안전재고</th>
-          <th class="pm-col-consumable" style="cursor:pointer;" onclick="sortPm('is_consumable')">소모품 {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
+          <th class="pm-col-consumable" style="cursor:pointer;" onclick="sortPm('is_consumable')">소모품(체크 시, 발주) {'▲' if sort_by=='is_consumable' and sort_dir=='asc' else ('▼' if sort_by=='is_consumable' else '')}</th>
           <th class="pm-col-category">품류</th>
           <th class="pm-col-ptype">종류</th>
           <th class="pm-col-ctype">소모품종류</th>
@@ -20382,12 +20578,43 @@ async def purchase_order_settings_guide(
       <p style="font-size:13px;color:#1E40AF;margin:0 0 8px 0;"><b>발주 판정 순서</b> (발주 미리보기/검수 공통)</p>
       <ol style="font-size:13px;color:#1E3A8A;margin:0;padding-left:20px;line-height:1.8;">
         <li><b>전체 미발주</b>(order_excluded=예) → 항상 제외</li>
-        <li><b>현재고 ≥ 안전재고</b> → 제외 (재고 충분)</li>
-        <li><b>소모품 체크</b> → 체크된 품목만 발주 대상. 미체크 품목은 발주 제외 (모든 지점 공통)</li>
+        <li><b>현재고 ≥ 실효 안전재고</b> → 제외 (재고 충분) — 실효 안전재고는 아래 계산식 참고</li>
+        <li><b>소모품 체크</b> → 소모품·기타 품목은 체크 시에만 발주 대상. 장례용품(유골함·수의·스톤함·관·요람·기억머문담)은 체크 없이도 발주 대상 (모든 지점 공통)</li>
         <li><b>미입고 발주(접수/승인)</b> 존재 → 제외 + 별도 보고</li>
-        <li>통과 시 <b>주/월 분류</b>: 리드타임 ≥35일 또는 월예외 등록 → 월발주, 나머지 주발주</li>
-        <li>최종수량 = 안전재고를 <b>MOQ 배수</b>로 올림</li>
+        <li>통과 시 <b>주/월 분류</b>: 상품별 발주 방식(order_cycle)·월예외 등록·리드타임 ≥35일 → 월발주, 나머지 주발주</li>
+        <li>최종수량 = 실효 안전재고를 <b>MOQ 배수</b>로 올림</li>
       </ol>
+    </div>
+
+    <div class="card" style="background:#F0FDF4;border:1px solid #86EFAC;">
+      <p style="font-size:13px;color:#166534;margin:0 0 6px 0;"><b>📐 안전재고(발주 판정) 계산식</b></p>
+      <div style="font-size:13px;color:#14532D;line-height:1.8;">
+        <b>실효 안전재고 = max(수동 입력값, 자동 계산값, 상품별 최소 안전재고)</b><br>
+        · 자동 계산값 = 일평균 판매량 × (실제 리드타임 + 발주주기) — <b>소모품은 자동 계산 제외, 수동값만 사용</b><br>
+        &nbsp;&nbsp;- 일평균 판매량 = 최근 28일 일평균×60% + 최근 56일 일평균×40%
+        (하루 판매량이 평소 중앙값의 3배를 넘으면 3배로 제한 — 프로모션 급등 완화)<br>
+        &nbsp;&nbsp;- 발주주기 커버: 주간 발주(약 2주 간격) +14일, 월간 발주 +30일 — 월간은 자동값이 일평균×35일 상한(실제 도착 5~10일)<br>
+        &nbsp;&nbsp;- 판매 이력 14일 미만 → 자동값 미사용(수동값만), 14~27일 → 판매일수/28만큼 단계 반영, 28일 이상 → 100%<br>
+        &nbsp;&nbsp;- 자동값 상한 = 수동값×3 (급등 과대발주 방지)<br>
+        · 발주 판정: 현재고 &lt; 실효 안전재고 → 발주 대상<br>
+        · 발주수량 = 실효 안전재고 ÷ MOQ 올림<br>
+        <b>예시</b> (일평균 10개/일, 실제 리드타임 3일, 주간 발주):<br>
+        · 자동 안전재고 = 10 × (3+14) = 170개<br>
+        · 11/24(화) 주문 → 11/27(목) 도착 / 다음 주문 12/8(화) → 12/11(목) 도착 → 11/24 주문분이 약 12/10까지 유지되는 것이 목표이므로 도착 후 약 2주를 추가로 버팀<br>
+        · 안전재고 아래로 떨어지면 예정일 전이라도 수시 발주 가능 (긴급발주는 별도 기준)
+      </div>
+    </div>
+
+    <div class="card" style="background:#FFF7ED;border:1px solid #FDBA74;">
+      <p style="font-size:13px;color:#9A3412;margin:0 0 6px 0;"><b>🚨 긴급발주 계산식</b> (안전재고와 별개 — 실시간 소진 기준)</p>
+      <div style="font-size:13px;color:#7C2D12;line-height:1.8;">
+        · 일평균 판매량 = 최근 56일 판매량 합계 ÷ 56 (지점×품번)<br>
+        · 필요량 = 일평균 판매량 × 이번 주 목요일까지 남은 일수<br>
+        · 대상 조건: 현재고 &lt; 필요량 (안전재고 무관)<br>
+        &nbsp;&nbsp;제외: 상품 마스터 미등록 / 소모품 / 전체미발주 / 판매 0 / 긴급발주 제외 등록 / 미입고 발주(접수·승인) 존재<br>
+        · 발주 제안 수량 = (필요량 − 현재고) ÷ MOQ 올림<br>
+        · 소진 예상일 = 현재고 ÷ 일평균 판매량 후 경과 일수
+      </div>
     </div>
 
     <div class="card" style="background:#FFFBEB;border:1px solid #FCD34D;">
@@ -20395,7 +20622,7 @@ async def purchase_order_settings_guide(
       · 소모품 / 리드타임 / MOQ / 최소 안전재고 / 전체 미발주(숨기기) →
         <a href="/master/purchase-order/product-settings" style="color:#1E40AF;">상품 설정</a> 페이지 (품번 단위 일괄 적용 권장)<br>
       · 월 1회 예외(지점×상품) → 상품 설정 표의 '지방점 주발주 제외' 열 '설정' 버튼<br>
-      · <b>소모품 체크된 품목만 발주 대상</b>입니다. 미체크 품목은 모든 지점에서 발주 제외됩니다.</p>
+      · <b>발주 대상 = 장례용품(유골함·수의·스톤함·관·요람·기억머문담) + 소모품 체크 품목</b>입니다. 그 외 미체크 품목은 모든 지점에서 발주 제외됩니다.</p>
     </div>
 
     <div class="card">
@@ -20407,7 +20634,7 @@ async def purchase_order_settings_guide(
       <table data-colkey="guide-main" data-colw data-colver="2026-11-20" style="table-layout:fixed;min-width:1250px;"><colgroup><col style="width:110px"><col style="width:200px"><col style="width:80px"><col style="width:160px"><col style="width:70px"><col style="width:80px"><col style="width:70px"><col style="width:70px"><col style="width:100px"><col style="width:150px"><col style="width:150px"></colgroup>
         <thead><tr>
           <th>품번</th><th>상품명</th><th>지점행</th><th>적용 분류</th>
-          <th>소모품</th><th>전체미발주</th><th>리드타임</th><th>MOQ</th><th>최소안전재고</th>
+          <th>소모품(체크 시, 발주)</th><th>전체미발주</th><th>리드타임</th><th>MOQ</th><th>최소안전재고</th>
           <th>월예외 지점</th><th>소모품 지점 예외(미사용)</th>
         </tr></thead>
         <tbody>{rows_html}</tbody>
@@ -30532,7 +30759,27 @@ async def safety_stock_page(
     </div>
 
     <div class="card" style="background:#EFF6FF;border:1px solid #93C5FD;">
-      <p style="font-size:13px;color:#1E40AF;">지점×상품별 안전재고 수량을 관리합니다. 발주서 자동생성 시 "현재고 &lt; 안전재고"인 상품이 발주 대상이 되며, 발주수량은 안전재고 수량 그대로 산정됩니다.</p>
+      <p style="font-size:13px;color:#1E40AF;margin-bottom:6px;">
+        지점×상품별 안전재고를 관리합니다. 발주서 자동생성 시 <b>"현재고 &lt; 실효 안전재고"</b>인 상품이 발주 대상이 되고,
+        발주수량은 실효 안전재고를 MOQ 배수로 올린 값입니다.
+      </p>
+      <details style="font-size:12px;color:#1E3A8A;">
+        <summary style="cursor:pointer;font-weight:bold;">📐 안전재고·발주 계산식 보기</summary>
+        <div style="margin-top:8px;line-height:1.7;">
+          <b>실효 안전재고 = max(수동 입력값, 자동 계산값, 상품별 최소 안전재고)</b><br>
+          · 자동 계산값 = 일평균 판매량 × (실제 리드타임 + 발주주기) — <b>소모품은 자동 계산 제외, 수동값만 사용</b><br>
+          &nbsp;&nbsp;- 일평균 판매량 = 최근 28일 일평균×60% + 최근 56일 일평균×40%
+          (하루 판매량이 평소 중앙값의 3배를 넘으면 3배로 제한 — 프로모션 급등 완화)<br>
+          &nbsp;&nbsp;- 발주주기 커버: 주간 발주(약 2주 간격) +14일, 월간 발주 +30일 — 월간은 자동값이 일평균×35일 상한<br>
+          &nbsp;&nbsp;&nbsp;&nbsp;예: 일평균 10개·실제 리드타임 3일·주간 → 10×(3+14)=170개 (11/24 주문→11/27 도착, 다음 주문 12/8→12/11 도착이라 도착 후 약 2주 공백)<br>
+          &nbsp;&nbsp;- 판매 이력 14일 미만 → 자동값 미사용(수동값만 사용), 14~27일 → 판매일수/28만큼 단계 반영, 28일 이상 → 100%<br>
+          &nbsp;&nbsp;- 자동값 상한 = 수동값×3 (급등 과대발주 방지), 하한 = 상품별 최소 안전재고<br>
+          · 발주 판정: 현재고 &lt; 실효 안전재고 → 발주 대상<br>
+          · 발주수량 = 실효 안전재고 ÷ MOQ 올림<br><br>
+          <b>긴급발주 계산식 (안전재고와 별개, 실시간 소진 기준)</b><br>
+          · 현재고 &lt; 최근 56일 일평균 판매량 × 이번 주 목요일까지 남은 일수 → 긴급발주 대상
+        </div>
+      </details>
     </div>
 
     <div class="card">
