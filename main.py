@@ -26129,9 +26129,11 @@ def _cash_book_rows_html(b: dict, dates: list) -> str:
     fmt = _cash_book_fmt
     parts = []
     opening = b["opening"]
+    # colspan 없이 10칸 전부 채워야 컬럼 순서/숨김 기능(cvReorderable)이 동작한다
     parts.append(
-        f'<tr style="background:#F8FAFC;"><td colspan="3" style="font-weight:bold;">전월 이월</td>'
-        f'<td></td><td></td><td></td><td></td><td></td><td></td>'
+        f'<tr style="background:#F8FAFC;"><td></td><td>{_esc(b["name"])}</td>'
+        f'<td></td><td></td><td></td><td></td><td></td>'
+        f'<td style="font-weight:bold;">전월 이월</td><td></td>'
         f'<td style="text-align:right;font-weight:bold;">{fmt(opening) if opening is not None else "-"}</td></tr>'
     )
     cur_bal = opening if opening is not None else 0
@@ -26233,7 +26235,7 @@ async def closing_cash_book_page(session_token: str = Cookie(default=None),
   </div>
   <div style="font-size:12px;color:#888;margin-top:8px;">
     잔액 = 전월 이월(직전 실사 시재) + 현금매출 + 기타입금 − 본사입금 − 시재사용 − 기타출금 ·
-    * 표시 = 유비플러스 자동값 대신 수동 입력된 현금매출 · 기타 출금은 현재 입력 항목 없음(예비)
+    * 표시 = 유비플러스 자동값 대신 수동 입력된 현금매출
   </div>
 </div>''']
 
@@ -26253,8 +26255,9 @@ async def closing_cash_book_page(session_token: str = Cookie(default=None),
                     tot["actual_n"] += 1
             parts.append(f'''
 <div class="card" style="padding:0;overflow-x:auto;">
+  <style>.cashbook-tbl th,.cashbook-tbl td{{vertical-align:middle;}}</style>
   <div style="padding:10px 14px;font-weight:bold;border-bottom:1px solid #eee;">{_esc(b["name"])}</div>
-  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+  <table class="cashbook-tbl" style="width:100%;border-collapse:collapse;font-size:13px;">
     <thead><tr style="background:#F1F5F9;">
       <th style="padding:6px 8px;text-align:left;">날짜</th><th style="padding:6px 8px;">지점</th>
       <th style="padding:6px 8px;text-align:right;">현금매출</th>
@@ -26268,13 +26271,15 @@ async def closing_cash_book_page(session_token: str = Cookie(default=None),
     </tr></thead>
     <tbody>{_cash_book_rows_html(b, dates)}</tbody>
     <tfoot><tr style="background:#EFF6FF;font-weight:bold;">
-      <td colspan="2" style="padding:6px 8px;">{y}년 {m}월 합계</td>
+      <td style="padding:6px 8px;">{y}년 {m}월 합계</td>
+      <td style="padding:6px 8px;">{_esc(b["name"])}</td>
       <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["sale"])}</td>
       <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["hq"])}</td>
       <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["use"])}</td>
       <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["deposit"])}</td>
       <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["withdraw"])}</td>
-      <td colspan="2" style="padding:6px 8px;">실사 {tot["actual_n"]}일</td>
+      <td style="padding:6px 8px;">실사 {tot["actual_n"]}일</td>
+      <td style="padding:6px 8px;"></td>
       <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(b.get("closing", 0))}</td>
     </tr></tfoot>
   </table>
@@ -26338,22 +26343,35 @@ async def closing_cash_book_xlsx(session_token: str = Cookie(default=None),
         tot = {"sale": 0, "hq": 0, "use": 0, "deposit": 0, "withdraw": 0}
         cur_bal = b["opening"] if b["opening"] is not None else 0
         for d in dates:
+            # 진짜 date 객체로 써야 Excel이 날짜로 인식 (텍스트 붙여넣기 시 숫자/날짜 변환됨)
+            d_obj = _date(int(d[:4]), int(d[5:7]), int(d[8:10]))
             row = b["days"].get(d)
             if row is None:
-                ws.append([d, b["name"], None, None, None, None, None, None,
+                ws.append([d_obj, b["name"], None, None, None, None, None, None,
                            None, cur_bal])
                 continue
             for k2 in tot:
                 tot[k2] += row[k2]
             cur_bal = row.get("balance", cur_bal)
             ws.append([
-                d, b["name"], row["sale"] or None, row["hq"] or None,
+                d_obj, b["name"], row["sale"] or None, row["hq"] or None,
                 row["use"] or None, row["deposit"] or None, row["withdraw"] or None,
                 " / ".join(dict.fromkeys(row["memo"])) or None,
                 row["actual"], row.get("balance"),
             ])
         sum_ws.append([b["name"], tot["sale"], tot["hq"], tot["use"],
                        tot["deposit"], tot["withdraw"], b.get("closing")])
+
+    # 날짜/숫자 서식 — 다른 시트에 붙여넣어도 날짜·숫자로 인식되도록
+    for row in ws.iter_rows(min_row=2):
+        row[0].number_format = "yyyy-mm-dd"
+        for cell in row[2:7] + row[8:10]:
+            if cell.value is not None:
+                cell.number_format = "#,##0"
+    for row in sum_ws.iter_rows(min_row=2):
+        for cell in row[1:]:
+            if cell.value is not None:
+                cell.number_format = "#,##0"
 
     for col, w in zip("ABCDEFGHIJ", (10, 14, 12, 14, 12, 12, 12, 30, 12, 14)):
         ws.column_dimensions[col].width = w
