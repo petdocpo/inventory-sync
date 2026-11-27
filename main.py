@@ -16106,6 +16106,9 @@ async def cron_check_new_purchase(authorization: str = Header(default="")):
         return JSONResponse(status_code=500, content={"detail": err_msg})
 
 EOD_ALERT_DEDUP_DAYS = 7  # 최근 N일 내 알림 발송된 지점×품번은 긴급발주 후보에서 제외
+EOD_ORDER_CYCLE_DAYS = 14  # 격주 화요일 발주 주기
+EOD_LEAD_DAYS = 3          # 화요일 발주 → 목요일 도착
+EOD_BASE_COVER_DAYS = EOD_ORDER_CYCLE_DAYS + EOD_LEAD_DAYS  # 기본 발주량 = 17일치
 
 
 def _eod_alert_candidates(lookback_days: int = 56) -> dict:
@@ -16113,7 +16116,7 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
     안전재고 무관: 현재고(raw_inventory) < 일평균판매×도착까지일수 이면 대상.
     제외: product_master 미등록/소모품/전체미발주, 판매 0, eod_alert_exclusion 등록 건,
           최근 EOD_ALERT_DEDUP_DAYS일 내 알림 발송된 건(eod_alert_log), 미입고 발주(접수/승인) 존재.
-    반환: {"today","arrival","days_left","items":[{branch_name,branch_code,item_code,item_name,daily,stock,need,shortage,depletion,suggest_qty,moq}]}
+    반환: {"today","arrival","days_left","items":[{branch_name,branch_code,item_code,item_name,daily,stock,need,shortage,depletion,gap_days,cover_days,suggest_qty,moq}]}
     """
     import math
     from datetime import date, timedelta
@@ -16202,8 +16205,11 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
             continue
         shortage = need - stock
         moq = pm["moq"] or 1
-        suggest = math.ceil(shortage / moq) * moq if shortage > 0 else 0
+        # 발주 제안 수량 = 17일치(14일 주기+3일 리드타임) + 소진예정~도착예정 공백 일수, MOQ 올림
         depletion = today if stock <= 0 else today + timedelta(days=math.ceil(stock / daily))
+        gap_days = max(0, (thu - depletion).days)
+        cover_days = EOD_BASE_COVER_DAYS + gap_days
+        suggest = math.ceil(daily * cover_days / moq) * moq if daily > 0 else 0
         _sup = ((pm["supplier"] or "").strip() if pm else "") or _dst_vendor_prefix(r["item_name"] or "")
         _sup = _DST_VENDOR_NAME_MAP.get(_sup, _sup)
         if _sup in _DST_VENDOR_EXCLUDE:
@@ -16215,6 +16221,7 @@ def _eod_alert_candidates(lookback_days: int = 56) -> dict:
             "need": round(need, 1), "shortage": round(shortage, 1),
             "safety": ss_map.get((bn, r["item_name"]), 0),
             "depletion": depletion.isoformat(), "arrival": thu.isoformat(),
+            "gap_days": gap_days, "cover_days": cover_days,
             "moq": moq, "suggest_qty": suggest,
             "supplier": _sup,
         })
@@ -16397,6 +16404,9 @@ async def cron_send_eod_alert(authorization: str = Header(default="")):
         conn.close()
         if not enabled_row or enabled_row["value"] != "true":
             return JSONResponse(content={"skipped": True, "reason": "eod_alert_enabled off"})
+        # 화요일 = 정기 발주일 — 같은 주 목요일 도착 정기 발주로 커버되므로 알림 생략
+        if _kst_now().weekday() == 1:
+            return JSONResponse(content={"skipped": True, "reason": "화요일 정기 발주일 — 알림 생략"})
         test_mode = bool(test_row and test_row["value"] == "true")
 
         result = _eod_alert_candidates()
@@ -20617,7 +20627,8 @@ async def purchase_order_settings_guide(
         · 필요량 = 일평균 판매량 × 이번 주 목요일까지 남은 일수<br>
         · 대상 조건: 현재고 &lt; 필요량 (안전재고 무관)<br>
         &nbsp;&nbsp;제외: 상품 마스터 미등록 / 소모품 / 전체미발주 / 판매 0 / 긴급발주 제외 등록 / 미입고 발주(접수·승인) 존재<br>
-        · 발주 제안 수량 = (필요량 − 현재고) ÷ MOQ 올림<br>
+        · 발주 제안 수량 = (일평균 × (17일 + 소진예정~도착예정 공백 일수)) ÷ MOQ 올림
+          — 17일 = 격주 발주주기 14일 + 리드타임 3일. 소진이 도착보다 늦으면 공백 일수만큼 가산<br>
         · 소진 예상일 = 현재고 ÷ 일평균 판매량 후 경과 일수
       </div>
     </div>
@@ -31197,7 +31208,9 @@ async def safety_stock_page(
           · 발주 판정: 현재고 &lt; 실효 안전재고 → 발주 대상<br>
           · 발주수량 = 실효 안전재고 ÷ MOQ 올림<br><br>
           <b>긴급발주 계산식 (안전재고와 별개, 실시간 소진 기준)</b><br>
-          · 현재고 &lt; 최근 56일 일평균 판매량 × 이번 주 목요일까지 남은 일수 → 긴급발주 대상
+          · 현재고 &lt; 최근 56일 일평균 판매량 × 이번 주 목요일까지 남은 일수 → 긴급발주 대상<br>
+          · 발주 제안 수량 = 일평균 × (17일 + 소진~도착 공백 일수) ÷ MOQ 올림
+          (17일 = 격주 주기 14일 + 리드타임 3일 — 다음 발주 도착까지 버티는 양)
         </div>
       </details>
     </div>
