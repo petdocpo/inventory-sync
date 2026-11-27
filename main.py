@@ -3338,6 +3338,7 @@ def render_page(content: str, user: Optional[Dict] = None, active: str = "") -> 
         ("closing-group", None, "🧾", "마감", [
             ("재고 마감", "/stock-closing/status" if is_master else "/stock-closing"),
             ("매출 마감", "/closing"),
+            *([("현금 장부", "/closing/cash-book")] if is_master else []),
             ("재고 실사", daily_stocktake_href),
         ]),
         ("stock-group", None, "📦", "재고&발주", [
@@ -5274,7 +5275,11 @@ async def stock_closing_save(request: Request, session_token: str = Cookie(defau
 
 # 거래처명 정규화 매핑 — 비어 있으면 원본 그대로 사용. "펫네스트"(상품명 접두사)와
 # "펫네스트(디자인주권)"(구매내역 vendor)를 후자로 통일.
-_DST_VENDOR_NAME_MAP = {"펫네스트": "펫네스트(디자인주권)"}
+_DST_VENDOR_NAME_MAP = {
+    "펫네스트": "펫네스트(디자인주권)",
+    "건부(GB인쇄_)": "건부(GB인쇄)",
+    "벨르앤(중단)": "벨르앤",
+}
 
 # 상품 DB상 "구매처 없음"을 의미하는 플레이스홀더 — 거래처 필터에서는 (미등록)으로 취급
 _DST_SUPPLIER_BLANK_VALUES = {"[삭제된구매처]"}
@@ -20336,7 +20341,7 @@ async def purchase_order_product_settings_page(
         }});
         const data = await res.json();
         if (res.ok) {{
-          document.getElementById('pmUploadResult').innerText = '완료: ' + data.inserted + '건 등록/갱신';
+          document.getElementById('pmUploadResult').innerText = '완료: ' + data.inserted + '건 등록/갱신 (구매처 인식 ' + (data.supplier_filled || 0) + '건)';
           setTimeout(() => location.reload(), 1200);
         }} else {{
           document.getElementById('pmUploadResult').innerText = '오류: ' + (data.detail || '업로드 실패');
@@ -21397,6 +21402,23 @@ async def purchase_order_product_master_upload(request: Request, session_token: 
     if header_row_idx is None:
         return JSONResponse(status_code=400, content={"detail": "헤더(지점명/상품명 등)를 찾을 수 없습니다."})
 
+    # 2단 헤더 대응: 지점명/상품명 줄 기준 위·아래 1줄도 스캔해 별칭 컬럼을 보강
+    _SUPPLIER_ALIASES = {"구매처", "구매처명", "거래처", "거래처명", "공급처", "공급업체", "vendor", "Vendor", "VENDOR"}
+    _scan_rows = [r for r in (header_row_idx - 1, header_row_idx + 1) if r >= 1]
+    all_scan = list(ws.iter_rows(min_row=1, max_row=header_row_idx + 1, values_only=True))
+    for sr in _scan_rows:
+        if sr - 1 >= len(all_scan):
+            continue
+        srow = all_scan[sr - 1]
+        if not srow:
+            continue
+        for col_idx, cell in enumerate(srow):
+            if not cell:
+                continue
+            name = str(cell).strip()
+            if name in _SUPPLIER_ALIASES and "구매처" not in header_map:
+                header_map["구매처"] = col_idx
+
     required = ["지점명", "상품명"]
     for col in required:
         if col not in header_map:
@@ -21405,6 +21427,7 @@ async def purchase_order_product_master_upload(request: Request, session_token: 
     now = datetime.now().isoformat()
     conn = get_conn()
     inserted = 0
+    supplier_filled = 0
     for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
         if not row:
             continue
@@ -21424,6 +21447,8 @@ async def purchase_order_product_master_upload(request: Request, session_token: 
         item_code = str(get_col("품번", "") or "").strip()
         purchase_price = get_col("구매금액", 0) or 0
         supplier = str(get_col("구매처", "") or "").strip()
+        if supplier:
+            supplier_filled += 1
         tax_setting = str(get_col("과세설정", "") or "").strip()
         lead_time_raw = get_col("리드타임", 0)
         try:
@@ -21437,14 +21462,15 @@ async def purchase_order_product_master_upload(request: Request, session_token: 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (branch_name, item_code) DO UPDATE SET
                 item_name=excluded.item_name, purchase_price=excluded.purchase_price,
-                supplier=excluded.supplier, tax_setting=excluded.tax_setting,
+                supplier=CASE WHEN excluded.supplier<>'' THEN excluded.supplier ELSE product_master.supplier END,
+                tax_setting=excluded.tax_setting,
                 lead_time_days=excluded.lead_time_days, updated_at=excluded.updated_at
         """, (branch_name, item_name, item_code, purchase_price, supplier, tax_setting, lead_time_days, now))
         inserted += 1
 
     conn.commit()
     conn.close()
-    return JSONResponse(content={"status": "ok", "inserted": inserted})
+    return JSONResponse(content={"status": "ok", "inserted": inserted, "supplier_filled": supplier_filled})
 
 
 def _po_resolve_item_code(conn, item_name: str) -> str:
@@ -24633,7 +24659,7 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
     cash = _closing_cash_load(conn, view_key, pay_date)
     lines = cash["lines"]
     # 'sale' 행은 현금 매출 수동 수정값 — 입출금 행과 분리해 따로 처리
-    ui_lines = [l for l in lines if l.get("kind") in ("deposit", "use", "hq")]
+    ui_lines = [l for l in lines if l.get("kind") in ("deposit", "use", "hq", "withdraw")]
     sale_override = None
     for l in lines:
         if l.get("kind") == "sale":
@@ -24668,7 +24694,7 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
             f'<td><select name="cl_kind" style="width:100%;">'
             f'<option value="deposit"{" selected" if l["kind"] == "deposit" else ""}>기타 입금</option>'
             f'<option value="hq"{" selected" if l["kind"] == "hq" else ""}>현금 본사 입금</option>'
-            f'<option value="use"{" selected" if l["kind"] == "use" else ""}>시재 사용</option></select></td>'
+            f'<option value="use"{" selected" if l["kind"] == "use" else ""}>시재 사용</option><option value="withdraw"{" selected" if l["kind"] == "withdraw" else ""}>기타 출금</option></select></td>'
             f'<td><input type="number" min="0" step="1" inputmode="numeric" name="cl_amt" value="{l["amount"] or ""}" style="width:100%;box-sizing:border-box;"></td>'
             f'<td><input type="text" name="cl_cust" maxlength="50" value="{_esc(l["customer"])}" placeholder="고객명" style="width:100%;box-sizing:border-box;"></td>'
             f'<td><input type="text" name="cl_note" maxlength="100" value="{_esc(l["note"])}" placeholder="비고" style="width:100%;box-sizing:border-box;"></td>'
@@ -24678,7 +24704,7 @@ def _closing_cash_html(view_key: str, branch_name: str, pay_date: str, slot: str
         rows_html += (
             '<tr class="cash-line">'
             '<td><select name="cl_kind" style="width:100%;">'
-            '<option value="deposit">기타 입금</option><option value="hq">현금 본사 입금</option><option value="use">시재 사용</option></select></td>'
+            '<option value="deposit">기타 입금</option><option value="hq">현금 본사 입금</option><option value="use">시재 사용</option><option value="withdraw">기타 출금</option></select></td>'
             '<td><input type="number" min="0" step="1" inputmode="numeric" name="cl_amt" style="width:100%;box-sizing:border-box;"></td>'
             '<td><input type="text" name="cl_cust" maxlength="50" placeholder="고객명" style="width:100%;box-sizing:border-box;"></td>'
             '<td><input type="text" name="cl_note" maxlength="100" placeholder="비고" style="width:100%;box-sizing:border-box;"></td>'
@@ -25916,7 +25942,7 @@ async def closing_cash_save(request: Request, session_token: str = Cookie(defaul
                 if not isinstance(l, dict):
                     continue
                 _k = str(l.get("kind") or "")
-                kind = _k if _k in ("deposit", "use", "hq") else "use"
+                kind = _k if _k in ("deposit", "use", "hq", "withdraw") else "use"
                 try:
                     amt = max(0, int(float(str(l.get("amount") or 0))))
                 except (TypeError, ValueError):
@@ -25966,6 +25992,382 @@ async def closing_cash_save(request: Request, session_token: str = Cookie(defaul
     finally:
         conn.close()
     return _back("cash_saved")
+
+
+# ── 현금 장부 (월 마감 '현금입출내역' 양식) ──
+# 컬럼: 날짜 | 현금매출 | 지점계좌입금(=kind hq 본사입금) | 현금시재 사용(=use)
+#       | 기타 입금(=deposit) | 기타 출금(=withdraw, 예비) | 적요 | 실사 시재 | 잔액
+# 잔액 = 전월 이월(직전 실사 시재) + 현금매출 + 기타입금 − 본사입금 − 시재사용 − 기타출금
+
+_CASH_BOOK_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+def _cash_book_fmt(n) -> str:
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _cash_book_collect(conn, month: str):
+    """month 'YYYY-MM' 의 지점×일자 현금 장부 데이터 수집.
+    반환: {branch_key: {"name": str, "opening": int|None, "days": {date: row}}}"""
+    from datetime import date as _date
+    from calendar import monthrange
+
+    y, m = int(month[:4]), int(month[5:7])
+    month_start = f"{month}-01"
+    last_day = monthrange(y, m)[1]
+    dates = [f"{month}-{d:02d}" for d in range(1, last_day + 1)]
+
+    ex_sql, ex_params = _closing_excluded_sql()
+
+    # 지점 목록: 실적이 있는 지점 + closing_cash 등록 지점
+    branch_names = {}
+    for r in conn.execute(
+        "SELECT DISTINCT branch_name, REPLACE(branch_name,' ','') bk FROM payment_records WHERE " + ex_sql,
+        tuple(ex_params)).fetchall():
+        branch_names[r["bk"]] = r["branch_name"]
+    for r in conn.execute(
+        "SELECT DISTINCT branch_key, branch_name FROM closing_cash").fetchall():
+        branch_names.setdefault(r["branch_key"], r["branch_name"] or r["branch_key"])
+
+    books = {bk: {"name": nm, "opening": None, "days": {d: None for d in dates}}
+             for bk, nm in branch_names.items()}
+
+    def _day(bk, d):
+        if bk not in books:
+            books[bk] = {"name": bk, "opening": None,
+                         "days": {dd: None for dd in dates}}
+        b = books[bk]
+        row = b["days"].get(d)
+        if row is None:
+            row = {"sale": 0, "sale_manual": False, "hq": 0, "use": 0,
+                   "deposit": 0, "withdraw": 0, "memo": [], "actual": None}
+            b["days"][d] = row
+        return row
+
+    # 1) 유비플러스 현금 매출 (슬롯 전체 합산)
+    for r in conn.execute(
+        "SELECT pay_date, REPLACE(branch_name,' ','') bk, "
+        "SUM(CASE WHEN pay_status='취소' THEN -approve_amount ELSE approve_amount END) net_amt "
+        "FROM payment_records WHERE pay_date>=? AND pay_date<=? AND pay_type='현금' AND " + ex_sql + " "
+        "GROUP BY pay_date, bk",
+        (month_start, f"{month}-{last_day:02d}", *ex_params)).fetchall():
+        row = _day(r["bk"], r["pay_date"])
+        if row is not None:
+            row["sale"] = int(r["net_amt"] or 0)
+
+    # 2) closing_cash 실사 시재 + 수기 행
+    line_rows = conn.execute(
+        "SELECT branch_key, pay_date, kind, amount, customer, note "
+        "FROM closing_cash_lines WHERE pay_date>=? AND pay_date<=? "
+        "ORDER BY branch_key, pay_date, sort_order, id",
+        (month_start, f"{month}-{last_day:02d}")).fetchall()
+    for r in line_rows:
+        row = _day(r["branch_key"], r["pay_date"])
+        if row is None:
+            continue
+        k, amt = r["kind"], int(r["amount"] or 0)
+        if k == "sale":
+            row["sale"] = amt
+            row["sale_manual"] = True
+        elif k == "deposit":
+            row["deposit"] += amt
+        elif k == "hq":
+            row["hq"] += amt
+        elif k == "use":
+            row["use"] += amt
+        elif k == "withdraw":
+            row["withdraw"] += amt
+        memo = (r["customer"] or "").strip()
+        if r["note"]:
+            memo = (memo + " " + r["note"]).strip() if memo else r["note"].strip()
+        if memo:
+            row["memo"].append(memo[:80])
+
+    for r in conn.execute(
+        "SELECT branch_key, pay_date, actual_cash FROM closing_cash "
+        "WHERE pay_date>=? AND pay_date<=?",
+        (month_start, f"{month}-{last_day:02d}")).fetchall():
+        row = _day(r["branch_key"], r["pay_date"])
+        if row is not None and r["actual_cash"] is not None:
+            row["actual"] = int(r["actual_cash"])
+
+    # 3) 기초 잔액 = 월 시작 전 마지막 실사 시재
+    for r in conn.execute(
+        "SELECT DISTINCT ON (branch_key) branch_key, actual_cash FROM closing_cash "
+        "WHERE pay_date<? AND actual_cash IS NOT NULL ORDER BY branch_key, pay_date DESC",
+        (month_start,)).fetchall():
+        b = books.get(r["branch_key"])
+        if b is not None:
+            b["opening"] = int(r["actual_cash"])
+
+    # 4) 잔액 누적 계산
+    for bk, b in books.items():
+        bal = b["opening"] if b["opening"] is not None else 0
+        for d in dates:
+            row = b["days"].get(d)
+            if row is None:
+                continue
+            bal += row["sale"] + row["deposit"] - row["hq"] - row["use"] - row["withdraw"]
+            row["balance"] = bal
+        b["closing"] = bal
+
+    # 데이터가 전혀 없는 지점 제거 (열려 있는 지점만 표시)
+    out = {}
+    for bk, b in books.items():
+        has = any(b["days"][d] is not None for d in dates)
+        if has or b["opening"] is not None:
+            out[bk] = b
+    return out
+
+
+def _cash_book_rows_html(b: dict, dates: list) -> str:
+    """지점 하나의 일별 행 HTML."""
+    from html import escape as _esc
+    fmt = _cash_book_fmt
+    parts = []
+    opening = b["opening"]
+    parts.append(
+        f'<tr style="background:#F8FAFC;"><td colspan="3" style="font-weight:bold;">전월 이월</td>'
+        f'<td></td><td></td><td></td><td></td><td></td><td></td>'
+        f'<td style="text-align:right;font-weight:bold;">{fmt(opening) if opening is not None else "-"}</td></tr>'
+    )
+    cur_bal = opening if opening is not None else 0
+    for d in dates:
+        row = b["days"].get(d)
+        md = f"{int(d[5:7])}/{int(d[8:10])}"
+        if row is None:
+            # 데이터 없는 날도 잔액은 전일과 동일하게 표시 (원본 양식과 동일)
+            parts.append(
+                f'<tr><td>{md}</td><td></td><td></td><td></td><td></td><td></td><td></td>'
+                f'<td></td><td></td>'
+                f'<td style="text-align:right;font-weight:bold;color:#999;">{fmt(cur_bal)}</td></tr>'
+            )
+            continue
+        cur_bal = row.get("balance", cur_bal)
+        sale = row["sale"]
+        sale_txt = fmt(sale) + ("*" if row["sale_manual"] else "")
+        memo = " / ".join(dict.fromkeys(row["memo"]))
+        actual = row["actual"]
+        parts.append(
+            f'<tr><td>{md}</td><td></td>'
+            f'<td style="text-align:right;">{sale_txt if sale else ""}</td>'
+            f'<td style="text-align:right;">{fmt(row["hq"]) if row["hq"] else ""}</td>'
+            f'<td style="text-align:right;">{fmt(row["use"]) if row["use"] else ""}</td>'
+            f'<td style="text-align:right;">{fmt(row["deposit"]) if row["deposit"] else ""}</td>'
+            f'<td style="text-align:right;">{fmt(row["withdraw"]) if row["withdraw"] else ""}</td>'
+            f'<td style="font-size:11px;">{_esc(memo)}</td>'
+            f'<td style="text-align:right;">{fmt(actual) if actual is not None else ""}</td>'
+            f'<td style="text-align:right;font-weight:bold;">{fmt(row.get("balance",0))}</td></tr>'
+        )
+    return "".join(parts)
+
+
+@app.get("/closing/cash-book", response_class=HTMLResponse)
+async def closing_cash_book_page(session_token: str = Cookie(default=None),
+                                 month: str = "", branch: str = ""):
+    """월별 현금 장부 — 월마감 '현금입출내역' 양식. 본사(마스터/hq) 전용."""
+    import re as _re
+    from html import escape as _esc
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    # 현금 장부는 본사(마스터/hq) 전용 — 지점 계정의 마감 프로세스는 /closing 그대로
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if not is_all or not has_menu_permission(user["login_id"], "closing"):
+        return RedirectResponse(url="/closing", status_code=303)
+
+    if not _CASH_BOOK_MONTH_RE.match(month or ""):
+        month = _kst_now().strftime("%Y-%m")
+
+    conn = get_conn()
+    try:
+        all_books = _cash_book_collect(conn, month)
+    finally:
+        conn.close()
+
+    # 지점 필터 옵션은 전체 목록 기준으로 만든 뒤 표시용으로 좁힌다
+    branch_opts = '<option value="">전체 지점</option>' + "".join(
+        f'<option value="{_esc(nm)}"{" selected" if _closing_norm(nm) == _closing_norm(branch or "") else ""}>{_esc(nm)}</option>'
+        for nm in sorted({b["name"] for b in all_books.values()})
+    )
+
+    books = all_books
+    if branch:
+        target = _closing_norm(branch)
+        books = {k: b for k, b in books.items() if k == target}
+
+    from datetime import date as _date
+    from calendar import monthrange
+    y, m = int(month[:4]), int(month[5:7])
+    ndays = monthrange(y, m)[1]
+    dates = [f"{month}-{d:02d}" for d in range(1, ndays + 1)]
+
+    # 엑셀 다운로드 링크 (같은 필터)
+    qs = f"month={month}" + (f"&branch={_esc(branch)}" if (is_all and branch) else "")
+    xlsx_href = f"/closing/cash-book.xlsx?{qs}"
+
+    # 월 네비게이션
+    def _shift(mm, delta):
+        yy, mo = int(mm[:4]), int(mm[5:7]) + delta
+        yy += (mo - 1) // 12
+        mo = (mo - 1) % 12 + 1
+        return f"{yy:04d}-{mo:02d}"
+    prev_m, next_m = _shift(month, -1), _shift(month, 1)
+
+    parts = [f'''<h2 style="margin-bottom:8px;">💴 현금 장부</h2>
+<div class="card" style="padding:12px 16px;">
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <a class="btn secondary" href="/closing/cash-book?month={prev_m}{('&branch='+_esc(branch)) if branch else ''}">◀ 이전달</a>
+    <b style="font-size:16px;">{y}년 {m}월</b>
+    <a class="btn secondary" href="/closing/cash-book?month={next_m}{('&branch='+_esc(branch)) if branch else ''}">다음달 ▶</a>
+    <form method="get" action="/closing/cash-book" style="display:flex;gap:6px;align-items:center;">
+      <input type="month" name="month" value="{month}" style="padding:6px;">
+      {'<select name="branch" style="padding:6px;">' + branch_opts + '</select>' if is_all else ''}
+      <button class="btn" type="submit">조회</button>
+    </form>
+    <a class="btn" href="{xlsx_href}" style="margin-left:auto;">엑셀 다운로드</a>
+  </div>
+  <div style="font-size:12px;color:#888;margin-top:8px;">
+    잔액 = 전월 이월(직전 실사 시재) + 현금매출 + 기타입금 − 본사입금 − 시재사용 − 기타출금 ·
+    * 표시 = 유비플러스 자동값 대신 수동 입력된 현금매출 · 기타 출금은 현재 입력 항목 없음(예비)
+  </div>
+</div>''']
+
+    if not books:
+        parts.append('<div class="card">이 기간에 현금 관련 데이터가 없습니다.</div>')
+    else:
+        for bk in sorted(books, key=lambda k: books[k]["name"]):
+            b = books[bk]
+            tot = {"sale": 0, "hq": 0, "use": 0, "deposit": 0, "withdraw": 0, "actual_n": 0}
+            for d in dates:
+                row = b["days"].get(d)
+                if row is None:
+                    continue
+                for k2 in ("sale", "hq", "use", "deposit", "withdraw"):
+                    tot[k2] += row[k2]
+                if row["actual"] is not None:
+                    tot["actual_n"] += 1
+            parts.append(f'''
+<div class="card" style="padding:0;overflow-x:auto;">
+  <div style="padding:10px 14px;font-weight:bold;border-bottom:1px solid #eee;">{_esc(b["name"])}</div>
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead><tr style="background:#F1F5F9;">
+      <th style="padding:6px 8px;text-align:left;">날짜</th><th style="padding:6px 8px;">지점</th>
+      <th style="padding:6px 8px;text-align:right;">현금매출</th>
+      <th style="padding:6px 8px;text-align:right;">지점계좌입금</th>
+      <th style="padding:6px 8px;text-align:right;">현금시재 사용</th>
+      <th style="padding:6px 8px;text-align:right;">기타 입금</th>
+      <th style="padding:6px 8px;text-align:right;">기타 출금</th>
+      <th style="padding:6px 8px;text-align:left;">적요</th>
+      <th style="padding:6px 8px;text-align:right;">실사 시재</th>
+      <th style="padding:6px 8px;text-align:right;">잔액</th>
+    </tr></thead>
+    <tbody>{_cash_book_rows_html(b, dates)}</tbody>
+    <tfoot><tr style="background:#EFF6FF;font-weight:bold;">
+      <td colspan="2" style="padding:6px 8px;">{y}년 {m}월 합계</td>
+      <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["sale"])}</td>
+      <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["hq"])}</td>
+      <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["use"])}</td>
+      <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["deposit"])}</td>
+      <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(tot["withdraw"])}</td>
+      <td colspan="2" style="padding:6px 8px;">실사 {tot["actual_n"]}일</td>
+      <td style="padding:6px 8px;text-align:right;">{_cash_book_fmt(b.get("closing", 0))}</td>
+    </tr></tfoot>
+  </table>
+</div>''')
+
+    content = "\n".join(parts)
+    return HTMLResponse(content=render_page(content, user, "closing"))
+
+
+@app.get("/closing/cash-book.xlsx")
+async def closing_cash_book_xlsx(session_token: str = Cookie(default=None),
+                                 month: str = "", branch: str = ""):
+    """현금 장부 엑셀 다운로드 — '현금입출내역' 양식."""
+    import io
+    import re as _re
+    from datetime import date as _date
+    from calendar import monthrange
+
+    user = get_session(session_token)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    is_all = user["role"] == "master" or user.get("branch_type") == "hq"
+    if not is_all or not has_menu_permission(user["login_id"], "closing"):
+        return RedirectResponse(url="/closing", status_code=303)
+    if not _CASH_BOOK_MONTH_RE.match(month or ""):
+        month = _kst_now().strftime("%Y-%m")
+
+    conn = get_conn()
+    try:
+        books = _cash_book_collect(conn, month)
+    finally:
+        conn.close()
+
+    if branch:
+        target = _closing_norm(branch)
+        books = {k: v for k, v in books.items() if k == target}
+
+    y, m = int(month[:4]), int(month[5:7])
+    ndays = monthrange(y, m)[1]
+    dates = [f"{month}-{d:02d}" for d in range(1, ndays + 1)]
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "현금입출내역"
+    ws.append(["날짜", "지점", "현금매출", "지점계좌입금", "현금시재 사용",
+               "기타 입금", "기타 출금", "적요", "실사 시재", "잔액"])
+    for c in ws[1]:
+        c.font = openpyxl.styles.Font(bold=True)
+        c.fill = openpyxl.styles.PatternFill("solid", fgColor="F1F5F9")
+
+    sum_ws = wb.create_sheet("월 합계")
+    sum_ws.append(["지점", "현금매출", "지점계좌입금", "현금시재 사용",
+                   "기타 입금", "기타 출금", "기말 잔액"])
+    for c in sum_ws[1]:
+        c.font = openpyxl.styles.Font(bold=True)
+
+    for bk in sorted(books, key=lambda k: books[k]["name"]):
+        b = books[bk]
+        ws.append(["전월 이월", b["name"], None, None, None, None, None, None,
+                   None, b["opening"] if b["opening"] is not None else None])
+        tot = {"sale": 0, "hq": 0, "use": 0, "deposit": 0, "withdraw": 0}
+        cur_bal = b["opening"] if b["opening"] is not None else 0
+        for d in dates:
+            row = b["days"].get(d)
+            if row is None:
+                ws.append([d, b["name"], None, None, None, None, None, None,
+                           None, cur_bal])
+                continue
+            for k2 in tot:
+                tot[k2] += row[k2]
+            cur_bal = row.get("balance", cur_bal)
+            ws.append([
+                d, b["name"], row["sale"] or None, row["hq"] or None,
+                row["use"] or None, row["deposit"] or None, row["withdraw"] or None,
+                " / ".join(dict.fromkeys(row["memo"])) or None,
+                row["actual"], row.get("balance"),
+            ])
+        sum_ws.append([b["name"], tot["sale"], tot["hq"], tot["use"],
+                       tot["deposit"], tot["withdraw"], b.get("closing")])
+
+    for col, w in zip("ABCDEFGHIJ", (10, 14, 12, 14, 12, 12, 12, 30, 12, 14)):
+        ws.column_dimensions[col].width = w
+    for col, w in zip("ABCDEFG", (16, 12, 14, 14, 12, 12, 14)):
+        sum_ws.column_dimensions[col].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    fname = f"현금입출내역_{month}" + (f"_{_closing_norm(branch)}" if branch else "") + ".xlsx"
+    from urllib.parse import quote as _uq
+    return StreamingResponse(
+        buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{_uq(fname)}"})
 
 
 @app.post("/closing/save")
